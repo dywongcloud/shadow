@@ -563,6 +563,20 @@ const RELAY_CLIENT_BURST_FACTOR: u32 = 2;
 /// below systemd's `TimeoutStopSec` (90 s in hive-node.service) so the exit is ours, never
 /// SIGKILL's.
 const SHUTDOWN_DEADLINE_DEFAULT_SECS: u64 = 75;
+/// Connection-level DoS bounds on the control plane (`HIVE_ADMIN_MAX_BODY_MIB`,
+/// `HIVE_ADMIN_REQUEST_TIMEOUT_SECS`): the admin router has no streaming/SSE endpoints and deploys
+/// enqueue-then-return, so a per-request timeout and a body cap are safe, unlike the public
+/// gateway, which streams tenant responses and is bounded by the edge pipeline instead (16 MiB
+/// request bodies, per-IP rate limits).
+const ADMIN_MAX_BODY_MIB_DEFAULT: usize = 64;
+const ADMIN_REQUEST_TIMEOUT_SECS_DEFAULT: u64 = 120;
+/// Period of the self-management GC that reaps stale clone/build working dirs under the deploy
+/// roots (`$HIVE_DATA/deploys` and the legacy `/tmp/hive-deploys`, skipping dirs that still back a
+/// live deployment) and orphaned `Building…` placeholders, so build scratch never exhausts host
+/// disk (it pairs with the firecracker orphan-overlay GC).
+const BUILD_GC_INTERVAL: Duration = Duration::from_secs(600);
+/// A build working dir untouched for this long is a dead build.
+const STALE_BUILD_DIR_AGE: Duration = Duration::from_secs(1800);
 
 async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -1221,8 +1235,8 @@ async fn async_main() -> anyhow::Result<()> {
             if let Err(error) = crate::guardian::shutdown(final_guardian_generation).await {
                 tracing::error!(%error, "Guardian shutdown did not complete cleanly; exiting anyway");
             }
-            // Bound to its own statement so the lock guard is dropped BEFORE the
-            // await below — holding it across an await makes this future non-Send.
+            // Own statement so the lock guard drops BEFORE the await below: holding it across an
+            // await makes this future non-Send.
             let endpoint = flush_cloud.iroh.read().clone();
             if let Some(ep) = endpoint {
                 let budget = Duration::from_secs(env_u64("HIVE_ENDPOINT_CLOSE_SECS", 3));
@@ -1244,19 +1258,9 @@ async fn async_main() -> anyhow::Result<()> {
             std::process::exit(if restart_reason.is_some() { 17 } else { 0 });
         });
     }
-    // Start the enterprise SIEM streamer: audit entries for teams with SIEM
-    // enabled are POSTed (best-effort, async) to their configured endpoint.
     enterprise::spawn_siem_streamer(cloud.enterprise.clone(), cloud.http.clone());
-    // Seed the gossip-transport map from disk so we can reach peers over iroh
-    // immediately on restart (bootstrap without the HTTP-over-SSH tunnels). Stable
-    // persistent iroh identities keep these addresses valid across restarts.
     *cloud.peer_iroh.write() = persist::load_peer_iroh();
 
-    // Cold-start bootstrap: turn the seeds into always-available iroh gossip targets.
-    // Exclude ourselves (a seed list may include this node), key them as `seed:<id>`,
-    // and pre-seed `peer_iroh` so the gossip loop dials them over iroh even with an
-    // empty/wiped warm map. These are re-asserted each round (so the timeout+evict
-    // can't permanently drop a flaky seed) and added to the gossip target list.
     let self_iroh_id = iroh_ep.as_ref().map(|e| e.id().to_string());
     let seed_targets: Vec<(String, String, String)> = bootstrap_seeds
         .iter()
@@ -1283,16 +1287,10 @@ async fn async_main() -> anyhow::Result<()> {
         );
     }
 
-    // Record mesh peers so the build cache can be pulled P2P from other nodes.
     *cloud.peers.write() = args.peers.clone();
 
-    // Tier 4: store the iroh endpoint for outbound dialing, and accept inbound P2P
-    // tunnels — serving each to THIS node's gateway (so the request is routed to the
-    // right local deployment). This makes deployments reachable over QUIC across NATs.
     if let Some(ep) = iroh_ep.clone() {
         *cloud.iroh.write() = Some(ep.clone());
-        // Pooled cross-node transport: reuse one QUIC connection per peer, a new
-        // stream per request (built here, alongside the endpoint it dials with).
         *cloud.mesh.write() = Some(hive_p2p::PeerPool::new(ep.clone()));
         let browser_pool = hive_p2p::BrowserPool::new(ep.clone());
         *cloud.browser_mesh.write() = Some(browser_pool.clone());
@@ -1313,12 +1311,6 @@ async fn async_main() -> anyhow::Result<()> {
                     })
             })
         }));
-        // Team-scoped browser targets (bn-team-scoped-browser-targets-never-served):
-        // resolve the CALLER's authenticated tenant from the same headers
-        // auth::require_auth already accepts (Bearer / hive_jwt cookie / a
-        // dashboard API key) so try_browser can gate a Team-scoped target to
-        // members of its own owning tenant, never a public/anonymous caller.
-        // Public-scoped targets never call this at all.
         {
             let cloud_for_resolver = cloud.clone();
             gw.set_browser_claims_resolver(std::sync::Arc::new(move |headers| {
@@ -1329,13 +1321,8 @@ async fn async_main() -> anyhow::Result<()> {
                     .map(|claims| crate::admin::norm(&claims.tenant).to_string())
             }));
         }
-        // Live relay-set tracker (dynamic-hive-relay-urls-list): kept alongside
-        // `mesh`, synced on an interval by `spawn_relay_sync_loop` below.
         *cloud.relay_set.write() = Some(hive_p2p::RelaySet::new(ep.clone()));
         let gateway_addr = args.listen.to_string();
-        // #20 peer trust: enforce the allowlist only when HIVE_PEER_TRUST is set
-        // (opt-in — default keeps the mesh open, no behavior change). When on, the
-        // accept loop rejects any peer whose iroh identity isn't in the trust set.
         let enforce_trust = std::env::var("HIVE_PEER_TRUST")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
@@ -1346,17 +1333,7 @@ async fn async_main() -> anyhow::Result<()> {
                 "iroh P2P peer-trust enforcement ENABLED (#20)"
             );
         }
-        // Serve control-plane gossip over the same iroh mesh (the inbound side of
-        // the HTTP-over-SSH → QUIC migration). Always provided; peers only use it
-        // when THEY have HIVE_GOSSIP_IROH on. The connection trust gate (#20) still
-        // applies, so gossip is authenticated by the peer's iroh identity.
         let gossip_handler = crate::gossip::handler(cloud.clone());
-        // MESH HOT-JOIN: a not-yet-trusted node presents HMAC(HIVE_JWT_SECRET, its
-        // OWN endpoint id) over a dedicated join stream; the id is the QUIC
-        // connection's authenticated remote identity, so a valid proof admits
-        // exactly that key into the trust set — no allowlist edit, no restart
-        // anywhere. Only offered when the fleet secret is configured (fail-closed:
-        // without it, untrusted connections are dropped exactly as before).
         let join_handler: Option<hive_p2p::JoinHandler> = std::env::var("HIVE_JWT_SECRET")
             .ok()
             .filter(|s| !s.trim().is_empty())
@@ -1375,8 +1352,6 @@ async fn async_main() -> anyhow::Result<()> {
                             tracing::warn!(peer = %remote_id, "REJECTED mesh join: unparseable NodeInfo");
                             return Vec::new();
                         };
-                        // The announced iroh identity must BE the proven QUIC identity —
-                        // a valid proof must not admit a NodeInfo that routes elsewhere.
                         let announced_eid = node.iroh_addr.as_deref().and_then(hive_p2p::endpoint_id_from_addr_json);
                         if announced_eid.as_deref() != Some(remote_id.as_str()) {
                             tracing::warn!(peer = %remote_id, announced = ?announced_eid, "REJECTED mesh join: NodeInfo iroh identity mismatch");
@@ -1397,9 +1372,6 @@ async fn async_main() -> anyhow::Result<()> {
                 });
                 h
             });
-        // Generic raw TCP/UDP mesh forwarding (owner-node accept side): resolve
-        // inbound `STREAM_RAW_TARGET` handshakes to this node's local container
-        // legs — the cross-node hop behind the raw-port proxy / UDP relay.
         let raw_resolver = crate::mesh_raw::resolver(cloud.clone());
         let admission_cloud = cloud.clone();
         let browser_admission: hive_p2p::BrowserAdmissionHandler =
@@ -1409,13 +1381,6 @@ async fn async_main() -> anyhow::Result<()> {
                     crate::browser_admission::endpoint_admitted(&cloud, &endpoint_id).await
                 })
             });
-        // Browser-replicated database exchange (bn-browser-fleet-crr-exchange):
-        // the fleet half of `Op::CrrSync` — per-request grant re-check against
-        // this node's own replicated admission view, capped apply/export
-        // against the per-project replica file. See browser_db.rs.
-        // HIVE_BROWSER_DB_LISTEN=0 disables the serve arm (rollout/ops knob):
-        // `Op::CrrSync` then gets NO_HANDLER — exactly how a pre-change
-        // binary refuses it (never a fake grant, never a crash).
         let browser_crr = std::env::var("HIVE_BROWSER_DB_LISTEN")
             .ok()
             .filter(|v| v.trim() == "0")
@@ -1423,7 +1388,6 @@ async fn async_main() -> anyhow::Result<()> {
                 || Some(crate::browser_db::crr_sync_handler(&cloud)),
                 |_| None,
             );
-        // bn-impl-relay-byte-metering (registration line; sibling-owned file, flagged)
         hive_p2p::set_browser_meter(Some(crate::browser_metering::meter_handler(&cloud)));
         tokio::spawn(hive_p2p::serve_tunnels_full(
             ep,
@@ -1435,20 +1399,14 @@ async fn async_main() -> anyhow::Result<()> {
             Some(raw_resolver),
             Some(browser_admission),
             browser_crr,
-            // Store-snapshot replication shares the trunk fairly instead of
-            // queueing behind every probe — see
-            // `store_sync::SNAPSHOT_PATH_PREFIX`.
             &[crate::store_sync::SNAPSHOT_PATH_PREFIX],
         ));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }
 
-    // Initial owner resolution (single-node: this node is owner) + seed the
-    // gossiped fencing epoch.
     let _ = cloud.control_plane_leader();
     cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
 
-    // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
     spawn_cluster_loop(cloud.clone());
     spawn_guardian_snapshot_loop(cloud.clone());
@@ -1456,24 +1414,14 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_lease_loop(cloud.clone());
     spawn_sandbox_timeout_reap_loop(cloud.clone());
 
-    // Self-management GC: reap stale clone/build working dirs under the deploy
-    // roots ($HIVE_DATA/deploys, plus the legacy /tmp/hive-deploys) every 10 min
-    // (dirs untouched >30 min are dead builds), so build scratch never exhausts
-    // host disk. Pairs with the firecracker orphan-overlay GC. Skips dirs that
-    // still back a live deployment.
     let gc_cloud = cloud.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(600)).await;
-            let n = crate::git::gc_build_dirs(&gc_cloud, Duration::from_secs(1800)).await;
+            tokio::time::sleep(BUILD_GC_INTERVAL).await;
+            let n = crate::git::gc_build_dirs(&gc_cloud, STALE_BUILD_DIR_AGE).await;
             if n > 0 {
                 tracing::info!(removed = n, "gc: cleaned stale build dirs");
             }
-            // Same tick, different leak: a `Building…` placeholder whose build
-            // task never reached its removal line (user cancel aborts the task
-            // handle; a panic ends it) owns the project's host alias forever and
-            // makes this node answer for a deployment it does not have. Reaped
-            // here so a running node self-heals instead of waiting for a restart.
             let p = crate::git::reap_orphan_placeholders(&gc_cloud).await;
             if p > 0 {
                 tracing::info!(removed = p, "gc: reaped orphaned Building… placeholders");
@@ -1481,29 +1429,13 @@ async fn async_main() -> anyhow::Result<()> {
         }
     });
 
-    // Warm the always-on GuardianDB (durable, iroh-replicated state store) so it
-    // is live before the first snapshot. Best-effort; never blocks boot.
     guardian::set_node_name(&args.name);
-    // Seed known peers (GuardianDB-specific addresses — persist::
-    // save_peer_guardian_addr in the gossip loop, mirroring peer_iroh.json)
-    // BEFORE the KV store's one-time open. Empty on this node's first-ever
-    // boot with this feature (nothing has persisted a guardian address yet);
-    // has real data starting the restart after the gossip loop has had a
-    // chance to populate and persist it. See set_boot_seed_peers's doc
-    // comment for why this specific window matters.
     guardian::set_boot_seed_peers(
         crate::persist::load_peer_guardian_addr()
             .into_values()
             .collect(),
     );
     guardian::init_background();
-    // Fleet-consistent relational tables (project_teams, billing_*) — see
-    // relational.rs's module doc. Idempotent (CREATE TABLE IF NOT EXISTS);
-    // best-effort like every other GuardianDB-backed call, never blocks boot.
-    // Backfill existing projects (created before this migration shipped, so
-    // `set_project_team` never fired for them) — see backfill_projects's doc
-    // comment for why this is safe on every node but billing is deliberately
-    // excluded (self-heals via the metering loop instead).
     {
         let cloud = cloud.clone();
         tokio::spawn(async move {
@@ -1517,14 +1449,8 @@ async fn async_main() -> anyhow::Result<()> {
             relational::backfill_projects(existing).await;
         });
     }
-    // Restore-on-rollback guard: if the local snapshot regressed (older than the
-    // GuardianDB replica — the failure that silently dropped shoomoo's env vars +
-    // reset billing), adopt the replica. Web3 data-sovereignty: the replicated,
-    // content-addressed copy outranks a regressed local file.
     guardian::spawn_restore_guard(cloud.clone());
 
-    // Authoritative DNS server (answers the platform's own records). Non-privileged
-    // port by default so it runs without root; set HIVE_DNS_ADDR=0.0.0.0:53 in prod.
     {
         let dns_addr: SocketAddr = std::env::var("HIVE_DNS_ADDR")
             .ok()
@@ -1537,11 +1463,9 @@ async fn async_main() -> anyhow::Result<()> {
             }
         });
     }
-    // Discovery (Plane B, node↔node): the platform's own pkarr relay — serves/accepts
-    // self-verifying iroh NodeAddr records so the fleet resolves peers on platform-owned
-    // infra instead of n0. Bind with HIVE_DISCOVERY_ADDR (run on stable PUBLIC nodes).
-    // NOTE: distinct from Seer (Plane A, client→node DNS, in dnsserver.rs). HIVE_SEER_ADDR
-    // is still accepted as a deprecated alias for the bind addr (the names once collided).
+    // Discovery (Plane B, node-to-node pkarr relay) is distinct from Seer (Plane A, client-to-node
+    // DNS, dnsserver.rs); HIVE_SEER_ADDR is a deprecated alias for its bind address (the names once
+    // collided).
     if let Some(disc_addr) = std::env::var("HIVE_DISCOVERY_ADDR")
         .or_else(|_| std::env::var("HIVE_SEER_ADDR"))
         .ok()
@@ -1553,23 +1477,14 @@ async fn async_main() -> anyhow::Result<()> {
             }
         });
     }
-    // ALWAYS spawn the gossip loop: targets are now DYNAMIC (recomputed every
-    // round from CLI peers + seeds + the persisted/learned key-addressed roster),
-    // so a node started with zero peer config still gossips the moment a peer
-    // joins INTO it (inbound join populates peer_iroh) or the guardian-replicated
-    // roster lands. A zero-target round is a no-op.
     spawn_gossip_loop(cloud.clone(), args.peers.clone(), seed_targets.clone());
-    // Roster fallback from GuardianDB (iroh-docs, replicated): when the local
-    // peer_iroh.json was lost (wiped data dir) and no seeds are configured, adopt
-    // the replicated roster so the node still rejoins the mesh by KEY. Best-effort,
-    // never blocks boot; existing entries are never clobbered.
     {
         let c = cloud.clone();
         tokio::spawn(async move {
             for _ in 0..12 {
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if !c.peer_iroh.read().is_empty() {
-                    return; // seeds/CLI/live gossip already populated it
+                    return;
                 }
                 if let Some(bytes) = guardian::get("mesh/roster").await {
                     if let Ok(map) = serde_json::from_slice::<
@@ -1594,79 +1509,37 @@ async fn async_main() -> anyhow::Result<()> {
             }
         });
     }
-    // Active full-mesh health probing: direct, parallel probes of every public peer so
-    // down-detection is fast (sub-interval) rather than transitive-gossip + staleness.
     spawn_health_loop(cloud.clone());
 
-    // Eager full-mesh trunking: proactively keep a live iroh trunk to EVERY healthy
-    // peer (not just the ones we directly gossip), so cross-node requests reuse a
-    // warm trunk instead of paying a cold dial/holepunch on the critical path.
     spawn_trunk_warmer(cloud.clone());
 
-    // Speculative prewarm: start the function a request is about to invoke
-    // during its TLS handshake (the SNI arrives before the request does).
-    // Installs the ClientHello hook and runs the hint worker on the bulkhead.
     crate::prewarm::spawn(cloud.clone());
 
-    // Live relay-set refresh (dynamic-hive-relay-urls-list): keeps the bound iroh
-    // endpoint's relay map in sync with [own relay_url, every healthy peer's
-    // relay_url, the central relay.shadw.cloud backstop] as the registry changes,
-    // via live `insert_relay`/`remove_relay` (no rebind) — see `RelaySet`.
     spawn_relay_sync_loop(cloud.clone());
 
-    // GuardianDB anti-entropy loop (implement-anti-entropy-loop): periodic
-    // Dynamo-style read-repair over the iroh-docs-backed replicated store —
-    // catches divergences the opportunistic live-sync path missed (this node
-    // offline/partitioned during a peer's write, ticket exchange never ran
-    // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
     spawn_anti_entropy_loop(cloud.clone());
     spawn_geo_refresh(cloud.registry.clone());
     spawn_disk_refresh(cloud.registry.clone(), runtime_capability_source.clone());
     spawn_memory_pressure_alarm();
 
-    // Billing meter loop: periodically converts measured fleet compute usage into
-    // charges (usage → rate card → ledger → invoice). Runs whether Stripe is
-    // configured or not (mock or real). Spawned on EVERY node; each tick only the
-    // node `leadership::may_act(BillingMeter)` admits meters (strict chain owner,
-    // tenure, voter quorum), so a flapping view can never double-charge.
-    // `HIVE_BILLING_COORDINATOR_NODE` remains a manual pin on chain-less meshes.
     spawn_billing_meter_loop(cloud.clone());
 
     spawn_promotion_reconcile_loop(cloud.clone());
 
-    // Relational mirror: teams/members/deployments + full billing backfill into
-    // the fleet-replicated SQL view (see spawn_relational_mirror_loop's doc).
     spawn_relational_mirror_loop(cloud.clone());
-    // Follower pull of the owner's stores — DB-free, never behind a SQL await.
     store_follower::spawn(cloud.clone());
 
-    // Web-push + SMS delivery for the notification inbox — leader-only inside
-    // the loop, tenant-scoped by construction (see `push::spawn_push_dispatcher`).
     crate::push::spawn_push_dispatcher(cloud.clone());
 
-    // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
-    // World interface -- no external queue dependency).
     tokio::spawn(crate::world_queue::run_delivery_loop(
         cloud.clone(),
         cloud.world_queue.clone(),
     ));
 
-    // Cloudflare Queues parity: Worker-consumer push delivery + retention
-    // sweep + GuardianDB recovery (crate::queues).
     tokio::spawn(crate::queues::spawn_delivery_loop(cloud.clone()));
 
-    // Nameserver prover: EVERY node (not leader-only — the whole value is
-    // independent vantages) queries every peer that claims a public `:53` and
-    // gossips the ones that actually answer, so the reconciler below can
-    // publish an NS only for a node proven reachable from off its own host.
     dns_probe::spawn_ns_prober(cloud.clone());
 
-    // Dashboard capability prober: measure THIS node's own dashboard upstream
-    // and gossip the verdict (`NodeInfo::dashboard`), so the DNS reconciler can
-    // keep slow-SSR nodes out of the apex/`www` A-set (see
-    // `vercel_dns::desired_platform`). The budget bounds the first-paint SSR a
-    // published node may impose on a first visit; a node with no upstream
-    // configured simply never claims the capability.
     {
         let cloud = cloud.clone();
         let upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
@@ -1687,7 +1560,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(Ok(resp)) => resp.status().is_success() || resp.status().is_redirection(),
-                    _ => false, // slow (over budget), connection refused, or error
+                    _ => false,
                 };
                 cloud.registry.set_self_dashboard(ok);
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -1695,149 +1568,55 @@ async fn async_main() -> anyhow::Result<()> {
         });
     }
 
-    // Vercel DNS reconciler (ngrok retirement): leader-elected loop publishing
-    // healthy node IPs to api.{platform}/*.{apps} via the Vercel API. No-op in
-    // ngrok ingress mode (unless HIVE_DNS_RECONCILE=1 forces it for testing).
     vercel_dns::spawn_reconciler(cloud.clone());
 
-    // ACME (Let's Encrypt DNS-01 via Vercel): leader issues/renews the wildcard
-    // bundles; every node syncs them from the replicated store and hot-swaps the
-    // SNI resolver. No-ops entirely in ngrok ingress mode.
     acme::spawn_acme(cloud.clone());
     acme::spawn_cert_sync(cloud.clone());
-    // Custom tenant domains (verified attaches) get per-domain HTTP-01
-    // bundles: leader issues/renews, every node syncs via the same
-    // guardian/mesh/http distribution as the platform bundles.
     acme::spawn_custom_cert_loop(cloud.clone());
-    // Self-heal provisioned DB backings (restart-killed / machine-reset
-    // containers) — see spawn_db_reconcile's doc for the witnessed loss classes.
     databases::spawn_db_reconcile(cloud.clone());
-    // Custom-domain ownership verification: the leader watches pending
-    // challenges and asks each attach's owning node to activate (the owner
-    // arm re-proves the TXT itself) — see activate_domain_alias in admin.rs.
     crate::admin::spawn_domain_verify_loop(cloud.clone());
-    // Managed serverless-GPU inference endpoints (llama.cpp): coordinator
-    // nodes run/converge llama-server children, the leader injects
-    // HIVE_INFERENCE_URL — see inference.rs's module doc.
     inference::spawn_reconcile(cloud.clone());
-    // Reschedule orphaned workflow-world queue jobs (claimed-then-dropped
-    // deliveries) so a delivery-path failure can never strand runs in
-    // `pending` forever — see world::reconcile_orphan_jobs.
     world::spawn_world_reconcile(cloud.clone());
 
-    // Auto-deploy git-sourced projects that have NO installed webhook by polling
-    // their tracked branch's HEAD (leader-only) — the credential-free path that
-    // makes `git push` deploy even when the owner's GitHub connection is dead or
-    // the project was imported as a plain public URL. See git::spawn_git_poll_reconcile.
     git::spawn_git_poll_reconcile(cloud.clone());
 
-    // Node-death self-heal: when a project's production host has been
-    // offline past a grace period, automatically redeploy it to a healthy
-    // node elsewhere (leader-only) — see production_deployments.rs module
-    // doc for why the durable production_deployments store exists and what
-    // it fixes that the volatile peer_deployments gossip cache cannot.
     production_deployments::spawn_node_death_reconcile(cloud.clone());
 
-    // Keep podman's shared lock pool from filling up. Containers AND volumes each
-    // consume one lock out of a fixed pool (default 2048), so a leak starves the
-    // whole HOST: witnessed 2032 leaked volumes on the leader, freeLocks 0, and
-    // every deployment's cold start on that node failing as 503
-    // CAPACITY_EXHAUSTED. The leak itself is fixed (`podman rm -v`) and the run
-    // path self-heals reactively, but this sweep restores headroom BEFORE a
-    // request pays for it — and covers locks leaked by anything outside that
-    // path (a crashed node, a manual podman run).
     spawn_container_lock_sweep();
 
-    // Memory watchdog. Every node (RSS is per-host, like the lock pool above).
-    // The fleet's OOM kills are episodic bursts that idle-state profiling never
-    // catches, so this arms jemalloc sampling and dumps a profile DURING the
-    // burst, and logs the allocator/RSS/bound gauges every tick above the arm
-    // threshold — the record that survives the kill. See `memwatch`.
     memwatch::spawn(cloud.hive.clone(), controlled_restart.clone());
 
-    // Mesh-isolation watchdog. Every node. A node whose iroh transport wedges
-    // keeps its process, unit and HTTP surfaces healthy while seeing ZERO of
-    // its peers — and never recovers on its own (measured: 2.17M iroh
-    // transport events, gossip completely dead, `systemctl is-active` still
-    // `active`). On the control-plane leader that also fails every admin
-    // mutation fleet-wide, because the leader-forward candidate list is built
-    // from the local registry and comes out empty. See `meshwatch`.
     meshwatch::spawn(cloud.clone(), controlled_restart.clone());
     tenancy_reconcile::spawn(cloud.clone());
-    // Host listener audit. Every node (listeners are per-host). Anything not
-    // this process bound to a wildcard address inside the internet-open
-    // published-port range is world-reachable through the security group and
-    // otherwise invisible: two week-old `python3 -m http.server` hand-offs on
-    // fc-virginia:28126/:28127 were found by the cloud provider's scanner, not
-    // by the platform (2026-08-27 ticket). Detects and reports only; never
-    // kills. See `listener_audit`.
     listener_audit::spawn(cloud.clone(), |c| {
         leadership::may_act(c, leadership::Job::ListenerAudit)
     });
-    // Incident reconciler: automated incidents are level-triggered projections
-    // of observed conditions and resolve themselves when the observation
-    // lapses; the leader (the store's writer) is the only node that changes
-    // the list. See `incidents`.
     incidents::spawn_reconciler(cloud.clone());
     spawn_deletion_reconcile_loop(cloud.clone());
 
-    // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
-    // against (a SIGKILLed process cannot write it on the way out, which is
-    // exactly why the kill was invisible), and re-states an OOM-cycling
-    // verdict periodically so it is loud in a log tail taken at any moment —
-    // not only in the seconds right after the restart. See restart_audit.rs.
     restart_audit::spawn(args.name.clone(), cloud.clone());
 
-    // Reap browser-function artifacts no live deployment references anymore.
-    // Every node (the store is per-host), guarded against empty/mostly-orphaned
-    // keep-sets — see browser_artifacts::gc.
     browser_artifacts::spawn_gc_loop(cloud.clone());
-    // Browser-replicated databases (bn-browser-fleet-crr-exchange): per project
-    // with a `browser_db` opt-in, keep the fleet replica file (+ its spec-
-    // derived schema) present, and reap inert replicas only past the 30-day
-    // grace window with the blast-radius guards — see browser_db.rs.
     browser_db::spawn_reconcile(cloud.clone());
-    // Fleet<->fleet anti-entropy for those replicas. Without it, node-to-node
-    // convergence flows ONLY through browser carriers, so a project whose tabs
-    // are all closed stops converging and a freshly-joined node keeps answering
-    // from the empty replica `reconcile_replicas` created for it. Pull-only,
-    // every node, bounded peers per tick — see browser_db::spawn_fleet_sync.
     browser_db::spawn_fleet_sync(cloud.clone());
-    // Protocol-wide browser ROLL CALL: a periodic read-only inventory + drift
-    // audit over the admitted browser population (who is present, what each
-    // serves, which db grant each holds) against this node's own gateway
-    // routing. Every node, because the routing half is node-local — see
-    // browser_admission::spawn_roll_call. Cadence: HIVE_BROWSER_ROLL_CALL_SECS
-    // (default 420s, `0` disables).
     browser_admission::spawn_roll_call(cloud.clone());
 
-    // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone()).layer(
         axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline),
     );
-    // Connection-level DoS bounds on the control plane (the admin router has no
-    // streaming/SSE endpoints and deploys enqueue-then-return, so a bounded
-    // per-request timeout and body cap are safe — unlike the public gateway,
-    // which streams tenant responses and already caps request bodies at 16 MiB
-    // + per-IP rate-limits in the edge pipeline). Env-tunable.
     let admin_max_body: usize = std::env::var("HIVE_ADMIN_MAX_BODY_MIB")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64)
+        .unwrap_or(ADMIN_MAX_BODY_MIB_DEFAULT)
         * 1024
         * 1024;
     let admin_req_timeout = Duration::from_secs(
         std::env::var("HIVE_ADMIN_REQUEST_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(120),
+            .unwrap_or(ADMIN_REQUEST_TIMEOUT_SECS_DEFAULT),
     );
     let admin_router = admin::router(cloud.clone())
-        // guardian-growth-and-gc-observability: guardian.rs owns this route's
-        // handler/state end-to-end (single-writer scope), so it merges here
-        // rather than adding a line inside admin::router() itself. Same
-        // auth/rate-limit/body-limit/timeout layers as every other admin
-        // route below.
         .merge(crate::guardian::routes().with_state(cloud.clone()))
         .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn_with_state(
@@ -1853,16 +1632,6 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
 
-    // Host-based dispatch (real-DNS ingress): on the shared public listener,
-    // `Host: api.{platform_domain}` routes to the ADMIN router (the platform
-    // API), everything else — `*.{apps_domain}` etc. — to the deployment edge
-    // pipeline. Only active when `HIVE_INGRESS != ngrok`; in ngrok mode the
-    // public listener is byte-identical to today. Exposing the admin API on a
-    // public host REQUIRES JWT enforcement — refuse to split otherwise.
-    // Dashboard hosts (apex + www). Hoisted because TWO consumers need them:
-    // the host dispatcher below, and the cross-origin-isolation policy, whose
-    // default (`lane`) isolates exactly these hosts at the browser-node lane
-    // paths — see `coi`.
     let dash_hosts = vec![
         cloud.platform_domain.clone(),
         format!("www.{}", cloud.platform_domain),
@@ -1876,18 +1645,8 @@ async fn async_main() -> anyhow::Result<()> {
             public
         } else {
             let api_host = format!("api.{}", cloud.platform_domain);
-            // Ops/admin console host — the operator surface, distinct from the
-            // developer/API-key `api.` host (both currently reach the admin router).
             let admin_host = format!("admin.{}", cloud.platform_domain);
-            // Incoming GitOps/OpenEdge build-notification receiver
-            // (OPENEDGE_WEBHOOK_URL, /v1/git/webhook) — same admin router, its own
-            // host so webhook traffic is distinguishable from the api./admin.
-            // developer/operator surfaces.
             let webhook_host = format!("webhook.{}", cloud.platform_domain);
-            // Dashboard hosts (apex + www): reverse-proxied to `HIVE_DASHBOARD_UPSTREAM`
-            // — each node's own self-hosted dashboard on loopback
-            // (http://127.0.0.1:3002), never an external tunnel. Empty upstream =
-            // no dashboard hosts.
             let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
                 .ok()
                 .map(|v| v.trim().trim_end_matches('/').to_string())
@@ -1909,22 +1668,11 @@ async fn async_main() -> anyhow::Result<()> {
         public
     };
 
-    // Cross-origin isolation (COOP + COEP) for the browser-node lane —
-    // SharedArrayBuffer, which node-worker's synchronous bridge needs, exists
-    // only in a cross-origin-isolated document. Layered HERE, after host
-    // dispatch and BEFORE every clone below (`tls_public`, the dedicated-IPv4
-    // listeners, the plain-HTTP `serve`), so all four public listeners agree
-    // on one policy: withhold it from one and the same URL is isolated on
-    // https:// and not on https://<addon-ip>, which is a worse failure than
-    // never having it (the lane degrades only on some requests). Default is
-    // `lane` (dashboard hosts at `/run-node`, `/run-node-worker.js`,
-    // `/browser-node/*`) because a global `require-corp` would take out the
-    // dashboard's Clerk embed and every tenant deployment. See `coi`.
+    // Layered once, after host dispatch and before every clone below (tls_public, the
+    // dedicated-IPv4 listeners, plain HTTP), so all four public listeners agree on one COOP/COEP
+    // policy (see `coi`).
     let public = coi::layer(public, coi::Config::from_env(&dash_hosts));
 
-    // Production TLS: terminate HTTPS on the gateway (same edge pipeline). Uses a
-    // real cert from HIVE_TLS_CERT/HIVE_TLS_KEY (PEM paths) when set, else a
-    // generated self-signed cert for local dev. Runs ALONGSIDE plain HTTP.
     let tls_public = public.clone();
     let tls_addr: SocketAddr = std::env::var("HIVE_TLS_ADDR")
         .ok()
@@ -1936,38 +1684,13 @@ async fn async_main() -> anyhow::Result<()> {
         }
     });
 
-    // Per-tenant DB gateway (Neon/Upstash model): TLS-SNI proxies to each tenant
-    // DB's container on `HIVE_DB_PG_LISTEN`/`HIVE_DB_REDIS_LISTEN` (default
-    // :5432/:6379 — overridable because two hive-cloud instances on one host
-    // collide on the defaults). Spawns only when the gateway is enabled
-    // (HIVE_DB_DOMAIN set); the wildcard `*.{db_domain}` cert comes from the same
-    // ACME-managed SNI resolver. High ports (>1024) — no capability needed.
     db_gateway::spawn(cloud.clone());
-    // DNS-only A/AAAA for that gateway when its zone is Cloudflare-served and
-    // Vercel DNS is not available. Opt-in (HIVE_DB_DNS_PROVIDER=cloudflare).
     cloudflare_dns::spawn_db_dns(cloud.clone());
 
-    // Generic raw-TCP ingress (the db_gateway pattern generalized to ALLOCATED
-    // ports): one public listener per raw-protocol deployment's stamped
-    // public_port (`raw_ports`), on every node — local connections splice into
-    // the leased instance, remote ones ride the iroh mesh's raw-target streams
-    // to the owner. Reconciles listeners against local + gossiped allocations.
     raw_proxy::spawn(cloud.clone());
 
-    // UDP relay — the DATAGRAM half of the raw-port space (Minecraft Bedrock
-    // 19132/udp, any UDP service). Its own mechanism, NOT the TCP splice:
-    // NAT-style per-client session table on each allocated public UDP port,
-    // forwarding to the container's published `/udp` loopback port locally or
-    // over `[u32 len]`-framed raw-target mesh streams to the owner node, with
-    // idle-timeout session eviction. Shares raw_proxy's allocations + mesh
-    // primitive; see `udp_relay.rs`.
     udp_relay::spawn(cloud.clone());
 
-    // Real-DNS ingress listeners (ngrok retirement): a public HTTPS listener with
-    // the hot-swappable SNI resolver (wildcard apps cert + api cert; ACME-managed)
-    // and a port-80 listener that only 301s to https. Only bound when
-    // `HIVE_INGRESS != ngrok`. Low ports need CAP_NET_BIND_SERVICE (see RUNBOOK) —
-    // bind failures are logged, never fatal, so a dev box still boots.
     if cloud.ingress != "ngrok" {
         let https_addr: SocketAddr = std::env::var("HIVE_HTTPS_LISTEN")
             .ok()
@@ -1978,14 +1701,6 @@ async fn async_main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "0.0.0.0:80".parse().unwrap());
         let https_router = public.clone();
-        // Graceful-shutdown handle for the PUBLIC listener specifically — this is
-        // the one carrying real customer traffic (including active gateway tunnel
-        // proxying to placed apps' cells), so it is the highest-value target for
-        // "a restart must not break placed apps' cell tunnels". Cloned into the
-        // SIGTERM handler below; `graceful_shutdown` stops accepting NEW
-        // connections and gives already-open ones up to the grace window to
-        // finish instead of the previous behavior (immediate `process::exit`
-        // severing every in-flight request/tunnel the instant SIGTERM arrived).
         let https_shutdown_handle = axum_server::Handle::new();
         SHUTDOWN_HTTPS_HANDLE
             .set(https_shutdown_handle.clone())
@@ -2002,12 +1717,6 @@ async fn async_main() -> anyhow::Result<()> {
                 tracing::error!(error = %e, %https_addr, "HTTPS listener failed (check CAP_NET_BIND_SERVICE / port availability)");
             }
         });
-        // Port 80: redirect-only (no content ever served in cleartext) — with
-        // ONE deliberate exception: ACME HTTP-01 challenges, which Let's
-        // Encrypt fetches over plain http by definition. Answering them
-        // directly (instead of 301ing to an https host that has no cert yet —
-        // the deadlock that made first issuance impossible) is the entire
-        // point of the challenge type. Everything else still 301s.
         let challenge_cloud = cloud.clone();
         tokio::spawn(async move {
             let cloud = challenge_cloud;
@@ -2038,20 +1747,6 @@ async fn async_main() -> anyhow::Result<()> {
                                 )
                                     .into_response(),
                                 None => {
-                                    // Miss on this node: the issuer is the
-                                    // leader and Let's Encrypt's
-                                    // multi-perspective fetches land on RANDOM
-                                    // nodes within ~1s of set_ready — long
-                                    // before the 60s store_sync pull can
-                                    // replicate the leader-local token. Proxy
-                                    // the lookup to the leader (whose own
-                                    // port-80 arm answers from the store)
-                                    // instead of fail-validating every
-                                    // issuance ~13/14 of the time — the proxy
-                                    // previously existed only on the 443
-                                    // pipeline LE never reaches (adversarial
-                                    // finding, both re-reviews). Unknown token
-                                    // everywhere = flat 404, no existence leak.
                                     if let Some(leader) = cloud.leader_forward_target() {
                                         if let Some(ip) = cloud
                                             .registry
@@ -2119,24 +1814,11 @@ async fn async_main() -> anyhow::Result<()> {
             }
         });
 
-        // Dedicated public IPv4 addon (paid): one additional HTTPS listener
-        // per address this node owns, reusing this SAME `public` router (edge
-        // pipeline + SNI resolver included) — never a bare TCP splice, which
-        // would bypass WAF/bot defense entirely. See
-        // `dedicated_ipv4_listener.rs`'s module doc for the full reasoning.
         dedicated_ipv4_listener::spawn(cloud.clone(), public.clone());
     }
 
     tracing::info!(region=%region, node=%args.name, public=%args.listen, admin=%args.admin, tls=%tls_addr, "hive-cloud node up");
 
-    // The loopback admin listener serves the raw admin router, and the
-    // dashboard's /cloud proxy targets it (HIVE_ADMIN=127.0.0.1:8786) — so a
-    // dashboard-driven mutation was handled by WHICHEVER node hosted that
-    // dashboard and never reached the control-plane leader (only the public
-    // admin_ingress forwarded). Witnessed 2026-08-04: an admission granted on
-    // a follower never appeared on the leader, and browser serving never
-    // engaged through the public ingress. Mirror admin_ingress's discipline
-    // here: mutations on a non-leader forward to the leader; reads stay local.
     let admin_router = admin_router.layer(axum::middleware::from_fn_with_state(
         (cloud.clone(), format!("api.{}", cloud.platform_domain)),
         admin_loopback_forward,
@@ -2148,62 +1830,53 @@ async fn async_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mutations that must never be forwarded to the control-plane leader by
-/// either leader gate — two DISTINCT rationales share this one bypass.
-///
-/// A managed SQLite database is a FILE on `Database::host_node`, and
-/// `hrana::serve` proxies to that node itself. Sending its pipeline POSTs to
-/// the leader first would (a) add a hop that still has to proxy, (b) pin an
-/// interactive transaction's baton to whichever node was leader when the
-/// stream opened — so a leadership change mid-transaction strands it — and (c)
-/// deadlock the owner-proxy hop outright, because the mesh envelope
-/// (`/v1/databases/<id>/hrana-mesh`) is itself a POST and would be bounced
-/// straight back to the leader instead of being served by the owner it was
-/// deliberately addressed to.
-///
-/// shadw drive (`/v1/drive/*`, both the REST surface and the WebDAV mount)
-/// needs no owner at all: every write lands in `relational::drive_*`, which
-/// is GuardianDB's CRDT last-write-wins relational store — safe to apply from
-/// ANY node, by the store's own design (see `relational::drive_put_file`'s
-/// doc comment). Leader-forwarding it bought zero correctness and cost a
-/// real round trip on every single PUT/DELETE — measured as the direct cause
-/// of "copying/moving files is slow" over WebDAV, since a Windows Explorer
-/// drag-drop of many small files serializes one leader-forward hop per file.
-/// WebDAV's own non-CRUD methods (MKCOL/COPY/MOVE/PROPFIND/LOCK/UNLOCK)
-/// already bypassed this gate by accident (the `is_mutation` classifier below
-/// only recognizes POST/PUT/DELETE/PATCH) — this makes PUT/DELETE consistent
-/// with them instead of the other way around.
+/// Paths that must never be forwarded to the control-plane leader by either leader gate, for two
+/// DISTINCT reasons. OWNER-routed: a managed SQLite database is a FILE on `Database::host_node` and
+/// `hrana::serve` proxies to that node itself, so sending its pipeline POSTs to the leader first
+/// would add a hop that still has to proxy, pin an interactive transaction's baton to whichever
+/// node was leader when the stream opened (a leadership change mid-transaction strands it) and
+/// deadlock the owner-proxy hop (the mesh envelope `/v1/databases/<id>/hrana-mesh` is itself a POST
+/// and would bounce back to the leader instead of reaching the owner it was addressed to). The same
+/// holds for browser_db's libsql/Hrana + Upstash REST surface (`/v1/browser-db/`, owner-routed to
+/// `browser_db::rest_owner_for_project`, computed because there is no `Database` record to carry a
+/// host_node), runtime artifact transfers (addressed to the immutable request's exact target node:
+/// a chunk sent to the leader would mutate a different host's journal or fail WrongTarget, and make
+/// resumable delivery impossible across leader changes) and sandbox owner RPCs
+/// (`/v1/internal/sandboxes/`, addressed by the LEADER to the exact node that holds or must
+/// provision the cell: bouncing them back re-runs the create on a node with no exec backend, or
+/// deadlocks the hop). OWNER-FREE: shadw drive (`/v1/drive/*`, REST and WebDAV) needs no owner,
+/// because every write lands in `relational::drive_*`, GuardianDB's CRDT last-write-wins store,
+/// safe to apply from ANY node; leader-forwarding it cost a round trip per PUT/DELETE and bought no
+/// correctness (the cause of slow WebDAV copies of many small files). WebDAV's non-CRUD methods
+/// already bypassed the gate, since `is_mutation_request` only recognizes POST/PUT/DELETE/PATCH.
 fn owner_routed(path: &str) -> bool {
     path.starts_with("/v1/sqlite/")
         || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
         || (path.starts_with("/v1/databases/") && path.ends_with("/studio-mesh"))
         || path.starts_with("/v1/drive/")
-        // browser_db's libsql/Hrana + Upstash REST surface (bn-browser-db-rest):
-        // owner-ROUTED to the elected REST owner (`browser_db::rest_owner_for_project`),
-        // never leader-forwarded — the `/v1/sqlite/` precedent, computed rather
-        // than stored since there is no `Database` record to carry a host_node.
         || path.starts_with("/v1/browser-db/")
         || (path.starts_with("/v1/projects/") && path.ends_with("/browser-db/rest-mesh"))
-        // Runtime artifact transfers are addressed to the immutable request's
-        // exact target node. Sending a chunk to the control-plane leader would
-        // mutate a different host's transaction journal (or fail WrongTarget)
-        // and make resumable delivery impossible across leader changes.
         || path.starts_with("/v1/runtime-artifact-transfer/v1/")
-        // Sandbox owner RPCs (`sandboxes_api`'s delegate-create / owner-op) are
-        // addressed by the LEADER to the exact node that holds — or is being
-        // asked to provision — the cell. Bouncing them back to the leader would
-        // re-run the create on a node with no exec backend (the fail-closed
-        // refusal the delegation exists to route around) or deadlock the hop.
         || path.starts_with("/v1/internal/sandboxes/")
 }
 
-/// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
-/// to the raw admin listener). Reads serve locally; mutations on a non-leader
-/// forward to the current leader over the SNI-pinned client. Chain
-/// termination + internal hops: a request marked x-hive-admin-forwarded
-/// (forwarded by a peer) or x-hive-internal (service hop) is always served
-/// locally; /v1/token is stateless HS256 minting and must never depend on
-/// leader reachability.
+/// Whether the request mutates state (POST/PUT/DELETE/PATCH), the only kind that serializes through
+/// the control-plane leader; WebDAV's non-CRUD methods (MKCOL/COPY/MOVE/PROPFIND/LOCK/UNLOCK) are
+/// not classified as mutations.
+fn is_mutation_request(req: &axum::http::Request<axum::body::Body>) -> bool {
+    matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH")
+}
+
+/// Loopback-admin mutation forwarding (the `admin_ingress` leader rule applied to the raw admin
+/// listener, which the dashboard's /cloud proxy targets: before this, a dashboard-driven mutation
+/// was handled by whichever node hosted the dashboard and never reached the leader; witnessed as an
+/// admission granted on a follower that never appeared on the leader). Reads serve locally;
+/// mutations on a non-leader forward to the current leader over the SNI-pinned client, the exact
+/// helper `admin_ingress` uses, never a second bespoke path. A request marked
+/// `x-hive-admin-forwarded` (forwarded by a peer) is applied only on the CURRENT leader (503
+/// anywhere else: a forged marker or a mid-flight leadership change, so the client retries and
+/// re-resolves) and one marked `x-hive-internal` (service hop) is always served locally;
+/// `/v1/token` is stateless HS256 minting and must never depend on leader reachability.
 async fn admin_loopback_forward(
     axum::extract::State((cloud, api_host)): axum::extract::State<(
         std::sync::Arc<state::CloudState>,
@@ -2212,11 +1885,7 @@ async fn admin_loopback_forward(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    // Chain termination with the same anti-spoof rule admin_ingress applies: a
-    // forwarded-marked mutation is only ever applied on the CURRENT leader —
-    // landing anywhere else means a forged marker or a mid-flight leadership
-    // change, both refused with 503 (the client retries and re-resolves).
+    let is_mutation = is_mutation_request(&req);
     if req.headers().contains_key("x-hive-admin-forwarded") {
         if is_mutation && !cloud.is_control_plane_leader() {
             return not_leader_refusal();
@@ -2231,24 +1900,25 @@ async fn admin_loopback_forward(
     {
         return next.run(req).await;
     }
-    // Forward to the leader over the public SNI-pinned HTTPS ingress — the
-    // exact helper admin_ingress uses (production-proven transport), never a
-    // second bespoke path.
     admin_forward_to_leader(&cloud, &api_host, req).await
 }
 
-/// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the
-/// PLATFORM API + API-key surface), `admin.{platform_domain}` (the ops/admin
-/// console surface) AND `webhook.{platform_domain}` (incoming GitOps/OpenEdge
-/// build-notification receiver, `OPENEDGE_WEBHOOK_URL`) → the admin router; the
-/// dashboard hosts → the dashboard proxy; anything else → the deployment edge
-/// pipeline. Implemented as a fallback handler that oneshots into the matching
-/// inner router, so the x-hive-proxied loop guard, WS upgrade path and
-/// everything else inside each router are untouched. Host matching is
-/// case-insensitive and strips `:port`. api/admin/webhook share one router
-/// today (same auth); the split is by HOSTNAME so each reads as its own
-/// surface, and they can diverge (separate auth/route sets) without touching
-/// this dispatch.
+/// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the PLATFORM API +
+/// API-key surface), `admin.{platform_domain}` (the ops/admin console) and
+/// `webhook.{platform_domain}` (the incoming GitOps/OpenEdge build-notification receiver,
+/// `OPENEDGE_WEBHOOK_URL`) go to the admin router, the dashboard hosts to the dashboard proxy (each
+/// node's own self-hosted dashboard on loopback, `HIVE_DASHBOARD_UPSTREAM`, never an external
+/// tunnel), and anything else to the deployment edge pipeline. It is a fallback handler that
+/// `oneshot`s into the matching inner router, so the x-hive-proxied loop guard, the WS upgrade path
+/// and everything inside each router stay untouched. Host matching is case-insensitive and strips
+/// `:port`; HTTP/2 carries the authority in the URI, not a Host header, so both are read (reading
+/// only Host sent api/apex traffic into the public router). `api-<region>.<domain>` is the
+/// region-pinned API surface (its DNS record names ONE region's nodes) and dispatches like `api.`,
+/// matched by shape rather than enumerated (an unpublished api-<x> host simply does not resolve)
+/// with a real label boundary, so `api-evil-shadw.cloud`-style hosts cannot match a bare
+/// `ends_with`. The MATCHED host is passed on so a leader forward pins the right SNI.
+/// api/admin/webhook share one router today (same auth); the split is by hostname so each reads as
+/// its own surface and they can diverge without touching this dispatch.
 fn host_switch_router(
     cloud: Arc<CloudState>,
     api_host: String,
@@ -2272,9 +1942,6 @@ fn host_switch_router(
         let dash_upstream = dash_upstream.clone();
         let http = http.clone();
         async move {
-            // HTTP/2 carries the authority in the URI pseudo-header, NOT a Host
-            // header — read both or h2 requests dispatch as host="" (the bug that
-            // sent api/apex traffic into the public router).
             let host = req
                 .headers()
                 .get(axum::http::header::HOST)
@@ -2286,18 +1953,9 @@ fn host_switch_router(
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            // `api-<region>.<platform>` is the region-pinned API surface: same
-            // dispatch as `api.`, but its DNS record names ONE region's nodes,
-            // so a client that wants a specific region uses the hostname alone.
-            // Pattern-matched rather than enumerated — the region list lives in
-            // the DNS reconciler/ACME SANs, and an api-<x> host that was never
-            // published simply doesn't resolve, so accepting the shape is safe.
             let region_api = api_host
                 .strip_prefix("api.")
                 .map(|domain| {
-                    // `api-<region>.<domain>` exactly: the suffix must be a REAL
-                    // label boundary (`.domain`), or `api-evil-shadw.cloud`-style
-                    // hosts would match a bare ends_with(domain).
                     let suffix = format!(".{domain}");
                     host.starts_with("api-")
                         && host.ends_with(&suffix)
@@ -2306,14 +1964,8 @@ fn host_switch_router(
                 })
                 .unwrap_or(false);
             if host == api_host || host == admin_host || host == webhook_host || region_api {
-                // Pass the MATCHED host so a leader-forward pins to the right SNI
-                // (the platform cert covers api./admin./webhook. and, once the
-                // SAN-coverage reissue lands, every api-<region>.).
                 return admin_ingress(cloud, admin, host, req).await;
             }
-            // Dashboard hosts: reverse-proxy to the configured origin — each
-            // node's own self-hosted dashboard on loopback, never an external
-            // tunnel (HIVE_DASHBOARD_UPSTREAM=http://127.0.0.1:3002).
             if let (true, Some(up)) = (
                 dash_hosts.iter().any(|h| *h == host),
                 dash_upstream.as_ref(),
@@ -2329,32 +1981,17 @@ fn host_switch_router(
     axum::Router::new().fallback(handler)
 }
 
-/// Regional AdminAPI ingress for `api.{platform_domain}`. Runs on EVERY healthy
-/// node — clients reach the nearest via health-aware DNS. It authenticates the
-/// request, then serves locally IF this node is the control-plane leader, else
-/// forwards to the leader over HTTPS (pinned to the leader's IP, SNI = api host).
-/// A loop-guard header prevents re-forwarding. First-slice policy: after auth,
-/// forward ALL requests (reads + writes) to the leader. Entirely dormant unless a
-/// node runs with `HIVE_INGRESS!=ngrok` AND `HIVE_JWT_SECRET` set (see caller).
-/// Explicit cache policy on every admin GET response (previously NO `/v1/*`
-/// JSON carried any Cache-Control at all — every intermediary guessed).
-/// TENANT-SAFE BY CONSTRUCTION, two classes only:
-///
-/// - **Global, non-tenant catalogs** (`/v1/regions*`, `/v1/frameworks`):
-///   `public, s-maxage=3600, stale-while-revalidate=86400` — shared caches/CDNs
-///   may serve these to everyone (they contain zero tenant data) and keep
-///   serving stale while revalidating in the background; browsers get a short
-///   `max-age` so a catalog change still lands quickly.
-/// - **Everything else** (tenant-scoped data): `private, no-store` — NO shared
-///   cache (CDN/proxy) may store it (structurally eliminating the
-///   cross-tenant-cache-bleed class: there is nothing a tenant-blind cache key
-///   could ever mis-serve), and browsers don't persist it locally either. The
-///   tenant-keyed stale-while-revalidate layer for this data lives in the
-///   dashboard client (`ui/lib/api.ts`: cache keys are `${tenant}|${path}`,
-///   TTL+SWR-ish reuse, purged on every mutation and team switch) — the layer
-///   that can actually key on the VERIFIED tenant.
-///
-/// Handlers that set their own Cache-Control (project thumbnails) keep it.
+/// Explicit Cache-Control on every admin GET response (previously NO `/v1/*` JSON carried any, so
+/// every intermediary guessed), TENANT-SAFE BY CONSTRUCTION with two classes only: global
+/// non-tenant catalogs (`/v1/regions*`, `/v1/frameworks`) get
+/// `public, s-maxage=3600, stale-while-revalidate=86400` (shared caches may serve them to everyone
+/// and keep serving stale while revalidating; browsers get a short `max-age` so a catalog change
+/// still lands quickly), and everything else gets `private, no-store`, so no shared cache
+/// (CDN/proxy) can store tenant data and the cross-tenant cache-bleed class is eliminated
+/// structurally. The tenant-keyed stale-while-revalidate layer lives in the dashboard client
+/// (`ui/lib/api.ts`, keys `${tenant}|${path}`, purged on every mutation and team switch), the layer
+/// that can actually key on the VERIFIED tenant. Handlers that set their own Cache-Control (project
+/// thumbnails) keep it.
 async fn admin_cache_headers(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
@@ -2382,6 +2019,25 @@ async fn admin_cache_headers(
     resp
 }
 
+/// Regional AdminAPI ingress for `api.{platform_domain}` (also `admin.`, `webhook.` and
+/// `api-<region>.`): it runs on EVERY healthy node, which clients reach through health-aware DNS.
+/// Reads are FULLY DISTRIBUTED: every node serves GET/HEAD locally from its own gossip-replicated
+/// state, because forwarding them to the leader put a cross-ocean RTT in front of every dashboard
+/// fetch and made one far or wedged leader read as "the platform is down". MUTATIONS serialize
+/// through the control-plane leader: with auth enforced a mutation without a valid JWT or dashboard
+/// API key is rejected BEFORE forwarding (the leader re-verifies either; JWT-only here made API
+/// keys silently read-only), then it is served locally on the leader or forwarded over HTTPS,
+/// SNI-pinned to a registry IP, failing CLOSED (never plain DNS, which could send the write
+/// anywhere) with a 503 rather than applying it here, which would split the brain. `/v1/token` is
+/// exempt (stateless HS256 minting, so login never depends on leader reachability) and so are
+/// owner-routed paths. A request carrying `x-hive-admin-forwarded` is applied ONLY if this node is
+/// (still) the leader: the marker rides the public api host and can be forged, so its presence
+/// never places a write on a non-leader. A mutation there gets 503 (the client retries and
+/// re-resolves); a forwarded mutation stamped with a control-plane epoch BEHIND ours is fenced (the
+/// sender missed a promotion), answering our epoch in `x-hive-cp-epoch-current` so a well-behaved
+/// forwarder can max-merge and re-stamp (provably not applied, so the retry is safe; a genuinely
+/// superseded sender never converges); reads still serve locally. Entirely dormant unless a node
+/// runs with `HIVE_INGRESS!=ngrok` AND `HIVE_JWT_SECRET` set.
 async fn admin_ingress(
     cloud: Arc<CloudState>,
     admin: axum::Router,
@@ -2398,23 +2054,8 @@ async fn admin_ingress(
             Err(never) => match never {},
         }
     }
-    // Loop guard + anti-forgery: a request carrying the internal forward marker is
-    // served locally ONLY if we are (still) the control-plane leader. The marker
-    // rides the same public `api` host, so a client can forge it — we therefore
-    // never trust its mere presence to place a write on a non-leader. If leadership
-    // changed mid-flight, or a client forged the marker toward a non-leader, refuse
-    // mutations with 503 (the client retries and re-resolves to the current
-    // leader); reads may serve locally best-effort. This closes both the spoof
-    // (forced write on a non-leader) and the stale-forward split-brain, while still
-    // terminating any forward chain (a forwarded request is never re-forwarded).
     if req.headers().contains_key("x-hive-admin-forwarded") {
-        // Epoch fence (proposal step 5): a forwarded mutation carries the
-        // sender's control-plane epoch. If it is BEHIND ours, the sender's view
-        // of ownership is stale (it missed at least one promotion/failover) —
-        // refuse rather than apply a write routed under superseded ownership.
-        // Absent/unparsable header (pre-upgrade peers) fences nothing: the
-        // owner-recheck below still gates.
-        let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+        let is_mutation = is_mutation_request(&req);
         if is_mutation {
             let sender_epoch = req
                 .headers()
@@ -2429,13 +2070,6 @@ async fn admin_ingress(
                         local_epoch = ours,
                         "rejected forwarded mutation with stale control-plane epoch (fenced)"
                     );
-                    // Disclose OUR current epoch so a well-behaved forwarder can
-                    // max-merge it and re-stamp instead of failing the write on
-                    // a pure race (an epoch bump landing while the forward was
-                    // in flight). This refusal is provably-not-applied — it
-                    // fires before the router — so that retry is safe; a
-                    // genuinely superseded sender never converges to a current
-                    // epoch and is still refused after the bounded retries.
                     let mut resp = (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         STALE_EPOCH_BODY,
@@ -2456,30 +2090,21 @@ async fn admin_ingress(
         }
         return serve_local(admin, req).await;
     }
-    // Auth-first: with enforcement on, reject a mutation lacking a valid token
-    // BEFORE forwarding (fail fast). Reads pass (the leader re-verifies anyway).
     if crate::auth::enforced() {
-        let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+        let is_mutation = is_mutation_request(&req);
         let path = req.uri().path();
-        // Keep in sync with auth::require_auth's `open` list — the zkauth
-        // preview-unlock endpoints authenticate via a shared x-hive-internal
-        // secret (zkauth::internal_ok), never a platform JWT.
+        // Keep in sync with auth::require_auth's `open` list: these paths authenticate by something
+        // other than a platform JWT (zkauth internal secret, per-database or per-project bearer,
+        // WebDAV Basic).
         let open = path == "/healthz"
             || path == "/v1/token"
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
-            // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
-            // Per-project browser_db REST bearer, not a platform JWT — see
-            // auth::require_auth.
             || path.starts_with("/v1/browser-db/")
-            // WebDAV Basic-auth, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/drive/webdav/");
         if is_mutation && !open {
-            // Accept a platform JWT or a dashboard API key (`hive_…`) — the
-            // leader's `require_auth` re-verifies either; this gate only
-            // fails fast. JWT-only here made API keys silently read-only.
             let ok = crate::auth::extract_token(req.headers())
                 .map(|t| {
                     crate::auth::verify(&t).is_ok()
@@ -2495,33 +2120,13 @@ async fn admin_ingress(
             }
         }
     }
-    // READS ARE FULLY DISTRIBUTED: every node serves GET/HEAD from its own
-    // gossip-replicated state (eventually-consistent, last-writer-wins — the
-    // same converged view the loopback admin always served). Forwarding reads
-    // to the leader (the original first-slice policy) put a cross-ocean RTT in
-    // front of EVERY dashboard fetch and made one node a global choke point —
-    // one wedged/far leader read as "the platform is down" even though every
-    // node held the data. Only MUTATIONS still serialize through the leader.
-    //
-    // `/v1/token` is exempt even though it's a POST: minting is pure HS256
-    // signing with the fleet-shared secret — no state is written — so login
-    // must never depend on leader reachability or distance.
-    let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    // libsql/Hrana pipelines are OWNER-routed, never leader-routed — see
-    // `owner_routed`.
+    let is_mutation = is_mutation_request(&req);
     if !is_mutation || owner_routed(req.uri().path()) || req.uri().path() == "/v1/token" {
         return serve_local(admin, req).await;
     }
-    // Leader serves locally.
     if cloud.is_control_plane_leader() {
         return serve_local(admin, req).await;
     }
-    // Forward to the leader. Every candidate is SNI-pinned to a registry IP: a
-    // leader with no reachable IP — OR a malformed registry IP that won't parse to
-    // a socket addr — must FAIL CLOSED (never fall back to plain DNS, which could
-    // send the write anywhere), so with nothing dialable the mutation is refused
-    // with 503 rather than applied here (split-brain). Reads never reach this
-    // point (they returned locally above).
     admin_forward_to_leader(&cloud, &api_host, req).await
 }
 
@@ -3594,11 +3199,14 @@ fn spawn_metrics_persist_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Periodic podman lock-headroom sweep — see the call site's comment in `main()`.
-///
-/// Takes no `CloudState`: it reads the HOST's podman state, nothing of ours.
-/// Runs on every node (not leader-only) because the lock pool it protects is
-/// per-host. `HIVE_LOCK_SWEEP_SECS=0` disables it.
+/// Periodic podman lock-headroom sweep: containers AND volumes each consume one lock from a fixed
+/// pool (default 2048), so a leak starves the whole HOST (witnessed: 2032 leaked volumes on the
+/// leader, freeLocks 0, every deployment's cold start on that node failing as 503
+/// CAPACITY_EXHAUSTED). The leak itself is fixed (`podman rm -v`) and the run path self-heals
+/// reactively; this sweep restores headroom BEFORE a request pays for it and covers locks leaked by
+/// anything outside that path (a crashed node, a manual `podman run`). It takes no `CloudState` (it
+/// reads the HOST's podman state), runs on every node because the lock pool is per-host, and
+/// `HIVE_LOCK_SWEEP_SECS=0` disables it.
 fn spawn_container_lock_sweep() {
     let secs = env_u64("HIVE_LOCK_SWEEP_SECS", 300);
     if secs == 0 {
