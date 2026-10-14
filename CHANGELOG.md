@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-10-13 — a tenant token can no longer register or remove another tenant's database replica
+
+`POST /v1/databases/replica` (the primary's cross-region replica fanout) took only the request
+body: `auth::require_auth` proves "some valid token" for a mutation, so any signed-in tenant
+could `register` a replica whose `connection` fed `apply_db_egress` (attacker-chosen
+`BLOB_*`/`DATABASE_URL` values written into a victim project's runtime env; a Postgres/Redis
+`kind` also starts a container on the node), `remove` with an empty or unknown `db.id` to strip
+the victim's DB env keys, or, knowing a database id and the owner's team string, remove the
+record and its container. The only guard compared the stored team with the attacker-supplied
+`db.team`. The HTTP route now mounts `database_replica_public`, which runs the new
+`admin::require_mesh_rpc` first: a platform operator, the fleet's `x-hive-internal` secret, or a
+`mesh-internal` service delegation minted for the replicated database's own team
+(`auth::is_mesh_internal`, the one predicate for "a fleet node, not a tenant"). The inner
+`database_replica`, which the iroh gossip arm still calls behind the transport's signer and
+trust gate, also refuses a `db.project` the claimed team does not own, and the HTTP leg of
+`send_replica_rpc` now presents a `mesh-internal` bearer minted for the database's team (it
+sent no credential before, so on an auth-enforced node that leg was a 401). Witnessed on
+throwaway auth-enforced nodes (tenants `ta` and `tb`): before, `ta` overwrote `tb`'s
+`BLOB_BUCKET` with `ATTACKER-BUCKET`, deleted `BLOB_BUCKET`/`BLOB_ENDPOINT`, and deleted `tb`'s
+database by id; after, all three answer 403 and `tb`'s env and database are untouched, the
+operator, the `x-hive-internal` secret and a delegation minted for `tb` still register `tb`'s
+replica, and a delegation minted for `tb` is refused for team `ta`. On two real nodes meshed
+over loopback iroh QUIC (signed gossip) and over `--peer` admin URLs, a database created with
+replicas in both regions still lands its copy on the other node, before and after. Operator
+note: nothing to migrate; anything other than the platform's own fanout that called this route
+with an ordinary tenant token now gets 403. The admin.rs half of this change landed inside the
+cron-purge commit `350d417d34` (a path-scoped commit of the shared file took the whole diff);
+this commit carries the `auth.rs`/`db_replicate.rs` half and the rustfmt of two lines. Not rolled.
+
 ## 2026-10-13 — the cron page no longer labels a seconds-level or ranged schedule as something else
 
 `describeSchedule` (the English label on a cron job row) dropped the first field of every

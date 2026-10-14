@@ -97,12 +97,21 @@ async fn send_replica_rpc(cloud: &Arc<CloudState>, t: &Target, op: &str, db: &Da
     let payload = serde_json::json!({ "op": op, "db": db });
     let body = serde_json::to_vec(&payload).unwrap_or_default();
     if let Some(admin) = &t.admin {
-        cloud
+        let mut rb = cloud
             .http
             .post(format!("{admin}/v1/databases/replica"))
             .header("x-hive-team", db.team.clone())
-            .header("content-type", "application/json")
-            .body(body)
+            .header("content-type", "application/json");
+        if let Ok(tok) = crate::auth::issue(
+            crate::auth::MESH_INTERNAL_SUB,
+            &db.team,
+            crate::auth::MESH_SERVICE_ROLE,
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
+            rb = rb.header("authorization", format!("Bearer {tok}"));
+        }
+        rb.body(body)
             .timeout(std::time::Duration::from_secs(15))
             .send()
             .await

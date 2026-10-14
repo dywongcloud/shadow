@@ -3644,7 +3644,8 @@ pub(crate) fn require_mesh_rpc(
     if require_operator_or_internal(headers, claims).is_ok() {
         return Ok(());
     }
-    let minted_for_team = |cl: &crate::auth::Claims| team.map_or(true, |t| norm(&cl.tenant) == norm(t));
+    let minted_for_team =
+        |cl: &crate::auth::Claims| team.map_or(true, |t| norm(&cl.tenant) == norm(t));
     if claims.is_some_and(|cl| crate::auth::is_mesh_internal(cl) && minted_for_team(cl)) {
         return Ok(());
     }
@@ -13033,7 +13034,10 @@ async fn database_replica_public(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let team = body.pointer("/db/team").and_then(Value::as_str).unwrap_or("");
+    let team = body
+        .pointer("/db/team")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some(team))?;
     database_replica(State(c), Json(body)).await
 }
