@@ -47,6 +47,9 @@ pub enum BrokerError {
     /// Caller's tenant does not own this project. Message is deliberately
     /// generic (see module doc point 1) — do not add detail here.
     NotOwner,
+    /// The deployment is not one of the path project's deployments for this caller (see
+    /// [`authorize_deployment`]); the same answer whether it exists or not.
+    UnknownDeployment,
     /// The snapshot id itself is unsafe (see `snapshot::safe_component`).
     InvalidId(String),
     /// The deployment is already at its snapshot ceiling.
@@ -57,12 +60,58 @@ impl std::fmt::Display for BrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BrokerError::NotOwner => write!(f, "project belongs to a different team"),
+            BrokerError::UnknownDeployment => write!(f, "unknown deployment"),
             BrokerError::InvalidId(id) => write!(f, "invalid snapshot id: {id}"),
             BrokerError::QuotaExceeded { limit, have } => {
                 write!(f, "snapshot quota exceeded: {have}/{limit}")
             }
         }
     }
+}
+
+/// The `(project, tenant tag)` the fleet view records for `deployment_id`: this node's own gateway
+/// first, then every peer's gossiped records.
+fn deployment_owner(cloud: &Arc<CloudState>, deployment_id: &str) -> Option<(String, String)> {
+    if let Some(record) = cloud
+        .gw
+        .deployment_records()
+        .into_iter()
+        .find(|record| record.id == deployment_id)
+    {
+        return Some((record.project, record.tenant));
+    }
+    cloud
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .find(|deployment| deployment.id.to_string() == deployment_id)
+        .map(|deployment| (deployment.project.clone(), deployment.tenant.clone()))
+}
+
+/// Authorizes any snapshot operation on `deployment_id` reached through `project`'s path: the
+/// route authorizes the PROJECT in the path, but the path's `deployment_id` is
+/// attacker-controlled, so without this a tenant reaches another tenant's data image through its
+/// own project. The deployment must be one of `project`'s and, when its record carries a tenant
+/// tag, that tag must be the caller's (an untagged legacy record inherits the project's owner, the
+/// check `require_project` already made). A deployment no node of the fleet view knows is left to
+/// the handlers' own not-found answer.
+pub fn authorize_deployment(
+    cloud: &Arc<CloudState>,
+    caller_tenant: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<(), BrokerError> {
+    let Some((deployment_project, deployment_tenant)) = deployment_owner(cloud, deployment_id)
+    else {
+        return Ok(());
+    };
+    let tag = crate::admin::record_tenant(&deployment_tenant);
+    let foreign_tenant = tag != crate::admin::UNTAGGED_TENANT && tag != caller_tenant;
+    if !deployment_project.eq_ignore_ascii_case(project) || foreign_tenant {
+        return Err(BrokerError::UnknownDeployment);
+    }
+    Ok(())
 }
 
 /// Authorizes a snapshot CREATE for `project` on behalf of `caller_tenant`. `Ok(())` means the

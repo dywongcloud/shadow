@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-13 — a tenant can no longer snapshot, list or delete another tenant's deployment data through its own project
+
+`POST|GET|DELETE /v1/projects/:project/deployments/:deployment_id/snapshots[/:snapshot_id]`
+(`storage_api.rs`) authorized the PROJECT in the path (`require_project`) but acted on the
+path's `deployment_id` with no proof that the deployment belongs to that project or tenant:
+tenant A could reflink tenant B's data image into a snapshot, list B's snapshots and delete
+them by sending B's deployment id (it is in B's URLs) through A's own project. The three
+handlers, which the gossip arms that proxy to the hosting node call too, now cross one
+`authorize`: `require_project` plus the new `storage_broker::authorize_deployment`, which
+requires the deployment (this node's gateway first, then the gossiped peer records) to be a
+deployment of the path's project and, when its record carries a tenant tag, of the caller's
+tenant (an untagged legacy record inherits the project's owner, which `require_project`
+already proved). A foreign deployment answers exactly what an id that does not exist
+answers: 404 `unknown deployment` for create and delete, the empty list for list. Witnessed on
+a throwaway auth-enforced node (macOS, so no Firecracker backend: a request that passes
+authorization answers 501 from the backend check that follows it): before, tenant `ta`'s
+cross-tenant create, list and delete against tenant `tb`'s deployment all answered 501, that
+is authorized and into the data-image code; after, 404, 200 with an empty list and 404, while
+`ta`'s and `tb`'s own deployments still reach the backend check (501) on every route, `tb`'s
+project path is still 403 for `ta` and an unknown id is still 404. Operator note: nothing to
+migrate and no change for owners; a deployment that no node's view knows is still answered by
+the handlers' existing not-found path. Not rolled.
+
 ## 2026-10-13 — HIVE_OWNER_EMAIL is parsed in one place on the dashboard server
 
 The dashboard server parsed `HIVE_OWNER_EMAIL` (a comma-separated list) at four sites with
@@ -306,9 +329,9 @@ public origin through a cloudflared quick tunnel (53 bound checks: header forwar
 range, rewrite against the final url, 2 MiB and 64 MiB caps, content-type refusals and
 relabels, client-cancel teardown of the upstream socket, idle stall). The feature still
 works: of 60 random iptv-org catalog channels 47 playlists were proxied and rewritten and
-36 first segments streamed before, 46 and 35 after (two `stream8.cinerama.uz` channels
-whose origin started answering this IP with a 302 to a "blocked" slate between the runs,
-curl sees the same; one flapping channel came back), and a 300-channel run played 168
+36 first segments streamed before, 46 and 35 on one later run and 48 and 37 on the final
+run (the differences are origins that flap between runs: `stream8.cinerama.uz` 302s this
+IP to a "blocked" slate for a while, curl sees the same), and a 300-channel run played 168
 first segments, including the three `.ts`-as-`text/vnd.trolltech.linguist` channels the
 bare allowlist had refused. One catalog host,
 `folxsloapp.b-cdn.net`, publishes an A record of 127.0.0.1 and used to be dialed on the

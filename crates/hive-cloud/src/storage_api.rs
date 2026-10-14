@@ -11,8 +11,10 @@
 //! snapshot request has to reach whichever node hosts the deployment, which may or may not be the
 //! leader and may or may not be the node round-robin `api.<domain>` DNS landed this request on.
 //!
-//! Every handler therefore: (1) authorizes the caller against `project` through `require_project`,
-//! which is fleet-aware and safe to run on ANY node (see `admin::project_owned_by`); (2) checks
+//! Every handler therefore: (1) authorizes the caller through `authorize`: `require_project` (fleet-
+//! aware, safe to run on ANY node, see `admin::project_owned_by`) AND proof that the path's
+//! `deployment_id` is a deployment of that project (`storage_broker::authorize_deployment`: the
+//! project in the path is the caller's own, the deployment id is attacker-chosen); (2) checks
 //! whether THIS node's local gateway (`c.gw`) hosts `deployment_id`; (3) if not, proxies the whole
 //! (already authorized) request to the hosting node through `admin::host_node_for_deployment` and
 //! an HTTP-then-mesh helper (`post_body_to_host` / `fetch_from_host` / `delete_to_host`), the same
@@ -74,6 +76,7 @@ fn require_firecracker(
 fn broker_status(e: crate::storage_broker::BrokerError) -> (StatusCode, String) {
     let code = match &e {
         crate::storage_broker::BrokerError::NotOwner => StatusCode::FORBIDDEN,
+        crate::storage_broker::BrokerError::UnknownDeployment => StatusCode::NOT_FOUND,
         crate::storage_broker::BrokerError::InvalidId(_) => StatusCode::BAD_REQUEST,
         crate::storage_broker::BrokerError::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
     };
@@ -88,6 +91,22 @@ fn hosted_here(c: &Arc<CloudState>, deployment_id: &str) -> bool {
         .any(|r| r.id == deployment_id)
 }
 
+/// The ONE authorization every snapshot route crosses, local or proxied (the mesh arms call these
+/// handlers too): the caller owns `project` AND `deployment_id` is a deployment of that project
+/// (`storage_broker::authorize_deployment`). Returns the caller's tenant.
+fn authorize(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: &Claims,
+    project: &str,
+    deployment_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = require_project(c, headers, claims.as_ref().map(|e| &e.0), project)?;
+    crate::storage_broker::authorize_deployment(c, &t, project, deployment_id)
+        .map_err(broker_status)?;
+    Ok(t)
+}
+
 pub(crate) async fn create_snapshot(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -95,7 +114,7 @@ pub(crate) async fn create_snapshot(
     Path((project, deployment_id)): Path<(String, String)>,
     Json(body): Json<CreateReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = authorize(&c, &headers, &claims, &project, &deployment_id)?;
 
     if !hosted_here(&c, &deployment_id) {
         let Some(node) = host_node_for_deployment(&c, &deployment_id) else {
@@ -138,7 +157,11 @@ pub(crate) async fn list_snapshots(
     claims: Claims,
     Path((project, deployment_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = match authorize(&c, &headers, &claims, &project, &deployment_id) {
+        Ok(t) => t,
+        Err((StatusCode::NOT_FOUND, _)) => return Ok(Json(json!({ "snapshots": [] }))),
+        Err(refusal) => return Err(refusal),
+    };
 
     if !hosted_here(&c, &deployment_id) {
         if let Some(node) = host_node_for_deployment(&c, &deployment_id) {
@@ -163,7 +186,7 @@ pub(crate) async fn delete_snapshot(
     claims: Claims,
     Path((project, deployment_id, snapshot_id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = authorize(&c, &headers, &claims, &project, &deployment_id)?;
 
     if !hosted_here(&c, &deployment_id) {
         let Some(node) = host_node_for_deployment(&c, &deployment_id) else {
