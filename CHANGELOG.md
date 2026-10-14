@@ -1,5 +1,139 @@
 # Changelog
 
+## 2026-10-13 — a plan is bought or granted, never self-assigned: the tier-change primitive decides who may raise it (f00b3ebe32)
+
+`PUT /v1/teams/:slug/plan` was gated only by `require_team(owner|admin)`, so a team's owner, an admin,
+or an owner's API key could set the team's plan to `enterprise` (or `pro`) with no checkout: the team
+record and the billing account both read the paid tier and every plan-gated feature (IP blocking, SIEM,
+SAML, SCIM, fail-over, 1-hour runtimes) opened for free. `team_create` already encoded the policy
+("create the team on Hobby, then complete checkout to upgrade"), but only at that one route. The check
+now lives at the sink every tier change funnels through: `admin::apply_plan_everywhere` takes a required
+`PlanChange` (`Request(claims)`: an operator, or anyone on an unenforced dev node, sets any tier and
+everyone else may only keep or lower it; `Paid`: a verified checkout, or the mock checkout of a node
+with no Stripe; `Cancellation`: the Stripe subscription-deleted downgrade; `AdminTenant`: the platform
+admin's own enterprise lock), refuses an unknown plan (400) and a raise without the authority to raise
+(403 naming the checkout route). All eight call sites pass their reason. Witnessed on a real enforced
+node (`scratch2/work/secfix2-plan.sh`): before, the owner, an admin and the owner's API key all got 200
+with the plan changed and the enterprise-only IP blocking then answered 200; after, all 403 with the plan
+unchanged, while the operator's PUT, an owner downgrade, billing grants, the free-plan checkout, a mock
+pro checkout plus confirm, an operator creating a pro team and a non-operator's 402 on a paid team are
+unchanged. Operator note: the dashboard's Plan card and `shadw team plan` still call this route, so for a
+non-operator their upgrade buttons now answer 403 until the card routes upgrades through
+`POST /v1/billing/checkout`; downgrades work. Not rolled.
+
+## 2026-10-13 — a restart no longer swaps the host-less default deployment for the oldest one (c96d546a79)
+
+A request with no Host header on the public listener is answered by the gateway's default deployment.
+Live, `deploy` and `promote` make the deployment that takes a project's alias the default (the
+newest); `Gateway::restore` did `default.get_or_insert(id)` while `persist::restore` replays records
+oldest first, so after every restart the oldest ready record (any tenant's) answered instead and stayed
+the default until the next deploy. `restore` now sets the default to each alias winner, ending on the
+newest. Witnessed on a real node (`scratch2/work/secfix2-default.sh`): before, a host-less request
+answered SITE-bravo (newest) live and SITE-alpha (oldest) after a restart; after, SITE-bravo both times.
+Reviewed and NOT changed: `ProjectStore::upsert_env`/`delete_env` match on key only; the dashboard edits
+and deletes by key (one row per variable, the target is a field of that row) and `DELETE /env/:key`
+carries no target, so that is the data model, not a slip. Not rolled.
+
+## 2026-10-13 — placement and the control-plane election ask the one shared reachability and address predicate (2c90d1ea2d)
+
+`schedule::place_for_project` (lease-holder stickiness) inlined a reachability check without the
+`dialable()` test `place` applies, so a lease holder with a peer id and an iroh address but no public
+address, no relay, no live trunk and no admin URL was chosen, the build was dispatched to it and, since
+stickiness also pins the deploy to its holder, failed "could not reach any target" though this node could
+have built it. `Cluster::billing_leader_with_pref` kept a non-trimming copy of `Cluster::addressable`, so
+a node advertising `public_ip` `"   "` with the lowest peer id won the identity election over a node
+with a real public address. Both now call the shared predicates (`schedule::reachable`,
+`Cluster::addressable`, and `schedule::has_public_address` delegates to the latter). Witnessed on a real
+enforced node pulling crafted registry entries and a lease from a fake HTTP gossip peer
+(`scratch2/work/secfix2-place.sh`): before, a git deploy was placed on the unreachable holder and ended in
+error and `/v1/cluster` named the blank-address node leader; after, the build is ready on this node and
+the leader is the node with the real address. Not rolled.
+
+## 2026-10-13 — SCIM authenticates by its own bearer on an enforced platform, and the SAML ACS no longer lets a signed-in stranger forge a roster member (c45cbe1508)
+
+SCIM (`/v1/scim/v2/*`) authenticates every request by the team's own bearer but sat behind the platform
+gate, so an IdP's POST/PATCH/DELETE (no platform JWT) was answered 401 before the handler. The prefix is
+now on the open-route list and `scim_team_for_token` fails closed (empty token, and a stored value no key
+can open is never compared: `secrets::decrypt` hands such a ciphertext back unchanged, which made the
+leaked ciphertext a working bearer). The open-route list is one function, `auth::is_open_route`, used by
+`require_auth` and by `admin_ingress`, whose private copy had drifted (it lacked `/v1/billing/webhook`,
+`/v1/browser/admissions` and `/v1/zkauth/project-team`, so an unauthenticated POST to those was refused 401
+at the api ingress though the node treats them as self-authenticating; they now reach their handlers, which
+verify the Stripe signature, the admission's claims and the internal secret). The SAML ACS verifies no
+signature and is NOT opened, but any signed-in caller of any team could POST a forged NameID to another
+team's ACS and, with `auto_provision`, add that email to its roster: it now requires the path team's
+owner or admin (anonymous stays 401, another team's caller or a plain member is 403), and `RelayState`
+goes through `auth::same_origin_path` (it was appended to the dashboard URL as given:
+`https://dash.example` + `@evil.example/x` is host evil.example). Witnessed on a real enforced node
+(`scratch2/work/secfix2-saml-scim.sh`): before, another team's owner and a member forged roster entries,
+4 of 6 RelayState values left the dashboard host and SCIM POST with the IdP bearer was 401; after, 403,
+every RelayState lands on the dashboard, SCIM create/list/PATCH/DELETE work (also through the ingress) and
+empty, wrong, absent, JWT or other-team bearers provision nothing. Operator note: SAML sign-in still
+cannot complete on an enforced platform (an IdP's browser POST carries no platform JWT) until assertion
+signatures are verified; the ingress now lets the three routes above through to their handlers. Not rolled.
+
+## 2026-10-13 — a DNS-only domain record no longer invents registrar facts the platform never measured (f60ae96f5f)
+
+`dns::default_domain` seeded every record with registrar "OpenEdge", renewal_price "$13 per year",
+auto_renew true and an expiry one year out; `GET /v1/domains/:domain` served them as fact (the dashboard's
+Expiration Date of an attached domain still showed the invented date) and `PUT .../auto-renew` flipped a
+flag that renewed nothing. The four keys now carry no value (`""`, `""`, `false`, `0`) and
+`DomainStore::load` scrubs them on every boot and snapshot adoption, so records persisted or replicated by
+an earlier build stop serving them. The keys are emptied, not removed: a node on an earlier build parses
+`state.json` and replicated snapshots with them required and a failed parse resets that node's whole
+platform state, so removing one is a rollback and mixed-fleet hazard. The dead auto-renew route and its
+setter are gone (404). Witnessed on a real node (`scratch2/work/secfix2-dns.sh`): before, a fresh record
+read OpenEdge / $13 per year / true / +365d, the toggle answered 200 and a persisted record kept serving
+the invented values after a restart; after, empty, false, 0, a 404, scrubbed on load, and the older binary
+still boots on the data dir the new one wrote. Not rolled.
+
+## 2026-10-13 — a checkout names a real plan, and deleting a database that does not exist is a 404 that plants no tombstone (71f14d7300)
+
+`billing_checkout`'s free-plan shortcut resolved the requested plan through `plan_spec`, which falls back
+to Hobby for any string, so `"garbage"`, `"Enterprise"` or `"hobby "` looked free and the raw string was
+stored in the team record while billing normalized to hobby (the two halves disagreed about the tier).
+`billing::known_plan` is the lookup without the fallback; the checkout and both lookups in `billing_grant`
+use it, so a request naming no plan is a 400 listing the plans. `database_delete` retried the lookup for
+replication lag and then, for an id still unknown, called `remove_db_and_purge_data` and answered
+`{removed: id}`; `remove_db` inserts a tombstone for the id, which replicates fleet-wide and drops whichever
+record that id later names, another tenant's included. An id still unknown after the retries is now a 404
+and nothing is removed or tombstoned. Witnessed on a real enforced node (`scratch2/work/secfix2-billing-db.sh`):
+before, four garbage plans answered 200 with the team record reading that string and a delete of
+`db_0123456789abcdef` answered 200 with a tombstone in `state.json`; after, 400 and 404 with neither, and
+every legitimate checkout, grant and delete behaves as before. Operator note: a retried delete of a database
+that is already gone now answers 404. Not rolled.
+
+## 2026-10-13 — the audit log appends off the serving worker, can no longer interleave lines, and boots from its tail (13926dc5f3)
+
+`AuditLog::record` ran `create_dir_all`, open, `writeln!` and `sync_all` on whichever tokio worker served the
+mutation, so a burst of mutations parked every worker in an fsync; concurrent appends interleaved (`writeln!`
+on an unbuffered file is two writes, line then newline), so in a 96-mutation burst 22 lines of `audit.jsonl`
+held two JSON objects and 34 were blank; and `AuditLog::new` read the whole file at boot to keep 1000 lines.
+`record` now assigns the sequence number and queues the line under the ring lock (file order is sequence
+order) and never waits; one writer thread appends everything queued under a single fsync (group commit,
+bounded by `HIVE_AUDIT_QUEUE_MAX`, default 65536, then the entry stays in the ring only and is counted and
+logged); `audit::flush_blocking` drains it at graceful shutdown (first thing in `persist::flush_blocking`);
+boot reads only the file tail (64 KiB chunks, at most 8 MiB). Line format, field order and the ring API are
+unchanged. Witnessed on a real enforced node (`scratch2/work/secfix2-audit.sh`): 150 sequential mutations p50
+8.0 ms -> 0.3 ms; 96 concurrent mutations 0.25 s -> 0.03 s with an unrelated `GET /healthz` p99 69.8 ms ->
+3.2 ms; the burst file went from 22 merged and 34 blank lines to 247 parseable contiguous ones; boot over a
+212 MB file 333 MB peak RSS (+216 MB) -> 124 MB (+1 MB), sequence continuing from the tail. Operator note: an
+entry is on disk after the writer's next group commit (milliseconds), not before the mutation returns; a
+SIGKILL inside that window loses those entries (the platform snapshot is already written behind the same
+way). Not rolled.
+
+## 2026-10-13 — a supervised loop's restart backoff resets after a healthy run (f52e6f0d10)
+
+`supervise::spawn_supervised` doubled its restart backoff from 5 s to a 300 s cap on every crash and never
+lowered it, so after a loop had crashed seven times in its life (however far apart) every later crash waited
+the full 5 minutes before the subsystem restarted: one transient panic after days of running left a
+leader-only job, the reconciler or a replication loop dead for 5 minutes with `/healthz` green. A run longer
+than the longest backoff (300 s, on the runtime clock) is healthy, so the crash that ends it starts a new
+incident: the backoff returns to 5 s. A deterministic crash loop still doubles 5, 10, 20 ... 300. Witnessed
+with a throwaway crate outside the repo that includes the real `supervise.rs` (`scratch2/work/s2-sup-witness`),
+on tokio's paused clock and on the wall clock: before, the restart after a 400 s healthy run waited 300 s;
+after, 5 s, then 10 s and 20 s for immediate re-crashes. Not rolled.
+
 ## 2026-10-13 — the password gate no longer reflects the visitor's path into its form or redirect, and the edge forward keeps `//` paths (1f5458f68f)
 
 `edge::password_page` interpolated the visitor's raw request path, unescaped, into `<form action="{path}">`.
