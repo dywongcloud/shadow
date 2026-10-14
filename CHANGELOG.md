@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-10-13 — the GitHub OAuth return path can no longer leave the site
+
+The connect route (`app/api/github/connect/route.ts`), `verifyState` (`lib/github-app.ts`)
+and the OAuth callback accepted any return path that began with `/`, which includes the
+protocol-relative `//evil.example` and `/\evil.example` (browsers read the backslash as a
+slash); the callback then resolved `new URL(`${returnTo}…`, origin)` to the external host,
+so a signed state carrying such a path redirected the user off-site after the OAuth
+round trip (found by the ui comment sweep; it needs a validly signed state plus the
+victim's nonce cookie, so it was low severity, but the guard was weaker than its stated
+intent). One shared helper, `sameOriginPath` (`lib/same-origin-path.ts`), now accepts a
+path only when it starts with a single `/` followed by neither `/` nor `\`, carries no
+control character (URL parsers strip tab and newline, which turns `/<TAB>/evil.example`
+into `//evil.example`) and still resolves to the same origin. It is used where the path
+enters (the connect route, fallback `/new`), where it is read back out of the signed
+state (`verifyState`, fallback `/`) and again in the callback before it redirects
+(fallback `/`). Witnessed through the real `github-app` module and `next dev` with a
+GitHub App test configuration: of 37 return paths (23 hostile: `//evil.example`,
+`/\evil.example`, `///`, tab, newline, CR, NUL and DEL after the slash, `https:`,
+`javascript:` and `data:` URLs, empty and relative paths; 14 legitimate: queries,
+fragments, `/%2F/…`, `/.//…`, spaces, non-ASCII, a backslash later in the path) 11
+hostile ones left the site or kept a control character before, and after all 37 are
+handled (hostile paths become `/`, legitimate ones are preserved byte for byte); the
+callback answered `307 Location: http://evil.example/steal?github_error=…` for a hostile
+signed state before and `http://localhost:3040/?github_error=…` after, and the connect
+route signed `//evil.example/steal` before and `/new` after. Not rolled.
+
 ## 2026-10-13 — the dashboard's TV stream proxy can no longer be pointed at a private address
 
 `GET /api/tv/hls?url=` (`ui/app/api/tv/hls/route.ts`) fetched any `https:` URL for any

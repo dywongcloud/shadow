@@ -7,6 +7,7 @@ import {
   verifyState,
 } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
+import { sameOriginPath } from "@/lib/same-origin-path";
 
 /** OAuth callback for the first-party GitHub App (the URL registered on the App, https://shadw.cloud/oauth/github/callback): verifies the signed CSRF state, exchanges the
  *  code for a user token, seals it into the encrypted httpOnly cookie and returns to the page the user started on with `?connected=github`, the contract the Composio flow
@@ -46,15 +47,16 @@ export async function GET(req: NextRequest) {
     return back("/integrations", { github_error: "Invalid or expired sign-in state — please try connecting again." });
   }
 
+  const returnTo = sameOriginPath(v.returnTo, "/");
   const bundle = await exchangeCode(code);
   if (!bundle) {
-    return back(v.returnTo, { github_error: "GitHub token exchange failed — please try again." });
+    return back(returnTo, { github_error: "GitHub token exchange failed — please try again." });
   }
 
   if (v.uid) bundle.uid = v.uid;
   await setTokenCookie(bundle);
-  const sep = v.returnTo.includes("?") ? "&" : "?";
-  const res = NextResponse.redirect(new URL(`${v.returnTo}${sep}connected=github`, origin));
+  const sep = returnTo.includes("?") ? "&" : "?";
+  const res = NextResponse.redirect(new URL(`${returnTo}${sep}connected=github`, origin));
   consumeStateCookie(res);
   return res;
 }

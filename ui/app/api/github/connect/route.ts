@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { composioConfigured, githubConnect, resolveEntity } from "@/lib/composio";
 import { authorizeUrl, currentUserId, githubAppConfigured, makeState, stateCookieName } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
+import { sameOriginPath } from "@/lib/same-origin-path";
 
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
-  const returnToRaw = typeof body?.returnTo === "string" ? body.returnTo : "/new";
-  const returnTo = returnToRaw.startsWith("/") ? returnToRaw : "/new";
+  const returnTo = sameOriginPath(body?.returnTo, "/new");
 
   if (githubAppConfigured()) {
     const { state, nonce } = makeState(returnTo, await currentUserId());

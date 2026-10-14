@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "crypto";
 import { auth } from "@clerk/nextjs/server";
 import { cookies } from "next/headers";
+import { sameOriginPath } from "@/lib/same-origin-path";
 
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
 
@@ -120,8 +121,7 @@ export function verifyState(
     const j = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
     if (!cookieNonce || j.n !== cookieNonce) return { ok: false, returnTo: "/" };
     if (typeof j.t !== "number" || Date.now() - j.t > STATE_TTL_MS) return { ok: false, returnTo: "/" };
-    const returnTo = typeof j.r === "string" && j.r.startsWith("/") ? j.r : "/";
-    return { ok: true, returnTo, uid: typeof j.u === "string" ? j.u : undefined };
+    return { ok: true, returnTo: sameOriginPath(j.r, "/"), uid: typeof j.u === "string" ? j.u : undefined };
   } catch {
     return { ok: false, returnTo: "/" };
   }
