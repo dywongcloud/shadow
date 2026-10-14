@@ -637,7 +637,6 @@ impl TeamStore {
             Err(RosterRefusal::AboveActor | RosterRefusal::LastOwner) => {
                 Some(MemberRemoval::Privileged)
             }
-            // a removal never validates the email (a legacy ghost row must stay removable)
             Err(RosterRefusal::BadEmail) => Some(MemberRemoval::Absent),
         }
     }

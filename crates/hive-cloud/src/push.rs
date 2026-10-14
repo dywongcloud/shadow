@@ -609,9 +609,6 @@ pub async fn send_web_push(
     let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let body = encrypt_payload(&sub.p256dh, &sub.auth, &bytes)
         .ok_or("payload encryption failed (bad subscription keys?)")?;
-    // Re-validated at send time (DNS can change after subscribe) through the connect-time-filtered
-    // guard, never the bare shared client: `allowed_push_host` gates the allow-listed suffix, this
-    // gates the resolved address.
     let target = hive_outbound::validate_url(&sub.endpoint)
         .map_err(|e| format!("endpoint no longer valid: {e}"))?;
     let r = hive_outbound::client()

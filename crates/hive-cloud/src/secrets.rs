@@ -45,8 +45,6 @@ fn raw_key() -> &'static [u8; 32] {
     static RAW: OnceLock<[u8; 32]> = OnceLock::new();
     RAW.get_or_init(|| {
         load_or_create_key().unwrap_or_else(|reason| {
-            // Loud and deterministic: a key this boot cannot trust or cannot keep is worse than no
-            // boot at all (AGENTS.md "fail fast, loud, deterministic" / never weaken a security gate).
             tracing::error!(%reason, "fatal: at-rest secret key resolution failed");
             eprintln!("fatal: at-rest secret key resolution failed: {reason}");
             std::process::exit(1);
@@ -215,8 +213,6 @@ fn load_or_create_key() -> Result<[u8; 32], String> {
     if let Ok(h) = std::env::var("HIVE_SECRET_KEY") {
         return hex_to_32(&h).ok_or_else(|| {
             if h.trim().is_empty() {
-                // A unit/drop-in line `Environment=HIVE_SECRET_KEY=` (or an empty/blank value) SETS
-                // the variable: it is not "absent", so it can never mean "use the file key".
                 format!(
                     "HIVE_SECRET_KEY is set but EMPTY (a `HIVE_SECRET_KEY=` line with no value) — \
                      unset it, or give it exactly 64 hex characters; refusing to fall back to this \

@@ -5,17 +5,19 @@
 //! `viewer < member < admin < owner`:
 //!
 //! - **viewer** reads. It changes nothing, except the self-service routes in [`RULES`] (its own
-//!   notifications, push and SMS delivery, browser node and profile sync).
+//!   notifications, push and SMS delivery, browser node and profile sync) and a query that only
+//!   reads (a vector index query).
 //! - **member** does the day-to-day project work: deploys, env, attaching and verifying domains,
 //!   databases (create and connect), storage, queues, sandboxes, cron, workflows, microfrontend
-//!   groups, the conformance policy, its own API keys. Every route it may call is NAMED in
-//!   [`RULES`].
+//!   groups, the conformance policy, its own API keys and a team of its own. A read that hands
+//!   out a way to write or to execute (database credentials, a sandbox shell, a realtime room)
+//!   is member work too. Every route it may call is NAMED in [`RULES`].
 //! - **admin** runs the team and is the floor of EVERY other change, a route nobody listed
 //!   included: team settings and membership below its own rank, enterprise configuration,
 //!   webhooks, integrations and their credentials, API-key revocation, billing, DNS records and
 //!   nameservers, the destructive database operations (delete, credential rotation), the edge
-//!   security rules (WAF, rate limits, bot rules), the repository link, project protection and
-//!   ownership, project delete.
+//!   security rules (WAF, rate limits, bot rules), the SMS delivery provider, the repository
+//!   link, project protection and ownership, project delete.
 //! - **owner** does everything an admin may, plus deleting the team. A Clerk org's highest JWT role
 //!   is `admin` (the dashboard mints `owner` only for a personal namespace), so an owner floor on a
 //!   project action would lock every org out of it: project delete and transfer sit at admin.
@@ -68,7 +70,6 @@ const fn rule(methods: &'static [&'static str], pattern: &'static str, floor: Ro
 /// The matrix. The FIRST matching row wins; a request no row matches needs viewer when it reads and
 /// ADMIN when it changes state, so a route is only ever open to a member because it is listed.
 const RULES: &[Rule] = &[
-    // viewer: the caller's own state (notifications, push and SMS delivery, browser node, profile)
     rule(POST, "/v1/notifications/*", Role::Viewer),
     rule(POST_DELETE, "/v1/push/subscribe", Role::Viewer),
     rule(PUT, "/v1/push/sms", Role::Viewer),
@@ -76,9 +77,7 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/push/test", Role::Viewer),
     rule(POST, "/v1/identity/sync", Role::Viewer),
     rule(POST_DELETE, "/v1/browser/*", Role::Viewer),
-    // viewer: a query that only reads
     rule(POST, "/v1/storage/vector/:index/query", Role::Viewer),
-    // member: reads that hand out a way to write or to execute
     rule(GET, "/v1/databases/:id/credentials", Role::Member),
     rule(
         GET,
@@ -86,7 +85,6 @@ const RULES: &[Rule] = &[
         Role::Member,
     ),
     rule(GET, "/v1/ws/realtime/:room", Role::Member),
-    // admin: secrets, integrations, webhooks, project protection and ownership
     rule(GET, "/v1/integrations/:id/credentials", Role::Admin),
     rule(POST, "/v1/integrations", Role::Admin),
     rule(DELETE, "/v1/integrations/:id", Role::Admin),
@@ -96,7 +94,6 @@ const RULES: &[Rule] = &[
     rule(PUT, "/v1/projects/:project/team", Role::Admin),
     rule(DELETE, "/v1/projects/:project", Role::Admin),
     rule(DELETE, "/v1/apikeys/:id", Role::Admin),
-    // admin: money, DNS and the destructive database operations
     rule(POST, "/v1/billing/checkout", Role::Admin),
     rule(POST, "/v1/billing/confirm", Role::Admin),
     rule(POST, "/v1/billing/charge", Role::Admin),
@@ -107,7 +104,6 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/domains/:domain/ssl/renew", Role::Admin),
     rule(DELETE, "/v1/databases/:id", Role::Admin),
     rule(POST, "/v1/databases/:id/rotate", Role::Admin),
-    // admin: the team's edge security, its SMS delivery provider and its repository link
     rule(WRITES, "/v1/waf/*", Role::Admin),
     rule(WRITES, "/v1/ratelimit", Role::Admin),
     rule(WRITES, "/v1/bot", Role::Admin),
@@ -115,20 +111,15 @@ const RULES: &[Rule] = &[
     rule(WRITES, "/v1/push/sms-key", Role::Admin),
     rule(WRITES, "/v1/push/sms-relay", Role::Admin),
     rule(WRITES, "/v1/gitops", Role::Admin),
-    // microfrontend groups and the conformance policy are project work (member), the rest of the
-    // enterprise configuration (IP blocks, SIEM, SAML, SCIM, deployment protection) is admin
     rule(WRITES, "/v1/enterprise/microfrontends/*", Role::Member),
     rule(WRITES, "/v1/enterprise/conformance/*", Role::Member),
     rule(WRITES, "/v1/enterprise/*", Role::Admin),
     rule(POST, "/v1/saml/:team/acs", Role::Admin),
-    // team settings and membership (`admin::require_team` still binds the path slug to the tenant)
     rule(POST, "/v1/teams/:slug/members", Role::Admin),
     rule(DELETE, "/v1/teams/:slug/members/:email", Role::Admin),
     rule(PUT, "/v1/teams/:slug/plan", Role::Admin),
     rule(PUT, "/v1/teams/:slug/sso", Role::Admin),
     rule(DELETE, "/v1/teams/:slug", Role::Owner),
-    // member: the day-to-day project work, each route (or the lifecycle of one resource) named
-    // deploy and build
     rule(POST, "/deployments", Role::Member),
     rule(POST, "/v1/deploy/image", Role::Member),
     rule(POST, "/v1/deploy/zip", Role::Member),
@@ -139,10 +130,8 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/deployments/:id/promote", Role::Member),
     rule(POST, "/v1/projects/:project/redeploy", Role::Member),
     rule(POST, "/v1/projects/:project/rename", Role::Member),
-    // environment
     rule(POST, "/v1/projects/:project/env", Role::Member),
     rule(DELETE, "/v1/projects/:project/env/:key", Role::Member),
-    // domains: attaching and verifying one (DNS records, nameservers and certificates are admin)
     rule(POST, "/v1/projects/:project/domains", Role::Member),
     rule(
         DELETE,
@@ -160,7 +149,6 @@ const RULES: &[Rule] = &[
         Role::Member,
     ),
     rule(POST, "/v1/domains/:domain/verify", Role::Member),
-    // project settings and snapshots
     rule(PUT, "/v1/projects/:project/build", Role::Member),
     rule(WRITES, "/v1/projects/:project/container", Role::Member),
     rule(PUT, "/v1/projects/:project/cron-enabled", Role::Member),
@@ -183,13 +171,10 @@ const RULES: &[Rule] = &[
         "/v1/projects/:project/deployments/:deployment_id/snapshots/*",
         Role::Member,
     ),
-    // databases: create and connect (delete and credential rotation are admin)
     rule(POST, "/v1/databases", Role::Member),
     rule(POST, "/v1/databases/replica", Role::Member),
     rule(POST, "/v1/databases/:id/sqlite-engine", Role::Member),
     rule(POST, "/v1/databases/:id/studio-open", Role::Member),
-    // resources a project owns: sandboxes, cron, queues, storage, workflows, drive, routing, cache,
-    // microfrontend groups, secure links, incidents
     rule(WRITES, "/v1/projects/:project/sandboxes/*", Role::Member),
     rule(POST, "/v1/sandbox", Role::Member),
     rule(WRITES, "/v1/cron/*", Role::Member),
@@ -205,7 +190,6 @@ const RULES: &[Rule] = &[
     rule(WRITES, "/v1/incidents/*", Role::Member),
     rule(POST, "/v1/gitops/synced", Role::Member),
     rule(POST, "/v1/wqueue/enqueue", Role::Member),
-    // the caller's own: an API key (never above the creator's role) and a team of its own
     rule(POST, "/v1/apikeys", Role::Member),
     rule(POST, "/v1/teams", Role::Member),
 ];

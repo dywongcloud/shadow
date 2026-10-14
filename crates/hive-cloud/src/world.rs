@@ -1272,9 +1272,6 @@ async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str
     if cloud.apps_domain.trim().is_empty() {
         return false;
     }
-    // `cloud.deploy_url` is the one hardened primitive for "this project's own host" (see
-    // `state.rs::host_scoped_https_url`); building the URL by hand here would repeat the exact
-    // userinfo/authority-override shape the queue-consumer and cron/workflow-step fixes close.
     let Ok(mut url) = reqwest::Url::parse(&format!(
         "{}/.well-known/workflow/v1/flow",
         cloud.deploy_url(project)

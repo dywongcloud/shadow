@@ -810,21 +810,12 @@ async fn edge_pipeline_inner(
                         break 'cands;
                     }
                     attempted = true;
-                    // `path_q` is the VISITOR's own request path+query: a raw TCP client can put
-                    // almost anything in it (the HTTP request-line grammar allows `@`/`:`/`//` in a
-                    // path), so it is set as the PATH and QUERY of the gossiped `cand.gateway`
-                    // base (`with_request_target`), never concatenated into a URL string and never
-                    // resolved as a reference: the authority cannot change by construction, and a
-                    // legitimate `//assets/x.js` request still reaches the backend as that path.
                     let Some(url) = reqwest::Url::parse(cand.gateway.trim_end_matches('/'))
                         .ok()
                         .map(|base| with_request_target(base, &path_q))
                     else {
                         continue;
                     };
-                    // Never follows a redirect: a 3xx from the backend is relayed to the visitor
-                    // verbatim below (their own client decides whether to follow it), and the node
-                    // never dereferences a Location it does not control server-side.
                     let mut rb = hive_outbound::internal_client()
                         .request(rmethod.clone(), url)
                         .header("host", &host)
@@ -1501,9 +1492,6 @@ fn with_request_target(mut base: reqwest::Url, path_q: &str) -> reqwest::Url {
 /// engaging the 30 s retry backoff instead of letting the next request re-fire a refresh.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
-        // `path_q` is the original cached REQUEST's path+query (visitor-derived): set as the path
-        // and query of `public_base` (`with_request_target`), the same construction as the
-        // forward leg, never a raw `format!` a crafted path could redirect.
         let Some(target) = reqwest::Url::parse(&cloud.public_base)
             .ok()
             .map(|base| with_request_target(base, &path_q))
@@ -1752,9 +1740,6 @@ fn preview_gate(
         if let Some(submitted) = query_param(query, "__shadw_pw") {
             if cloud.enterprise.verify_password(project, &submitted) {
                 let cookie = cloud.enterprise.seal_password_cookie(project, &submitted);
-                // `path` is the visitor's own request path: a `//host/..` or `/\host` one would
-                // make this Location protocol-relative to another host. Only a same-origin path
-                // is a safe redirect target (anything else lands on the site root).
                 let mut resp =
                     axum::response::Redirect::temporary(crate::auth::same_origin_path(path, "/"))
                         .into_response();
