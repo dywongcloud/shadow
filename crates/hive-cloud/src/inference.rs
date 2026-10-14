@@ -219,39 +219,108 @@ fn models_dir() -> std::path::PathBuf {
     )
 }
 
-/// Download-and-cache the model file (content-addressed by ref hash so a
-/// changed ref refetches). Returns (path, size_bytes).
+/// Domain separator for the model-blob content identity (AGENTS.md: a NEW content identity mints
+/// BLAKE3 via a domain-separated hash of the bytes).
+const MODEL_BLOB_DOMAIN: &[u8] = b"hive-inference-model-blob-v1\0";
+
+/// Largest model this node will download in one `ensure_model` call. `fluid.json`'s
+/// `inference.model` is tenant input reaching a real network fetch with no bound otherwise;
+/// `HIVE_INFERENCE_MAX_MODEL_BYTES` overrides (default 200 GiB, generous for the largest quantized
+/// models this stack targets).
+fn max_model_bytes() -> u64 {
+    std::env::var("HIVE_INFERENCE_MAX_MODEL_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(200 * 1024 * 1024 * 1024)
+}
+
+/// A small pointer from a model ref's cheap lookup key to the content-addressed blob it currently
+/// resolves to: `fnv(url)` is never collision-resistant (a deliberate collision is brute-forceable
+/// in a 64-bit space), so the pointer's own stored `url` is compared verbatim before trusting it —
+/// a colliding ref just misses the cache and re-downloads under its own content hash, it can never
+/// make one tenant's cached bytes serve under a different tenant's model ref.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ModelRef {
+    url: String,
+    file: String,
+}
+
+/// Download-and-cache the model file. The URL is tenant input (`fluid.json` `inference.model`) that
+/// reaches a real fetch, so it goes through the same `hive_outbound` guard as every other
+/// tenant-URL fetcher (public addresses only, redirects re-validated per hop — HuggingFace's CDN
+/// redirects legitimately) and a size cap; a failure is one fixed, generic reason, never the
+/// upstream status or body (no oracle for an internal address). The stored blob is named by the
+/// BLAKE3 content hash of its OWN bytes (a NEW content identity, hashed incrementally as it
+/// downloads so a multi-GB model is never held in memory at once) rather than a hash of the URL:
+/// the old `fnv(url)` filename let two different URLs that happened to collide on 64 bits silently
+/// share a cache slot. Returns (path, size_bytes).
 async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> {
     let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
     let dir = models_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
-    let path = dir.join(format!("hive-{:016x}.gguf", fnv(&url)));
-    if let Ok(md) = tokio::fs::metadata(&path).await {
-        if md.len() > 0 {
-            return Ok((path, md.len()));
+
+    let ref_path = dir.join(format!("hive-{:016x}.ref.json", fnv(&url)));
+    if let Ok(raw) = tokio::fs::read(&ref_path).await {
+        if let Ok(r) = serde_json::from_slice::<ModelRef>(&raw) {
+            if r.url == url {
+                let path = dir.join(&r.file);
+                if let Ok(md) = tokio::fs::metadata(&path).await {
+                    if md.len() > 0 {
+                        return Ok((path, md.len()));
+                    }
+                }
+            }
         }
     }
-    tracing::info!(%url, ?path, "inference: downloading model");
-    let tmp = path.with_extension("part");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+
+    let target = hive_outbound::validate_fetch_url(&url)
+        .map_err(|_| "model URL refused by the outbound policy".to_string())?;
+    tracing::info!(%url, "inference: downloading model");
+    let tmp = dir.join(format!("hive-{:016x}.part", fnv(&url)));
+    // No overall request timeout: a multi-GB model legitimately takes minutes to transfer. The
+    // shared client's own connect timeout still bounds the handshake phase, and the size cap below
+    // bounds the transfer.
+    let mut resp = hive_outbound::following_client()
+        .get(target)
+        .send()
+        .await
+        .map_err(|_| "model fetch failed".to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("model fetch {} -> {}", url, resp.status()));
+        return Err("model fetch failed".to_string());
+    }
+    let max_bytes = max_model_bytes();
+    if resp.content_length().is_some_and(|len| len > max_bytes) {
+        return Err("model exceeds the maximum download size".to_string());
     }
     let mut f = tokio::fs::File::create(&tmp)
         .await
         .map_err(|e| e.to_string())?;
     use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MODEL_BLOB_DOMAIN);
+    let mut written: u64 = 0;
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|_| "model fetch failed".to_string())?
+    {
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            drop(f);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err("model exceeds the maximum download size".to_string());
+        }
+        hasher.update(&chunk);
         f.write_all(&chunk).await.map_err(|e| e.to_string())?;
     }
     f.flush().await.map_err(|e| e.to_string())?;
     drop(f);
+
+    let digest = hasher.finalize().to_hex().to_string();
+    let file_name = format!("{digest}.gguf");
+    let path = dir.join(&file_name);
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| e.to_string())?;
@@ -259,6 +328,15 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
         .await
         .map_err(|e| e.to_string())?
         .len();
+    let pointer = ModelRef {
+        url: url.clone(),
+        file: file_name,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&pointer) {
+        if let Err(e) = tokio::fs::write(&ref_path, &bytes).await {
+            tracing::warn!(error = %e, ?ref_path, "inference: could not persist model-ref pointer (next call will re-download and re-verify)");
+        }
+    }
     Ok((path, size))
 }
 
