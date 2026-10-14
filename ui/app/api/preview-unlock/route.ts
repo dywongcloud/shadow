@@ -1,19 +1,17 @@
 import { NextResponse, type NextRequest } from "next/server";
-import { auth, clerkClient } from "@clerk/nextjs/server";
+import { auth } from "@clerk/nextjs/server";
 import { sameOriginPath } from "@/lib/same-origin-path";
-import { ownerEmails } from "@/lib/owner-emails";
+import { isPersonalTeam, teamAccess } from "@/lib/preview-access";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 const NODE_TIMEOUT_MS = 10_000;
-const PERSONAL = new Set(["personal", "__personal__", ""]);
 const LEGACY_PERSONAL_TEAM = "personal";
 const UNTAGGED_TEAM = "__untagged__";
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
 const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 const RETRY_AFTER_SECS = "5";
 
-type Access = "granted" | "denied" | "unavailable";
 type TeamResolution = { team: string } | { refusal: NextResponse };
 
 function isLocalhostHost(host: string): boolean {
@@ -44,42 +42,6 @@ function retryable(error: string): NextResponse {
 
 function nodeFetch(path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`${ADMIN}${path}`, { ...init, signal: AbortSignal.timeout(NODE_TIMEOUT_MS) });
-}
-
-async function clerkUsers() {
-  return (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient).users as any;
-}
-
-/** A personal namespace belongs to exactly ONE user, so membership is checked directly rather than through Clerk orgs: `u_<clerkUid>` must match
- *  exactly, and the legacy shared `personal` belongs to the platform owner(s) by HIVE_OWNER_EMAIL (with none configured only a non-production
- *  deployment lets anyone in). A Clerk lookup that fails is `unavailable`, never a verdict. */
-async function personalAccess(team: string, userId: string): Promise<Access> {
-  if (team.startsWith("u_")) return team === `u_${userId}` ? "granted" : "denied";
-  const owners = ownerEmails();
-  if (owners.length === 0) return process.env.NODE_ENV !== "production" ? "granted" : "denied";
-  try {
-    const u = await (await clerkUsers()).getUser(userId);
-    const emails: string[] = (u?.emailAddresses ?? []).map((e: any) => String(e?.emailAddress || "").toLowerCase());
-    return emails.some((e) => owners.includes(e)) ? "granted" : "denied";
-  } catch {
-    return "unavailable";
-  }
-}
-
-/** Is `userId` a member of the Clerk org whose slug (or id) == `team`? */
-async function orgAccess(userId: string, team: string): Promise<Access> {
-  try {
-    const res = await (await clerkUsers()).getOrganizationMembershipList({ userId, limit: 200 });
-    const list: any[] = res?.data ?? res ?? [];
-    return list.some((m) => {
-      const o = m.organization || {};
-      return o.slug === team || o.id === team;
-    })
-      ? "granted"
-      : "denied";
-  } catch {
-    return "unavailable";
-  }
 }
 
 /** The node's authoritative owning team of `project` (never the `?team=` the edge redirect carried): unanswerable is a retryable refusal, empty or untagged is
@@ -125,8 +87,8 @@ export async function GET(req: NextRequest) {
   if ("refusal" in resolution) return resolution.refusal;
   const { team } = resolution;
 
-  const personal = PERSONAL.has(team) || team.startsWith("u_");
-  const access = personal ? await personalAccess(team, userId) : await orgAccess(userId, team);
+  const personal = isPersonalTeam(team);
+  const access = await teamAccess(team, userId);
   if (access === "unavailable") return retryable("We could not verify your membership right now. Please try again.");
   if (access === "denied") {
     return NextResponse.json(

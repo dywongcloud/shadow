@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-10-13 — ZK roster enrollment runs the same membership check as preview unlock
+
+`POST /api/zk-enroll` (`ui/app/api/zk-enroll/route.ts`) skipped the Clerk membership check
+for `personal`, `__personal__` and the empty team and took the team from the request body,
+so any signed-in user could enroll their derived key into the shared legacy `personal` ZK
+roster, which the node gossips mesh-wide (found by the adversarial review of the preview
+unlock commits: minting still needs `/api/preview-unlock`, whose `personal` check requires
+an owner email, so nothing unlocked, but the ring a `personal` proof is verified against
+was open to arbitrary accounts). The route also answered 403 for a user's own `u_<id>`
+namespace (it only knew Clerk orgs) and treated a failed Clerk lookup as "not a member".
+The authorization now lives once in `ui/lib/preview-access.ts` (`teamAccess`: org
+membership, a user's own `u_<id>`, the legacy `personal` roster only for the owner emails
+and only permissive outside production when none is configured; a Clerk failure is
+`unavailable`, a retryable 503) and both `/api/zk-enroll` and `/api/preview-unlock` call it;
+deleting the route was the alternative, but its only caller `ZkPreviewAuth` (a no-op unless
+`NEXT_PUBLIC_ZKAUTH=1`, which nothing sets) would have had to go with it, and the
+experiment's background enrollment is what grows the anonymity set. Witnessed by running the
+real route handler (Clerk replaced by an identity stub) against a throwaway auth-enforced
+node and reading its roster back with a tenant token: before, five non-owner enrollments
+into `personal`, `__personal__`, the empty team, `personal` with no owner configured under
+production and `personal` with the Clerk lookup throwing all landed in the node roster;
+after, all five are 403 or 503 and the roster holds none, the owner, a member of their own
+org and a user's own `u_<id>` still enroll, another user's `u_<id>` and a foreign org are
+refused, and the preview unlock witness answers exactly as before the refactor. Not
+rolled.
+
 ## 2026-10-13 — an API key can no longer carry the mesh's `service` role, or a role above its creator's
 
 `POST /v1/apikeys` stored the request's `role` string verbatim (`apikeys::create`) and
