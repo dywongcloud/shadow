@@ -314,6 +314,13 @@ const GUEST_LOCAL_CONNECT_PERMITS: usize = 1;
 const SLOW_ARCHIVE_VERIFY_MS: u128 = 50;
 /// `tar` flag that stores what a symlink points at: a SONAME is very often a symlink.
 const TAR_DEREFERENCE_FLAG: &str = "-h";
+/// `start_cmd[0]` of a container cell (`__container__ <image> <port> <net-json>`), which bypasses
+/// litebox for host podman.
+const CONTAINER_LAUNCH_MARKER: &str = "__container__";
+/// Ceiling on a guest's boot to a listening socket.
+const GUEST_LISTEN_BUDGET: Duration = Duration::from_secs(15);
+/// How long the stderr reader gets to drain what a dying guest wrote before its tail is read.
+const STDERR_DRAIN_GRACE: Duration = Duration::from_millis(150);
 
 /// Guest-side half of the artifact handshake, run before tenant code in Node and Bun: it exits with
 /// `RUNTIME_GUARD_EXIT_CODE` unless the mounted marker matches the host's protocol, id and content
@@ -2680,6 +2687,9 @@ fn host_interpreted_environment_key(key: &str) -> bool {
         )
 }
 
+/// Keys the platform sets itself, so a tenant cannot supply them: the runtime-guard preload rides
+/// `NODE_OPTIONS`/`BUN_OPTIONS`, and a tenant value there would load ahead of the platform's
+/// artifact handshake.
 fn platform_environment_key(key: &str) -> bool {
     key.starts_with("HIVE_RUNTIME_")
         || matches!(
@@ -4695,9 +4705,6 @@ impl CellBackend for LiteboxBackend {
         let bytes = read_bounded_file(file, MAX_REFERENCE_BYTES)?;
         let reference: LiteboxImageReference = serde_json::from_slice(&bytes)?;
         validate_image_reference(&reference, image)?;
-        // Hash-verified once per deployment per TTL; every later launch of the
-        // same deployment (and `provision_runtime`'s re-derive of this very
-        // identity) reuses that proof instead of re-reading the whole archive.
         let _archive = verified_app_archive(
             &self.verified_archives,
             image,
@@ -4716,6 +4723,15 @@ impl CellBackend for LiteboxBackend {
         artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
+    /// Launches the function in a guest; container cells bypass litebox for host podman. A Bun
+    /// launch is refused first, before any reservation, network or tar setup or spawn, on
+    /// `func.runtime` alone (the platform's own discriminator, never a parse of the
+    /// tenant-controlled `start_cmd`): the syscall shim panics on Bun's boot probe and
+    /// `resources::detect` already reports `bun_runtime: Some(false)`, so reaching it means a stale
+    /// registry entry or a launch forced past placement. The artifact lock is held while the
+    /// reference, archive and runtime tar are resolved and released as soon as the runner has been
+    /// spawned (it holds the archive descriptor), never across readiness: holding it through the
+    /// boot queued every other cold start on the node behind one guest.
     async fn start_function(
         &self,
         cell: &CellHandle,
@@ -4725,9 +4741,7 @@ impl CellBackend for LiteboxBackend {
             return Err(launch_refusal("function start command is empty"));
         }
 
-        // CONTAINER cell: bypass litebox entirely, run via host podman — the
-        // same helper FirecrackerBackend calls. See module doc for why.
-        if func.start_cmd[0] == "__container__" {
+        if func.start_cmd[0] == CONTAINER_LAUNCH_MARKER {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
             let internal: u16 = func
                 .start_cmd
@@ -4746,12 +4760,6 @@ impl CellBackend for LiteboxBackend {
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
-            // Extra raw/published TCP publishes (`FunctionLaunch::tcp_ports` —
-            // includes the primary, whose pairing is already ports[0]; a
-            // duplicate `-p` for the same pair fails the run). Without these
-            // the raw proxy's per-port loopback leg (`Lease::tcp_host_port`)
-            // dials a port nothing publishes — connection refused on every
-            // node running THIS backend while the mock path worked.
             ports.extend(func.tcp_ports.iter().filter_map(|t| {
                 if t.host_port == func.port {
                     return None;
@@ -4781,44 +4789,10 @@ impl CellBackend for LiteboxBackend {
             return Ok(endpoint);
         }
 
-        // Bun is refused here, before any reservation, network setup, tar
-        // alias, or process spawn — never after. `func.runtime` (the
-        // authoritative platform discriminator FunctionLaunch itself carries,
-        // never a parse of `start_cmd`'s tenant-controlled argv text) is the
-        // only signal trusted for this decision, exactly like
-        // `hive-cell-agent`'s own `platform_runtime_program` gate.
-        //
-        // This backend's syscall shim panics (`unimplemented!()`,
-        // `litebox_shim_linux/src/syscalls/file.rs:1210`) on Bun's own
-        // boot-time `readlink("/proc/self/fd/3")` probe — a hard Rust panic
-        // inside the guest's interception layer, not a recoverable error.
-        // Letting a Bun launch reach `resolve_direct_launch`/spawn below would
-        // turn every Bun cold start into an uncontrolled crash instead of an
-        // honest, typed node fault. This mirrors `resources::detect`'s
-        // `bun_runtime: Some(false)` verdict for this backend — placement
-        // should already have excluded this node for a Bun deployment
-        // (`schedule::bun_capable`), so reaching here means the gossiped
-        // capability and this launch disagree (a stale registry entry, a
-        // launch forced past placement). Never falls back to Mock or the
-        // host, never classifies as capacity or a tenant-app fault — this is
-        // a NODE fault, the same class `NODE_IMAGE_MISSING` and
-        // `NODE_BACKEND_UNAVAILABLE` are.
         if func.runtime == hive_core::Runtime::Bun {
             return Err(bun_unsupported_refusal());
         }
 
-        // Plain function: bind this cell to the exact durable reference before
-        // resolving any repository-controlled launch metadata. Package managers
-        // are never run here: a narrow, validated package-script reducer emits
-        // one direct Node process or a typed backend-capability refusal (Bun is
-        // refused above, before this lock, before any of the machinery below).
-        //
-        // The guard is RELEASED as soon as the runner holds the archive (see the
-        // drop after `spawn`), not at the end of this function: it used to be
-        // held across `wait_litebox_ready` (up to 15 s) as well, so every other
-        // deployment's cold start on the node queued behind one guest's boot --
-        // a boot that starts a hundred deployments then spent minutes, and the
-        // last ones answered tens of seconds after the node was already up.
         let publication = self.artifact_lock.clone().lock_owned().await;
         let directories = self.prepare_artifact_dirs()?;
         let mut reference = self
@@ -4848,9 +4822,6 @@ impl CellBackend for LiteboxBackend {
             "{}: litebox launch requested a different runtime artifact identity",
             hive_core::fault::NODE_IMAGE_MISSING
         );
-        // `Runtime::Bun` is refused unconditionally above, before this branch
-        // is ever reached, so only `Node` remains a legitimate plain-function
-        // runtime on this backend.
         if func.runtime != hive_core::Runtime::Node {
             return Err(launch_refusal(format!(
                 "runtime {:?} is not a Node runtime",
@@ -4871,16 +4842,6 @@ impl CellBackend for LiteboxBackend {
             bin,
             mut args,
         } = resolve_direct_launch(func, &reference, &app_archive).await?;
-        // Belt-and-braces for the same panic this function's entry already
-        // refuses on `func.runtime`: `resolve_direct_launch` derives ITS
-        // runtime from `start_cmd`'s argv text (needed to tell `node` from
-        // `bun` from a shared package-script reducer), so a launch whose
-        // `start_cmd` names `bun` while `func.runtime` claims something else
-        // — a malformed or mismatched launch that reached this point despite
-        // the entry check — would otherwise still be spawned against the
-        // unsupported syscall shim. The entry check above already refused
-        // every launch where `func.runtime` itself says Bun, so reaching
-        // `DirectRuntime::Bun` here can only mean that disagreement.
         if runtime == DirectRuntime::Bun {
             return Err(bun_unsupported_refusal());
         }
@@ -4947,9 +4908,6 @@ impl CellBackend for LiteboxBackend {
             .arg("--")
             .arg(&bin)
             .args(&args)
-            // Nothing from hive-node is inherited. Host-loader, runner-control
-            // and platform-owned keys were removed before the remaining tenant
-            // application environment was inserted.
             .env_clear()
             .envs(&guest_environment)
             .env("PORT", func.port.to_string())
@@ -4957,11 +4915,6 @@ impl CellBackend for LiteboxBackend {
             .env("HOME", "/")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            // Node honours this regardless of OpenSSL's compiled-in default
-            // path, which is what the planted bundle at
-            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
-            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
-            // 226 KiB bundle present, measured 2026-10-08).
             .envs(guest_ca_env())
             .env("HIVE_RUNTIME_WORKDIR", &reference.guest_workdir)
             .env(
@@ -4975,14 +4928,6 @@ impl CellBackend for LiteboxBackend {
             )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            // Piped, not nulled: a runtime that exits before listening is
-            // reported to the tenant/operator only through the launch error, so
-            // a discarded stderr turned every guest-side failure (shim panic,
-            // module resolution, bind refusal) into an unexplained "exit
-            // status: 1" — witnessed live on nodes-wtf. A bounded tail of it is
-            // folded into that error; a HEALTHY guest's stderr keeps draining
-            // into the same bounded buffer so the pipe can never fill and
-            // backpressure the app.
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         if runtime == DirectRuntime::Node {
@@ -4991,9 +4936,6 @@ impl CellBackend for LiteboxBackend {
                 format!("--require {GUEST_RUNTIME_GUARD_PATH}"),
             );
         } else {
-            // Bun's CLI preload above is the ordered guard. Do not let a
-            // tenant-supplied compatibility/options variable inject an earlier
-            // preload ahead of that platform-owned handshake.
             command.env_remove("NODE_OPTIONS").env_remove("BUN_OPTIONS");
         }
 
@@ -5004,13 +4946,13 @@ impl CellBackend for LiteboxBackend {
                 self.cfg.runner_bin.display()
             )
         })?;
-        // The runner inherited the archive's file descriptor (`--initial-files`
-        // is a /proc/self/fd path), so the bytes it will read are pinned for
-        // that process regardless of what publication/GC does to the directory
-        // entry afterwards. Nothing below needs the publication lock.
         drop(publication);
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
         if let Some(mut pipe) = child.stderr.take() {
+            /// Bounded tail of the guest's stderr, folded into the launch error: a runtime that
+            /// exits before listening is otherwise reported only as an unexplained exit status, and
+            /// a healthy guest's stderr keeps draining into the same buffer so the pipe never fills
+            /// and backpressures the app.
             const STDERR_TAIL_CAP: usize = 8 * 1024;
             let tail = stderr_tail.clone();
             tokio::spawn(async move {
@@ -5030,17 +4972,11 @@ impl CellBackend for LiteboxBackend {
             });
         }
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
-        // Armed for the whole readiness wait: covers a normal timeout/exit
-        // `Err` AND the future being dropped outright (the caller gave up —
-        // see `ChildReapGuard`'s doc). Disarmed only once the guest has
-        // proven it is listening, at which point `child` moves into
-        // long-lived tracking and `terminate()` becomes the reaper.
         let mut reap_guard = ChildReapGuard::new(&mut child);
         if let Err(error) =
-            wait_litebox_ready(reap_guard.child_mut(), &func_addr, Duration::from_secs(15)).await
+            wait_litebox_ready(reap_guard.child_mut(), &func_addr, GUEST_LISTEN_BUDGET).await
         {
-            // Give the reader a beat to drain what the dying guest wrote.
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            tokio::time::sleep(STDERR_DRAIN_GRACE).await;
             let tail = {
                 let tail = stderr_tail
                     .lock()
@@ -5064,12 +5000,7 @@ impl CellBackend for LiteboxBackend {
             );
         }
         reap_guard.disarm();
-        // Guest readiness proves Litebox has materialized the initial tar. Drop
-        // the descriptor-relative pathname now; cancellation before this point
-        // takes the same Drop cleanup path automatically.
         drop(initial_files_alias);
-        // Publication/GC serialization was already released above (right after
-        // `spawn`, when the runner inherited the archive's descriptor).
 
         let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -5108,6 +5039,10 @@ impl CellBackend for LiteboxBackend {
         Ok(CellEndpoint::Tcp(tunnel_addr))
     }
 
+    /// Ends the cell: aborts its tunnel, stops its container, SIGKILLs the process group of every
+    /// live sandbox exec and shell (a guest that ignores its stdio would otherwise outlive the
+    /// sandbox: a DELETE answered 200 while the runner held a core at 100%), then reaps the
+    /// function runner and removes its TUN link and root.
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
         let id = cell.id.clone();
         let root = cell.root.clone();
@@ -5125,13 +5060,7 @@ impl CellBackend for LiteboxBackend {
             if let Some(container) = container {
                 container.terminate().await;
             }
-            // Every live sandbox exec in this cell — one-shot commands AND
-            // interactive shells, each its own process group — dies with the
-            // cell, before its TUN does. A guest that ignores its stdio (a
-            // spinning fork child, `sleep infinity`) otherwise outlives the
-            // sandbox that owned it: witnessed, a DELETE answered 200 while
-            // the runner held a core at 100% until an operator killed it.
-            let doomed: Vec<(String, i32)> = {
+            let execs_to_kill: Vec<(String, i32)> = {
                 let mut execs = execs.lock().await;
                 let ids: Vec<String> = execs
                     .iter()
@@ -5142,7 +5071,7 @@ impl CellBackend for LiteboxBackend {
                     .filter_map(|k| execs.remove(&k).map(|e| (k, e.pgid)))
                     .collect()
             };
-            for (exec_id, pgid) in doomed {
+            for (exec_id, pgid) in execs_to_kill {
                 #[cfg(unix)]
                 {
                     // SAFETY: killpg(2) with a pgid this process spawned and a
@@ -5182,10 +5111,8 @@ impl CellBackend for LiteboxBackend {
             .map_err(|e| anyhow::anyhow!("litebox cleanup task failed: {e}"))
     }
 
+    /// Guest and runner are one process, so the runner's own PID is the guest's CPU usage.
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
-        // Guest and runner are one process (litebox has no separate VMM), so
-        // the runner's own PID directly IS the guest's CPU usage — sampling
-        // is more direct here than the Firecracker VMM-proxy case.
         let pid = {
             let funcs = self.funcs.lock().await;
             funcs.get(&cell.id).and_then(|c| c.child.id())?
@@ -5193,16 +5120,13 @@ impl CellBackend for LiteboxBackend {
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
 
-    /// One argv command inside `cell` (Sandboxes `run_command`) — the SAME
-    /// guest mechanism `exec_pty` uses: a fresh `litebox-runner` spawned
-    /// against the cell's TUN device with a guest tar holding the fixed
-    /// shell/coreutils set plus the resolved program and its `ldd` closure.
-    /// stdout/stderr are separate pipes streamed as distinct `ExecOutput`
-    /// lines, then exactly one `ExecDone { exit_code }` — `None` when the
-    /// runner died by signal (a `kill_exec`), never a fake `Some(0)`. The
-    /// runner is its own process-group leader so `kill_exec` can terminate
-    /// the whole guest tree by exec id. Returns as soon as the runner is
-    /// spawned; the caller drains the channel.
+    /// One argv command inside `cell` (Sandboxes `run_command`), through the same guest mechanism
+    /// as `exec_pty`: a fresh runner on its own TUN link with a guest tar holding the fixed
+    /// shell/coreutils set plus the resolved program and its `ldd` closure. stdout and stderr
+    /// stream as separate `ExecOutput` lines, then exactly one `ExecDone { exit_code }`, `None`
+    /// when the runner died by signal (a `kill_exec`), never a fake `Some(0)`. The runner leads its
+    /// own process group, so `kill_exec` ends the whole guest tree by exec id. Returns once the
+    /// runner is spawned; the caller drains the channel.
     async fn exec_command(
         &self,
         cell: &CellHandle,
