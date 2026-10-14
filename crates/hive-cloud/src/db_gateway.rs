@@ -12,23 +12,32 @@
 //! Per-DB DNS points `<slug>` at the node actually running the container (see
 //! [`crate::vercel_dns`]), so the proxy always finds it locally.
 //!
-//! A connection is UNPROVEN until its database answers, and every unproven stage is bounded the same
-//! way the mesh transport bounds an inbound accept (see AGENTS.md): the preamble read, the TLS
-//! handshake, the FIRST CLIENT BYTE after it and the backend connect each run under
-//! [`accept_deadline`], and the backend's FIRST REPLY under [`first_reply_deadline`] (a legitimate
-//! client always gets one at once: a Postgres authentication request, a RESP reply; one byte and then
-//! silence gets none). A [`PendingGuard`] cap (global, `HIVE_DB_GATEWAY_PENDING_MAX`, plus per source
-//! address, `HIVE_DB_GATEWAY_PENDING_PER_IP_MAX`) bounds how many connections may sit in that
-//! unproven window at once; the first byte is read BEFORE the backend is touched, so a client that
-//! handshakes TLS and goes silent never costs the database a connection slot.
+//! A connection is UNPROVEN until its database ACCEPTS AUTHENTICATION ([`AuthProof`]: a Postgres
+//! `AuthenticationOk`, a Redis `+OK` to `AUTH` or the reply to `HELLO`; any reply at all is not enough,
+//! because `-NOAUTH` and `+RESET` are answered to a client that never authenticates). Every unproven
+//! stage is bounded the same way the mesh transport bounds an inbound accept (see AGENTS.md): the
+//! preamble read, the TLS handshake, the FIRST CLIENT BYTE after it and the backend connect each run
+//! under [`accept_deadline`], and authentication under [`auth_deadline`] counted from the first byte
+//! forwarded. The first byte is read BEFORE the backend is touched, so a client that handshakes TLS and
+//! goes silent never costs the database a connection slot.
 //!
-//! A PROVEN session (the database has answered) has no idle bound: a long statement, a pooled idle
-//! connection and a `LISTEN`/`SUBSCRIBE` one legitimately carry nothing for hours. A vanished peer is
-//! found by TCP keepalive ([`enable_keepalive`]). The sessions one source address may hold at a
-//! backend, proven or not, are capped ([`SessionGuard`], `HIVE_DB_GATEWAY_SESSIONS_PER_IP_MAX`) before
-//! the backend is touched, per SOURCE address because the abuser is an address: a per-database cap
-//! would let one address lock a tenant out of its own database, a global one would let it lock out
-//! every tenant, and NAT'd pools stay well under the default.
+//! Every connection holds a [`PendingGuard`] from accept until it is proven. The budget is global
+//! (`HIVE_DB_GATEWAY_PENDING_MAX`, default 4096) and per source address (`..._PENDING_PER_IP_MAX`,
+//! default 1024: a NAT'd fleet of 800 clients restarting at once arrives from ONE address and must not
+//! be reset; a burst beyond it has its excess refused at once and reconnects). A budget that a handful of
+//! addresses could fill with half-open connections would starve everyone else, so when it is full a new
+//! connection EVICTS the oldest connection that has sat unproven for `HIVE_DB_GATEWAY_PENDING_STUCK_MS`
+//! (default 2 s: a legitimate connection is proven within milliseconds, so the oldest stuck one is a
+//! flooder's) and is refused only when nothing is stuck, i.e. during a genuine burst.
+//!
+//! A PROVEN session has no idle bound: a long statement, a pooled idle connection and a
+//! `LISTEN`/`SUBSCRIBE` one legitimately carry nothing for hours. A vanished peer is found by TCP
+//! keepalive ([`enable_keepalive`]). The sessions one source address may hold at a backend, proven or
+//! not, are capped ([`SessionGuard`], `HIVE_DB_GATEWAY_SESSIONS_PER_IP_MAX`) before the backend is
+//! touched, per SOURCE address because the abuser is an address: a per-database cap would let one
+//! address lock a tenant out of its own database, a global one would let it lock out every tenant, and
+//! NAT'd pools stay well under the default. Failures are logged through a [`Throttle`], one line per
+//! 10 s with the count it suppressed, so a flood cannot fill the log.
 //!
 //! The two directions are copied independently ([`splice`]), so a client that half-closes after its
 //! request still receives the whole reply and a TLS `close_notify`; once either direction has ended
@@ -38,7 +47,7 @@
 //! Enabled ONLY when `HIVE_DB_DOMAIN` is set (`cloud.db_domain` non-empty).
 
 use crate::state::CloudState;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -46,7 +55,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
@@ -115,18 +124,30 @@ fn accept_deadline() -> Duration {
     )
 }
 
-/// Longest a session that has forwarded its first client bytes waits for the backend's FIRST reply
-/// (`HIVE_DB_GATEWAY_FIRST_REPLY_MS`, default 30 s, never under 250 ms). A legitimate client is
-/// answered at once (Postgres: an authentication request; Redis: a reply to its first command, even
-/// `-NOAUTH`); a client that sends one byte and then nothing is answered never, and without this bound
-/// it would hold the gateway's two sockets and a database connection slot for as long as it liked.
-fn first_reply_deadline() -> Duration {
+/// Longest a session may take, from its first forwarded client bytes, to get the backend to ACCEPT
+/// AUTHENTICATION (`HIVE_DB_GATEWAY_AUTH_DEADLINE_MS`, default 30 s, never under 250 ms). A legitimate
+/// client authenticates within a round trip or two; one that sends a byte and goes silent, or that is
+/// only ever answered `-NOAUTH`, never does, and without this bound it would hold the gateway's two
+/// sockets and a database connection slot for as long as it liked.
+fn auth_deadline() -> Duration {
     Duration::from_millis(
-        std::env::var("HIVE_DB_GATEWAY_FIRST_REPLY_MS")
+        std::env::var("HIVE_DB_GATEWAY_AUTH_DEADLINE_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(30_000)
             .max(250),
+    )
+}
+
+/// How long a connection must have sat unproven before a full pending budget may evict it to admit a
+/// newcomer (`HIVE_DB_GATEWAY_PENDING_STUCK_MS`, default 2 s). A legitimate connection is proven in
+/// milliseconds, so past this it is almost certainly a half-open flooder's.
+fn stuck_after() -> Duration {
+    Duration::from_millis(
+        std::env::var("HIVE_DB_GATEWAY_PENDING_STUCK_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(2_000),
     )
 }
 
@@ -144,27 +165,27 @@ fn linger() -> Duration {
     )
 }
 
-/// Concurrent accepted connections (across both wires) not yet proven by a backend reply:
-/// `HIVE_DB_GATEWAY_PENDING_MAX` overrides (default 2048). This bounds only the attacker-cheap
-/// unproven phase, never a proven session (see [`Accounting::proven`]).
+/// Concurrent accepted connections (across both wires) not yet proven by a backend that accepted their
+/// authentication: `HIVE_DB_GATEWAY_PENDING_MAX` overrides (default 4096). This bounds only the
+/// attacker-cheap unproven phase, never a proven session (see [`Accounting::proven`]), and a full
+/// budget evicts its oldest stuck connection rather than refuse a newcomer ([`PendingGuard::acquire`]).
 fn pending_max() -> usize {
     std::env::var("HIVE_DB_GATEWAY_PENDING_MAX")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(2048)
+        .unwrap_or(4096)
 }
 
-/// The same window, per SOURCE address ([`pending_key`]): one client must not be able to fill the
-/// global cap alone and lock every other client out of the gateway. `HIVE_DB_GATEWAY_PENDING_PER_IP_MAX`
-/// overrides (default 256). Every legitimate connection leaves this window in milliseconds, so the
-/// default only has to cover a burst (a NAT'd fleet of clients reconnecting after a restart arrives
-/// from ONE address); the global default is raised with it, so it still takes eight addresses to
-/// fill it.
+/// The same window, per SOURCE address ([`pending_key`]): one address must not be able to hold the
+/// whole budget. `HIVE_DB_GATEWAY_PENDING_PER_IP_MAX` overrides (default 1024). Every legitimate
+/// connection leaves this window in milliseconds, so the default only has to cover a burst: a NAT'd
+/// fleet reconnecting after a restart arrives from ONE address (800 simultaneous clients are admitted
+/// with room to spare; the excess of a burst past this bound is refused at once and reconnects).
 fn pending_per_ip_max() -> usize {
     std::env::var("HIVE_DB_GATEWAY_PENDING_PER_IP_MAX")
         .ok()
         .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(256)
+        .unwrap_or(1024)
 }
 
 /// Sessions one SOURCE address may hold at a backend at once, proven or still awaiting their first
@@ -177,14 +198,6 @@ fn sessions_per_ip_max() -> usize {
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(4096)
 }
-
-#[derive(Default)]
-struct PendingCounts {
-    total: usize,
-    by_source: HashMap<IpAddr, usize>,
-}
-
-static PENDING: LazyLock<Mutex<PendingCounts>> = LazyLock::new(Default::default);
 
 /// The key a source address is counted under: an IPv4 address as is (an IPv4-mapped IPv6 one in its
 /// IPv4 form), an IPv6 one as its /64 — a single host routinely owns a whole /64, so counting exact
@@ -203,40 +216,116 @@ fn pending_key(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// One reserved slot against the pending-connection caps; dropping it (once the backend has answered,
-/// on an early `?`, or on a timeout) always releases the slot, so every exit path is covered the same
-/// way.
+/// One connection's place in the pending budget.
+struct PendingEntry {
+    source: IpAddr,
+    since: Instant,
+    /// Wakes the connection's task when it is evicted to make room.
+    evict: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct PendingTable {
+    next_id: u64,
+    /// Oldest first: ids rise with arrival, so the first entry is the oldest.
+    entries: BTreeMap<u64, PendingEntry>,
+    /// `(source, id)` of every entry, so a source's OLDEST entry is one range lookup, never a scan.
+    by_arrival: BTreeSet<(IpAddr, u64)>,
+    by_source: HashMap<IpAddr, usize>,
+}
+
+impl PendingTable {
+    /// Removes entry `id` (the guard's drop, or an eviction), keeping the indexes and counts.
+    fn remove(&mut self, id: u64) -> Option<PendingEntry> {
+        let entry = self.entries.remove(&id)?;
+        self.by_arrival.remove(&(entry.source, id));
+        match self.by_source.get_mut(&entry.source) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                self.by_source.remove(&entry.source);
+            }
+            None => {}
+        }
+        Some(entry)
+    }
+
+    /// Evicts the OLDEST entry (of `source` when given) if it has been pending at least `stuck`: the
+    /// oldest is the first to qualify, so when it does not, nothing does. `false` when none qualifies.
+    fn evict_oldest_stuck(&mut self, source: Option<IpAddr>, stuck: Duration) -> bool {
+        let oldest = match source {
+            Some(source) => self
+                .by_arrival
+                .range((source, 0)..=(source, u64::MAX))
+                .next()
+                .map(|&(_, id)| id),
+            None => self.entries.keys().next().copied(),
+        };
+        let Some(id) = oldest else {
+            return false;
+        };
+        let pending_for = self
+            .entries
+            .get(&id)
+            .map(|e| Instant::now().saturating_duration_since(e.since));
+        if pending_for.is_none_or(|age| age < stuck) {
+            return false;
+        }
+        if let Some(evicted) = self.remove(id) {
+            evicted.evict.notify_one();
+        }
+        true
+    }
+}
+
+static PENDING: LazyLock<Mutex<PendingTable>> = LazyLock::new(Default::default);
+
+/// One place in the pending budget, held from accept until the connection is proven; dropping it (once
+/// the backend accepted authentication, on an early `?`, on a timeout or after an eviction) always
+/// releases the place, so every exit path is covered the same way.
 struct PendingGuard {
-    key: IpAddr,
+    id: u64,
 }
 
 impl PendingGuard {
-    /// Reserves a slot for a connection from `peer`, or `None` when [`pending_max`] or
-    /// [`pending_per_ip_max`] is already reached.
-    fn acquire(peer: IpAddr) -> Option<PendingGuard> {
+    /// Takes a place for a connection from `peer`, with the signal that wakes the connection if it is
+    /// evicted later. A source at [`pending_per_ip_max`] makes room from ITS OWN stuck connections, a
+    /// full [`pending_max`] from the oldest stuck connection of anyone ([`stuck_after`]); `None` only
+    /// when nothing is stuck, i.e. during a burst of connections that are all still progressing.
+    fn acquire(peer: IpAddr) -> Option<(PendingGuard, Arc<Notify>)> {
         let key = pending_key(peer);
-        let mut counts = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        let from_source = counts.by_source.get(&key).copied().unwrap_or(0);
-        if counts.total >= pending_max() || from_source >= pending_per_ip_max() {
+        let stuck = stuck_after();
+        let mut table = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+        if table.by_source.get(&key).copied().unwrap_or(0) >= pending_per_ip_max()
+            && !table.evict_oldest_stuck(Some(key), stuck)
+        {
             return None;
         }
-        counts.total += 1;
-        *counts.by_source.entry(key).or_insert(0) += 1;
-        Some(PendingGuard { key })
+        if table.entries.len() >= pending_max() && !table.evict_oldest_stuck(None, stuck) {
+            return None;
+        }
+        let evict = Arc::new(Notify::new());
+        let id = table.next_id;
+        table.next_id += 1;
+        table.entries.insert(
+            id,
+            PendingEntry {
+                source: key,
+                since: Instant::now(),
+                evict: evict.clone(),
+            },
+        );
+        table.by_arrival.insert((key, id));
+        *table.by_source.entry(key).or_insert(0) += 1;
+        Some((PendingGuard { id }, evict))
     }
 }
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        let mut counts = PENDING.lock().unwrap_or_else(|e| e.into_inner());
-        counts.total = counts.total.saturating_sub(1);
-        match counts.by_source.get_mut(&self.key) {
-            Some(n) if *n > 1 => *n -= 1,
-            Some(_) => {
-                counts.by_source.remove(&self.key);
-            }
-            None => {}
-        }
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(self.id);
     }
 }
 
@@ -315,32 +404,66 @@ fn enable_keepalive(stream: &TcpStream) {
     }
 }
 
-/// Logs a refused accept at most once per 10 s: under a flood the refusals arrive by the thousand
-/// per second and would otherwise fill the log (and the disk) faster than the cap protects it.
-fn warn_refused_accept(addr: &str, wire: Wire, peer: std::net::SocketAddr) {
-    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
-    let now = hive_core::now_ms();
-    let last = LAST_WARN_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 10_000
-        && LAST_WARN_MS
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        tracing::warn!(%addr, wire = ?wire, %peer, max = pending_max(), per_source_max = pending_per_ip_max(), "db-gateway: pending-connection cap reached, refusing accept (logged at most once per 10 s)");
+/// A log line allowed once per 10 s that reports how many it suppressed since the last: under a flood
+/// the lines would otherwise arrive by the thousand per second and fill the log (and the disk) faster
+/// than any cap protects it.
+struct Throttle {
+    last_ms: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl Throttle {
+    const fn new() -> Throttle {
+        Throttle {
+            last_ms: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// `Some(n)` when this call may log (`n` calls were suppressed since the last line that did),
+    /// `None` when it was counted instead.
+    fn allow(&self) -> Option<u64> {
+        let now = hive_core::now_ms();
+        let last = self.last_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= 10_000
+            && self
+                .last_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            Some(self.suppressed.swap(0, Ordering::Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            None
+        }
     }
 }
 
-/// [`warn_refused_accept`] for a source at its proven-session cap, at most once per 10 s.
+static REFUSED_ACCEPTS: Throttle = Throttle::new();
+static SESSION_CAPS: Throttle = Throttle::new();
+static FAILED_CONNECTIONS: Throttle = Throttle::new();
+
+/// Logs a refused accept (the pending budget is full and nothing in it is stuck), throttled.
+fn warn_refused_accept(addr: &str, wire: Wire, peer: std::net::SocketAddr) {
+    if let Some(suppressed) = REFUSED_ACCEPTS.allow() {
+        tracing::warn!(%addr, wire = ?wire, %peer, max = pending_max(), per_source_max = pending_per_ip_max(), suppressed, "db-gateway: pending-connection budget full and nothing in it is stuck, refusing accept (logged at most once per 10 s)");
+    }
+}
+
+/// [`warn_refused_accept`] for a source at its session cap, throttled.
 fn warn_session_cap(peer: IpAddr) {
-    static LAST_WARN_MS: AtomicU64 = AtomicU64::new(0);
-    let now = hive_core::now_ms();
-    let last = LAST_WARN_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 10_000
-        && LAST_WARN_MS
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
-        tracing::warn!(%peer, per_source_max = sessions_per_ip_max(), "db-gateway: source holds its cap of established sessions, closing a new one (logged at most once per 10 s)");
+    if let Some(suppressed) = SESSION_CAPS.allow() {
+        tracing::warn!(%peer, per_source_max = sessions_per_ip_max(), suppressed, "db-gateway: source holds its cap of established sessions, closing a new one (logged at most once per 10 s)");
+    }
+}
+
+/// Logs a connection that failed before it was proven (a TLS handshake that never finished, a client
+/// that sent nothing, an unknown SNI), throttled: every one of these is the client's doing and a
+/// half-open flood produces them by the thousand. Every failure is still visible at `debug`.
+fn warn_connection_failed(peer: std::net::SocketAddr, wire: Wire, error: &anyhow::Error) {
+    tracing::debug!(%peer, wire = ?wire, %error, "db-gateway: connection failed");
+    if let Some(suppressed) = FAILED_CONNECTIONS.allow() {
+        tracing::warn!(%peer, wire = ?wire, %error, suppressed, "db-gateway: connection failed (logged at most once per 10 s; `debug` shows every one)");
     }
 }
 
@@ -402,7 +525,7 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
                     continue;
                 }
             };
-            let Some(pending) = PendingGuard::acquire(peer.ip()) else {
+            let Some((pending, evicted)) = PendingGuard::acquire(peer.ip()) else {
                 // `stream` drops here, closing the just-accepted socket immediately.
                 warn_refused_accept(&addr, wire, peer);
                 continue;
@@ -416,8 +539,17 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
                 peer: peer.ip(),
             };
             tokio::spawn(async move {
-                if let Err(e) = handle(cloud, stream, acceptor, wire, accounting).await {
-                    tracing::warn!(%peer, wire = ?wire, error = %e, "db-gateway: connection failed");
+                // Evicted (the budget was full and this connection was the oldest stuck one): the
+                // handler future is dropped, which closes both sockets.
+                let outcome = tokio::select! {
+                    outcome = handle(cloud, stream, acceptor, wire, accounting) => outcome,
+                    () = evicted.notified() => {
+                        tracing::debug!(%peer, wire = ?wire, "db-gateway: connection evicted to admit a newcomer");
+                        Ok(())
+                    }
+                };
+                if let Err(e) = outcome {
+                    warn_connection_failed(peer, wire, &e);
                 }
             });
         }
@@ -446,11 +578,11 @@ fn is_pg_ssl_request(pre: &[u8; 8]) -> bool {
 /// reach the engine untouched. A database without a `local_port` is simulated (no container) or
 /// hosted on another node, which per-DB DNS should prevent.
 ///
-/// `accounting` carries the pending slot until the backend FIRST ANSWERS (see the module doc) and
-/// the source's session slot from the moment the backend is reached: the backend is not even
+/// `accounting` carries the pending slot until the backend ACCEPTS AUTHENTICATION (see the module
+/// doc) and the source's session slot from the moment the backend is reached: the backend is not even
 /// connected for a client that handshakes and says nothing or whose source is at its session cap, and
-/// a connection the database never answers is cut at [`first_reply_deadline`] instead of holding its
-/// slots forever.
+/// a connection that never authenticates is cut at [`auth_deadline`] instead of holding its slots
+/// forever.
 async fn handle(
     cloud: Arc<CloudState>,
     mut stream: TcpStream,
@@ -498,6 +630,10 @@ async fn handle(
         .ok_or_else(|| {
             anyhow::anyhow!("db {} not locally hosted / not live (no local_port)", db.id)
         })?;
+    let proof = AuthProof::new(
+        wire,
+        db.connection.get("password").is_some_and(|p| !p.is_empty()),
+    );
     // The client must speak before the backend is touched: a client that handshakes with a valid SNI
     // and then goes silent would otherwise hold a database connection slot (Postgres
     // `max_connections`) while costing the attacker nothing. Both wires are client-first (the PG
@@ -525,16 +661,102 @@ async fn handle(
         .map_err(|_| anyhow::anyhow!("backend {backend_addr} first write timed out"))?
         .map_err(|e| anyhow::anyhow!("backend {backend_addr} first write failed: {e}"))?;
 
-    splice(tls, backend, accounting).await
+    splice(tls, backend, accounting, proof).await
+}
+
+/// Postgres `AuthenticationOk`: message type `R`, length 8, code 0. A NUL-free text field (an error
+/// message echoing the client's own input) can never contain it.
+const PG_AUTH_OK: [u8; 9] = *b"R\0\0\0\x08\0\0\0\0";
+
+/// Most backend bytes [`AuthProof`] keeps while it looks for its proof.
+const PROOF_SCAN_MAX: usize = 64 * 1024;
+
+/// Watches the backend's replies while a session is unproven and says when they show the backend
+/// ACCEPTED authentication. A bare reply is no proof: a Redis that requires a password answers
+/// `-NOAUTH` to everything but `AUTH`/`HELLO`/`QUIT`/`RESET`, and `+RESET` (and a `QUIT`'s `+OK`, then
+/// the engine closes) come back to a client that never authenticated; a Postgres backend sends an
+/// authentication REQUEST before it accepts anything.
+struct AuthProof {
+    wire: Wire,
+    /// Redis only: whether the database has a password. Without one there is nothing to authenticate
+    /// and the first non-error reply proves a working session.
+    password_required: bool,
+    /// What is not yet decided: the last, still incomplete reply line (Redis) or the last bytes that
+    /// could begin a pattern split across two reads (Postgres).
+    carry: Vec<u8>,
+}
+
+impl AuthProof {
+    fn new(wire: Wire, password_required: bool) -> AuthProof {
+        AuthProof {
+            wire,
+            password_required,
+            carry: Vec::new(),
+        }
+    }
+
+    /// Feeds the next backend-to-client bytes; `true` once they show authentication was accepted.
+    fn accepted(&mut self, chunk: &[u8]) -> bool {
+        self.carry.extend_from_slice(chunk);
+        if self.carry.len() > PROOF_SCAN_MAX {
+            let cut = self.carry.len() - PROOF_SCAN_MAX;
+            self.carry.drain(..cut);
+        }
+        match self.wire {
+            Wire::Postgres => {
+                let found = self
+                    .carry
+                    .windows(PG_AUTH_OK.len())
+                    .any(|window| window == PG_AUTH_OK);
+                let keep = PG_AUTH_OK.len() - 1;
+                if self.carry.len() > keep {
+                    let cut = self.carry.len() - keep;
+                    self.carry.drain(..cut);
+                }
+                found
+            }
+            Wire::Redis => {
+                let mut start = 0;
+                let mut found = false;
+                while let Some(end) = self.carry[start..].iter().position(|&b| b == b'\n') {
+                    if redis_reply_proves_auth(
+                        &self.carry[start..start + end],
+                        self.password_required,
+                    ) {
+                        found = true;
+                        break;
+                    }
+                    start += end + 1;
+                }
+                self.carry.drain(..start);
+                found
+            }
+        }
+    }
+}
+
+/// Whether one reply line (the first line of a reply) shows Redis accepted authentication: with a
+/// password, only what `AUTH` and `HELLO` answer (`+OK`, a RESP3 map, a RESP2 array); without one, any
+/// non-error reply. Errors (`-`, `!`) and the `+RESET` an unauthenticated client can obtain prove nothing.
+fn redis_reply_proves_auth(line: &[u8], password_required: bool) -> bool {
+    match line.first() {
+        None | Some(b'-') | Some(b'!') => false,
+        Some(_) if line.starts_with(b"+RESET") => false,
+        Some(first) if password_required => {
+            line.starts_with(b"+OK") || matches!(first, b'%' | b'*')
+        }
+        Some(_) => true,
+    }
 }
 
 /// Where a session stands, shared by its two directions.
 #[derive(Clone, Copy)]
 enum Phase {
-    /// The first client bytes went to the backend and nothing has come back: the backend must answer
-    /// by `deadline`.
-    AwaitingReply { deadline: Instant },
-    /// The backend has answered: the session is proven and nothing bounds its idleness any more.
+    /// The first client bytes went to the backend and it has not accepted authentication: it must by
+    /// `deadline`.
+    Authenticating { deadline: Instant },
+    /// The backend accepted authentication: the session is proven and nothing bounds its idleness any
+    /// more.
     Open,
     /// One direction has ended: the other has [`linger`] of inactivity to finish.
     Draining,
@@ -551,7 +773,7 @@ enum Exit {
 const PUMP_BUF: usize = 16 * 1024;
 
 /// One read of `from`, bounded by what the session's phase allows. `reply_bound` marks the
-/// backend-to-client direction: while the session awaits its first reply that read has the reply
+/// backend-to-client direction: while the session is authenticating that read has the auth
 /// deadline; once either direction has ended the surviving read has [`linger`] of inactivity (the
 /// clock restarts on every call, so a reply that is still draining is never cut); otherwise a read
 /// waits as long as it must. `None` means the bound ran out. Cancel-safe: a phase change drops the
@@ -565,7 +787,7 @@ async fn read_phased<R: AsyncRead + Unpin>(
     let mut changes = phase.subscribe();
     loop {
         let deadline = match *changes.borrow_and_update() {
-            Phase::AwaitingReply { deadline } if reply_bound => Some(deadline),
+            Phase::Authenticating { deadline } if reply_bound => Some(deadline),
             Phase::Draining => Some(Instant::now() + linger()),
             _ => None,
         };
@@ -604,14 +826,16 @@ async fn pump_up(
     }
 }
 
-/// Backend to client. The first byte is the proof the session needs: it trades the pending slot for
-/// a proven-session slot and opens the phase. At the backend's end of stream the client gets its TLS
-/// `close_notify` and the session starts draining.
+/// Backend to client. Until the backend's replies show it ACCEPTED authentication ([`AuthProof`]) the
+/// session is unproven and bounded by the auth deadline; the proof releases the pending slot and opens
+/// the phase. At the backend's end of stream the client gets its TLS `close_notify` and the session
+/// starts draining.
 async fn pump_down(
     mut backend: OwnedReadHalf,
     mut client: WriteHalf<TlsStream<TcpStream>>,
     phase: &watch::Sender<Phase>,
     accounting: &mut Accounting,
+    proof: &mut AuthProof,
 ) -> std::io::Result<Exit> {
     let mut buf = vec![0u8; PUMP_BUF];
     let mut proven = false;
@@ -624,11 +848,11 @@ async fn pump_down(
                 return Ok(Exit::Eof);
             }
             Some(n) => {
-                if !proven {
+                if !proven && proof.accepted(&buf[..n]) {
                     proven = true;
                     accounting.proven();
                     phase.send_modify(|p| {
-                        if matches!(p, Phase::AwaitingReply { .. }) {
+                        if matches!(p, Phase::Authenticating { .. }) {
                             *p = Phase::Open;
                         }
                     });
@@ -642,23 +866,30 @@ async fn pump_down(
 
 /// Copies an established session's two directions until it ends. Each direction runs on its own, so
 /// a client that half-closes after its request still receives the whole reply and a `close_notify`.
-/// The session is bounded only where it is unproven: the backend must answer within
-/// [`first_reply_deadline`], and once either direction has ended the other may sit silent for at most
+/// The session is bounded only where it is unproven: the backend must accept authentication within
+/// [`auth_deadline`], and once either direction has ended the other may sit silent for at most
 /// [`linger`]. A proven session has no idle bound (a pooled connection, a long statement and a
 /// `LISTEN` legitimately carry nothing for hours); `enable_keepalive` finds a vanished peer.
 async fn splice(
     client: TlsStream<TcpStream>,
     backend: TcpStream,
     mut accounting: Accounting,
+    mut proof: AuthProof,
 ) -> anyhow::Result<()> {
     let peer = accounting.peer;
     let (client_read, client_write) = tokio::io::split(client);
     let (backend_read, backend_write) = backend.into_split();
-    let (phase, _observer) = watch::channel(Phase::AwaitingReply {
-        deadline: Instant::now() + first_reply_deadline(),
+    let (phase, _observer) = watch::channel(Phase::Authenticating {
+        deadline: Instant::now() + auth_deadline(),
     });
     let up = pump_up(client_read, backend_write, &phase);
-    let down = pump_down(backend_read, client_write, &phase, &mut accounting);
+    let down = pump_down(
+        backend_read,
+        client_write,
+        &phase,
+        &mut accounting,
+        &mut proof,
+    );
     tokio::pin!(up, down);
     let (mut up_ended, mut down_ended) = (false, false);
     while !(up_ended && down_ended) {
@@ -675,7 +906,7 @@ async fn splice(
         match ended {
             Ok(Exit::Eof) => {}
             Ok(Exit::TimedOut) => {
-                tracing::debug!(%peer, "db-gateway: session cut: no backend reply, or a half-closed direction stayed silent");
+                tracing::debug!(%peer, "db-gateway: session cut: authentication was not accepted in time, or a half-closed direction stayed silent");
                 return Ok(());
             }
             Err(e)
