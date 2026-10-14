@@ -141,6 +141,9 @@ impl Cluster {
             .cloned()
     }
 
+    /// THE "has a public address" predicate (an empty or blank string is no address): the strict
+    /// chain owner, the identity election and placement (`schedule::has_public_address`) all ask
+    /// it, so no caller can count a node the others reject.
     pub(crate) fn addressable(n: &hive_edge::NodeInfo) -> bool {
         n.public_ip
             .as_deref()
@@ -215,14 +218,10 @@ impl Cluster {
         pref: Option<&str>,
         nodes: &[hive_edge::NodeInfo],
     ) -> Option<String> {
-        let addressable = |n: &hive_edge::NodeInfo| {
-            n.public_ip.as_deref().is_some_and(|ip| !ip.is_empty())
-                || n.public_ip6.as_deref().is_some_and(|ip| !ip.is_empty())
-        };
         if let Some(p) = pref.filter(|p| !p.is_empty()) {
             if nodes
                 .iter()
-                .any(|n| n.name == p && n.healthy && n.peer_id.is_some() && addressable(n))
+                .any(|n| n.name == p && n.healthy && n.peer_id.is_some() && Self::addressable(n))
             {
                 return Some(p.to_string());
             }
@@ -231,7 +230,7 @@ impl Cluster {
             nodes
                 .iter()
                 .filter(|n| n.healthy)
-                .filter(|n| !require_public || addressable(n))
+                .filter(|n| !require_public || Self::addressable(n))
                 .filter_map(|n| n.peer_id.as_ref().map(|p| (p.clone(), n.name.clone())))
                 .min_by(|a, b| a.0.cmp(&b.0))
                 .map(|(_, name)| name)

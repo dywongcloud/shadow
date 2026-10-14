@@ -50,7 +50,8 @@ fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
 }
 
 /// `place` with lease-holder stickiness: a redeploy stays on the node holding the project's live
-/// container lease (its state lives there) while that node is healthy, reachable, in an allowed
+/// container lease (its state lives there) while that node is healthy, [`reachable`] (the SAME
+/// predicate `place` filters on, so a NAT'd holder nobody can dial is never chosen), in an allowed
 /// region and meets the same capability needs as `place`; otherwise it falls through to `place`
 /// with the same arguments.
 pub fn place_for_project(
@@ -73,9 +74,7 @@ pub fn place_for_project(
                 || regions
                     .iter()
                     .any(|r| r.trim().eq_ignore_ascii_case(&n.region));
-            let reachable = n.name == cloud.node_name
-                || cloud.node_admins.read().contains_key(&n.name)
-                || (n.peer_id.is_some() && n.iroh_addr.is_some());
+            let reachable = reachable(cloud, n);
             let gpu_ok = !needs_gpu || n.gpu_count > 0;
             let wasm_ok = wasm_capable(n, needs_interpreter.wasm);
             let bun_ok = bun_capable(n, needs_interpreter.bun);
@@ -227,8 +226,11 @@ fn below_disk_floor(n: &NodeInfo, floor_gb: u64) -> bool {
     n.disk_free_gb > 0 && n.disk_free_gb < floor_gb
 }
 
+/// Whether `n` advertises a public address: [`crate::cluster::Cluster::addressable`], the one
+/// predicate the control-plane election and `strict_chain_owner` use (an empty or blank string is
+/// no address).
 fn has_public_address(n: &NodeInfo) -> bool {
-    n.public_ip.is_some() || n.public_ip6.is_some()
+    crate::cluster::Cluster::addressable(n)
 }
 
 /// Dispatch route for `n`: self is `(None, None)`, otherwise every transport it has, because HTTP
@@ -258,8 +260,7 @@ fn dialable(n: &NodeInfo) -> bool {
     if has_public_address(n) {
         return true;
     }
-    if n
-        .iroh_addr
+    if n.iroh_addr
         .as_deref()
         .is_some_and(|a| a.contains("\"Relay\""))
     {
@@ -652,7 +653,7 @@ fn placement_blocker(
             n.disk_free_gb
         ));
     }
-    if is_container && n.public_ip.is_none() && n.public_ip6.is_none() {
+    if is_container && !has_public_address(n) {
         return Some(
             "no public address (a container is served from the node's own host)".to_string(),
         );
