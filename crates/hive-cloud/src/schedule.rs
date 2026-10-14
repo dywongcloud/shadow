@@ -1,18 +1,12 @@
-//! Placement scheduler — decides which node(s) should HOST a deployment, given
-//! the project's configured regions (or none) plus live mesh state.
+//! Placement scheduler: which node(s) host a deployment, from the project's regions plus live mesh
+//! state.
 //!
-//! Policy (see the placement plan):
-//!   * eligible node = healthy + an advertised production isolation backend +
-//!     meets a memory floor. Firecracker is intrinsically eligible; Litebox is
-//!     eligible only while it advertises the current runtime-artifact protocol.
-//!     Mock is never silently treated as isolated.
-//!   * explicit regions → one target per selected region; the explicit choice
-//!     overrides the eligibility filter (so picking `los-angeles` deploys to the
-//!     local nodes on purpose). Ties broken by least current load.
-//!   * no regions → the eligible node geographically NEAREST the coordinator (this
-//!     node, which is the user's own machine — so "nearest me" ≈ "nearest you").
-//!   * if nothing is eligible/reachable, returns empty → the caller falls back to
-//!     hosting locally so deploys never silently fail.
+//! An eligible node is healthy, runs an isolation backend (Firecracker, or Litebox while it
+//! advertises the current runtime-artifact protocol; Mock is never treated as isolated) and meets
+//! `MEM_FLOOR_MB`. Explicit regions yield one target per region; no regions yields the capable node
+//! nearest the coordinator, the coordinator itself winning when it qualifies. An empty result means
+//! no target was chosen: the caller hosts locally, except where a hard capability need (GPU,
+//! Wasmer, a repository build) makes it refuse the deploy.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -23,12 +17,12 @@ use crate::state::CloudState;
 
 /// Minimum total memory (MB) for a node to be auto-eligible.
 const MEM_FLOOR_MB: u64 = 1024;
+const BUILD_EXECUTOR_PROTOCOL_V1: u16 = 1;
+const DEFAULT_DISK_FLOOR_GB: u64 = 20;
+const UNKNOWN_GEO_DISTANCE_KM: f64 = f64::MAX;
 
-/// A chosen placement target. Dispatch route, in preference order:
-///   * `admin = Some(url)` → POST the deploy to that HTTP admin URL.
-///   * `admin = None, iroh = Some((id, addr))` → dispatch over the iroh mesh (a NAT'd
-///     coordinator has no HTTP path to FC nodes; the SSH tunnels were cut).
-///   * `admin = None, iroh = None` → THIS node (host locally).
+/// A placement target: `admin` (HTTP admin URL) and `iroh` (id, addr) are every transport known for
+/// the node, HTTP tried first; both `None` means THIS node (host locally).
 #[derive(Clone, Debug)]
 pub struct Target {
     pub node: String,
@@ -42,8 +36,7 @@ fn eligible(n: &NodeInfo) -> bool {
     n.healthy && isolated && n.mem_total_mb >= MEM_FLOOR_MB
 }
 
-/// Per-node count of hosted deployments (a cheap "load" proxy): how many serve
-/// hosts each node owns — self from the local gateway, peers from the gossiped
+/// Served hosts per node, the load proxy: self from the local gateway, peers from the gossiped
 /// routing table.
 fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
     let mut m: HashMap<String, usize> = HashMap::new();
@@ -56,19 +49,10 @@ fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
     m
 }
 
-/// `place` with lease-holder stickiness for REDEPLOYS (audit proposal step 11):
-/// when the project already has a LIVE container lease (`cloud.leases`, keyed by
-/// project), prefer the current holder — a redeploy of an existing stateful
-/// container should land where its state/lease already lives instead of being
-/// blindly re-placed (gratuitous migration: new node cold-starts, old node's
-/// lease lingers until expiry, any node-local volume state is left behind). The
-/// holder is honored only while healthy + reachable and (for region-pinned
-/// projects) inside an allowed region; otherwise this falls through to the
-/// normal placement policy unchanged.
-///
-/// `stateful` (see [`place`]'s doc for the full hazard) is threaded through to
-/// the fallback `place` call so a fresh (no-lease-yet) stateful deployment is
-/// ALSO protected, not just redeploys of an already-leased one.
+/// `place` with lease-holder stickiness: a redeploy stays on the node holding the project's live
+/// container lease (its state lives there) while that node is healthy, reachable, in an allowed
+/// region and meets the same capability needs as `place`; otherwise it falls through to `place`
+/// with the same arguments.
 pub fn place_for_project(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -79,10 +63,6 @@ pub fn place_for_project(
     needs_interpreter: impl Into<InterpreterNeeds>,
     needs_runtime_artifact: bool,
     needs_build_isolation: bool,
-    // The package manager this project's BUILD needs (from an explicit
-    // install/build command, or the repo's lockfile on a redeploy), when it is
-    // knowable before the build runs. `None` = nothing package-manager-shaped
-    // resolved yet — nothing is gated on it.
     needs_build_toolchain: Option<&str>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
@@ -96,60 +76,17 @@ pub fn place_for_project(
             let reachable = n.name == cloud.node_name
                 || cloud.node_admins.read().contains_key(&n.name)
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
-            let gpu_ok = !needs_gpu || n.gpu_count > 0;
-            // Stickiness must not out-rank capability: a lease held from before
-            // the project switched to `runtime: "wasmer"`/`"bun"` would
-            // otherwise pin every redeploy to a node that cannot execute it.
-            // Same predicates `place` uses, by construction — see
-            // `wasm_capable`/`bun_capable`.
-            let wasm_ok = wasm_capable(n, needs_interpreter.wasm);
-            let bun_ok = bun_capable(n, needs_interpreter.bun);
-            let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
-            let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
-            // Stickiness must not out-rank capability here either: a lease held
-            // from before the project's install command switched to `bun install`
-            // would otherwise pin every redeploy to a node with no `bun`, which
-            // is the exact `/bin/sh: line 1: bun: command not found` failure
-            // this field was added for.
-            let build_toolchain_ok = build_toolchain_capable(n, needs_build_toolchain);
-            if n.healthy
-                && region_ok
-                && reachable
-                && gpu_ok
-                && wasm_ok
-                && bun_ok
-                && runtime_artifact_ok
-                && build_isolation_ok
-                && build_toolchain_ok
-            {
+            let capable_ok = meets_capability_needs(
+                n,
+                needs_gpu,
+                needs_interpreter,
+                needs_runtime_artifact,
+                needs_build_isolation,
+                needs_build_toolchain,
+            );
+            if n.healthy && region_ok && reachable && capable_ok {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
-                // Carry BOTH transports whenever both are known. They are
-                // complementary, not alternatives: a security group that blocks
-                // 8786/8787 kills HTTP admin dispatch while the node stays
-                // perfectly healthy over iroh, and a degraded mesh path fails the
-                // reverse way. Filling only one (this used to set `iroh: None` the
-                // moment an admin URL existed, and vice versa) left the dispatcher
-                // with no second option, so a single transport hiccup failed the
-                // whole deploy — witnessed as "✗ fc-sanjose-gpu-1: iroh dispatch
-                // failed" on a node that was otherwise healthy. `dispatch_deploy`
-                // decides preference and falls back.
-                let target = if n.name == cloud.node_name {
-                    Target {
-                        node: n.name.clone(),
-                        admin: None,
-                        iroh: None,
-                    }
-                } else {
-                    Target {
-                        node: n.name.clone(),
-                        admin: cloud.node_admins.read().get(&n.name).cloned(),
-                        iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
-                            (Some(id), Some(addr)) => Some((id, addr)),
-                            _ => None,
-                        },
-                    }
-                };
-                return vec![target];
+                return vec![target_of(cloud, n)];
             }
         }
     }
@@ -166,61 +103,21 @@ pub fn place_for_project(
     )
 }
 
-/// May `n` host a deployment whose functions run on `Runtime::Wasmer`?
-///
-/// ONE definition, called from both `place`'s capability filter and
-/// `place_for_project`'s lease-stickiness fast path, because those two answering
-/// differently is precisely how a capability gate springs a leak: stickiness
-/// would keep pinning redeploys to the node a project was leased to before it
-/// switched runtimes, routing around the filter entirely.
-///
-/// `None` is NOT CAPABLE, deliberately unlike the `disk_free_gb == 0`
-/// unknown-so-admit rule. A peer that does not report the field is running a
-/// binary from before Wasmer support existed, on a rootfs built before wasmer
-/// was ever staged into it — known-incapable, not unknown. Admitting it hands
-/// the deployment to a node guaranteed to fail every cold start forever; an
-/// empty candidate set and an honest refusal is strictly better, the same call
-/// `gpu_count == 0` already makes.
+/// May `n` host a `Runtime::Wasmer` deployment? Only a node reporting `Some(true)`: `None` is NOT
+/// CAPABLE, unlike `disk_free_gb == 0`, because a peer that does not report it predates Wasmer
+/// support and would fail every cold start.
 pub fn wasm_capable(n: &NodeInfo, needs_wasm: bool) -> bool {
     !needs_wasm || n.wasm_runtime == Some(true)
 }
 
-/// May `n` host a deployment whose functions run on `Runtime::Bun`?
-///
-/// Exact mirror of [`wasm_capable`] — same ONE-definition rationale (called
-/// from both `place`'s capability filter and `place_for_project`'s
-/// lease-stickiness fast path so the two can never answer differently), same
-/// `None` = NOT CAPABLE asymmetry versus `disk_free_gb == 0`'s unknown-so-admit
-/// rule (a peer not reporting `bun_runtime` predates Bun capability probing
-/// and is known-incapable, not unknown), and the identical empty-placement-
-/// beats-guaranteed-failure logic: a node whose gossiped record is stale or
-/// whose Litebox backend cannot execute Bun at all (see `NodeInfo::bun_runtime`)
-/// must never win a Bun deployment.
+/// May `n` host a `Runtime::Bun` deployment? Same rule as [`wasm_capable`]: only a node reporting
+/// `Some(true)`.
 pub fn bun_capable(n: &NodeInfo, needs_bun: bool) -> bool {
     !needs_bun || n.bun_runtime == Some(true)
 }
 
-/// Interpreter-runtime capability needs for one placement decision, bundled so
-/// a NEW interpreter gate (this file's second one, after Wasmer) never has to
-/// widen `place`/`place_for_project`'s positional argument list again — every
-/// existing call site passes a bare `bool` for what used to be `needs_wasm`,
-/// and `From<bool>` below keeps every one of them compiling with its EXACT
-/// prior meaning (`bun: false`) unchanged. A caller that wants to gate on Bun
-/// too constructs this directly instead of relying on the conversion.
-///
-/// This is the extension point a future `git.rs` change should use to make
-/// Bun-aware placement live: derive `needs_bun` there exactly the way
-/// `needs_wasm`/`known_wasm`/`is_wasm` already are (`git.rs`'s
-/// `hive_core::Runtime::from_config_str(..) == Some(hive_core::Runtime::Bun)`
-/// pre-build, and `hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) ==
-/// hive_core::Runtime::Bun` post-build) and pass
-/// `InterpreterNeeds { wasm, bun: needs_bun }` instead of a bare bool at both
-/// `place_for_project`'s and `place`'s call sites. Until that lands, Bun
-/// placement is filtered only by the pre-spawn refusal in
-/// `hive_backend::litebox` and by nodes never advertising `bun_runtime`
-/// truthfully where they cannot run it — this struct exists so wiring the
-/// rest through is a one-line change at each call site, not a signature
-/// change here.
+/// Interpreter-runtime needs of one placement; `From<bool>` keeps a bare `bool` argument meaning
+/// `wasm` only (`bun: false`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct InterpreterNeeds {
     pub wasm: bool,
@@ -233,36 +130,17 @@ impl From<bool> for InterpreterNeeds {
     }
 }
 
-/// Source-built functions use the split host-static-root / guest-workdir
-/// runtime-artifact contract. A node that does not advertise protocol v1 is a
-/// pre-upgrade peer whose interpretation is incompatible, so both ordinary
-/// placement and lease stickiness must fail closed rather than route around the
-/// gate.
+/// A source-built function needs a node advertising runtime-artifact protocol v1 (the split
+/// host-static-root / guest-workdir contract); a pre-upgrade peer reads it differently, so
+/// placement and lease stickiness fail closed.
 pub fn runtime_artifact_capable(n: &NodeInfo, needed: bool) -> bool {
     !needed || n.runtime_artifact_protocol == Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION)
 }
 
-/// May `n`'s BUILD LANE run a build whose package manager is `manager`?
-///
-/// ONE definition, used by `place`'s capability filter, by
-/// `place_for_project`'s lease-stickiness fast path AND by
-/// `dispatch_fallbacks` — the three answering differently is exactly how a
-/// capability gate springs a leak, the same rationale `wasm_capable` and
-/// `bun_capable` already carry.
-///
-/// `None` (no toolchain reported) means UNKNOWN and is ADMITTED, deliberately
-/// unlike `wasm_capable`/`bun_capable`: a missing PACKAGE MANAGER has a
-/// substitute (`npm` ships with node), so an unreported node is not guaranteed
-/// to fail — the build lane degrades to a present manager and logs it.
-/// Excluding every unreported peer would empty the candidate set mid-rollout,
-/// the `retain_dialable` partition lesson.
-///
-/// A reported set admits the node when it has the requested manager OR a
-/// substitute for it. It is never enough to have NEITHER: a build dispatched
-/// there would execute a command that cannot exist, which is precisely the
-/// `/bin/sh: line 1: bun: command not found` failure this gate exists to
-/// prevent. `None` for `manager` (nothing package-manager-shaped was resolved)
-/// admits every node — there is nothing to gate on yet.
+/// May `n`'s build lane run a build whose package manager is `manager`? Unlike `wasm_capable`, an
+/// unreported toolchain set (`None`) is ADMITTED: a missing manager has a substitute (`npm` ships
+/// with node), and excluding unreported peers would empty the candidate set mid-rollout. A reported
+/// set needs the manager or a substitute; `manager: None` gates nothing.
 pub fn build_toolchain_capable(n: &NodeInfo, manager: Option<&str>) -> bool {
     let Some(manager) = manager else {
         return true;
@@ -274,66 +152,64 @@ pub fn build_toolchain_capable(n: &NodeInfo, manager: Option<&str>) -> bool {
         || crate::resources::package_manager_substitute(manager, have).is_some()
 }
 
-/// Preference rank for `place`'s ordering: a node carrying the EXACT requested
-/// package manager sorts before one that would have to substitute, which sorts
-/// before one that could not run the build at all. Ranking (not filtering) is
-/// what makes "a build that needs bun goes to a node that HAS bun" true without
-/// ever refusing a deploy that would succeed degraded — see
-/// [`build_toolchain_capable`].
+const TOOLCHAIN_EXACT: u8 = 0;
+/// An unreported node ranks here: unknown, never preferred over a node known to carry the manager.
+const TOOLCHAIN_SUBSTITUTE_OR_UNREPORTED: u8 = 1;
+const TOOLCHAIN_CANNOT_BUILD: u8 = 2;
+
+/// Ordering rank for `place` (lower first): a bun build prefers a node that has bun without ever
+/// refusing a deploy that would succeed degraded. See [`build_toolchain_capable`].
 pub fn build_toolchain_rank(n: &NodeInfo, manager: Option<&str>) -> u8 {
     let Some(manager) = manager else {
-        return 0;
+        return TOOLCHAIN_EXACT;
     };
     let Some(have) = n.build_toolchains.as_ref() else {
-        return 1; // unreported: unknown, never preferred over a known-capable node
+        return TOOLCHAIN_SUBSTITUTE_OR_UNREPORTED;
     };
     if have.iter().any(|t| t == manager) {
-        0
+        TOOLCHAIN_EXACT
     } else if crate::resources::package_manager_substitute(manager, have).is_some() {
-        1
+        TOOLCHAIN_SUBSTITUTE_OR_UNREPORTED
     } else {
-        2
+        TOOLCHAIN_CANNOT_BUILD
     }
 }
 
-/// Repository-controlled commands may run only on nodes whose boot-time live
-/// probe proved the complete BuildExecutor v1 contract. An absent field is an
-/// old node that still builds on the host and is therefore known-incapable.
-pub fn build_isolation_capable(n: &NodeInfo, needed: bool) -> bool {
-    // A node can run repository build commands when either: it advertises the
-    // isolated BuildExecutor (required for the Firecracker microVM backend,
-    // whose guest cannot exec host build commands), OR it runs a HOST-EXEC
-    // backend (mock/litebox) that builds directly on the host — the byte-
-    // identical `crate::mock::run_build_process` path litebox and mock have
-    // always used. A host-exec backend never needed the microVM-era executor,
-    // so requiring it there would exclude every litebox/mock node from source
-    // builds and refuse the deploy fleet-wide.
-    !needed
-        || n.build_isolation_protocol == Some(1)
-        || matches!(n.backend.as_str(), "mock" | "litebox")
+fn host_exec_backend(n: &NodeInfo) -> bool {
+    matches!(n.backend.as_str(), "mock" | "litebox")
 }
 
-/// Minimum free disk (GiB) a node must report to be eligible for new placement.
-///
-/// Sized above hive-backend's per-cold-start `FLOOR_BYTES` (3 GiB) on purpose:
-/// admitting a node with barely one deployment's worth of space just defers the
-/// failure to the cold start, which then reports it as the customer's problem.
-/// `HIVE_PLACEMENT_DISK_FLOOR_GB` tunes it per fleet.
+/// Repository build commands need a node whose boot probe proved BuildExecutor v1, or a host-exec
+/// backend (mock/litebox) that builds on the host and never needed the microVM-era executor.
+pub fn build_isolation_capable(n: &NodeInfo, needed: bool) -> bool {
+    !needed
+        || n.build_isolation_protocol == Some(BUILD_EXECUTOR_PROTOCOL_V1)
+        || host_exec_backend(n)
+}
+
+/// Minimum free disk (GiB) for new placement, above the ~3 GiB per-cold-start floor
+/// (`HIVE_DISK_FLOOR_MIB`, hive-backend) so an admitted node fits this deployment and the next;
+/// `HIVE_PLACEMENT_DISK_FLOOR_GB` overrides.
 fn disk_floor_gb() -> u64 {
     std::env::var("HIVE_PLACEMENT_DISK_FLOOR_GB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(20)
+        .unwrap_or(DEFAULT_DISK_FLOOR_GB)
 }
 
-/// Build the dispatch route for a chosen node: self (both None), else EVERY
-/// transport that node currently has — HTTP admin URL and/or iroh (id, addr).
-///
-/// Both are filled when both are known. They fail independently (a security
-/// group blocking 8786/8787 kills HTTP while iroh is fine; a degraded mesh path
-/// fails the other way), so populating only the preferred one left the
-/// dispatcher no second option and turned one transport hiccup into a failed
-/// deployment. `fanout_remote` prefers HTTP and falls back to iroh.
+/// A hard filter, not a score term: a full node stays full until something is deleted. Only a
+/// positive reading under the floor rejects, because `disk_free_gb == 0` is UNKNOWN (a pre-upgrade
+/// peer).
+fn below_disk_floor(n: &NodeInfo, floor_gb: u64) -> bool {
+    n.disk_free_gb > 0 && n.disk_free_gb < floor_gb
+}
+
+fn has_public_address(n: &NodeInfo) -> bool {
+    n.public_ip.is_some() || n.public_ip6.is_some()
+}
+
+/// Dispatch route for `n`: self is `(None, None)`, otherwise every transport it has, because HTTP
+/// admin and iroh fail independently and `fanout_remote` falls back from HTTP to iroh.
 fn target_of(cloud: &Arc<CloudState>, n: &NodeInfo) -> Target {
     if n.name == cloud.node_name {
         return Target {
@@ -352,16 +228,11 @@ fn target_of(cloud: &Arc<CloudState>, n: &NodeInfo) -> Target {
     }
 }
 
-/// True when some path to `n` can actually carry traffic: a public address, a
-/// relay in its advertised iroh address, or a live trunk to us.
-///
-/// A peer id plus an iroh address is NOT by itself evidence of reachability — a
-/// NAT'd node can advertise only an RFC1918 address and no relay, which no
-/// remote coordinator can dial. Placing on such a node succeeds and then the
-/// dispatch hangs, which is strictly worse than refusing it up front. A peer
-/// that dialled out to us leaves a live trunk, so that case is admitted.
+/// True when some path to `n` can carry traffic: a public address, a relay in its iroh address, or
+/// a live trunk to us. A peer id plus an iroh address alone is no evidence (a NAT'd node may
+/// advertise only RFC1918).
 fn dialable(n: &NodeInfo) -> bool {
-    if n.public_ip.is_some() || n.public_ip6.is_some() {
+    if has_public_address(n) {
         return true;
     }
     if n
@@ -376,19 +247,42 @@ fn dialable(n: &NodeInfo) -> bool {
         .is_some_and(|id| hive_p2p::establish::peer_conns(id) > 0)
 }
 
-/// A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
-/// over the iroh mesh (has a peer id + dialable address). The last case is what lets
-/// a NAT'd coordinator place deploys on FC nodes after the SSH tunnels were cut.
+/// Dispatchable: this node, a node with a known HTTP admin URL, or a peer with an iroh id and a
+/// `dialable` address.
 fn reachable(cloud: &Arc<CloudState>, n: &NodeInfo) -> bool {
     n.name == cloud.node_name
         || cloud.node_admins.read().contains_key(&n.name)
         || (n.peer_id.is_some() && n.iroh_addr.is_some() && dialable(n))
 }
 
-/// Capability filter. Containers run through host podman on every backend;
-/// ordinary functions require a production isolation backend. Firecracker is
-/// intrinsically eligible, verified Litebox proves that status by advertising
-/// the current runtime-artifact protocol, and Mock remains container-only.
+/// The hard needs of one deployment, shared by `capable` and lease stickiness so the two never
+/// disagree.
+fn meets_capability_needs(
+    n: &NodeInfo,
+    needs_gpu: bool,
+    needs_interpreter: InterpreterNeeds,
+    needs_runtime_artifact: bool,
+    needs_build_isolation: bool,
+    needs_build_toolchain: Option<&str>,
+) -> bool {
+    (!needs_gpu || n.gpu_count > 0)
+        && wasm_capable(n, needs_interpreter.wasm)
+        && bun_capable(n, needs_interpreter.bun)
+        && runtime_artifact_capable(n, needs_runtime_artifact)
+        && build_isolation_capable(n, needs_build_isolation)
+        && build_toolchain_capable(n, needs_build_toolchain)
+}
+
+/// Mock builds and runs directly on the host (`mock::run_build_process`), needing neither
+/// BuildExecutor nor the split runtime-artifact contract `eligible` enforces for Firecracker, so a
+/// region made only of mock nodes can still place any deployment.
+fn healthy_mock_node(n: &NodeInfo) -> bool {
+    n.healthy && n.backend == "mock"
+}
+
+/// Capability filter: the hard needs, the disk floor, then an eligible backend or a healthy Mock
+/// node. A container also needs a public address: it is served from the node's own host, never
+/// through the microVM guest network.
 fn capable(
     n: &NodeInfo,
     is_container: bool,
@@ -398,122 +292,55 @@ fn capable(
     needs_build_isolation: bool,
     needs_build_toolchain: Option<&str>,
 ) -> bool {
-    if needs_gpu && n.gpu_count == 0 {
+    if !meets_capability_needs(
+        n,
+        needs_gpu,
+        needs_interpreter,
+        needs_runtime_artifact,
+        needs_build_isolation,
+        needs_build_toolchain,
+    ) {
         return false;
     }
-    // Wasmer capability, same hard-filter shape as the GPU gate above.
-    // See `wasm_capable` for why `None` excludes rather than admits.
-    if !wasm_capable(n, needs_interpreter.wasm) {
+    if below_disk_floor(n, disk_floor_gb()) {
         return false;
     }
-    // Bun capability, identical shape and identical reasoning — see
-    // `bun_capable`.
-    if !bun_capable(n, needs_interpreter.bun) {
-        return false;
-    }
-    if !runtime_artifact_capable(n, needs_runtime_artifact) {
-        return false;
-    }
-    if !build_isolation_capable(n, needs_build_isolation) {
-        return false;
-    }
-    // Build-toolchain capability, the same hard-filter shape as the GPU/Wasmer
-    // gates above — a node with neither the requested package manager nor a
-    // substitute cannot run this build at all. See `build_toolchain_capable`
-    // for why an UNREPORTED set is admitted instead of excluded.
-    if !build_toolchain_capable(n, needs_build_toolchain) {
-        return false;
-    }
-    // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
-    // filtered on health/region/GPU and then sorted by deployment COUNT, a
-    // metric that says nothing about space. So the node with the most free
-    // capacity and the node with none scored identically, and a full node
-    // kept winning. Witnessed 2026-07-31 — fc-sanjose hit 0 bytes free and
-    // took 9 customer deployments down ("host disk critically low ... after
-    // GC") while fc-frankfurt and both CVM nodes sat under 10% used with
-    // ~920 GiB free each.
-    //
-    // A HARD filter, not another term in the score, because disk is not like
-    // CPU or memory: it does not drain on its own once a deployment lands,
-    // so a node that is out of space is out until something is deleted. A
-    // weighted score would still let it win when peers look busy.
-    //
-    // The floor is deliberately larger than the per-cold-start requirement
-    // (`FLOOR_BYTES`, 3 GiB in hive-backend): placement must leave room for
-    // the deployment it is about to create PLUS the next one, or it just
-    // hands the node to the very check that will reject it.
-    //
-    // `disk_free_gb == 0` means UNKNOWN, not full — a pre-upgrade peer does
-    // not report it. Excluding those would empty the candidate set during a
-    // rollout, so unknown is admitted and only a positive, genuinely-low
-    // reading rejects.
-    let floor_gb = disk_floor_gb();
-    if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
-        return false;
-    }
-    if is_container {
-        // A container deployment is served on this node's own public host —
-        // never through the microVM guest network — so a node with NO public
-        // address can win placement (it's `reachable()` for build DISPATCH via
-        // admin/iroh) but the resulting deployment is then unreachable by any
-        // real client: only 127.0.0.1. Witnessed as a live risk when the local
-        // Mac dev nodes moved region to san-jose — the mock-backend widening
-        // below exists so containers can run on them at all, but a
-        // region-pinned container could land there and silently never serve.
-        // Require a public address for EITHER family, on every backend
-        // (firecracker included — a NAT'd FC node has the identical problem,
-        // this is not mock-specific), so an unreachable node simply isn't a
-        // candidate rather than winning and quietly failing to serve.
-        let has_public = n.public_ip.is_some() || n.public_ip6.is_some();
-        has_public && (eligible(n) || (n.healthy && n.backend == "mock"))
-    } else {
-        // The SAME mock widening the container branch above already applies,
-        // for the SAME reason `build_isolation_capable`/`runtime_artifact_capable`
-        // (checked above, lines 322-327) explicitly admit mock: it builds and
-        // runs a function directly on the host (`crate::mock::run_build_process`),
-        // needing neither the isolated BuildExecutor nor the split host/guest
-        // runtime-artifact contract those gates exist to enforce for Firecracker.
-        // `eligible()` alone does not know this — its own `isolated` check is a
-        // narrower, Firecracker/Litebox-specific definition of "production
-        // isolation backend" that was never meant to also gate "can this node
-        // run a source build at all". Without this widening, a REGION WHOLLY
-        // MADE OF MOCK NODES (e.g. `los-angeles`, this fleet's Mac dev nodes)
-        // could never place ANY non-container deployment there: every mock node
-        // passed both real capability checks and was then excluded anyway by
-        // `eligible()`'s separate backend check, landing every LA-region source
-        // deploy on BUILD_ISOLATION_UNAVAILABLE despite 5 genuinely-capable
-        // healthy nodes. Unlike the container branch, no `has_public` gate is
-        // needed here: a non-container function is served through the
-        // platform's own gateway/DNS routing (already NAT/private-address safe
-        // — the same mesh path every ordinary function deployment already
-        // uses), never by a client dialing the node's host port directly.
-        eligible(n) || (n.healthy && n.backend == "mock")
+    (!is_container || has_public_address(n)) && (eligible(n) || healthy_mock_node(n))
+}
+
+fn coordinator_geo(nodes: &[NodeInfo], me: &str) -> Option<(f64, f64)> {
+    nodes
+        .iter()
+        .find(|n| n.name == me)
+        .and_then(|n| match (n.lat, n.lon) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        })
+}
+
+fn distance_km(from: Option<(f64, f64)>, n: &NodeInfo) -> f64 {
+    match (from, n.lat, n.lon) {
+        (Some(s), Some(a), Some(b)) => haversine_km(s, (a, b)),
+        _ => UNKNOWN_GEO_DISTANCE_KM,
     }
 }
 
-/// Ordered DISPATCH FALLBACKS for a build whose placed target(s) could not be
-/// REACHED — the deploy request never arrived, nothing ran. Every other remote
-/// node that is healthy, dispatchable and `capable` of this exact deployment
-/// (the same predicate `place` filters on — never the explicit-region widening,
-/// because a fallback must genuinely be able to build and host it), minus
-/// `exclude` (the targets already tried) and this node.
-///
-/// Order is a preference, not a fence: nodes in the project's configured
-/// region(s) first, in request order, then everything else by proximity to
-/// this coordinator; ties by load, then most free disk, then name (so every
-/// retry and every observer agree on the sequence — the `capable_peers`
-/// convention in `sandboxes_api`). A region-pinned project whose only in-region
-/// node is unreachable therefore lands OUT of region rather than failing
-/// outright, and the build log says so; the next deploy re-evaluates placement.
-///
-/// Witnessed 2026-09-01: project `express`, region frankfurt, sole target
-/// fc-frankfurt. Eight consecutive deploys in 75 minutes failed "iroh: no
-/// reply" while the leader's trunk to fc-frankfurt was cold (its cached-hint
-/// dials timing out ~10/min) yet fc-frankfurt stayed HEALTHY in the registry
-/// (still gossiping via other peers — a single-observer transport fault must
-/// not withdraw it from placement). Placement produced exactly one candidate
-/// and the coordinator gave up: ten other capable litebox/firecracker nodes
-/// sat idle the whole time.
+/// The coordinator itself when it is among `candidates` (a local build has full log fidelity and no
+/// mesh dependency; pure load-sorting would send every deploy to whichever peer is idlest), else the
+/// first. `candidates` must not be empty.
+fn prefer_coordinator<'a>(candidates: &[&'a NodeInfo], me: &str) -> &'a NodeInfo {
+    candidates
+        .iter()
+        .copied()
+        .find(|n| n.name == me)
+        .unwrap_or(candidates[0])
+}
+
+/// Remote nodes to retry a build on after every placed target was UNREACHED (nothing ran): healthy,
+/// dispatchable, `capable` of this exact deployment (never `place`'s explicit-region widening), not
+/// in `exclude`, not this node. Ordered by configured region, proximity, toolchain rank, load, most
+/// free disk, then name, so every observer agrees on the sequence; a region-pinned project whose
+/// only in-region node is down lands out of region instead of failing.
 pub fn dispatch_fallbacks(
     cloud: &Arc<CloudState>,
     regions: &[String],
@@ -541,19 +368,8 @@ pub fn dispatch_fallbacks(
             .position(|r| n.region.eq_ignore_ascii_case(r))
             .unwrap_or(regions.len())
     };
-    let self_geo = nodes
-        .iter()
-        .find(|n| n.name == me)
-        .and_then(|n| match (n.lat, n.lon) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        });
-    let dist = |n: &NodeInfo| -> f64 {
-        match (self_geo, n.lat, n.lon) {
-            (Some(s), Some(a), Some(b)) => haversine_km(s, (a, b)),
-            _ => f64::MAX,
-        }
-    };
+    let self_geo = coordinator_geo(&nodes, &me);
+    let dist = |n: &NodeInfo| -> f64 { distance_km(self_geo, n) };
     let mut cands: Vec<&NodeInfo> = nodes
         .iter()
         .filter(|n| {
@@ -581,8 +397,6 @@ pub fn dispatch_fallbacks(
                     .partial_cmp(&dist(b))
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            // A fallback must be able to run the build: prefer a node carrying
-            // the exact package manager over one that would substitute.
             .then_with(|| {
                 build_toolchain_rank(a, needs_build_toolchain)
                     .cmp(&build_toolchain_rank(b, needs_build_toolchain))
@@ -594,74 +408,28 @@ pub fn dispatch_fallbacks(
     cands.into_iter().map(|n| target_of(cloud, n)).collect()
 }
 
-/// Choose placement targets. See module docs for the policy. `is_container` routes
-/// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
-/// mock/podman backend) — Firecracker nodes can't run them, so placing a container
-/// there fails every cold start with "no capacity / No such file or directory".
-///
-/// `stateful` is the multi-region-fanout safety guard: a container deployment gets
-/// an automatic, durable, PER-NODE persistent volume (`container_volume_cfg` in
-/// `git.rs`) — a fresh, independent volume on every node it's placed on, with NO
-/// data-sync or leader-election between them. For a stateless function that's fine
-/// (every replica is interchangeable). For a stateful single-writer service (a
-/// Postgres database, a Minecraft world save — anything whose
-/// `FunctionConfig::needs_raw_proxy()` is true, or that is otherwise a container
-/// per the existing single-owner lease model in `lease.rs`) it is NOT: fanning out
-/// to multiple regions would silently create independent, diverging volumes the
-/// moment more than one region is selected — e.g. two Minecraft world saves
-/// silently forking apart, or two Postgres instances both accepting independent
-/// writes with no replication between them (a split-brain). When `stateful` is
-/// true, the explicit-region branch below is constrained to a single region (with
-/// a clear warning logged) instead of fanning out one target per region — matching
-/// this module's existing convention of degrading a placement request to a safe
-/// default with a logged explanation rather than hard-failing the deploy (see the
-/// module doc's "if nothing is eligible/reachable" fallback, and
-/// `place_for_project`'s lease-holder stickiness, for the same pattern).
+/// Choose placement targets (module docs: policy); empty means no target chosen. `is_container`
+/// needs a public address; `stateful` (single-writer data in a per-node volume with no sync)
+/// constrains an explicit multi-region request to its first region, since fan-out would fork the
+/// data. Each `needs_*` is a hard capability: an explicit region is never widened past it, because
+/// an empty placement beats a node that fails every cold start. `needs_build_toolchain` is also
+/// ranked, so a bun build prefers a bun node.
 pub fn place(
     cloud: &Arc<CloudState>,
     regions: &[String],
     is_container: bool,
     stateful: bool,
-    // The project's functions request a serverless GPU: only nodes ADVERTISING
-    // GPUs (NodeInfo::gpu_count > 0, from the boot nvidia-smi probe) are
-    // capable. There is deliberately NO silent fallback to a CPU node — a GPU
-    // workload placed on a GPU-less host would cold-start into CUDA errors,
-    // which is strictly worse than the explicit empty-placement failure the
-    // caller already handles for "nothing eligible".
     needs_gpu: bool,
-    // The project's functions run on `Runtime::Wasmer` and/or `Runtime::Bun`:
-    // only nodes ADVERTISING the matching capability
-    // (`NodeInfo::wasm_runtime`/`NodeInfo::bun_runtime == Some(true)`, from
-    // the active-backend resource probe) are capable. Same rule and same
-    // reasoning as `needs_gpu` directly above, and it is not hypothetical: the
-    // first cut of Wasmer support installed the binary on the HOST while every
-    // fleet node is Firecracker, which execs `start_cmd` inside the microVM
-    // GUEST — so every placement was onto a node guaranteed to ENOENT on every
-    // cold start, forever, and the tenant was told to debug their own app.
-    // Empty placement plus an honest error is strictly better. `impl
-    // Into<InterpreterNeeds>` so a bare `bool` (every call site written before
-    // Bun's own gate existed) keeps compiling with its EXACT prior meaning —
-    // see `InterpreterNeeds`'s doc for the non-breaking-extension rationale.
     needs_interpreter: impl Into<InterpreterNeeds>,
-    // Source-built functions require the split host/guest runtime-artifact v1
-    // contract. Pre-upgrade nodes must not receive them.
     needs_runtime_artifact: bool,
-    // Any repository-controlled command requires the live-probed outer
-    // BuildExecutor contract. Old peers and failed probes are ineligible.
     needs_build_isolation: bool,
-    // The package manager this build needs, when known up front (see
-    // `place_for_project`). Ranked as well as filtered, so a bun build lands on
-    // a bun node whenever the fleet has one.
     needs_build_toolchain: Option<&str>,
 ) -> Vec<Target> {
     let needs_interpreter = needs_interpreter.into();
-    let nodes = cloud.registry.nodes(); // self first
+    let nodes = cloud.registry.nodes();
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
     let load_of = |name: &str| -> usize { load.get(name).copied().unwrap_or(0) };
-    // ONE definition each for the dispatch route, the reachability test and the
-    // capability filter — shared with `dispatch_fallbacks`, so a fallback can
-    // never be a node this placement would have refused.
     let target_of = |n: &NodeInfo| -> Target { target_of(cloud, n) };
     let reachable = |n: &NodeInfo| -> bool { reachable(cloud, n) };
     let capable = |n: &NodeInfo| -> bool {
@@ -683,11 +451,6 @@ pub fn place(
         .collect();
 
     if !regions.is_empty() {
-        // One target per selected region — EXCEPT for a stateful/single-writer
-        // deployment, which is forced to a single region (see this fn's doc for the
-        // diverging-replica hazard this closes). Silently constrain + log rather
-        // than reject the deploy outright: consistent with every other placement
-        // fallback in this module (never hard-fail on a placement/region choice).
         let regions: &[String] = if stateful && regions.len() > 1 {
             tracing::warn!(
                 requested_regions = ?regions,
@@ -704,66 +467,46 @@ pub fn place(
         } else {
             &regions[..]
         };
-        // One target per selected region.
         let mut targets: Vec<Target> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for region in regions {
-            let cands: Vec<&NodeInfo> = nodes
+            let healthy_in_region: Vec<&NodeInfo> = nodes
                 .iter()
                 .filter(|n| n.healthy && n.region.eq_ignore_ascii_case(region) && reachable(n))
                 .collect();
-            if cands.is_empty() {
-                continue; // no reachable node in that region
+            if healthy_in_region.is_empty() {
+                continue;
             }
-            // Prefer eligible nodes; if none are eligible, honor the explicit
-            // region choice with any healthy node there (e.g. los-angeles → local).
-            //
-            // EXCEPT for a GPU request: widening here would hand the deployment to
-            // a node with no GPU, and the launch then fails on the CDI device that
-            // host cannot resolve ("unresolvable CDI devices nvidia.com/gpu=all").
-            // Witnessed live — this widening is what silently defeated the
-            // gpu_count filter and put a gpu deployment on a CPU node. Skipping the
-            // region entirely is correct: `targets` staying empty is the signal the
-            // caller turns into an explicit failure.
-            let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| capable(n)).collect();
-            if needs_gpu && eligibles.is_empty() {
+            let capable_here: Vec<&NodeInfo> = healthy_in_region
+                .iter()
+                .copied()
+                .filter(|n| capable(n))
+                .collect();
+            if needs_gpu && capable_here.is_empty() {
                 tracing::warn!(region = %region, "placement: no GPU-capable node in this region — not widening (gpu request)");
                 continue;
             }
-            // Same rule, same reason, for the wasm runtime. The widening below
-            // deliberately falls back to `cands` (health/region only) when
-            // nothing passes `capable()`, which is right for a node that is
-            // merely resource-poor — but WRONG for a hard capability: widening
-            // hands the deployment to a node with no `wasmer` binary at all,
-            // which is exactly the empty-placement-beats-guaranteed-failure rule
-            // the gpu arm above encodes. Without this the `capable()` filter was
-            // decorative on this path: it removed the incapable nodes and then
-            // the fallback put them straight back.
-            if needs_interpreter.wasm && eligibles.is_empty() {
+            if needs_interpreter.wasm && capable_here.is_empty() {
                 tracing::warn!(region = %region, "placement: no wasm-capable node in this region — not widening (wasmer runtime)");
                 continue;
             }
-            // Same rule, same reason, for Bun.
-            if needs_interpreter.bun && eligibles.is_empty() {
+            if needs_interpreter.bun && capable_here.is_empty() {
                 tracing::warn!(region = %region, "placement: no bun-capable node in this region — not widening (bun runtime)");
                 continue;
             }
-            if needs_runtime_artifact && eligibles.is_empty() {
+            if needs_runtime_artifact && capable_here.is_empty() {
                 tracing::warn!(region = %region, "placement: no runtime-artifact-v1 node in this region — not widening (source build)");
                 continue;
             }
-            if needs_build_isolation && eligibles.is_empty() {
+            if needs_build_isolation && capable_here.is_empty() {
                 tracing::warn!(region = %region, "placement: no build-isolation-v1 node in this region — not widening (repository build)");
                 continue;
             }
-            let mut pool = if eligibles.is_empty() {
-                cands
+            let mut pool = if capable_here.is_empty() {
+                healthy_in_region
             } else {
-                eligibles
+                capable_here
             };
-            // Order by load, then by MOST free disk. The disk term is what
-            // actively drains a filling node instead of merely refusing it
-            // once it is already over the floor (Reverse => larger first).
             pool.sort_by_key(|n| {
                 (
                     build_toolchain_rank(n, needs_build_toolchain),
@@ -771,23 +514,7 @@ pub fn place(
                     std::cmp::Reverse(n.disk_free_gb),
                 )
             });
-            // Prefer the COORDINATOR itself when it's a valid candidate for this
-            // region: a local build has full log fidelity and zero cross-node
-            // dispatch/mirror dependency, whereas dispatching to a remote node
-            // (esp. an iroh-only one) hinges on the mesh round-trip both
-            // delivering the deploy AND streaming the build log back -- if that
-            // mirror stalls, the dashboard shows a build stuck at "dispatching"
-            // even though the deployment succeeded remotely. Pure load-sorting
-            // otherwise sends every deploy to whichever peer is idlest (a fresh
-            // node with 0 deployments always wins), which is exactly how a
-            // brand-new node became the sink for every build. Self only wins the
-            // region it's actually IN; other regions still pick the least-loaded
-            // node there.
-            let chosen = pool
-                .iter()
-                .copied()
-                .find(|n| n.name == me)
-                .unwrap_or(pool[0]);
+            let chosen = prefer_coordinator(&pool, &me);
             if seen.insert(chosen.name.clone()) {
                 targets.push(target_of(chosen));
             }
@@ -795,23 +522,12 @@ pub fn place(
         return targets;
     }
 
-    // Default: the eligible node nearest the coordinator (this node).
-    let self_geo = nodes
-        .iter()
-        .find(|n| n.name == me)
-        .and_then(|n| match (n.lat, n.lon) {
-            (Some(a), Some(b)) => Some((a, b)),
-            _ => None,
-        });
+    let self_geo = coordinator_geo(&nodes, &me);
     let mut elig: Vec<&NodeInfo> = nodes
         .iter()
         .filter(|n| capable(n) && reachable(n))
         .collect();
     if elig.is_empty() {
-        // Empty = "no target chosen". For an ordinary deployment the caller hosts
-        // locally, which is the long-standing safe default. For a GPU request the
-        // caller MUST instead fail the deploy (see `deploy_targets_or_fail` in
-        // git.rs) — hosting locally would put it on a GPU-less node.
         if needs_gpu {
             tracing::warn!("placement: gpu requested but no healthy GPU-capable node is reachable");
         }
@@ -837,12 +553,7 @@ pub fn place(
         }
         return Vec::new();
     }
-    let dist = |n: &NodeInfo| -> f64 {
-        match (self_geo, n.lat, n.lon) {
-            (Some(s), Some(a), Some(b)) => haversine_km(s, (a, b)),
-            _ => f64::MAX, // unknown geo sorts last
-        }
-    };
+    let dist = |n: &NodeInfo| -> f64 { distance_km(self_geo, n) };
     elig.sort_by(|a, b| {
         dist(a)
             .partial_cmp(&dist(b))
@@ -853,58 +564,29 @@ pub fn place(
             })
             .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
     });
-    // Prefer the coordinator itself when it's eligible: `self` is always the
-    // nearest node (distance 0 to its own geo), so this only overrides the
-    // load-tiebreak that otherwise ships every deploy to whichever same-region
-    // peer is idlest — which is how a fresh 0-deployment node became the sink
-    // for every build, then failed each one on the fragile cross-node dispatch/
-    // mirror path. A local build has full log fidelity and no mesh dependency.
-    // When `self` isn't eligible (e.g. a mock/LA coordinator), the nearest
-    // eligible remote still wins.
-    let chosen = elig
-        .iter()
-        .copied()
-        .find(|n| n.name == me)
-        .unwrap_or(elig[0]);
-    vec![target_of(chosen)]
+    vec![target_of(prefer_coordinator(&elig, &me))]
 }
 
-/// Why `place` returned NO target for a repository build, for the deploy
-/// refusal message in `git.rs`.
-///
-/// Every count is computed with the SAME predicates `place` filters on
-/// (`build_isolation_capable`, `capable`, `reachable`, `n.healthy`), because
-/// the refusal exists to name the constraint that actually emptied the
-/// candidate set. Counting "nodes that can run a build" while ignoring
-/// health/reachability and the rest of `capable()` is what made a fleet whose
-/// capable nodes were all unreachable read as "8 capable node(s), 5 in your
-/// region(s), and the platform refuses anyway" — pointing the tenant at a
-/// missing BuildExecutor when the real cause was node health.
+/// Why `place` returned no target for a repository build (the refusal in `git.rs`): every count
+/// uses the predicates `place` filters on, so it names the constraint that actually emptied the
+/// candidate set.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct BuildPlacementDiagnosis {
-    /// Nodes known to the mesh that can run repository build commands at all:
-    /// an isolated BuildExecutor v1, or a host-exec mock/litebox backend that
-    /// builds on the host. Fleet-wide; health and region deliberately ignored,
-    /// so this is the "the capability exists somewhere" figure.
+    /// Nodes that can run repository builds at all (BuildExecutor v1, or a host-exec mock/litebox
+    /// backend); health and region ignored.
     pub capable_total: usize,
     /// `capable_total` narrowed to the project's configured region(s); every
     /// node when the project configures none.
     pub capable_in_region: usize,
-    /// `capable_in_region` narrowed further to the nodes `place` would
-    /// actually have returned — healthy, reachable and through every other
-    /// `capable()` filter. THIS is the number that explains an empty
-    /// placement.
+    /// `capable_in_region` that `place` would return (healthy, reachable, through every `capable()`
+    /// filter): the figure that explains an empty placement.
     pub placeable_in_region: usize,
-    /// Why the other `capable_in_region` nodes were not placeable, one counted
-    /// reason per entry (`"2 unhealthy"`, `"1 below the 20 GiB placement disk
-    /// floor"`), deterministically ordered.
+    /// One counted reason per other `capable_in_region` node (`"2 unhealthy"`), in a stable order.
     pub blockers: Vec<String>,
 }
 
-/// The FIRST `place` predicate `n` fails, or `None` when `place` would have
-/// accepted it. Checked in the same order `capable`/`place` apply them, so the
-/// refusal names the constraint that actually bit rather than a later one that
-/// also happens to hold.
+/// The first `place` predicate `n` fails (checked in `capable`'s order, so the refusal names the
+/// constraint that bit), or `None` when `place` would accept it.
 fn placement_blocker(
     cloud: &Arc<CloudState>,
     n: &NodeInfo,
@@ -947,22 +629,18 @@ fn placement_blocker(
         }
     }
     let floor_gb = disk_floor_gb();
-    if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
+    if below_disk_floor(n, floor_gb) {
         return Some(format!(
             "below the {floor_gb} GiB placement disk floor ({} GiB free)",
             n.disk_free_gb
         ));
     }
-    if is_container && n.public_ip.is_none() && n.public_ip6.is_none() {
+    if is_container && !has_public_address(n) {
         return Some(
             "no public address (a container is served from the node's own host)".to_string(),
         );
     }
-    // `capable()`'s tail: a production isolation backend (Firecracker, or
-    // Litebox proving runtime-artifact v1) OR a healthy host-exec mock node —
-    // the healthy half is already established by the check above, so only the
-    // backend string is left to test here.
-    if !eligible(n) && n.backend != "mock" {
+    if !eligible(n) && !healthy_mock_node(n) {
         if n.mem_total_mb < MEM_FLOOR_MB {
             return Some(format!(
                 "below the {} MiB placement memory floor ({} MiB)",
@@ -977,15 +655,9 @@ fn placement_blocker(
     None
 }
 
-/// Diagnose a repository-build placement that came back EMPTY: how many nodes
-/// can run repository build commands, how many of those are in the requested
-/// region(s), and — the figure that explains the failure — how many of those
-/// `place` would actually have returned.
-///
-/// `needs_build_isolation` is implied: a repository build is the case being
-/// diagnosed, so every node counted here already passes
-/// [`build_isolation_capable`] (BuildExecutor v1 OR a host-exec
-/// mock/litebox backend).
+/// Diagnose an empty repository-build placement: how many nodes can run repository builds, how many
+/// are in the requested region(s), and how many of those `place` would actually return. Every
+/// counted node already passes [`build_isolation_capable`], so `needs_build_isolation` is implied.
 pub fn build_placement_diagnosis(
     cloud: &Arc<CloudState>,
     regions: &[String],
@@ -1003,8 +675,6 @@ pub fn build_placement_diagnosis(
         .filter(|r| !r.is_empty())
         .collect();
     let mut diagnosis = BuildPlacementDiagnosis::default();
-    // BTreeMap so the blocker list is ordered identically on every node and in
-    // every retry of the same deploy (the `capable_peers` convention).
     let mut blockers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     for n in nodes.iter() {
         if !build_isolation_capable(n, true) {
