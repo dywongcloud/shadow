@@ -102,7 +102,8 @@ async function respond(upstream: SafeResponse, isKey: boolean): Promise<NextResp
 /** Same-origin HLS proxy so hls.js obeys the CSP `connect-src 'self'`: playlists are rewritten to point back here and segments stream through, but only public https hosts are reachable
  *  (`safeGet`), only `range` is forwarded, and bodies are size- and content-type-bounded (a gzip/deflate body an origin sends despite `accept-encoding: identity` is decoded under the same
  *  caps). A body is a playlist only if it starts with `#EXTM3U`: an encryption key, whether its rewritten URI says `role=key` or a server labels it as a playlist, is served as at most
- *  `KEY_MAX_BYTES` of `application/octet-stream`. */
+ *  `KEY_MAX_BYTES` of `application/octet-stream`. `role=key` is client-supplied, so it is no authorization: a caller can add it to relabel at most `KEY_MAX_BYTES` of any public body as that
+ *  inert type (`nosniff`, `no-store`), past the media-type allowlist. */
 export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get("url");
   if (!raw) return reply("missing url", 400);

@@ -3,18 +3,18 @@ import dns from "node:dns";
 import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { LookupFunction } from "node:net";
-import { Readable, Transform, pipeline } from "node:stream";
-import { createGunzip, createInflate } from "node:zlib";
+import { Readable, Transform, pipeline, type TransformCallback } from "node:stream";
+import { createGunzip, createInflate, createInflateRaw } from "node:zlib";
 import { isPublicAddress, refusedHost } from "@/lib/public-address";
 
 const MAX_REDIRECTS = 3;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SOCKET_IDLE_TIMEOUT_MS = 10_000;
 const ENCODED_OVERHEAD_BYTES = 16 * 1024;
-const DECODERS: Record<string, () => Transform> = {
-  gzip: createGunzip,
-  "x-gzip": createGunzip,
-  deflate: createInflate,
+const DECODERS: Record<string, (firstByte: number) => Transform> = {
+  gzip: () => createGunzip(),
+  "x-gzip": () => createGunzip(),
+  deflate: (firstByte) => ((firstByte & 0x0f) === 8 ? createInflate() : createInflateRaw()),
 };
 
 /** A failure that already knows the HTTP status a route should answer with. */
@@ -88,7 +88,7 @@ export async function safeGet(
   }
 }
 
-/** The response's one content-coding: `""` for a plain body, its name when the proxy can undo it (gzip and deflate, 32 KiB windows), `null` for anything else (a chain, zstd, compress,
+/** The response's one content-coding: `""` for a plain body, its name when the proxy can undo it (gzip and deflate, zlib-wrapped or raw: 32 KiB windows), `null` for anything else (a chain, zstd, compress,
  *  brotli: its 16 MiB window is too much memory per request for an origin that ignored `accept-encoding: identity`). */
 export function contentCoding(headers: IncomingHttpHeaders): string | null {
   const coding = String(headers["content-encoding"] ?? "").trim().toLowerCase();
@@ -106,6 +106,45 @@ function capped(limit: number): Transform {
   });
 }
 
+/** A decoder made on the first non-empty chunk: a body with no bytes (a 204, `content-length: 0`) is an empty body, not an unexpected end of file, and `choose` can read the first byte
+ *  (`deflate` is zlib-wrapped, yet some origins send it raw). The decoder is paused while this stream's readable side is full, so it never runs ahead of the reader. */
+class LazyDecoder extends Transform {
+  private decoder: Transform | null = null;
+
+  constructor(private readonly choose: (firstByte: number) => Transform) {
+    super();
+  }
+
+  override _transform(chunk: Buffer, _encoding: BufferEncoding, done: TransformCallback): void {
+    if (chunk.length === 0) return done();
+    if (!this.decoder) {
+      const decoder = this.choose(chunk[0]);
+      decoder.on("data", (decoded: Buffer) => {
+        if (!this.push(decoded)) decoder.pause();
+      });
+      decoder.on("error", (error) => this.destroy(error));
+      this.decoder = decoder;
+    }
+    this.decoder.write(chunk, done);
+  }
+
+  override _flush(done: TransformCallback): void {
+    if (!this.decoder) return done();
+    this.decoder.once("end", () => done());
+    this.decoder.end();
+  }
+
+  override _read(size: number): void {
+    this.decoder?.resume();
+    super._read(size);
+  }
+
+  override _destroy(error: Error | null, callback: (error?: Error | null) => void): void {
+    this.decoder?.destroy();
+    super._destroy(error, callback);
+  }
+}
+
 /** The origin's bytes as the caller meant them, at most `maxBytes` of them, the upstream torn down when the stream ends for any reason. A gzip/deflate body (an origin that ignored
  *  `accept-encoding: identity`) is decoded with the cap on BOTH sides of the decoder: the decoded side stops a bomb, the encoded side stops an endless stream that decodes to nothing. */
 function boundedSource(response: SafeResponse, maxBytes: number): Readable {
@@ -117,7 +156,7 @@ function boundedSource(response: SafeResponse, maxBytes: number): Readable {
       : new UpstreamError(502, "a partial upstream response in a content-coding cannot be decoded");
   }
   const decoded = capped(maxBytes);
-  const decoding = coding === "" ? [] : [capped(maxBytes + ENCODED_OVERHEAD_BYTES), DECODERS[coding]()];
+  const decoding = coding === "" ? [] : [capped(maxBytes + ENCODED_OVERHEAD_BYTES), new LazyDecoder(DECODERS[coding])];
   pipeline([response.body, ...decoding, decoded], () => {});
   return decoded;
 }
