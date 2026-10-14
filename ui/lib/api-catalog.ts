@@ -206,7 +206,6 @@ export const API_CATEGORIES: ApiCategory[] = [
         response: `{
   "domain": "acme.com",
   "nameservers": ["ns1.shadw.cloud", "ns2.shadw.cloud"],
-  "auto_renew": true,
   "records": [
     { "id": "rec_a1", "type": "A", "name": "@", "value": "76.76.21.21", "ttl": 3600 }
   ]

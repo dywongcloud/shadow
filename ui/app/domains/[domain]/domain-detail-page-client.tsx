@@ -3,7 +3,7 @@
 import { useState, use, useEffect } from "react";
 import Link from "next/link";
 import {
-  ChevronRight, RefreshCw, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
+  ChevronRight, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
   Pencil, X, DownloadCloud, FileUp, Check, AlertTriangle, Link2,
 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
@@ -18,10 +18,6 @@ const RECORD_TYPES = ["A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "
 
 function NotAvailable() {
   return <span className="text-muted">Not available for DNS-only domains</span>;
-}
-
-function fmtDate(ms: number) {
-  return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
 export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ domain: string }> }) {
@@ -54,7 +50,7 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       </div>
 
       <div className="mb-8 grid grid-cols-2 gap-y-4 border-b border-border pb-6 text-sm sm:grid-cols-3 lg:grid-cols-6">
-        <Meta label="Expiration Date" value={attached ? <span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span> : <NotAvailable />} />
+        {!attached && <Meta label="Expiration Date" value={<NotAvailable />} />}
         {!attached && <Meta label="Renewal Price" value={<NotAvailable />} />}
         {!attached && <Meta label="Registrar" value={<NotAvailable />} />}
         {!attached && <Meta label="Auto Renewal" value={<NotAvailable />} />}

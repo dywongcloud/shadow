@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Search, Filter, RotateCw, ChevronRight, Wand2 } from "lucide-react";
+import { Search, Filter, ChevronRight, Wand2 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { usePoll, type Deployment } from "@/lib/api";
 import { deploymentHost } from "@/lib/deploy-url";
@@ -53,7 +53,7 @@ export default function DomainsPage() {
           >
             <div>
               <div className="flex items-center gap-2 font-medium">{d.domain} {d.kind === "custom" ? <Badge tone="blue">custom</Badge> : <Badge>managed</Badge>}</div>
-              <div className="flex items-center gap-1 text-xs text-secondary"><RotateCw className="h-3 w-3" /> {d.project}{d.kind === "custom" && d.verify_status ? "" : " · auto-renews"}</div>
+              <div className="text-xs text-secondary">{d.project}</div>
             </div>
             <div className="flex items-center gap-3">
               {d.kind === "custom" && d.verify_status === "pending"

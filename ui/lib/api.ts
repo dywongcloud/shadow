@@ -1309,15 +1309,14 @@ export interface SslCert {
   expires_ms: number;
   provider: string;
 }
+/** A domain's DNS record. The node still serves emptied `registrar`/`renewal_price`/`auto_renew`/`expires_ms` keys
+ *  (older nodes parse state with them required) but it is not a registrar and measures none of them: never declared
+ *  here, so no component can show them as fact. */
 export interface DomainRecord {
   domain: string;
   tenant: string;
-  registrar: string;
-  renewal_price: string;
-  auto_renew: boolean;
   cdn_active: boolean;
   created_ms: number;
-  expires_ms: number;
   nameservers: string[];
   ssl: SslCert;
   records: DnsRecord[];
