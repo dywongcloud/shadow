@@ -28,11 +28,10 @@ export async function POST(req: NextRequest) {
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ ok: false, error: "GitHub not connected." }, { status: 400 });
 
-  // The repository link is an admin write (`PUT /v1/gitops`): refuse a role that misses it BEFORE creating a repository on the user's GitHub account that no link would point at. The role is read from the caller's own
-  // JWT only to decide that; the backend verifies it and answers the link below.
   const authToken = authTokenFrom(req);
   const claimed = claimedRole(authToken);
-  if (!claimed.operator && !can(claimed.role, "repo.link")) {
+  const roleMissesTheRepositoryLink = !claimed.operator && !can(claimed.role, "repo.link");
+  if (roleMissesTheRepositoryLink) {
     return NextResponse.json({ ok: false, error: roleRefusalFor("repo.link") }, { status: 403 });
   }
 

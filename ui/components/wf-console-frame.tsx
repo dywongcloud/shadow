@@ -5,11 +5,6 @@ import { usePathname, useSearchParams } from "next/navigation";
 import { useTheme } from "next-themes";
 import { currentTeam, ensureSessionMinted } from "@/lib/api";
 
-// Seamless same-origin iframe embed of the upstream @workflow/web console (served at /wfc): the
-// iframe isolates its Tailwind v4 from the dashboard's v3, its `name` carries
-// "wfc|<team>|<project>" to the patched rpc client, and the app-wide session keeper
-// (components/session-token.tsx) keeps hive_jwt fresh for it: this frame never mints on its own.
-
 const URL_SYNC_INTERVAL_MS = 300;
 
 const WF_THEME_KEY = "workflow-theme";
@@ -30,6 +25,9 @@ function syncConsoleTheme(frame: HTMLIFrameElement | null, resolved: string | un
   }
 }
 
+/** Seamless same-origin iframe embed of the upstream @workflow/web console (served at /wfc): the
+ *  iframe isolates its Tailwind v4 from the dashboard's v3 and its `name` carries
+ *  "wfc|<team>|<project>" to the patched rpc client. */
 export function WfConsoleFrame({
   project,
   initialPath = "",

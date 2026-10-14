@@ -18,9 +18,8 @@ import { RoleGate } from "@/components/role-gate";
 import { apiGet, apiSend, currentTeam } from "@/lib/api";
 import type { TeamAction } from "@/lib/team-role";
 
-// Enterprise settings: one consolidated surface for the enterprise suite. Every section is team-scoped, plan-gated server-side (the API answers 403 when the
-// team is not on the required plan) and role-gated by the team-role matrix (`needs`: a role below it gets the section read-only, an unknown role keeps the
-// controls and the server answers); the UI surfaces refusals inline.
+// Enterprise settings: one consolidated surface for the enterprise suite. Every section is team-scoped and plan-gated server-side (the API answers 403 when the
+// team is not on the required plan); the UI surfaces those errors inline instead of hiding the controls.
 
 function Section({
   icon,
