@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-13 — every project picker lists the projects whose builds all failed
+
+The Drive page, the Storage page (`useDatabases`, which feeds the SQLite create form and
+the SQLite detail page), the webhook project filter, the Domains wizard, the domain
+detail's Connect dialog and the TV recorder's destination derived their project list from
+`/deployments` alone, so a project whose first build failed (no deployment, name still
+reserved, listed by the dashboard and the command bar through `lib/projects.ts`) could not
+be chosen anywhere else (found by the ui comment sweep: Drive and Storage; the other four
+share the same `Array.from(new Set(deployments.map(d => d.project)))`). One hook now backs
+every picker, `useProjectNames` (`lib/projects.ts`), the alphabetical names of the same
+merged list `useProjects` gives the dashboard, and all six sites use it; the Domains page
+keeps its managed-domain rows on deployed projects only, since an undeployed project has no
+live domain. Witnessed in headless Chrome against the failed-first-build harness (`uiok`
+deployed, `uifail` with a missing root directory and `uifailcmd` with a failing build
+command, neither with a deployment): before, the Drive select, the Storage SQLite project
+select and the webhook project chips offered only `uiok`; after, all three offer `uifail`,
+`uifailcmd` and `uiok`, the Domains wizard select the same three while its managed rows
+still list only `uiok`, and Drive with `uifail` selected shows its empty folder without an
+error. Not rolled.
+
 ## 2026-10-13 — the dashboard's server-side backend calls can no longer forget the caller's session
 
 `backend()` (`lib/gitops-server.ts`) took its `authToken` as a trailing optional argument,

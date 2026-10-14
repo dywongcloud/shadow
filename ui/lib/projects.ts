@@ -91,6 +91,12 @@ export async function loadProjectNames(): Promise<string[]> {
   return mergeProjects(deployments, rows).map((p) => p.project);
 }
 
+/** Alphabetical project names for a picker, from the same merged list as every other project surface, so a project whose builds all failed is selectable. */
+export function useProjectNames(intervalMs = 15000): string[] {
+  const { projects } = useProjects(intervalMs);
+  return useMemo(() => projects.map((p) => p.project).sort(), [projects]);
+}
+
 /** The one project list for every surface: `/deployments` alone omits a project whose builds never produced a deployment (a failed first build), which then stayed invisible while its
  *  name stayed reserved, so this merges it with the backend's inventory view (every row the tenant owns), deployment first. The summary poll is independent of the deployment poll: an
  *  older backend answers 404 and the dashboard keeps working on deployments alone. */

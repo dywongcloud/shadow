@@ -22,7 +22,7 @@ import {
   type DvrRecording,
   type RecordHandle,
 } from "@/lib/dvr";
-import { usePoll, type Deployment } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 
 let HlsModule: typeof import("hls.js").default | null = null;
 let hlsLoad: Promise<void> | null = null;
@@ -193,14 +193,10 @@ function RegionTvViewer({ target, onClose }: { target: TvTarget; onClose: () => 
     setIdx(0);
   }, [target]);
 
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 15000);
-  const projects = useMemo(
-    () => Array.from(new Set((deps ?? []).map((d) => d.project))).sort(),
-    [deps],
-  );
+  const projects = useProjectNames();
   const [project, setProject] = useState<string>("");
   useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- picks a default project once the async deployments poll resolves; projects aren't known at mount so this can't be a lazy initializer
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- picks a default project once the async project list resolves; projects aren't known at mount so this can't be a lazy initializer
     if (!project && projects.length) setProject(projects[0]);
   }, [projects, project]);
   const [mins, setMins] = useState(30);

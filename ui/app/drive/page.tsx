@@ -1,18 +1,13 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { Card, PageHeader } from "@/components/ui";
-import { usePoll, type Deployment } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 import { ProjectDrive } from "./project-drive";
 
-/** Team-level Drive tab: a file browser against `/v1/drive/:project/*` (drive_api.rs). Drive is per PROJECT and the dashboard has no project-list endpoint, so the picker is
- *  derived from `/deployments` like Storage's `useDatabases`; a project with no deployment yet does not appear until it has one. */
+/** Team-level Drive tab: a file browser against `/v1/drive/:project/*` (drive_api.rs). Drive is per PROJECT, so the picker lists every project the tenant owns. */
 export default function DrivePage() {
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 15000);
-  const projects = useMemo(
-    () => Array.from(new Set((deps ?? []).map((d) => d.project))).sort(),
-    [deps]
-  );
+  const projects = useProjectNames();
   const [projectOverride, setProjectOverride] = useState("");
   const project = projectOverride || projects[0] || "";
 

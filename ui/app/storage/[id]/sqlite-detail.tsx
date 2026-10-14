@@ -12,6 +12,7 @@ import {
   type Deployment, type ProjectSettings, type BrowserDbPolicy,
   type BrowserDbStatusResponse, type BrowserDbRestMint,
 } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 import { RedeployModal } from "@/components/redeploy-modal";
@@ -49,10 +50,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
     return all.find((d) => d.project === project) ?? null;
   }, [loading, deployments, settingsPolicy, project]);
 
-  const projects = useMemo(
-    () => Array.from(new Set((deployments ?? []).map((d) => d.project))).sort(),
-    [deployments],
-  );
+  const projects = useProjectNames(15000);
 
   const [editing, setEditing] = useState(false);
   const [redeploying, setRedeploying] = useState(false);

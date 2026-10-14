@@ -8,7 +8,8 @@ import {
 } from "lucide-react";
 import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
 import { Switch } from "@/components/ui";
-import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type Deployment, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 import { toast } from "@/components/toast";
 import { timeAgo, copyText } from "@/lib/utils";
 
@@ -454,8 +455,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
 
 /** Attach this domain (or a subdomain of it) to a project. */
 function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; open: boolean; onClose: () => void; onChange: () => void }) {
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 8000);
-  const projects = Array.from(new Set((deps ?? []).map((d) => d.project)));
+  const projects = useProjectNames(8000);
   const [project, setProject] = useState("");
   const [sub, setSub] = useState("");
   const [err, setErr] = useState("");

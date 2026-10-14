@@ -6,6 +6,7 @@ import { Search, Filter, RotateCw, ChevronRight, Wand2 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { usePoll, type Deployment } from "@/lib/api";
 import { deploymentHost } from "@/lib/deploy-url";
+import { useProjectNames } from "@/lib/projects";
 import { DomainWizard } from "@/components/domain-wizard";
 
 interface DomainEntry { project: string; domain: string; verify_status?: string }
@@ -16,8 +17,9 @@ export default function DomainsPage() {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [q, setQ] = useState("");
 
-  const projects = Array.from(new Set((deps ?? []).map((d) => d.project)));
-  const managed = projects.map((p) => ({ domain: deploymentHost(`${p}.localhost`), project: p, kind: "managed" as const }));
+  const projects = useProjectNames(4000);
+  const deployedProjects = Array.from(new Set((deps ?? []).map((d) => d.project)));
+  const managed = deployedProjects.map((p) => ({ domain: deploymentHost(`${p}.localhost`), project: p, kind: "managed" as const }));
   const customList = (custom ?? []).map((c) => ({ ...c, kind: "custom" as const }));
   const all = [...customList, ...managed].filter((d) => d.domain.toLowerCase().includes(q.toLowerCase()));
 

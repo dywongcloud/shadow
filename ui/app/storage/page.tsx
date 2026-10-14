@@ -12,6 +12,7 @@ import {
   apiGet, apiSend, usePoll,
   type Database, type DbKind, type Deployment, type BrowserDbPolicy,
 } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 import Image from "next/image";
@@ -62,10 +63,7 @@ function useDatabases() {
   }, [managed]);
 
   const { data: deployments } = usePoll<Deployment[]>("/deployments", 15000);
-  const projects = useMemo(
-    () => Array.from(new Set((deployments ?? []).map((d) => d.project))).sort(),
-    [deployments],
-  );
+  const projects = useProjectNames(15000);
 
   const { data: browserDb, refresh: refreshBrowserDb } =
     usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy; rest?: { libsql_url: string; sql_url: string } }[] }>(

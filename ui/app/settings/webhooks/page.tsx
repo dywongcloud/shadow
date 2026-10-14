@@ -4,7 +4,8 @@ import { useState } from "react";
 import Link from "next/link";
 import { Webhook as WebhookIcon, Check, X, Trash2, ArrowLeft } from "lucide-react";
 import { Badge, Button, Card } from "@/components/ui";
-import { apiSend, usePoll, type Webhook, type Delivery, type Deployment } from "@/lib/api";
+import { apiSend, usePoll, type Webhook, type Delivery } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 import { timeAgo } from "@/lib/utils";
 
 const GROUPS: { title: string; events: { label: string; slug: string }[] }[] = [
@@ -58,8 +59,7 @@ const GROUPS: { title: string; events: { label: string; slug: string }[] }[] = [
 export default function WebhooksPage() {
   const { data: hooks, refresh } = usePoll<Webhook[]>("/v1/webhooks", 5000);
   const { data: deliveries } = usePoll<Delivery[]>("/v1/webhooks/deliveries", 5000);
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 8000);
-  const projectNames = Array.from(new Set((deps ?? []).map((d) => d.project))).sort();
+  const projectNames = useProjectNames(8000);
 
   const [scope, setScope] = useState<"all" | "specific">("all");
   const [projects, setProjects] = useState<string[]>([]);
