@@ -12,11 +12,24 @@
 //! Per-DB DNS points `<slug>` at the node actually running the container (see
 //! [`crate::vercel_dns`]), so the proxy always finds it locally.
 //!
+//! Every accepted connection is bounded the same way the mesh transport bounds an inbound accept
+//! (see AGENTS.md): the preamble read, the TLS handshake and the backend connect each run under
+//! [`accept_deadline`], so a client that stalls any one of them cannot pin the accepting task
+//! forever, and a global [`PendingGuard`] cap (`HIVE_DB_GATEWAY_PENDING_MAX`) bounds how many
+//! connections may sit in that not-yet-established window at once — the cap is released the moment
+//! the backend connects, so it never limits already-established sessions, only the attacker-cheap
+//! window before one exists. Once spliced, [`splice_with_idle_timeout`] closes a session that carries
+//! zero bytes in BOTH directions for [`idle_timeout`] (generous: a pooled connection legitimately
+//! parks for minutes), the one case bounding deadlines above it do not cover — a client that
+//! TLS-handshakes with a valid SNI and then never speaks the wire protocol at all.
+//!
 //! Enabled ONLY when `HIVE_DB_DOMAIN` is set (`cloud.db_domain` non-empty).
 
 use crate::state::CloudState;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -70,6 +83,71 @@ fn port_of(addr: &str, default: u16) -> u16 {
         .next()
         .and_then(|p| p.parse().ok())
         .unwrap_or(default)
+}
+
+/// Longest time to wait for the preamble read, the TLS handshake or the backend connect: a client
+/// that stalls any ONE of them must not pin the accepting task (and its fds) past this.
+/// `HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS` overrides.
+fn accept_deadline() -> Duration {
+    Duration::from_millis(
+        std::env::var("HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(15_000),
+    )
+}
+
+/// How long a spliced session may carry zero bytes in BOTH directions before it is closed.
+/// `HIVE_DB_GATEWAY_IDLE_MS` overrides; generous by default since a connection pool legitimately
+/// parks a connection for minutes between uses.
+fn idle_timeout() -> Duration {
+    Duration::from_millis(
+        std::env::var("HIVE_DB_GATEWAY_IDLE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10 * 60 * 1000),
+    )
+}
+
+/// Concurrent accepted connections (across both wires) still inside the preamble/handshake/connect
+/// window: `HIVE_DB_GATEWAY_PENDING_MAX` overrides. This bounds only the attacker-cheap,
+/// not-yet-proven-legitimate phase, never an established session (see [`PendingGuard::acquire`]).
+fn pending_max() -> usize {
+    std::env::var("HIVE_DB_GATEWAY_PENDING_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(512)
+}
+
+static PENDING: AtomicUsize = AtomicUsize::new(0);
+
+/// One reserved slot against the pending-connection cap; dropping it (on success past the backend
+/// connect, on an early `?`, or on a timeout) always releases the slot, so every exit path is
+/// covered the same way.
+struct PendingGuard;
+
+impl PendingGuard {
+    /// Reserves a slot, or `None` when [`pending_max`] is already reached.
+    fn acquire() -> Option<PendingGuard> {
+        loop {
+            let current = PENDING.load(Ordering::Relaxed);
+            if current >= pending_max() {
+                return None;
+            }
+            if PENDING
+                .compare_exchange(current, current + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(PendingGuard);
+            }
+        }
+    }
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        PENDING.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Spawn the DB-gateway listeners when the gateway is enabled. No-op otherwise.
@@ -130,10 +208,15 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
                     continue;
                 }
             };
+            let Some(pending) = PendingGuard::acquire() else {
+                // `stream` drops here, closing the just-accepted socket immediately.
+                tracing::warn!(%addr, wire = ?wire, max = pending_max(), "db-gateway: pending-connection cap reached, refusing accept");
+                continue;
+            };
             let cloud = cloud.clone();
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(cloud, stream, acceptor, wire).await {
+                if let Err(e) = handle(cloud, stream, acceptor, wire, pending).await {
                     tracing::warn!(%peer, wire = ?wire, error = %e, "db-gateway: connection failed");
                 }
             });
@@ -162,23 +245,37 @@ fn is_pg_ssl_request(pre: &[u8; 8]) -> bool {
 /// publishes on THIS node), so the client's post-handshake bytes (PG StartupMessage, RESP AUTH)
 /// reach the engine untouched. A database without a `local_port` is simulated (no container) or
 /// hosted on another node, which per-DB DNS should prevent.
+///
+/// `pending` is held until the backend connects (see the module doc), then dropped before the
+/// idle-bounded splice: an established session is never counted against the pending-connection cap.
 async fn handle(
     cloud: Arc<CloudState>,
     mut stream: TcpStream,
     acceptor: TlsAcceptor,
     wire: Wire,
+    pending: PendingGuard,
 ) -> anyhow::Result<()> {
+    let deadline = accept_deadline();
     if matches!(wire, Wire::Postgres) {
         let mut pre = [0u8; 8];
-        stream.read_exact(&mut pre).await?;
+        tokio::time::timeout(deadline, stream.read_exact(&mut pre))
+            .await
+            .map_err(|_| anyhow::anyhow!("postgres preamble read timed out"))?
+            .map_err(|e| anyhow::anyhow!("postgres preamble read failed: {e}"))?;
         if !is_pg_ssl_request(&pre) {
-            let _ = stream.write_all(b"N").await;
+            let _ = tokio::time::timeout(deadline, stream.write_all(b"N")).await;
             anyhow::bail!("postgres client did not request TLS (needs sslmode=require)");
         }
-        stream.write_all(b"S").await?;
+        tokio::time::timeout(deadline, stream.write_all(b"S"))
+            .await
+            .map_err(|_| anyhow::anyhow!("postgres TLS-ack write timed out"))?
+            .map_err(|e| anyhow::anyhow!("postgres TLS-ack write failed: {e}"))?;
     }
 
-    let tls = acceptor.accept(stream).await?;
+    let tls = tokio::time::timeout(deadline, acceptor.accept(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))?
+        .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
     let sni = tls
         .get_ref()
         .1
@@ -199,13 +296,70 @@ async fn handle(
             anyhow::anyhow!("db {} not locally hosted / not live (no local_port)", db.id)
         })?;
     let backend_addr = format!("127.0.0.1:{local_port}");
-    let mut backend = TcpStream::connect(&backend_addr)
+    let backend = tokio::time::timeout(deadline, TcpStream::connect(&backend_addr))
         .await
+        .map_err(|_| anyhow::anyhow!("backend {backend_addr} connect timed out"))?
         .map_err(|e| anyhow::anyhow!("backend {backend_addr} unreachable: {e}"))?;
 
-    let mut tls = tls;
-    tokio::io::copy_bidirectional(&mut tls, &mut backend).await?;
+    // Established: release the pending slot before the (potentially hours-long) splice.
+    drop(pending);
+    splice_with_idle_timeout(tls, backend, idle_timeout()).await?;
     Ok(())
+}
+
+/// Splices two full-duplex streams until EOF or an I/O error on either side, or until `idle` passes
+/// with zero bytes read in BOTH directions. A legitimate session is never bounded by total duration
+/// (pooled connections idle for minutes between uses) — only total silence on both legs, the state a
+/// client that TLS-handshaked with a valid SNI and then never spoke the wire protocol sits in
+/// forever without this.
+async fn splice_with_idle_timeout<A, B>(a: A, b: B, idle: Duration) -> std::io::Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let (mut a_read, mut a_write) = tokio::io::split(a);
+    let (mut b_read, mut b_write) = tokio::io::split(b);
+    let last_activity_ms = AtomicU64::new(hive_core::now_ms());
+
+    let a_to_b = async {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = a_read.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<(), std::io::Error>(());
+            }
+            last_activity_ms.store(hive_core::now_ms(), Ordering::Relaxed);
+            b_write.write_all(&buf[..n]).await?;
+        }
+    };
+    let b_to_a = async {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = b_read.read(&mut buf).await?;
+            if n == 0 {
+                return Ok::<(), std::io::Error>(());
+            }
+            last_activity_ms.store(hive_core::now_ms(), Ordering::Relaxed);
+            a_write.write_all(&buf[..n]).await?;
+        }
+    };
+    let idle_ms = idle.as_millis() as u64;
+    let watchdog = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let silent_ms =
+                hive_core::now_ms().saturating_sub(last_activity_ms.load(Ordering::Relaxed));
+            if silent_ms >= idle_ms {
+                return;
+            }
+        }
+    };
+
+    tokio::select! {
+        r = a_to_b => r,
+        r = b_to_a => r,
+        _ = watchdog => Ok(()),
+    }
 }
 
 #[cfg(test)]
