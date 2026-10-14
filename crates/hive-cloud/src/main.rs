@@ -1706,7 +1706,7 @@ async fn async_main() -> anyhow::Result<()> {
             .set(https_shutdown_handle.clone())
             .ok();
         tokio::spawn(async move {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            install_ring_crypto_provider();
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(acme::server_config());
             tracing::info!(%https_addr, "public HTTPS listener (SNI resolver, ACME-managed certs)");
             if let Err(e) = axum_server::bind_rustls(https_addr, cfg)
@@ -2130,17 +2130,16 @@ async fn admin_ingress(
     admin_forward_to_leader(&cloud, &api_host, req).await
 }
 
-/// The EXACT body a node returns when a forwarded mutation lands on it and it is
-/// not the control-plane leader. One constant, three users — the two refusal
-/// sites and `is_not_leader_refusal` — because a forwarder now has to RECOGNISE
-/// this answer to route around it, and a drift between emitter and matcher would
-/// silently reinstate the dead end this constant exists to close.
+/// The EXACT body a node returns when a forwarded mutation lands on it and it is not the
+/// control-plane leader. One constant, three users (the two refusal sites and
+/// `is_not_leader_refusal`): a forwarder has to RECOGNISE this answer to route around it, and a
+/// drift between emitter and matcher would silently reinstate the dead end this constant exists to
+/// close.
 const NOT_LEADER_BODY: &str = "not control-plane leader";
 
-/// The refusal itself. Load-bearing property: it is emitted BEFORE `next.run` /
-/// `serve_local`, so a caller that receives it knows the request was PROVABLY
-/// not applied — which is the only reason re-sending it to another candidate is
-/// safe (an ambiguous failure, e.g. a mid-flight transport error, is never
+/// The refusal itself. Load-bearing: it is emitted BEFORE `next.run` / `serve_local`, so a caller
+/// that receives it knows the request was PROVABLY not applied, the only reason re-sending it to
+/// another candidate is safe (an ambiguous failure, such as a mid-flight transport error, is never
 /// retried).
 fn not_leader_refusal() -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -2153,38 +2152,32 @@ fn is_not_leader_refusal(status: u16, body: &[u8]) -> bool {
         && std::str::from_utf8(body).is_ok_and(|s| s.trim() == NOT_LEADER_BODY)
 }
 
-/// The EXACT body the epoch fence in `admin_ingress`'s forwarded-marker branch
-/// returns when a forwarded mutation's sender epoch is behind the receiver's.
-/// One constant, two users — emitter and [`is_stale_epoch_refusal`] — the same
-/// emitter/matcher drift discipline as [`NOT_LEADER_BODY`].
+/// The EXACT body the epoch fence in `admin_ingress`'s forwarded-marker branch returns when a
+/// forwarded mutation's sender epoch is behind the receiver's; one constant for the emitter and
+/// [`is_stale_epoch_refusal`], the same drift discipline as [`NOT_LEADER_BODY`].
 const STALE_EPOCH_BODY: &str = "stale control-plane epoch (ownership changed); retry";
 
-/// True for exactly the response the `admin_ingress` epoch fence produces.
-/// Like [`not_leader_refusal`], that refusal is emitted BEFORE the receiver's
-/// router ever runs, so the mutation was provably not applied and re-sending
-/// it with a converged epoch is safe.
+/// True for exactly the response the `admin_ingress` epoch fence produces. Like
+/// [`not_leader_refusal`], it is emitted BEFORE the receiver's router runs, so the mutation was
+/// provably not applied and re-sending it with a converged epoch is safe.
 fn is_stale_epoch_refusal(status: u16, body: &[u8]) -> bool {
     status == axum::http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
         && std::str::from_utf8(body).is_ok_and(|s| s.trim() == STALE_EPOCH_BODY)
 }
 
-/// Bounded count of same-candidate re-stamps after a receiver discloses a
-/// newer epoch (a bump that landed mid-forward, or one gossip delivered during
-/// the round trip). A bump storm faster than the forward RTT, or a sender that
-/// can never converge, still ends in the refusal — the fence's protection is a
-/// bound, not a single shot.
+/// Bounded count of same-candidate re-stamps after a receiver discloses a newer epoch (a bump that
+/// landed mid-forward, or one gossip delivered during the round trip). A bump storm faster than the
+/// forward RTT, or a sender that can never converge, still ends in the refusal: the fence's
+/// protection is a bound, not a single shot.
 const MAX_STALE_EPOCH_RETRIES: u32 = 3;
 
-/// A no-redirect reqwest client that resolves `api_host` to a specific leader
-/// IP:443 — so the forward deterministically hits the leader with a valid SNI +
-/// cert (the wildcard/api bundle covers `api_host`). Cached per (ip, host).
-/// Returns `None` when `ip` doesn't parse to an address or the client can't be
-/// built, so the caller FAILS CLOSED rather than falling back to plain DNS (which
-/// would resolve `api_host` to an arbitrary node and mis-route the forward).
-///
-/// The connect timeout is separate from (and far tighter than) the overall
-/// request timeout: a candidate whose address black-holes must not burn the
-/// whole 30s budget before the next candidate is tried.
+/// A no-redirect reqwest client that resolves `api_host` to a specific leader IP:443, so the
+/// forward deterministically hits the leader with a valid SNI and cert (the wildcard/api bundle
+/// covers `api_host`); cached per (ip, host). `None` when `ip` does not parse or the client cannot
+/// be built, so the caller FAILS CLOSED instead of falling back to plain DNS (which would resolve
+/// `api_host` to an arbitrary node and mis-route the forward). The connect timeout is separate
+/// from, and far tighter than, the overall request timeout: a candidate whose address black-holes
+/// must not burn the whole 30 s budget before the next candidate is tried.
 pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
@@ -2206,29 +2199,17 @@ pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client>
     Some(client)
 }
 
-/// Ordered (node name, dialable IP) candidates for a leader forward.
-///
-/// WHY THIS IS A LIST AND NOT ONE ADDRESS. `control_plane_leader()` resolves the
-/// owner from the CALLING node's own registry view, and that view is
-/// per-observer (AGENTS.md, "a health verdict is per-OBSERVER"). Ownership now
-/// keys on gossip presence rather than the observer's health verdict, but a
-/// 30 s gossip gap still makes this node fall through `HIVE_CP_OWNER_CHAIN` to
-/// the next entry — which does NOT agree it is the owner and answers the
-/// forwarded write with `not control-plane leader`. That
-/// dead-ends a write the fleet was perfectly able to accept: measured live
-/// 2026-08-05, every follower logged 6–9 owner changes in 3h (cp epoch 86,591)
-/// while the leader itself logged ZERO, i.e. the transitions were the observers'
-/// blips, not real failovers — surfacing to browser-node donors as a raw
-/// "not control-plane leader" on `POST /v1/browser/admissions`.
-///
-/// Order: this node's believed leader first (unchanged behaviour and, in the
-/// common case, correct), then the remaining curated chain entries in chain
-/// order — the operator-controlled candidate set that is the ONLY place
-/// ownership can legitimately sit. Addresses come from the LOCAL registry, so a
-/// candidate is still only ever a node this fleet already knows; deliberately
-/// NOT health-filtered, because the stale health verdict is precisely the input
-/// that just misled us. Self is skipped (we already know we are not the leader,
-/// so a round trip to our own public address can only refuse again).
+/// Ordered (node name, dialable IP) candidates for a leader forward. A list, not one address:
+/// `control_plane_leader()` resolves the owner from the CALLING node's own per-observer registry
+/// view, and a 30 s gossip gap still makes this node fall through `HIVE_CP_OWNER_CHAIN` to the next
+/// entry, which does NOT agree it is the owner and answers the forwarded write with
+/// `not control-plane leader`, dead-ending a write the fleet could have accepted (measured: every
+/// follower logged 6-9 owner changes in 3 h while the leader logged ZERO, surfacing to browser-node
+/// donors as a raw `not control-plane leader`). Order: this node's believed leader first, then the
+/// remaining curated chain entries in chain order (the operator-controlled set where ownership can
+/// legitimately sit). Addresses come from the LOCAL registry and are deliberately NOT
+/// health-filtered (the stale health verdict is the input that just misled us); self is skipped,
+/// since a round trip to our own public address can only refuse again.
 pub(crate) fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
     let nodes = cloud.registry.nodes();
     let addr_of = |name: &str| -> Option<String> {
@@ -2261,23 +2242,22 @@ pub(crate) fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String,
     out
 }
 
-/// Forward an admin MUTATION to the control-plane leader over HTTPS (pinned to a
-/// registry IP, SNI/Host = api host). Adds the loop-guard header + the epoch
-/// fencing token; preserves method, path+query, headers (incl.
-/// Authorization/Cookie) and body verbatim, so the receiving leader re-runs the
-/// FULL auth path and re-derives the tenant from the caller's own token — this
-/// hop grants nothing and asserts no identity of its own.
-///
-/// Walks [`leader_forward_candidates`] and moves to the next one on exactly
-/// three provably-not-applied outcomes: the `not control-plane leader` refusal
-/// (issued before the receiver's router ever runs), the stale-epoch fence
-/// refusal (also issued before the router ever runs — retried in place after
-/// adopting the receiver's disclosed epoch, bounded by
-/// [`MAX_STALE_EPOCH_RETRIES`], then walked like any other refusal), and a
-/// CONNECT failure (nothing was sent). Any other answer — including a
-/// mid-flight transport error, whose effect is unknowable — is returned as-is,
-/// because re-sending a mutation that may already have been applied is worse
-/// than surfacing the failure.
+/// Forwards an admin MUTATION to the control-plane leader over HTTPS (pinned to a registry IP,
+/// SNI/Host = api host), adding the loop-guard header and the epoch fencing token (the receiver
+/// refuses the write if that epoch is BEHIND its own, because the sender's view of ownership is
+/// stale) and preserving method, path+query, headers (Authorization and Cookie included) and body
+/// verbatim, so the leader re-runs the FULL auth path and re-derives the tenant from the caller's
+/// own token: this hop grants nothing and asserts no identity. It walks
+/// [`leader_forward_candidates`] and moves to the next on exactly three provably-not-applied
+/// outcomes: the `not control-plane leader` refusal, the stale-epoch refusal (retried in place
+/// after adopting the epoch the receiver discloses, so a mid-flight bump converges
+/// deterministically instead of racing gossip, bounded by [`MAX_STALE_EPOCH_RETRIES`], then walked
+/// like any other refusal, since epoch views are per-observer like health) and a CONNECT failure
+/// (nothing was sent). A refusal is kept as the answer of last resort. Any other answer, a
+/// mid-flight transport error included, is returned as-is, because re-sending a mutation that may
+/// already have been applied is worse than surfacing the failure. With every candidate refused or
+/// none dialable it fails CLOSED: it never applies the mutation locally, the split-brain the
+/// single-writer rule exists to prevent.
 async fn admin_forward_to_leader(
     cloud: &Arc<CloudState>,
     api_host: &str,
@@ -2310,13 +2290,9 @@ async fn admin_forward_to_leader(
     let mut stale_retries = 0u32;
     'candidates: for (i, (name, ip)) in candidates.iter().enumerate() {
         let Some(client) = leader_client(ip, api_host) else {
-            continue; // unparsable registry address: nothing was sent, try the next
+            continue;
         };
         loop {
-            // The forwarder's control-plane epoch rides along as the fencing
-            // token — the receiver refuses the write if this is behind ITS
-            // epoch (the sender's view of ownership is stale). See
-            // admin_ingress's forwarded branch.
             let mut rb = client
                 .request(method.clone(), &url)
                 .header("x-hive-admin-forwarded", "1")
@@ -2334,9 +2310,6 @@ async fn admin_forward_to_leader(
             match rb.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    // The fence discloses the epoch it fenced against, so a
-                    // mid-flight bump is converged deterministically instead of
-                    // racing gossip for it.
                     let disclosed_epoch = resp
                         .headers()
                         .get("x-hive-cp-epoch-current")
@@ -2361,9 +2334,6 @@ async fn admin_forward_to_leader(
                             remaining = last.saturating_sub(i),
                             "leader forward refused: candidate is not the control-plane leader"
                         );
-                        // Keep the refusal as the answer of last resort, then
-                        // try the next candidate — this node's own view is the
-                        // thing in doubt.
                         refused = Some(
                             (axum::http::StatusCode::SERVICE_UNAVAILABLE, NOT_LEADER_BODY)
                                 .into_response(),
@@ -2371,12 +2341,6 @@ async fn admin_forward_to_leader(
                         continue 'candidates;
                     }
                     if is_stale_epoch_refusal(status, &bytes) {
-                        // Provably not applied (the fence fires before the
-                        // receiver's router), so re-sending is safe — same
-                        // argument as the not-leader refusal. The disclosed
-                        // epoch is authoritative: max-merge it and re-stamp,
-                        // turning a mid-flight bump race into one retried round
-                        // trip instead of a user-visible 503.
                         if let Some(e) = disclosed_epoch {
                             cloud.cluster.adopt_epoch(e);
                         }
@@ -2393,11 +2357,6 @@ async fn admin_forward_to_leader(
                             );
                             continue;
                         }
-                        // Nothing newer to converge to (pre-upgrade receiver and
-                        // gossip has not caught up), or the bound is spent.
-                        // Another candidate may still be at our epoch — epoch
-                        // views are per-observer, like health — so walk on; the
-                        // refusal stays the answer of last resort.
                         refused = Some(
                             (
                                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -2413,7 +2372,7 @@ async fn admin_forward_to_leader(
                 }
                 Err(e) if e.is_connect() => {
                     tracing::warn!(candidate = %name, error = %e, "leader forward could not connect");
-                    continue 'candidates; // connection never established: provably not applied
+                    continue 'candidates;
                 }
                 Err(_) => {
                     return (
@@ -2425,9 +2384,6 @@ async fn admin_forward_to_leader(
             }
         }
     }
-    // Every candidate refused (or none was dialable at all). Fail CLOSED: never
-    // apply the mutation locally, which is exactly the split-brain the
-    // single-writer rule exists to prevent.
     refused.unwrap_or_else(|| {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -2437,22 +2393,20 @@ async fn admin_forward_to_leader(
     })
 }
 
-/// Minimal streaming reverse proxy for the dashboard hosts. Forwards method,
-/// path+query, headers (sans hop-by-hop + Host — the upstream needs ITS OWN
-/// Host to route, e.g. an ngrok origin) and body; streams the response back.
-///
-/// REDIRECTS ARE NEVER FOLLOWED server-side (a dedicated no-redirect client):
-/// auth flows (Clerk dev-browser handshake) must bounce the BROWSER, not the
-/// proxy. 3xx Location values (and their percent-encoded forms inside query
-/// strings) that reference the upstream origin are rewritten to the public
-/// host, so the user stays on shadw.cloud through the whole auth loop.
+/// Minimal streaming reverse proxy for the dashboard hosts: forwards method, path+query, headers
+/// (sans hop-by-hop and Host, since the upstream needs ITS OWN Host to route, e.g. an ngrok origin)
+/// and body, and streams the response back. REDIRECTS ARE NEVER FOLLOWED server-side (a dedicated
+/// no-redirect client): auth flows such as the Clerk dev-browser handshake must bounce the BROWSER.
+/// 3xx Location values (raw and percent-encoded inside query params like Clerk's redirect_url) that
+/// reference the upstream origin are rewritten to the public host, so the user stays on shadw.cloud
+/// through the auth loop.
 async fn dashboard_proxy(
     http: &reqwest::Client,
     upstream: &str,
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let _ = http; // proxying uses a dedicated NO-REDIRECT client (below)
+    let _ = http;
     static NOFOLLOW: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     let http = NOFOLLOW.get_or_init(|| {
         reqwest::Client::builder()
@@ -2513,15 +2467,9 @@ async fn dashboard_proxy(
         }
         rb = rb.header(k, v);
     }
-    // Tell the app what the PUBLIC origin is (Next/Clerk build absolute URLs).
-    // Host itself is left to default to the upstream's own authority (NOT
-    // overridden to public_host): an ngrok tunnel origin routes ON its Host
-    // header — forcing it to the platform's public domain here broke ngrok
-    // routing outright (live-reproduced: every dashboard-host request 421'd,
-    // "Misdirected Request", the moment this override shipped). A same-origin
-    // loopback upstream doesn't need Host forwarding at all (there's only one
-    // app listening there); x-forwarded-host/proto remain the mechanism the
-    // app itself is expected to read for its own absolute-URL construction.
+    // x-forwarded-host/proto tell the app the PUBLIC origin; Host is left to the upstream's own
+    // authority: an ngrok origin routes ON its Host header, and forcing the public domain 421'd
+    // every dashboard-host request.
     rb = rb
         .header("x-forwarded-host", &public_host)
         .header("x-forwarded-proto", "https");
@@ -2532,33 +2480,19 @@ async fn dashboard_proxy(
             let mut builder = axum::http::Response::builder().status(status);
             for (k, v) in resp.headers().iter() {
                 let name = k.as_str().to_ascii_lowercase();
-                // `content-encoding` is deliberately NOT stripped, and
-                // `accept-encoding` is deliberately forwarded upstream (see the
-                // request loop above). The two are ONE change: the upstream
-                // Next server (`compress: true`) only compresses when it sees
-                // the client's Accept-Encoding, and its compressed bytes are
-                // only decodable by the browser if the Content-Encoding label
-                // survives this hop. Stripping the request header made the
-                // dashboard serve every HTML/JS/CSS byte uncompressed while
-                // still emitting `Vary: Accept-Encoding` — the exact live
-                // signature measured on shadw.cloud. Stripping only ONE of the
-                // two would be worse than the bug: forwarding the header while
-                // deleting the label hands the browser brotli bytes labelled
-                // as plaintext. This is safe to pass through because the
-                // workspace `reqwest` is built WITHOUT the gzip/brotli
-                // features, so it never transparently decompresses the body
-                // behind our back; the body is streamed verbatim below, and
-                // `content-length`/`transfer-encoding` are still dropped so the
-                // re-framing stays consistent.
+                // content-encoding is NOT stripped and accept-encoding IS forwarded upstream: they
+                // are one change. Stripping the request header served every dashboard byte
+                // uncompressed while still emitting Vary: Accept-Encoding, and stripping only the
+                // label would hand the browser brotli bytes labelled plaintext. Safe because the
+                // workspace reqwest is built WITHOUT gzip/brotli, so it never decompresses behind
+                // our back; the body streams verbatim and content-length/transfer-encoding are
+                // still dropped.
                 if matches!(
                     name.as_str(),
                     "connection" | "transfer-encoding" | "content-length"
                 ) {
                     continue;
                 }
-                // Keep the user on the PUBLIC host across auth bounces: rewrite
-                // upstream-origin references in Location (raw + percent-encoded
-                // inside query params like Clerk's redirect_url).
                 if name == "location" {
                     if let Ok(loc) = v.to_str() {
                         let enc_up = upstream_host.replace(':', "%3A").replace('/', "%2F");
@@ -2590,10 +2524,9 @@ async fn dashboard_proxy(
     }
 }
 
-/// Derive a stable, human-readable region id from a node's geolocation, so a
-/// node's region reflects where it actually is (e.g. "los-angeles") rather than a
-/// hard-coded label. Co-located nodes resolve to the same id (one region, many
-/// nodes). Falls back to "local" when geolocation is unavailable (offline).
+/// Derives a stable, human-readable region id from a node's geolocation (e.g. "los-angeles"), so a
+/// node's region reflects where it actually is; co-located nodes share the id, and it falls back to
+/// "local" when geolocation is unavailable (offline).
 fn region_id_from_geo(geo: Option<&(f64, f64, String, String, Option<String>)>) -> String {
     let slug = |s: &str| {
         s.trim()
@@ -2613,13 +2546,12 @@ fn region_id_from_geo(geo: Option<&(f64, f64, String, String, Option<String>)>) 
     "local".to_string()
 }
 
-/// Terminate HTTPS for the gateway. Loads a real cert/key (PEM) from
-/// HIVE_TLS_CERT + HIVE_TLS_KEY when both are set (production), otherwise
-/// generates a self-signed cert for `localhost`/`*.localhost` (local dev).
+/// Terminates HTTPS for the gateway: a real cert/key (PEM) from `HIVE_TLS_CERT` + `HIVE_TLS_KEY`
+/// when both are set (production), else a self-signed cert for `localhost`/`*.localhost` (local
+/// dev).
 async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
     use axum_server::tls_rustls::RustlsConfig;
-    // Install the ring crypto provider for rustls (idempotent).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_ring_crypto_provider();
 
     let config = match (
         std::env::var("HIVE_TLS_CERT"),
@@ -2672,24 +2604,15 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
     }
 }
 
-/// Resolve this node's Tencent VPC-private address for CCN inter-region
-/// traffic, from `HIVE_PRIVATE_ADDR` ONLY — deliberately never sniffed off an
-/// interface (spec: "do not hardcode `eth0`", and this fleet already learned
-/// the hard way, via `dht`'s seed-address OOM incident, that an RFC1918
-/// address existing on a host says nothing about whether it is dialable by
-/// anyone else — a Docker/k8s/bridge/TUN interface can produce a private
-/// address that is NOT the Tencent VPC NIC). An explicit operator value is
-/// the only source of truth this repo already has for "this address is the
-/// one meant for CCN", the same posture `HIVE_PUBLIC_IP` takes for the public
-/// side.
-///
-/// Accepts either a bare IPv4 (`10.20.0.15`, paired with `HIVE_IROH_PORT` —
-/// falling back to iroh's default ephemeral-port convention is NOT safe here
-/// since the private candidate must name a real port a peer can dial, so a
-/// missing `HIVE_IROH_PORT` makes a bare-IP override inert rather than
-/// guessing) or a full `ip:port` pair. Unset ⇒ `None` — the safe default:
-/// this node never becomes a CCN-private dial target, byte-identical to
-/// pre-feature behavior.
+/// Resolves this node's Tencent VPC-private address for CCN inter-region traffic from
+/// `HIVE_PRIVATE_ADDR` ONLY, never sniffed off an interface: an RFC1918 address existing on a host
+/// says nothing about whether anyone else can dial it (a Docker/k8s/bridge/TUN interface produces
+/// private addresses that are NOT the Tencent VPC NIC; the fleet learned this from `dht`'s
+/// seed-address OOM incident), so an explicit operator value is the only source of truth, the same
+/// posture `HIVE_PUBLIC_IP` takes. Accepts a bare IPv4 (paired with `HIVE_IROH_PORT`: the private
+/// candidate must name a real port a peer can dial, so a missing `HIVE_IROH_PORT` makes a bare-IP
+/// override inert rather than guessing) or a full `ip:port`. Unset gives `None`, the safe default:
+/// this node never becomes a CCN-private dial target.
 fn resolve_private_addr() -> Option<String> {
     let raw = std::env::var("HIVE_PRIVATE_ADDR").ok()?;
     let raw = raw.trim();
@@ -2710,27 +2633,17 @@ fn resolve_private_addr() -> Option<String> {
     Some(std::net::SocketAddr::new(ip, port).to_string())
 }
 
-/// Periodic re-geolocation so a machine that MOVES (a laptop node, or a cloud
-/// host whose ISP re-homes its IP) doesn't report a stale location until the
-/// next restart — the exact drift observed live on the LA-boot/San-Jose-now
-/// laptop nodes. `HIVE_GEO` still wins unconditionally on every call
-/// (`geolocate()`'s own first check), so a manually-pinned node is unaffected;
-/// this only helps the auto-detected case. Deliberately does NOT update
-/// `region` — see `NodeRegistry::set_self_geo`'s doc for why re-deriving a
-/// node's stable identity from a drifted geolocation would be the disruptive
-/// half of a "fix", not this row's ask. Only writes when the position moved
-/// MATERIALLY (`HIVE_GEO_REFRESH_MIN_KM`, default 50km — a routine BGP reroute
-/// within the same city must not spuriously churn the registry every tick).
-/// Keep this node's gossiped free-disk figure current.
-///
-/// Placement reads `NodeInfo::disk_free_gb` to refuse a node with no headroom.
-/// A boot-time-only value would be worse than useless there: it goes stale in
-/// exactly the direction that matters (a node fills up, keeps advertising the
-/// space it had at boot, and keeps winning deployments it cannot host). That is
-/// the shape that took fc-sanjose to 0 bytes free and 9 dead deployments on
-/// 2026-07-31.
-///
-/// Cheap by construction: one `statvfs`-class read per tick, no CPU sampling.
+/// Keeps this node's gossiped capacity figures current: a boot-time-only `disk_free_gb` goes stale
+/// in exactly the direction that matters (a node fills up, keeps advertising the space it had at
+/// boot and keeps winning deployments it cannot host), so each tick re-reads free disk (one
+/// `statvfs`-class read, no CPU sampling) and free GPU memory, and re-observes the
+/// runtime-capability tuple (wasm and bun runtime, runtime-artifact protocol, build toolchains:
+/// rootfs/proof publication and runtime installation can move under a running process) from one
+/// selected-backend source, publishing it under ONE registry write lock so gossip never sees a torn
+/// verdict. The musqld binary can likewise be installed or swapped under a running process, so it
+/// is probed only on nodes that opted into that engine (the fleet does not spawn a process every
+/// tick for a capability nobody uses), and the restart audit is re-published too because its 24 h
+/// window SLIDES (a node would keep advertising an OOM it had 25 h ago, or none while cycling).
 /// `HIVE_DISK_REFRESH_SECS` (default 30) tunes it; 0 disables.
 fn spawn_disk_refresh(
     registry: Arc<hive_edge::NodeRegistry>,
@@ -2749,10 +2662,6 @@ fn spawn_disk_refresh(
                 crate::supervise::beat("disk-refresh");
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
                 registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
-                // Rootfs/proof publication and runtime installation can move
-                // underneath this process. Re-observe all three fields from one
-                // selected-backend source, then publish the tuple under one
-                // registry write lock so gossip can never see a torn verdict.
                 let runtime_capabilities = runtime_capability_source.detect().await;
                 registry.set_self_runtime_capabilities(
                     runtime_capabilities.wasm_runtime,
@@ -2760,18 +2669,9 @@ fn spawn_disk_refresh(
                     runtime_capabilities.runtime_artifact_protocol,
                     runtime_capabilities.build_toolchains.clone(),
                 );
-                // Same reasoning as the tuple above: the musqld binary can be
-                // installed or swapped under a running process. Probed only on
-                // nodes that opted in, so the fleet does not spawn a process
-                // every tick for a capability nobody uses.
                 if crate::musql::default_engine() == crate::musql::Engine::Musql {
                     registry.set_self_musql_engine(crate::musql::probe());
                 }
-                // Same tick, same reason as the disk figure: the restart
-                // audit's 24h window SLIDES, so a boot-time-only value goes
-                // stale in the direction that matters (a node keeps
-                // advertising an OOM it had 25h ago, or — worse — advertises
-                // none while cycling).
                 registry.set_self_restart_audit(
                     crate::restart_audit::started_ms(),
                     crate::restart_audit::oom_restarts_24h(),
@@ -2783,13 +2683,19 @@ fn spawn_disk_refresh(
     });
 }
 
+/// Re-geolocates every `HIVE_GEO_REFRESH_SECS` (default 3600, 0 disables) so a machine that MOVES
+/// (a laptop node, or a cloud host whose ISP re-homes its IP) does not report a stale location
+/// until the next restart. `HIVE_GEO` still wins unconditionally on every call (`geolocate()`'s
+/// first check), so a manually pinned node is unaffected; this only helps the auto-detected case,
+/// and it runs even with `--region` pinned because lat/lon still matter for DNS-nearest accuracy.
+/// It never updates `region`, the node's stable identity (see `NodeRegistry::set_self_geo`), and
+/// writes only when the position moved by at least `HIVE_GEO_REFRESH_MIN_KM` (default 50 km), so a
+/// routine BGP reroute within the same city does not churn the registry every tick; a node with no
+/// prior geo (boot geolocation failed, e.g. offline) accepts any successful lookup.
 fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
-    // `--region` pinned explicitly (not "auto") means the operator already
-    // decided the identity; still worth refreshing lat/lon for DNS-nearest
-    // accuracy, so this loop runs unconditionally rather than gating on that.
     let interval = Duration::from_secs(env_u64("HIVE_GEO_REFRESH_SECS", 3600));
     if interval.is_zero() {
-        return; // HIVE_GEO_REFRESH_SECS=0 opts out entirely
+        return;
     }
     let min_km = std::env::var("HIVE_GEO_REFRESH_MIN_KM")
         .ok()
@@ -2813,8 +2719,6 @@ fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
                     (Some(plat), Some(plon)) => {
                         hive_edge::haversine_km((plat, plon), (lat, lon)) >= min_km
                     }
-                    // No prior geo at all (boot geolocation failed, e.g. offline
-                    // at start) — any successful lookup now is real information.
                     _ => true,
                 };
                 if moved {
@@ -2826,11 +2730,10 @@ fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
     });
 }
 
-/// Best-effort IP geolocation at startup → (lat, lon, city, country, public_ip). Uses
-/// the free ip-api.com endpoint with a short timeout; returns None on any failure so
-/// a node always boots even offline. Override with HIVE_GEO="lat,lon,city,country".
-/// The 5th tuple element is the detected external IP (ip-api `query`), used only when
-/// `HIVE_PUBLIC_IP=auto` (see `resolve_public_ip`).
+/// Best-effort IP geolocation at startup, `(lat, lon, city, country, public_ip)`, through
+/// ip-api.com with a short timeout; `None` on any failure, so a node always boots even offline.
+/// `HIVE_GEO="lat,lon,city,country"` overrides it. The 5th element is the detected external IP,
+/// used only when `HIVE_PUBLIC_IP=auto` (see `resolve_public_ip`).
 async fn geolocate() -> Option<(f64, f64, String, String, Option<String>)> {
     if let Ok(manual) = std::env::var("HIVE_GEO") {
         let parts: Vec<&str> = manual.splitn(4, ',').collect();
@@ -2871,9 +2774,8 @@ async fn geolocate() -> Option<(f64, f64, String, String, Option<String>)> {
 async fn serve(router: axum::Router, addr: SocketAddr, label: &str) -> anyhow::Result<()> {
     let mut listeners = vec![tokio::net::TcpListener::bind(addr).await?];
     tracing::info!(%addr, "{label} listening");
-    // For loopback, ALSO bind the other IP family on the same port. Browsers
-    // resolve `*.localhost` to ::1 (IPv6) first, so a v4-only bind makes deploys
-    // unreachable in the browser even though 127.0.0.1 works for curl/CLI.
+    // For loopback, ALSO bind the other IP family: browsers resolve *.localhost to ::1 first, so a
+    // v4-only bind makes deploys unreachable in the browser while curl on 127.0.0.1 works.
     if addr.ip().is_loopback() {
         let alt: SocketAddr = match addr.ip() {
             std::net::IpAddr::V4(_) => (std::net::Ipv6Addr::LOCALHOST, addr.port()).into(),
@@ -2936,20 +2838,10 @@ pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
     })
 }
 
-/// Container placement: every few seconds, for each container deployment this node
-/// holds, compute the preferred owner (rendezvous hash over LIVE holders) and
-/// Enforce the sandbox idle timeout: every `HIVE_SANDBOX_REAP_SECS` (default
-/// 30) stop each `Running` sandbox whose `timeout_expires_at` has passed.
-///
-/// Without this loop `timeout_ms` was decorative — `reap_expired` had no call
-/// site, so a sandbox created with a 10-minute timeout ran forever. The store
-/// is owner-scoped, so a node holding only an adopted metadata copy (the
-/// leader) never tears down a cell it does not own; the owner that provisioned
-/// the cell is the only node that stops it.
-///
-/// Cheap by construction: one read-lock scan over a per-project record list,
-/// and it touches the disk (persist) only on a tick that actually stopped
-/// something. 0 disables.
+/// Runs the sandbox idle-timeout reap every `HIVE_SANDBOX_REAP_SECS` (default 30, 0 disables) and
+/// persists only on a tick that actually stopped something; without this loop a sandbox's
+/// `timeout_ms` would be decorative. `reap_expired` carries the contract: only the OWNER reaps, and
+/// a sandbox with a command in flight or an open shell is busy, not idle.
 fn spawn_sandbox_timeout_reap_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_SANDBOX_REAP_SECS", 30));
     if interval.is_zero() {
@@ -2969,53 +2861,52 @@ fn spawn_sandbox_timeout_reap_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// either acquire/renew our fenced lease (if we're preferred) or release it (so the
-/// preferred node can take over). A short liveness window gives fast failover.
+/// A peer is a live container-lease holder when seen within this window; short on purpose, for fast
+/// failover.
+const LEASE_LIVE_WINDOW_MS: u64 = 12_000;
+
+/// Container placement, every 3 s: for each container deployment this node holds, it computes the
+/// preferred owner by rendezvous hash (`lease::hrw_owner`) over the LIVE holders (self plus the
+/// peers that gossiped they hold it, seen within [`LEASE_LIVE_WINDOW_MS`]) and either
+/// acquires/renews our fenced lease (when we are preferred) or releases it (so the preferred node
+/// can take over). Every node sees the same gossiped holders and regions, so all of them compute
+/// the same owner. A region-pinned container (`regions: ["virginia"]`) is elected only among
+/// holders in an allowed region, so a holder outside it cannot win the hash and serve from the
+/// wrong region; with NO holder in an allowed region the unconstrained set is used (availability
+/// beats strict pinning when mis-placed). Each pass also drains superseded deployments' keep-warm
+/// pools, so only a project's production deployment stays warm and the rest scale to zero.
 fn spawn_lease_loop(cloud: Arc<CloudState>) {
     use std::collections::{HashMap, HashSet};
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            // Drain superseded deployments' keep-warm pools — only the production
-            // deployment of each project stays warm (the rest scale to zero).
             cloud.gw.reconcile_keepwarm();
             let self_id = cloud.node_name.clone();
             let region = cloud.region.clone();
             let now = now_ms();
-            // Live nodes = self + peers seen within 12s (fast failover detection).
             let nodes_now = cloud.registry.nodes();
             let live: HashSet<String> = nodes_now
                 .iter()
-                .filter(|n| n.is_self || now.saturating_sub(n.last_seen_ms) < 12_000)
+                .filter(|n| n.is_self || now.saturating_sub(n.last_seen_ms) < LEASE_LIVE_WINDOW_MS)
                 .map(|n| n.id.clone())
                 .collect();
-            // node -> region, so the election can be region-constrained. Every node
-            // sees the same gossiped regions → all compute the same owner.
             let node_region: HashMap<String, String> = nodes_now
                 .iter()
                 .map(|n| (n.id.clone(), n.region.clone()))
                 .collect();
             let holders = cloud.container_holders.read().clone();
             for key in cloud.gw.container_projects() {
-                // The live nodes that can actually run this container (self + peers
-                // that gossiped they hold it).
-                let mut h: Vec<String> = holders.get(&key).cloned().unwrap_or_default();
-                if !h.contains(&self_id) {
-                    h.push(self_id.clone());
+                let mut live_holders: Vec<String> = holders.get(&key).cloned().unwrap_or_default();
+                if !live_holders.contains(&self_id) {
+                    live_holders.push(self_id.clone());
                 }
-                h.retain(|n| live.contains(n));
-                if h.is_empty() {
-                    h.push(self_id.clone());
+                live_holders.retain(|n| live.contains(n));
+                if live_holders.is_empty() {
+                    live_holders.push(self_id.clone());
                 }
-                // Region-constrain the election for region-pinned containers: a
-                // `regions:["virginia"]` container must only ever be owned by a
-                // holder IN an allowed region — otherwise a non-region holder could
-                // win the rendezvous hash and serve from the wrong region. Fall back
-                // to the unconstrained set only if NO holder is in an allowed region
-                // (availability beats strict pinning when mis-placed).
                 let regions = cloud.projects.get(&key).functions.regions;
                 if !regions.is_empty() {
-                    let allowed: Vec<String> = h
+                    let allowed: Vec<String> = live_holders
                         .iter()
                         .filter(|n| {
                             node_region
@@ -3026,10 +2917,10 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
                         .cloned()
                         .collect();
                     if !allowed.is_empty() {
-                        h = allowed;
+                        live_holders = allowed;
                     }
                 }
-                match crate::lease::hrw_owner(&key, &h) {
+                match crate::lease::hrw_owner(&key, &live_holders) {
                     Some(pref) if pref == self_id => {
                         if let Some(l) = cloud
                             .leases
@@ -3050,9 +2941,8 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
 /// SIGKILL of duplicate writers of a shared volume) before serving anyway.
 const CELL_REAP_BOOT_WAIT: Duration = Duration::from_secs(20);
 
-/// The boot reap's one journal line (`cell orphan reap: reaped=N
-/// per_volume={..}`), WARN whenever anything was removed, skipped, left
-/// behind or left uncovered.
+/// The boot reap's one journal line (`cell orphan reap: reaped=N per_volume={..}`): WARN whenever
+/// anything was removed, skipped, left behind or left uncovered.
 fn log_cell_reap(report: &hive_backend::ReapReport, elapsed: Duration) {
     if let Some(reason) = &report.skipped {
         tracing::warn!(
@@ -3092,43 +2982,34 @@ fn log_cell_reap(report: &hive_backend::ReapReport, elapsed: Duration) {
     );
 }
 
+/// Every 3 s re-resolves the control-plane owner from the live registry (`Cluster::observe_owner`
+/// inside bumps the fencing epoch exactly on a real ownership change) and gossips our current
+/// epoch, so the fleet's fencing tokens converge on the max witnessed; it also samples every
+/// leader-only job's ownership continuity (`leadership::observe`), so the `may_act` tenure is
+/// measured at this cadence and not only when a slow job happens to ask.
 fn spawn_cluster_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            // Re-resolve the control-plane owner from the live registry
-            // (observe_owner inside bumps the fencing epoch exactly on real
-            // ownership transitions) and gossip our current epoch so the
-            // fleet's fencing tokens converge on the max witnessed.
             let _ = cloud.control_plane_leader();
             cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
-            // Sample every leader-only job's ownership continuity so the
-            // `may_act` tenure is measured at this cadence, not only when a
-            // slow job happens to ask.
             leadership::observe(&cloud);
         }
     });
 }
 
-/// Periodic GuardianDB snapshot re-assert. `persist()` -> `guardian::replicate`
-/// only fires on a STATE MUTATION, so a node quiet since its last restart never
-/// writes its own `node/<name>/snapshot` key into the replicated doc — leaving
-/// the fleet's snapshot set permanently short of "every peer contributes one"
-/// (the observed gap: nodes with no tenant activity since restart had no
-/// snapshot anywhere in the shared KV). This loop captures + replicates on a
-/// fixed cadence so every node's snapshot is always PRESENT and FRESH,
-/// independent of mutation timing. Cheap at the blob layer when unchanged:
-/// iroh-docs content-addresses by BLAKE3, so re-putting identical bytes yields
-/// the same hash and stores no new blob — only a changed snapshot creates one.
+/// Periodic GuardianDB snapshot re-assert. `persist()` -> `guardian::replicate` only fires on a
+/// STATE MUTATION, so a node quiet since its last restart never writes its own
+/// `node/<name>/snapshot` key (the observed gap: nodes with no tenant activity since restart had no
+/// snapshot anywhere in the shared KV). This loop captures and replicates on a fixed cadence
+/// (`HIVE_GUARDIAN_SNAPSHOT_SECS`, 120), after a 30 s delay so first-boot restore settles, so every
+/// node's snapshot is always PRESENT and FRESH; it is cheap at the blob layer (iroh-docs
+/// content-addresses by BLAKE3, so identical bytes store no new blob). Capture clones and
+/// serializes the whole platform state (16-30 MB on the leader: 3-5 s of CPU), so it runs on the
+/// bulkhead runtime under `block_in_place`, never on a serving worker.
 fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_GUARDIAN_SNAPSHOT_SECS", 120));
-    // Bulkhead runtime + block_in_place: `capture` clones and serializes the
-    // whole platform state (16-30 MB on the leader: 3-5 s of CPU, audited
-    // 2026-10-01) and `replicate` is synchronous -- neither may occupy a
-    // serving worker. See `bulkhead`.
     crate::bulkhead::spawn(async move {
-        // Small initial delay so first-boot restore/seed settles before the
-        // first assert; then steady cadence.
         tokio::time::sleep(Duration::from_secs(30)).await;
         loop {
             let c = cloud.clone();
@@ -3141,19 +3022,15 @@ fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Periodic reap of departed nodes' `node/<name>/snapshot` keys.
-///
-/// LEADER-ONLY, unlike the snapshot loop above: that one writes only this
-/// node's OWN key (every node must, hence every node runs it), while this one
-/// DELETES other nodes' keys from the replicated store — a fan-out mutation,
-/// which the platform's single-writer discipline routes through the
-/// control-plane leader. The leader check is re-evaluated every pass, not
-/// captured once, so leadership changing mid-run hands the job over correctly.
-///
-/// Fully inert until `HIVE_NODE_ROSTER` is configured — see
-/// `guardian::reap_departed_node_snapshots` for why an unset roster must mean
-/// "do nothing" and never "everything looks departed". `HIVE_REAP_SECS=0`
-/// disables the loop outright.
+/// Periodic reap of departed nodes' `node/<name>/snapshot` keys. LEADER-ONLY, unlike the snapshot
+/// loop (which writes only this node's OWN key, so every node runs it): this one DELETES other
+/// nodes' keys from the replicated store, a fan-out mutation the single-writer discipline routes
+/// through the control-plane leader (`may_act(GuardianReap)`, re-evaluated every pass, so a
+/// leadership change mid-run hands the job over). It starts after a deliberately long delay (300 s:
+/// at boot this node has not resynced the replicated doc, so an immediate pass would judge
+/// departure from an incomplete view) and is inert until `HIVE_NODE_ROSTER` is configured (see
+/// `guardian::reap_departed_node_snapshots`: an unset roster means "do nothing", never "everything
+/// looks departed"); `HIVE_REAP_SECS=0` disables it.
 fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
     let secs = env_u64("HIVE_REAP_SECS", 6 * 60 * 60);
     if secs == 0 {
@@ -3161,9 +3038,6 @@ fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
     }
     let interval = Duration::from_secs(secs);
     tokio::spawn(async move {
-        // Deliberately long initial delay: at boot this node has not yet
-        // resynced the replicated doc, so an immediate pass would judge
-        // departure from an incomplete local view.
         tokio::time::sleep(Duration::from_secs(300)).await;
         loop {
             if leadership::may_act(&cloud, leadership::Job::GuardianReap) {
@@ -3214,13 +3088,10 @@ fn spawn_container_lock_sweep() {
     }
     let interval = Duration::from_secs(secs);
     crate::supervise::spawn_supervised("container-lock-sweep", move || async move {
-        // One immediate pass at boot: a node coming back from a crash or a
-        // podman-machine reset is exactly when leaked locks are already there.
         loop {
             crate::supervise::beat("container-lock-sweep");
             let path_env = crate::git::podman_path_env();
             match hive_backend::sweep_container_locks(&path_env).await {
-                // Healthy — recorded at debug so a normal node stays quiet.
                 Some((free, 0, 0)) => tracing::debug!(free_locks = free, "podman lock headroom ok"),
                 Some((free, vols, cells)) => tracing::warn!(
                     free_locks_before = free,
@@ -3228,9 +3099,6 @@ fn spawn_container_lock_sweep() {
                     cells_reclaimed = cells,
                     "reclaimed leaked podman locks"
                 ),
-                // No podman on this host (or it doesn't report FreeLocks) — nothing
-                // to protect; keep looping cheaply rather than killing the task, so
-                // a podman installed later is still covered.
                 None => {}
             }
             tokio::time::sleep(interval).await;
@@ -3238,16 +3106,15 @@ fn spawn_container_lock_sweep() {
     });
 }
 
+/// Ticks the cron scheduler every second and fires each due job as its own task. A project's cron
+/// kill switch only stops the firing: the schedule keeps advancing, so jobs are still created,
+/// updated and deleted on deploy, matching Vercel's semantics.
 fn spawn_cron_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let due = cloud.cron.tick(now_ms());
             for job in due {
-                // Project-level kill switch: the schedule still advances (jobs
-                // keep being created/updated/deleted on deploy, matching
-                // Vercel's semantics), but a disabled project's jobs don't
-                // actually fire.
                 if !cloud.projects.cron_enabled(&job.deployment) {
                     continue;
                 }
@@ -3274,11 +3141,10 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Loop-local partials returned by one peer's gossip sync, merged by whichever
-/// gossip round receives it (the direct cloud.* store writes already happened
-/// inside the task via internally-synchronized stores). The loop keeps each
-/// target's last ANSWERED sync so it can stand in while the next one is still
-/// in flight — see [`round_contributions`].
+/// Loop-local partials returned by one peer's gossip sync, merged by whichever gossip round
+/// receives it (the direct cloud.* store writes already happened inside the task, through
+/// internally-synchronized stores). The loop keeps each target's last ANSWERED sync so it can stand
+/// in while the next one is in flight; see [`round_contributions`].
 #[derive(Default, Clone)]
 struct PeerSync {
     /// (host, route) pairs learned from this peer's serve-hosts.
@@ -3320,16 +3186,14 @@ impl PeerSync {
     }
 }
 
-/// The syncs one gossip round merges. `answers` holds each target's newest
-/// ANSWERED sync (with the round it was dispatched in); a target contributes
-/// it when it landed this round, or when its next sync is still in flight and
-/// its node is still in the registry (`alive`, the fleet-deployments carry
-/// rule) — a live peer whose sync outlasts the deadline is late, not absent,
-/// so its holders, routes, deployments and zkauth roster never drop out of
-/// the per-round rebuilds on a slow round. A target that failed contributes
-/// nothing, as before. One sync per NODE, newest round first (ties: lowest
-/// target key): a seed is gossiped under both `seed:<eid>` and `<eid>`, and
-/// the two answers can come from different rounds.
+/// The syncs one gossip round merges. `answers` holds each target's newest ANSWERED sync (with the
+/// round it was dispatched in); a target contributes it when it landed this round, or when its next
+/// sync is still in flight and its node is still in the registry (`alive`, the fleet-deployments
+/// carry rule): a live peer whose sync outlasts the deadline is late, not absent, so its holders,
+/// routes, deployments and zkauth roster never drop out of the per-round rebuilds on a slow round.
+/// A target that failed contributes nothing. One sync per NODE, newest round first (ties: lowest
+/// target key), because a seed is gossiped under both `seed:<eid>` and `<eid>` and the two answers
+/// can come from different rounds.
 fn round_contributions<'a>(
     answers: &'a std::collections::HashMap<String, (u64, PeerSync)>,
     landed: &std::collections::HashSet<String>,
@@ -3353,12 +3217,62 @@ fn round_contributions<'a>(
     by_node.into_values().map(|(_, _, sync)| sync).collect()
 }
 
-/// Sync ONE peer: announce ourselves, learn its nodes/routes/deployments, and
-/// converge enterprise/lease state. All cloud.* writes go through
-/// internally-synchronized stores so many of these run concurrently safely;
-/// loop-local data (zkauth roster included) is returned as a [`PeerSync`]
-/// merged by whichever gossip round receives it (the round does not wait past
-/// its deadline).
+/// Whether a gossip target string is a real HTTP(S) admin URL, the only thing `node_admins` may
+/// hold: the deploy dispatcher (`git.rs`, `schedule.rs`) treats every entry as reachable via HTTP
+/// and POSTs the fan-out to `{admin}` plus `RUNTIME_ARTIFACT_FANOUT_PATH`, while a peer reached
+/// over iroh has a 64-hex endpoint id (or a `seed:` key) as its gossip key. Storing that poisons
+/// `node_admins`, so every deploy placed on the node fails with a reqwest "builder error" (an
+/// unparseable URL) instead of falling back to the working iroh dispatch route.
+fn is_http_admin_url(target: &str) -> bool {
+    target.starts_with("http://") || target.starts_with("https://")
+}
+
+/// Syncs ONE peer: announces ourselves, learns its nodes/routes/deployments and converges
+/// enterprise/lease state. All cloud.* writes go through internally-synchronized stores, so many of
+/// these run concurrently safely; loop-local data (zkauth roster included) is returned as a
+/// [`PeerSync`] merged by whichever gossip round receives it (the round does not wait past its
+/// deadline).
+///
+/// HOT-JOIN (client side): a gossip failure may mean we are not yet in the peer's trust set (first
+/// contact of a brand-new node, or a wiped trust roster), so with the fleet secret configured we
+/// present a join proof, `HMAC(secret, OUR endpoint id)`, over the dedicated join stream, dialing
+/// by KEY (the eid/seed mapping in `peer_iroh`; `fetch()` may have evicted it, so it is re-derived
+/// from the target string, which IS the endpoint id or `seed:<id>`, and restored on admission). On
+/// admission the reply is the peer's node roster, consumed like `/v1/nodes`. It is never tried when
+/// the announce's own DIAL failed this round: the join dials the same key through the same
+/// `acquire`, so against a dead seed it only doubled the round's cost (4 serial 5 s dial timeouts
+/// per round for a powered-off node), while a trust refusal happens AFTER the connection is up and
+/// so never reads as `Unreachable`. Its timeout MUST be at least
+/// `hive_p2p::dial_fallback_ceiling()`: a first-contact peer's cached hint (private IPs from its
+/// gossiped addr_json) is near-guaranteed to fail, so the join depends on `acquire`'s
+/// fresh-discovery fallback running to completion instead of being cancelled mid-flight.
+///
+/// Roster handling: the answering peer's first entry is its OWN self-report, the only copy allowed
+/// to rename it (`upsert_peer_self_report`); everything after it is a relayed third-party copy that
+/// never renames. Each round also converges the control-plane fencing epoch on the max witnessed
+/// anywhere in the fleet (monotonic, see `cluster.rs`) and registers or clears every peer's Tencent
+/// CCN private-path candidate on the live `PeerPool`. That only informs the NEXT fresh dial (a
+/// reused trunk is untouched, a live connection is never torn down) and is gated end to end by
+/// `is_private_path_candidate` (both sides declare `provider = tencent` and the region pair is
+/// configured), so without CCN configuration it is a no-op. The clear branch must run on the peer's
+/// `eid` alone, not also on `private_addr` being present, or a peer that stops reporting one leaks
+/// its entry forever; candidates of peers that left the registry are reaped each round for the same
+/// reason (the per-peer loop only touches peers this round's answer mentioned).
+///
+/// `node_admins` takes only real HTTP(S) admin URLs ([`is_http_admin_url`]): an HTTP target is
+/// inserted, while an iroh/seed-keyed target only REMOVES a stale non-http entry (a node that lost
+/// its HTTP tunnel) and never clobbers a good HTTP admin URL the same node registered under another
+/// gossip key, which would make the entry flap present/absent across rounds. A failed roster fetch
+/// marks the target's health through `health::demote`, which keeps a peer that still announces TO
+/// us (the fetch and announce directions fail independently) and marks it locally cold instead of
+/// withdrawing it; a target reached by nothing (announce, roster, join) returns at once, since the
+/// later reads would each burn their own 4 s HTTP timeout through the same evicted mapping.
+///
+/// Route sync is incremental: `target_node` remembers which node each target speaks for, so the
+/// next round can ask `?since=<generation>` before the peer's identity is known, and the peer
+/// answers the generation alone unless its host set moved. A peer on a pre-incremental build does
+/// not understand it and answers nothing, so the plain path is tried once, otherwise a mixed fleet
+/// would learn no routes mid-roll.
 async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) -> PeerSync {
     let mut out = PeerSync::default();
     let announce = gossip::fetch_outcome(
@@ -3375,25 +3289,11 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     let mut rtt = 0u64;
     let mut nodes_bytes =
         gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await;
-    // MESH HOT-JOIN (client side): a gossip failure to this target may mean we are
-    // not yet in ITS trust set (first contact of a brand-new node, or a wiped trust
-    // roster). When the fleet secret is configured, present a join proof —
-    // HMAC(secret, OUR endpoint id) — over the dedicated join stream; on admission
-    // the reply is the peer's full node roster, consumed exactly like /v1/nodes.
-    // The dial is by KEY (the eid/seed mapping in peer_iroh); no IP involved.
-    //
-    // Never when the announce's own DIAL failed this round: the join dials the
-    // same key through the same `acquire`, so against a dead seed it only doubled
-    // the round's cost (fc-bangkok, powered off: 4 serial 5 s dial timeouts per
-    // round, two for the announce and two more for the join). A trust refusal
-    // happens AFTER the connection is up, so it never reads as `Unreachable`.
     if nodes_bytes.is_none() && !announce_unreachable {
         if let Ok(secret) = std::env::var("HIVE_JWT_SECRET") {
             if !secret.trim().is_empty() {
                 let me_id = cloud.registry.me().peer_id;
                 let target = {
-                    // fetch() may have evicted the mapping on failure; fall back to
-                    // re-deriving it (seed keys/eids ARE the identity).
                     let pi = cloud.peer_iroh.read();
                     pi.get(&peer).cloned()
                 }
@@ -3405,11 +3305,6 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 let pool = cloud.mesh.read().clone();
                 if let (Some(me_id), Some((node_id, addr)), Some(pool)) = (me_id, target, pool) {
                     let proof = crate::admin::hmac_sha256_hex(secret.as_bytes(), me_id.as_bytes());
-                    // MUST be >= hive_p2p::dial_fallback_ceiling(): a first-contact
-                    // peer's cached hint (private IPs from its gossiped addr_json) is
-                    // near-guaranteed to fail, so this join depends entirely on
-                    // `acquire`'s fresh-discovery fallback getting to run to
-                    // completion instead of being cancelled mid-flight.
                     let attempt = tokio::time::timeout(
                         hive_p2p::dial_fallback_ceiling(),
                         pool.join_request(&node_id, &addr, &me_bytes, &proof),
@@ -3418,7 +3313,6 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     if let Ok(Ok(bytes)) = attempt {
                         if !bytes.is_empty() {
                             tracing::info!(peer = %node_id, "mesh join accepted — roster received");
-                            // Restore the transport mapping fetch() evicted.
                             cloud
                                 .peer_iroh
                                 .write()
@@ -3449,12 +3343,6 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 .as_ref()
                 .and_then(|n| n.peer_id.clone())
                 .filter(|id| !id.is_empty());
-            // Tencent CCN private-path eligibility: computed once per gossip
-            // round (not per peer) since the topology/self-info are stable
-            // within it. `ccn_topology`/`self_provider`/`self_region` cost
-            // nothing when `HIVE_CCN_REGIONS`/`HIVE_CLOUD_PROVIDER` are unset
-            // — every check below then trivially returns `false` and this
-            // whole block is a no-op, byte-identical to pre-feature behavior.
             let ccn_topology = hive_p2p::private_path::CcnTopology::from_env();
             let self_info = cloud.registry.me();
             for n in nodes {
@@ -3468,27 +3356,7 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                             }
                         }
                     }
-                    // Converge the control-plane fencing epoch on the max
-                    // witnessed anywhere in the fleet (monotonic; see cluster.rs).
                     cloud.cluster.adopt_epoch(n.cp_epoch);
-                    // Tencent CCN private-path: register/clear this peer's
-                    // private-VPC candidate on the live `PeerPool` so the
-                    // NEXT `acquire()` for it (reused trunks are untouched —
-                    // this never tears down a live connection, only informs
-                    // the next fresh dial) tries the private address
-                    // alongside its normal public/relay candidates. Gated
-                    // end-to-end by `is_private_path_candidate`: both sides
-                    // must declare `provider = tencent` and the region pair
-                    // must be configured, so a peer with no provider/region
-                    // match is a no-op here, exactly as before this feature
-                    // existed.
-                    // Unconditional on `eid` alone (not also gated on
-                    // `private_addr` being present) — a peer that stays
-                    // gossiped but stops reporting a private address (e.g.
-                    // `provider` flipped away from tencent) must still reach
-                    // the `else` branch and get cleared; gating on both
-                    // `Some`s left that case leaked forever (adversarial
-                    // review finding).
                     if let Some(eid) = n.peer_id.as_deref() {
                         let private_ip = n
                             .private_addr
@@ -3509,25 +3377,12 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                             }
                         }
                     }
-                    // The response's first entry is the answering peer's OWN
-                    // self-report — the only copy allowed to rename it (see
-                    // upsert_peer_self_report); everything after it is a
-                    // relayed third-party copy that must never rename.
                     if peer_self_id.as_deref() == Some(n.id.as_str()) {
                         cloud.registry.upsert_peer_self_report(n);
                     } else {
                         cloud.registry.upsert_peer(n);
                     }
                 }
-                // Reap private-candidate entries for any peer no longer in
-                // the registry's own live set (decommissioned/evicted) — the
-                // per-peer loop above only ever touches peers THIS round's
-                // gossip response actually mentioned, so a peer that stops
-                // being gossiped entirely (rather than merely losing its
-                // private_addr) would otherwise leak its entry forever
-                // (adversarial review finding). Cheap: the registry is the
-                // whole fleet, at most low hundreds of entries, and this is
-                // per-gossip-round, not per-peer.
                 if let Some(pool) = cloud.mesh.read().clone() {
                     let live: std::collections::HashSet<String> = cloud
                         .registry
@@ -3550,30 +3405,11 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     cloud.registry.set_health(&pid, rtt, true);
                     crate::health::clear_cold(&cloud.registry, &pid);
                 }
-                // `node_admins` MUST hold only real HTTP(S) admin URLs — the
-                // deploy dispatcher (see git.rs / schedule.rs) treats any entry
-                // here as "reachable via HTTP" and does `http.post(format!(
-                // "{admin}/v1/git/deploy"))`. A peer reached over IROH has a
-                // 64-char-hex node-id (or a `seed:` key) as its gossip `peer`
-                // key, NOT a URL — storing that poisons node_admins so every
-                // deploy placed on that node fails with a reqwest "builder
-                // error" (unparseable URL) instead of falling back to the
-                // working iroh dispatch route. So: insert ONLY for http(s)
-                // peers, and REMOVE any stale entry when the same node is now
-                // only iroh-reachable (a node that lost its HTTP tunnel).
-                if peer.starts_with("http://") || peer.starts_with("https://") {
+                if is_http_admin_url(&peer) {
                     cloud.node_admins.write().insert(pid, peer.clone());
                 } else {
-                    // Iroh/seed key, not a URL. Clean a POISONED (non-http)
-                    // stored value, but never clobber a good HTTP admin URL the
-                    // same node may have registered via a different (http-
-                    // tunnel) gossip key this or a prior round — else the entry
-                    // would flap present/absent across rounds.
                     let mut m = cloud.node_admins.write();
-                    let poisoned = m
-                        .get(&pid)
-                        .map(|a| !(a.starts_with("http://") || a.starts_with("https://")))
-                        .unwrap_or(false);
+                    let poisoned = m.get(&pid).map(|a| !is_http_admin_url(a)).unwrap_or(false);
                     if poisoned {
                         m.remove(&pid);
                     }
@@ -3588,35 +3424,17 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             .get(&peer)
             .map(|(id, _)| id.clone())
             .or_else(|| {
-                // Key-addressed targets: the target string IS the endpoint id (or a
-                // seed:<id>), so a failed round still marks health even after
-                // fetch() evicted the transport mapping.
                 let k = peer.strip_prefix("seed:").unwrap_or(&peer);
                 (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())).then(|| k.to_string())
             });
         if let Some(id) = id.filter(|s| !s.is_empty()) {
-            // ONE failed gossip fetch used to withdraw the peer outright here —
-            // no threshold, no counter-evidence, on every node, every round.
-            // On the leader that is a fleet-wide removal from DNS and
-            // placement caused by a single transient fetch. The chokepoint
-            // keeps a peer that is still announcing TO us (the fetch direction
-            // and the announce direction are different paths and fail
-            // independently) and marks it locally cold instead. See health.rs.
             crate::health::demote(&cloud.registry, &id, "gossip round: fetch failed", None);
         }
-        // Reached by nothing (announce, roster, join): the reads below go to
-        // the same target through the same (now evicted) mapping, and for a
-        // URL target each would spend its own 4 s HTTP timeout failing.
         if !announced {
             return out;
         }
     }
     out.reached = true;
-    // Ask only for what changed: if we already hold this node's route
-    // generation, the peer answers with the generation alone unless its host
-    // set moved. A peer on a pre-incremental build does not understand
-    // `?since=` and answers nothing, so fall back to the plain path once —
-    // otherwise a mixed fleet would learn no routes at all mid-roll.
     let since = cloud
         .target_node
         .read()
@@ -3657,8 +3475,6 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 out.seen = Some(node_id.clone());
                 out.meta = Some((region.clone(), gateway.clone(), rtt));
                 out.route_gen = v.get("gen").and_then(|x| x.as_u64());
-                // Remember which node this target speaks for, so the next
-                // round can ask it for a delta before its identity is known.
                 cloud.target_node.write().insert(peer.clone(), node_id.clone());
                 if let Some(hosts) = v.get("hosts").and_then(|x| x.as_array()) {
                     out.routes_full = true;
@@ -3748,17 +3564,41 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     out
 }
 
+/// Upper bound on the targets one gossip round dials, however large the roster has grown.
+const MAX_GOSSIP_TARGETS_PER_ROUND: usize = 64;
+
+/// The gossip loop. Its STATIC targets are the configured `--peer` URLs (warm path, through the
+/// persisted `peer_iroh` mapping or HTTP) plus the bootstrap seed keys, always-available iroh
+/// rendezvous points that carry a cold or wiped node until its warm `peer_iroh` is repopulated;
+/// each round re-adds a seed the timeout-and-evict path dropped (config-derived, so it must keep
+/// being retried) without clobbering a fresher learned address. DYNAMIC (hot-join, key-addressed)
+/// targets are added every round: every registry node with an iroh addr (learned transitively from
+/// any peer's `/v1/nodes` or an inbound join/announce; the freshest addr wins, so a rejoined node's
+/// new addr replaces a stale persisted one) and every persisted key-addressed roster entry not
+/// covered above (continuity right after a restart, before the registry re-converges). They are
+/// deduplicated by ENDPOINT ID, dialed by KEY (iroh resolves the address through
+/// discovery/relay/holepunch, never by IP) and capped at [`MAX_GOSSIP_TARGETS_PER_ROUND`]. This is
+/// what makes a new node visible fleet-wide with ZERO restarts: it joins one seed, the seed's
+/// `/v1/nodes` carries it everywhere, and every node's next round dials it first-hand.
+///
+/// Targets sync concurrently as their own tasks ([`sync_one_peer`], under `bounded_round`): the
+/// per-peer cloud.* writes (registry, `peer_iroh`, `node_admins`, trusted ids, enterprise, leases)
+/// go through internally-synchronized stores, so only the loop-local maps are merged from the
+/// returned [`PeerSync`] partials. The round waits only until `gossip_round::deadline()`; a target
+/// still syncing then keeps running under its in-flight flag (never dispatched twice at once) and
+/// its result lands in whichever round receives it: a result carrying this round's number reported
+/// inside the round, an older one is a straggler of an earlier round and counts as a missed round.
+/// `gossip_round::Rounds` owns the per-target leash (a target that keeps missing the deadline is
+/// waited on only briefly, parked, never cancelled or withdrawn, and still dialed every round) and
+/// the backoff for a target nobody has heard from. `answers` holds each target's newest ANSWERED
+/// sync with the round it was dispatched in, standing in while the next sync is in flight (a later
+/// result replaces an earlier one, a failed one drops the stand-in).
 fn spawn_gossip_loop(
     cloud: Arc<CloudState>,
     peers: Vec<String>,
     seeds: Vec<(String, String, String)>,
 ) {
     use std::collections::HashMap;
-    // STATIC gossip targets = the configured --peer URLs (warm path, via persisted
-    // peer_iroh or HTTP) PLUS the bootstrap seed keys (always-available iroh
-    // rendezvous). The seed keys carry the cold/wiped node until its warm
-    // peer_iroh is repopulated. DYNAMIC targets (hot-join) are added per-round
-    // below from the registry + persisted key-addressed roster.
     let mut targets = peers.clone();
     for (key, _, _) in &seeds {
         if !targets.contains(key) {
@@ -3766,22 +3606,11 @@ fn spawn_gossip_loop(
         }
     }
     tokio::spawn(async move {
-        // Content hash of the last roster replicated into GuardianDB, so the
-        // (5s-cadence) loop only writes the replicated doc when it CHANGES.
-        let mut roster_hash: u64 = 0;
-        // Per-target syncs run as their own tasks (`bounded_round`), so a round
-        // can end at its deadline while a slow target finishes in the
-        // background; its result lands in whichever round receives it.
+        let mut replicated_roster_hash: u64 = 0;
         let mut fanout = crate::bounded_round::BoundedRound::<PeerSync>::new();
         let mut rounds = crate::gossip_round::Rounds::new(now_ms());
-        // Each target's newest ANSWERED sync and the round it was dispatched in:
-        // it stands in for the target while its next sync is in flight.
         let mut answers: HashMap<String, (u64, PeerSync)> = HashMap::new();
         loop {
-            // Re-assert the bootstrap seeds into peer_iroh each round: the gossip
-            // timeout+evict drops a stale/dead target's entry, but seeds are
-            // config-derived rendezvous points we must keep retrying — so re-add any
-            // that were evicted (without clobbering a fresher learned address).
             {
                 let mut pi = cloud.peer_iroh.write();
                 for (key, nid, addr) in &seeds {
@@ -3789,15 +3618,6 @@ fn spawn_gossip_loop(
                         .or_insert_with(|| (nid.clone(), addr.clone()));
                 }
             }
-            // DYNAMIC target set (hot-join, key-addressed): every round, dial the
-            // union of the static targets, every REGISTRY node with an iroh addr
-            // (learned transitively from any peer's /v1/nodes, or via an inbound
-            // join/announce), and every persisted key-addressed roster entry.
-            // Dedup by ENDPOINT ID; peers are dialed by KEY (iroh resolves the
-            // address via discovery/relay/holepunch — never by IP). This is what
-            // makes a new node visible fleet-wide with ZERO restarts: it joins one
-            // seed, the seed's /v1/nodes carries it everywhere, and every node's
-            // next round dials it first-hand.
             let targets: Vec<String> = {
                 let mut round: Vec<String> = targets.clone();
                 let mut covered: std::collections::HashSet<String> =
@@ -3813,8 +3633,6 @@ fn spawn_gossip_loop(
                         }
                     }
                 }
-                // Registry-derived (freshest addr wins — a rejoined node's new addr
-                // must replace a stale persisted one).
                 let mut adds: Vec<(String, String)> = Vec::new();
                 for n in cloud.registry.nodes() {
                     if n.is_self {
@@ -3835,8 +3653,6 @@ fn spawn_gossip_loop(
                         round.push(eid.clone());
                     }
                 }
-                // Persisted roster continuity: eid-keyed entries not covered above
-                // (e.g. right after a restart, before the registry re-converges).
                 {
                     let pi = cloud.peer_iroh.read();
                     for (k, (nid, _)) in pi.iter() {
@@ -3848,20 +3664,13 @@ fn spawn_gossip_loop(
                         }
                     }
                 }
-                round.truncate(64); // bound the per-round dial fan-out
+                round.truncate(MAX_GOSSIP_TARGETS_PER_ROUND);
                 round
             };
-            // Rebuild the cross-node routing table from scratch each cycle so stale
-            // routes (peers that no longer host a deployment) age out.
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
-            // #24: node ids successfully gossiped this round — drives the route TTL
-            // merge so a transient miss to a healthy peer doesn't drop its routes.
             let mut seen_nodes: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            // Deployments hosted on each peer (name -> list), for the fleet-wide
-            // dashboard deployment view.
             let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
-            // Container holders, seeded with this node's own container deployments.
             let mut holders: HashMap<String, Vec<String>> = HashMap::new();
             for key in cloud.gw.container_projects() {
                 holders
@@ -3869,29 +3678,8 @@ fn spawn_gossip_loop(
                     .or_default()
                     .push(cloud.node_name.clone());
             }
-            // Announce + learn each peer's view CONCURRENTLY. The per-peer cloud.* writes
-            // (registry, peer_iroh, node_admins, trusted ids, enterprise, leases)
-            // all go through internally-synchronized stores, so they're race-free across
-            // tasks; only the loop-local maps are merged from the returned partials.
-            //
-            // The round waits for its targets only until `gossip_round::deadline()`
-            // (8 s): it used to `join_all` every target, so it lasted as long as its
-            // slowest — a dead seed stretched every round to 25-33 s, and each relayed
-            // `last_seen_ms` this node holds is only as fresh as its round is short.
-            // A target still syncing at the deadline keeps running under its in-flight
-            // flag (never dispatched twice at once; `bounded_round`), and a target
-            // nobody has heard from for 10 min — while other targets answer — is
-            // dialed on a 1 -> 3 min backoff (`gossip_round::Rounds`).
-            // A target that has missed the round deadline twice running gets a
-            // short per-target leash instead of the full deadline: the round
-            // stops waiting for it (it is parked, never cancelled, never
-            // withdrawn) while it is still dialed every round, so the moment
-            // it answers again it is picked up — inside the round if it beats
-            // the leash, one round later if it beats only the old deadline.
             rounds.begin_round();
             let round_deadline = tokio::time::Instant::now() + crate::gossip_round::deadline();
-            // Stragglers of earlier rounds that finished since: their flags are
-            // already clear, so they are dispatched again below.
             let mut landed = fanout.begin();
             let round_id = fanout.round();
             let me = cloud.registry.me();
@@ -3921,10 +3709,6 @@ fn spawn_gossip_loop(
                 rounds.note_straggler(&t, now);
             }
             landed.extend(more);
-            // Results arrive in order, so a target's later result replaces its earlier
-            // one; a target that failed drops its stand-in. A result carrying this
-            // round's number reported inside the round; anything older is a
-            // straggler of an earlier one and counts as a missed round.
             let mut landed_now: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             for (rid, t, pr) in landed {
@@ -3957,8 +3741,6 @@ fn spawn_gossip_loop(
                     targets.iter().map(String::as_str).collect();
                 answers.retain(|t, _| dialed.contains(t.as_str()) || in_flight.contains(t));
             }
-            // Registry-live node names: carries an in-flight target's last answer
-            // here, and an unreached node's deployments below.
             let alive: std::collections::HashSet<String> = cloud
                 .registry
                 .nodes()
@@ -4134,8 +3916,8 @@ fn spawn_gossip_loop(
                 roster_json.hash(&mut hasher);
                 hasher.finish()
             };
-            if h != roster_hash && !roster_json.is_empty() {
-                roster_hash = h;
+            if h != replicated_roster_hash && !roster_json.is_empty() {
+                replicated_roster_hash = h;
                 tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
             }
             // Refresh THIS node's own MESH iroh_addr (re-serialize `ep.addr()`
