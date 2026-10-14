@@ -266,7 +266,9 @@ fn default_consumer_type() -> ConsumerType {
 /// must be one of the caller's own: `queues::consumer_target_owned`). A `dead_letter_queue`, when
 /// named, must exist AND belong to the same tenant, as in Cloudflare's own consumer-create
 /// validation. The response carries the consumer's `signing_secret`: every batch is signed with it
-/// in `x-hive-signature`.
+/// in `x-hive-signature`, an HMAC-SHA256 of `"{x-hive-timestamp}.{x-hive-nonce}.{raw body}"` (not
+/// the body alone, so a captured batch cannot be replayed verbatim — verify by rebuilding that
+/// exact string from the two headers and the body, then comparing).
 async fn consumer_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,

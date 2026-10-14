@@ -532,6 +532,28 @@ fn configured_bool_default_true(name: &str) -> anyhow::Result<bool> {
     }
 }
 
+/// Builds `https://{label}.{base}` the SAFE way: parses `base` (this node's OWN apps/deploy-zone
+/// domain, configured by the operator, never attacker input) as a URL first, then sets the host to
+/// `{label}.{base-host}` through `Url::set_host`, which runs the WHATWG host parser and REJECTS
+/// `@`, `:`, `#`, `/` and anything else that is not a valid domain-label character. A raw
+/// `format!("https://{label}.{base}")` is vulnerable to the userinfo/fragment/port-override class
+/// of bug: a `label` containing `@` becomes userinfo and the REAL destination host (the rest of the
+/// string after it), one containing `#` swallows everything after it as a fragment the connection
+/// never sees, and a literal `:` changes the port the connection actually dials. `None` when
+/// `label` is not a valid host component; the caller falls back to a URL that never contains the
+/// untrusted label at all, never to one built by string interpolation.
+fn host_scoped_https_url(label: &str, base: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(&format!("https://{base}")).ok()?;
+    let existing_host = url.host_str()?.to_string();
+    url.set_host(Some(&format!("{label}.{existing_host}")))
+        .ok()?;
+    let host = url.host_str()?;
+    Some(match url.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
+}
+
 impl CloudState {
     /// The control-plane owner as a FORWARDING target, plus where the answer came from (see
     /// `Cluster::control_plane_owner_with_source`). With `HIVE_CP_OWNER_CHAIN` set: the strict
@@ -1073,13 +1095,14 @@ impl CloudState {
         if self.ingress != "ngrok" {
             let sub = alias.split('.').next().unwrap_or(alias);
             if let Some(dz) = crate::dnsserver::deploy_zone() {
-                if crate::vercel_dns::is_preview_label(sub)
-                    && crate::acme::zone_tls_ready(dz)
-                {
-                    return format!("https://{sub}.{dz}");
+                if crate::vercel_dns::is_preview_label(sub) && crate::acme::zone_tls_ready(dz) {
+                    if let Some(u) = host_scoped_https_url(sub, dz) {
+                        return u;
+                    }
                 }
             }
-            format!("https://{sub}.{}", self.apps_domain)
+            host_scoped_https_url(sub, &self.apps_domain)
+                .unwrap_or_else(|| format!("https://{}", self.apps_domain))
         } else {
             format!("https://{alias}")
         }

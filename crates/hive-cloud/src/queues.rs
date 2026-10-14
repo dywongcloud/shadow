@@ -822,12 +822,33 @@ fn label_project(cloud: &Arc<crate::state::CloudState>, label: &str) -> String {
         .unwrap_or_else(|| label.to_string())
 }
 
-/// Whether `script_name` addresses an app of `tenant`. A push consumer's batches are POSTed to
-/// `cloud.deploy_url(script_name)`, i.e. the host label `<script_name's first label>.{apps_domain}`
-/// of whatever project or deployment alias that label names, so the owner of that project must be
-/// the queue's own tenant; otherwise a tenant could aim its queue at another tenant's handler.
-/// Checked when a consumer is registered AND before every delivery pass (ownership can move
-/// after registration).
+/// A label this platform will ever put in front of its own apps/deploy-zone domain: lowercase
+/// ASCII letters, digits and hyphens ONLY. `script_name` is tenant input that reaches
+/// [`crate::state::CloudState::deploy_url`], which builds the delivery authority from it, so
+/// anything outside this set is refused outright here rather than trusted to survive URL
+/// construction unharmed — the userinfo/fragment/port-override class of bug a raw `format!` into a
+/// URL STRING is vulnerable to: a label containing `@` becomes userinfo and the REAL destination
+/// host, one containing `#` swallows the rest of the string as a fragment, and a literal `:`
+/// changes the port. `deploy_url` itself is hardened the same way (`host_scoped_https_url`), so
+/// this is defense in depth, not the only gate.
+fn valid_script_label(label: &str) -> bool {
+    !label.is_empty()
+        && label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Whether `script_name` addresses an app of `tenant`, requiring POSITIVE evidence. A push
+/// consumer's batches are POSTed to `cloud.deploy_url(script_name)`, i.e. the host label
+/// `<script_name's first label>.{apps_domain}` of whatever project or deployment alias that label
+/// names, so the owner of that project must be the queue's own tenant; otherwise a tenant could aim
+/// its queue at another tenant's handler. Unlike the general `admin::project_owned_by` (which
+/// trusts the caller optimistically for a project nobody has ever heard of, useful when claiming a
+/// brand-new name), a queue consumer must never target a not-yet-existing name: the only way such a
+/// name becomes real later is if SOME tenant deploys it, and an attacker who predicts or squats it
+/// would then receive the batches a trusting victim's queue was already addressed there. Checked
+/// when a consumer is registered AND before every delivery pass (ownership, and existence, can both
+/// change after registration).
 pub fn consumer_target_owned(
     cloud: &Arc<crate::state::CloudState>,
     tenant: &str,
@@ -838,11 +859,19 @@ pub fn consumer_target_owned(
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    if label.is_empty() {
+    if !valid_script_label(&label) {
         return false;
     }
     let project = label_project(cloud, &label);
-    crate::admin::project_owned_by(cloud, &project, tenant)
+    let owner = cloud.projects.team_of(&project);
+    if crate::admin::norm(&owner) == tenant {
+        return true;
+    }
+    cloud.gw.deployment_records().iter().any(|r| {
+        r.project.eq_ignore_ascii_case(&project) && crate::admin::record_tenant(&r.tenant) == tenant
+    }) || cloud.peer_deployments.read().values().flatten().any(|d| {
+        d.project.eq_ignore_ascii_case(&project) && crate::admin::record_tenant(&d.tenant) == tenant
+    })
 }
 
 /// Logs a foreign consumer target at most once a minute per consumer: the delivery loop revisits
@@ -922,10 +951,15 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                 if due.is_empty() {
                     continue;
                 }
-                let url = format!(
-                    "{}/{}",
-                    cloud.deploy_url(&consumer.script_name),
-                    "__hive_queue_consumer"
+                // The destination host is already hardened and whitelisted (`deploy_url` via
+                // `host_scoped_https_url`, `consumer_target_owned`'s label+ownership check just
+                // above): this is the platform's OWN apps-domain namespace, never an arbitrary
+                // tenant-supplied URL, so the full `hive_outbound` SSRF guard (which would also
+                // refuse a dev node whose apps domain is itself a loopback/internal name) does not
+                // apply here — only the no-redirect client does.
+                let target = format!(
+                    "{}/__hive_queue_consumer",
+                    cloud.deploy_url(&consumer.script_name)
                 );
                 let batch_json: Vec<serde_json::Value> = due
                     .iter()
@@ -939,16 +973,30 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                     })
                     .collect();
                 let body = serde_json::json!({ "messages": batch_json }).to_string();
+                // Signed over `timestamp.nonce.body` (never body alone), so a captured batch cannot
+                // be replayed verbatim: the receiver recomputes the HMAC over the SAME three parts
+                // (reading them back from the x-hive-timestamp/x-hive-nonce headers) and rejects a
+                // stale timestamp or a reused nonce itself, exactly as it already must recompute the
+                // signature.
+                let ts = now_ms().to_string();
+                let nonce = uuid::Uuid::new_v4().simple().to_string();
+                let signed_message = format!("{ts}.{nonce}.{body}");
                 let signature = crate::webhooks::sign(
                     &consumer_signing_secret(&queue.queue_id, &consumer.consumer_id),
-                    &body,
+                    &signed_message,
                 );
-                let req = cloud
-                    .http
-                    .post(&url)
+                // The destination is this platform's own apps domain (hardened host construction in
+                // `deploy_url`/`consumer_target_owned`), never an arbitrary tenant-supplied URL, so
+                // the no-redirect internal client is the right guard: a redirect here could only come
+                // from the target app itself, and following it anywhere is never required to deliver
+                // a batch to that app's own fixed consumer route.
+                let req = hive_outbound::internal_client()
+                    .post(target)
                     .header("content-type", "application/json")
                     .header("x-hive-queue-id", queue.queue_id.as_str())
                     .header("x-hive-queue-consumer", consumer.consumer_id.as_str())
+                    .header("x-hive-timestamp", ts)
+                    .header("x-hive-nonce", nonce)
                     .header("x-hive-signature", signature)
                     .body(body);
                 let outcome =
