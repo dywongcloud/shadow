@@ -810,10 +810,31 @@ async fn edge_pipeline_inner(
                         break 'cands;
                     }
                     attempted = true;
-                    let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
-                    let mut rb = cloud
-                        .http
-                        .request(rmethod.clone(), &url)
+                    // `path_q` is the VISITOR's own request path+query, a raw TCP client can put
+                    // almost anything in it (the HTTP request-line grammar allows `@`/`:` in a
+                    // path segment), so it is joined onto the gossiped `cand.gateway` base via
+                    // `Url::join` (never `format!`) and the result is required to stay on that
+                    // exact authority — the same userinfo/authority-override class of bug the
+                    // queue-consumer and cron/workflow-step fixes close, here on the path a hostile
+                    // visitor controls instead of a tenant config field. `cand.gateway` is this
+                    // node's own gossiped routing table, never attacker input.
+                    let Some(url) = reqwest::Url::parse(cand.gateway.trim_end_matches('/'))
+                        .ok()
+                        .and_then(|base| {
+                            let joined = base.join(&path_q).ok()?;
+                            (joined.scheme() == base.scheme()
+                                && joined.host_str() == base.host_str()
+                                && joined.port_or_known_default() == base.port_or_known_default())
+                            .then_some(joined)
+                        })
+                    else {
+                        continue;
+                    };
+                    // Never follows a redirect: a 3xx from the backend is relayed to the visitor
+                    // verbatim below (their own client decides whether to follow it), and the node
+                    // never dereferences a Location it does not control server-side.
+                    let mut rb = hive_outbound::internal_client()
+                        .request(rmethod.clone(), url)
                         .header("host", &host)
                         .header("x-hive-proxied", "1")
                         .header("x-hive-request-id", &rid)
@@ -1467,10 +1488,24 @@ fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: Cache
 /// engaging the 30 s retry backoff instead of letting the next request re-fire a refresh.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
-        let url = format!("{}{}", cloud.public_base, path_q);
-        let resp = match cloud
-            .http
-            .get(url)
+        // `path_q` is the original cached REQUEST's path+query (visitor-derived); joined onto
+        // `public_base` via `Url::join` and required to stay on that authority, the same guard as
+        // `invoke`'s cron/workflow-step fix, never a raw `format!` a crafted path could redirect.
+        let target = reqwest::Url::parse(&cloud.public_base)
+            .ok()
+            .and_then(|base| {
+                let joined = base.join(&path_q).ok()?;
+                (joined.scheme() == base.scheme()
+                    && joined.host_str() == base.host_str()
+                    && joined.port_or_known_default() == base.port_or_known_default())
+                .then_some(joined)
+            });
+        let Some(target) = target else {
+            cloud.cdn.note_revalidation_failed(&key);
+            return;
+        };
+        let resp = match hive_outbound::same_origin_client()
+            .get(target)
             .header("host", &host)
             .header("x-hive-revalidate", "1")
             .send()
