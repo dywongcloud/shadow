@@ -568,9 +568,8 @@ async fn mint_token(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let peer_ip = peer.ip().to_string();
     let now = hive_core::now_ms();
-    if !mint_allowed(&headers) {
-        // A request that cannot present the internal token is a guess at it: it alone spends the strict
-        // per-peer budget.
+    let request_is_a_guess_at_the_internal_token = !mint_allowed(&headers);
+    if request_is_a_guess_at_the_internal_token {
         if !mint_rate_limiter().check(&peer_ip, now) {
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -582,7 +581,6 @@ async fn mint_token(
             "token minting is server-only (x-hive-internal required)".into(),
         ));
     }
-    // The dashboard server minting for a user: a budget per user under a peer-wide backstop.
     if !mint_user_limiter().check(req.sub.trim(), now)
         || !mint_backstop_limiter().check(&peer_ip, now)
     {
@@ -1079,8 +1077,6 @@ async fn project_env_put(
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // `require_project*` proves TENANCY (the caller is some member of the owning team); the role
-    // (env vars can hold secrets, so writing one needs member or above) is `roles`' matrix.
     require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
@@ -5213,8 +5209,6 @@ async fn project_delete(
         return Err(StatusCode::BAD_REQUEST);
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // The row names the owner of record: another team is refused here, never cascaded to the fleet and
-    // never put through the relational tier (`row_holder`); the evidence below is for a row with no tag.
     let authorized = match row_holder(&c, &project) {
         Some(holder) if holder == t => true,
         Some(_) => return Err(StatusCode::NOT_FOUND),
@@ -5761,7 +5755,6 @@ async fn project_rename(
             ),
         ));
     }
-    // Same rule as the delete: the row's holder decides alone, another team is refused outright.
     let authorized = match row_holder(&c, &project) {
         Some(holder) if holder == t => true,
         Some(_) => {
@@ -7893,9 +7886,6 @@ async fn node_announce_public(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // A fleet-wide RPC with no per-tenant meaning: a delegation minted for ANY team still satisfies
-    // `is_mesh_internal` alone, so `Some("mesh")` (never `None`) closes that a tenant's own
-    // delegation, however it was obtained, can never reach this route.
     require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(node_announce(State(c), Json(node)).await)
 }
@@ -14655,8 +14645,6 @@ async fn push_sms_relay(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See `node_announce_public`: a fleet-wide RPC, `Some("mesh")` so a delegation minted for any
-    // one tenant's own team can never reach it.
     require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(Json(crate::push::sms_relay_exec(&c, v).await))
 }
@@ -14670,7 +14658,6 @@ async fn push_sms_direct_mx(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See `node_announce_public`.
     require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
     Ok(Json(crate::push::sms_direct_mx_exec(v).await))
 }
