@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-13 — a queue consumer can only target the queue's own tenant's app, and its batches are signed
+
+A push consumer's `script_name` was accepted unchecked (`queues_api.rs` `consumer_create`) and
+the delivery loop POSTed each batch to `cloud.deploy_url(script_name)/__hive_queue_consumer`
+with only unauthenticated `x-hive-queue-*` headers: tenant A could create a queue and a
+consumer naming tenant B's app, send messages, and B's handler received batches that look
+like platform deliveries (and nothing in the request let B tell a real one from a forgery:
+the URL is B's public host). Registration now refuses a `script_name` whose host label does
+not reach one of the queue tenant's own projects or deployment aliases (403, Cloudflare
+error 10006), through `queues::consumer_target_owned`, and the same check runs before every
+delivery pass, so a consumer whose target changes owner after registration, or a record that
+predates the check, is skipped (one WARN a minute per consumer) instead of delivered. Every
+batch now carries `x-hive-signature: sha256=<hmac>` over the exact body (the webhooks
+`sign`), keyed by a per-consumer `signing_secret` derived from the fleet-shared at-rest key
+(HMAC over `queue_id` and `consumer_id`, length-prefixed, like `zkauth::derive_secret`): no
+stored state, no migration, identical on every node and across restarts, and the owner reads
+it from the consumer view (`GET /v1/queues/:id`, the consumer create response) to verify
+deliveries. Witnessed on a throwaway auth-enforced node with a TLS ClientHello spy standing in
+for the apps domain (`HIVE_APPS_DOMAIN=localhost:<port>`, so the SNI host of every connection
+the platform opens for a queue is on record): before, tenant `ta`'s consumer on tenant `tb`'s
+`victim-app` was accepted (200) and the platform opened 3 connections addressed to
+`victim-app.localhost`, and after the operator moved `shared-app` from `ta` to `tb` it kept
+opening them (5 connections); after, the registration is 403 with no connection, deliveries
+into `shared-app` stop at the move (0 connections), `ta`'s consumer on its own `own-app` still
+delivers, two consumers have different secrets and a node restart leaves a secret unchanged.
+The signature itself could not be read on the wire locally (the delivery is TLS to the public
+URL and reqwest trusts only its bundled roots), so it rests on `webhooks::sign`, the function
+webhook deliveries already use. Operator note: nothing to migrate; consumers that pointed at
+another tenant's app stop delivering (their messages wait in the queue until retention
+expires) and an app that wants to authenticate batches reads its consumer's `signing_secret`.
+Not rolled.
+
 ## 2026-10-13 — a tenant can no longer snapshot, list or delete another tenant's deployment data through its own project
 
 `POST|GET|DELETE /v1/projects/:project/deployments/:deployment_id/snapshots[/:snapshot_id]`

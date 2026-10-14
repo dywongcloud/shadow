@@ -214,6 +214,7 @@ fn consumer_view(c: &crate::queues::Consumer) -> Value {
         "queue_id": c.queue_id,
         "type": c.kind,
         "script_name": c.script_name,
+        "signing_secret": crate::queues::consumer_signing_secret(&c.queue_id, &c.consumer_id),
         "dead_letter_queue": c.dead_letter_queue,
         "created_on": c.created_on,
         "settings": {
@@ -261,9 +262,11 @@ fn default_consumer_type() -> ConsumerType {
     ConsumerType::Worker
 }
 
-/// Creates a consumer (`script_name` is the Worker project the push loop POSTs batches to). A
-/// `dead_letter_queue`, when named, must exist AND belong to the same tenant, as in Cloudflare's
-/// own consumer-create validation.
+/// Creates a consumer (`script_name` is the Worker project the push loop POSTs batches to, and it
+/// must be one of the caller's own: `queues::consumer_target_owned`). A `dead_letter_queue`, when
+/// named, must exist AND belong to the same tenant, as in Cloudflare's own consumer-create
+/// validation. The response carries the consumer's `signing_secret`: every batch is signed with it
+/// in `x-hive-signature`.
 async fn consumer_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -274,6 +277,16 @@ async fn consumer_create(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if c.queues.get(&t, &queue_id).is_none() {
         return Err(not_found("queue"));
+    }
+    if body.kind == ConsumerType::Worker
+        && !body.script_name.is_empty()
+        && !crate::queues::consumer_target_owned(&c, &t, &body.script_name)
+    {
+        return Err(err_envelope(
+            StatusCode::FORBIDDEN,
+            10006,
+            "script_name must name one of your own projects",
+        ));
     }
     if let Some(dlq_name) = &body.dead_letter_queue {
         let dlq = c.queues.find_by_name(&t, dlq_name).ok_or_else(|| {

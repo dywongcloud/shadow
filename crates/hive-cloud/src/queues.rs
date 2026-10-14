@@ -13,8 +13,10 @@
 //! unbounded and only the owner needs the working set.
 
 use hive_core::now_ms;
+use hmac::{Hmac, Mac};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -769,6 +771,101 @@ async fn is_primary_for_queue(cloud: &Arc<crate::state::CloudState>, tenant: &st
         == Some(cloud.node_name.as_str())
 }
 
+type HmacSha256 = Hmac<Sha256>;
+
+/// Signing secret of one push consumer, derived from the fleet-shared at-rest key (the shape of
+/// `zkauth::derive_secret`): every node computes the same value, nothing is stored or replicated,
+/// and the consumer's owner reads it from the consumer view to verify the `x-hive-signature` of
+/// every batch. Each field is length-prefixed so ("ab", "c") and ("a", "bc") cannot collide.
+pub fn consumer_signing_secret(queue_id: &str, consumer_id: &str) -> String {
+    let mut mac = HmacSha256::new_from_slice(&crate::secrets::key_material())
+        .expect("HMAC accepts any key length");
+    mac.update(b"hive-queue-consumer-v1");
+    for part in [queue_id, consumer_id] {
+        mac.update(&(part.len() as u64).to_le_bytes());
+        mac.update(part.as_bytes());
+    }
+    let digest = mac.finalize().into_bytes();
+    format!(
+        "qsec_{}",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    )
+}
+
+/// The project the host label `<label>.{apps_domain}` reaches: a deployment alias of this node's
+/// gateway or of any peer's gossiped record, else the label is the project name itself.
+fn label_project(cloud: &Arc<crate::state::CloudState>, label: &str) -> String {
+    if let Some((_, project)) = cloud.gw.attribution_for_host(label) {
+        return project;
+    }
+    let names_label = |alias: &str| {
+        alias
+            .split('.')
+            .next()
+            .unwrap_or("")
+            .eq_ignore_ascii_case(label)
+    };
+    cloud
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .find(|d| {
+            [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                .into_iter()
+                .any(|alias| !alias.is_empty() && names_label(alias))
+        })
+        .map(|d| d.project.clone())
+        .unwrap_or_else(|| label.to_string())
+}
+
+/// Whether `script_name` addresses an app of `tenant`. A push consumer's batches are POSTed to
+/// `cloud.deploy_url(script_name)`, i.e. the host label `<script_name's first label>.{apps_domain}`
+/// of whatever project or deployment alias that label names, so the owner of that project must be
+/// the queue's own tenant; otherwise a tenant could aim its queue at another tenant's handler.
+/// Checked when a consumer is registered AND before every delivery pass (ownership can move
+/// after registration).
+pub fn consumer_target_owned(
+    cloud: &Arc<crate::state::CloudState>,
+    tenant: &str,
+    script_name: &str,
+) -> bool {
+    let label = script_name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if label.is_empty() {
+        return false;
+    }
+    let project = label_project(cloud, &label);
+    crate::admin::project_owned_by(cloud, &project, tenant)
+}
+
+/// Logs a foreign consumer target at most once a minute per consumer: the delivery loop revisits
+/// every consumer twice a second.
+fn warn_foreign_target(queue_id: &str, consumer: &Consumer) {
+    static LAST_WARNED: std::sync::LazyLock<parking_lot::Mutex<HashMap<String, u64>>> =
+        std::sync::LazyLock::new(Default::default);
+    let now = now_ms();
+    let mut last = LAST_WARNED.lock();
+    let due = last
+        .get(&consumer.consumer_id)
+        .is_none_or(|at| now.saturating_sub(*at) >= 60_000);
+    if due {
+        last.insert(consumer.consumer_id.clone(), now);
+        tracing::warn!(
+            queue = %queue_id,
+            consumer = %consumer.consumer_id,
+            target = %consumer.script_name,
+            "queues: consumer target is not an app of the queue's tenant, delivery skipped"
+        );
+    }
+}
+
 const DELIVERY_TICK_MS: u64 = 500;
 /// GuardianDB recovery and the retention sweep run on every Nth delivery tick (about 5 s).
 const MAINTENANCE_EVERY_TICKS: u32 = 10;
@@ -778,8 +875,10 @@ const MAINTENANCE_EVERY_TICKS: u32 = 10;
 /// node does not skip messages it has not loaded yet), runs GuardianDB recovery and the retention
 /// sweep every `MAINTENANCE_EVERY_TICKS` ticks, then takes due messages up to the consumer's
 /// `batch_size` and POSTs the batch to the consumer's `script_name` project over its normal public
-/// invocation URL (the `world_queue.rs` HTTP-dispatch shape, addressed at the tenant's own
-/// function). On success the whole batch acks; on failure every message's `attempts` increments and
+/// invocation URL (the `world_queue.rs` HTTP-dispatch shape), only while that project is the
+/// queue's own tenant's ([`consumer_target_owned`]) and signed with the consumer's own secret
+/// (`x-hive-signature`, [`consumer_signing_secret`]), so the handler can tell a delivery from a
+/// request anyone on the internet could forge. On success the whole batch acks; on failure every message's `attempts` increments and
 /// it reschedules with exponential backoff, dead-lettering at `max_retries`.
 pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(DELIVERY_TICK_MS));
@@ -809,6 +908,14 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                 if consumer.kind != ConsumerType::Worker || consumer.script_name.is_empty() {
                     continue;
                 }
+                if !consumer_target_owned(
+                    &cloud,
+                    crate::admin::record_tenant(&queue.tenant),
+                    &consumer.script_name,
+                ) {
+                    warn_foreign_target(&queue.queue_id, &consumer);
+                    continue;
+                }
                 let due = cloud
                     .queues
                     .take_due_for_push(&queue.queue_id, consumer.settings.batch_size);
@@ -831,12 +938,19 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                         })
                     })
                     .collect();
+                let body = serde_json::json!({ "messages": batch_json }).to_string();
+                let signature = crate::webhooks::sign(
+                    &consumer_signing_secret(&queue.queue_id, &consumer.consumer_id),
+                    &body,
+                );
                 let req = cloud
                     .http
                     .post(&url)
+                    .header("content-type", "application/json")
                     .header("x-hive-queue-id", queue.queue_id.as_str())
                     .header("x-hive-queue-consumer", consumer.consumer_id.as_str())
-                    .json(&serde_json::json!({ "messages": batch_json }));
+                    .header("x-hive-signature", signature)
+                    .body(body);
                 let outcome =
                     tokio::time::timeout(std::time::Duration::from_secs(30), req.send()).await;
                 let ok = matches!(&outcome, Ok(Ok(resp)) if resp.status().is_success());

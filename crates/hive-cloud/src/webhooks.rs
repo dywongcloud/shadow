@@ -188,7 +188,9 @@ impl Default for WebhookStore {
     }
 }
 
-fn sign(secret: &str, body: &str) -> String {
+/// `sha256=<hex>` HMAC of `body`, the `x-hive-signature` every signed delivery carries (webhooks and
+/// queue consumer batches).
+pub(crate) fn sign(secret: &str, body: &str) -> String {
     match HmacSha256::new_from_slice(secret.as_bytes()) {
         Ok(mut mac) => {
             mac.update(body.as_bytes());
