@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-13 — the dashboard's server-side backend calls can no longer forget the caller's session
+
+`backend()` (`lib/gitops-server.ts`) took its `authToken` as a trailing optional argument,
+so a call site that forgot it silently talked to the node as the anonymous tenant, and an
+auth-enforced node answers that with `200`, an empty body and `x-hive-anon: 1`: the
+integration link route (`app/api/integrations/link/route.ts`) read `/v1/gitops/projects`
+that way, so env auto-injection never found a project and `injected` was always 0, and the
+observability page prefetch (`lib/observability-data.ts`, `app/observability/page.tsx`)
+seeded its first paint with the anonymous summary, zeros for every tenant, until the first
+live poll replaced it (both found by the ui comment sweep). The class is closed at the
+primitive: `backend(path, team, authToken, init?)` now REQUIRES the token (an explicit
+`null` only where an anonymous read is intended), `buildOrgArtifacts(team, authToken,
+rootPath?)` and the observability fetchers require it too, so `tsc` rejects every call that
+omits it (witnessed with a probe file: `backend(path, team)`, `backend(path, team, {init})`,
+`buildOrgArtifacts(team)` and `fetchMetricsSummary(team, 5)` all fail to compile, the
+explicit `null` compiles) and all 21 `backend()` call sites and the four observability
+fetch calls were fixed. The observability prefetch now
+forwards the session cookie (`sessionAuthToken()`, the `hive_jwt` the ops console already
+reads) and, with no token, seeds nothing, so the client renders its loading state until the
+first live poll instead of zeros; `fetchAndValidate` treats an `x-hive-anon` answer as a
+401, so a rejected session is never rendered as an empty summary, and the two dead
+observability route handlers answer 401 without a token instead of anonymous zeros. The
+link route reports `injectionError` when the projects read fails instead of swallowing
+it. Witnessed on a throwaway auth-enforced node with a tenant token and 16 real requests
+on its project: the link route (real handler, Composio replaced by a stub) returned
+`injected: 0` before and `injected: 1` after, and the node then lists the injected variable;
+the `/observability` first paint seeded `{"projects":[],"series":[{…zeros}]}` for a valid
+session cookie before and `{"projects":[{"project":"victimproj","requests":16}]…` after,
+with no cookie or a garbage one `null` (loading state). Not rolled.
+
 ## 2026-10-13 — the preview unlock route authorizes only from the node's answer and fails closed
 
 `GET /api/preview-unlock` (the dashboard half of the protected-preview unlock: Clerk says

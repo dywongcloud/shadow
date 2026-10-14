@@ -22,12 +22,10 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ project: s
     new Promise<null>((resolve) => setTimeout(() => resolve(null), GITHUB_TOKEN_LOOKUP_DEADLINE_MS)),
   ]);
   if (token) body.git_token = token;
-  const r = await backend(
-    `/v1/projects/${encodeURIComponent(project)}/redeploy`,
-    team,
-    { method: "POST", body: JSON.stringify(body) },
-    authTokenFrom(req),
-  );
+  const r = await backend(`/v1/projects/${encodeURIComponent(project)}/redeploy`, team, authTokenFrom(req), {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
   const text = await r.text();
   return new NextResponse(text, {
     status: r.status,

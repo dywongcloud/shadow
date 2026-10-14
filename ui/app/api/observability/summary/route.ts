@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveTeam, fetchMetricsSummary, BackendFetchError } from "@/lib/observability-data";
+import { authTokenFrom } from "@/lib/gitops-server";
 
 // Cached observability SUMMARY (the cacheable first-paint payload; the live tail keeps its uncached 5 s poll, which must never be served stale).
 // `private` keeps tenant data out of shared caches and `vary: x-hive-team, cookie` makes the tenant part of the cache identity; the tenant is
@@ -25,11 +26,13 @@ export async function GET(req: NextRequest) {
     );
   }
 
+  const authToken = authTokenFrom(req);
+  if (!authToken) return NextResponse.json({ ok: false, error: "sign in required" }, { status: 401, headers: { "cache-control": "no-store" } });
   const team = await resolveTeam(req.headers.get("x-hive-team"));
 
   let data: unknown;
   try {
-    data = await fetchMetricsSummary(team, minutes);
+    data = await fetchMetricsSummary(team, minutes, authToken);
   } catch (e: unknown) {
     const status = e instanceof BackendFetchError ? e.status : 502;
     const message = e instanceof Error ? e.message : String(e);

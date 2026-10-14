@@ -38,6 +38,7 @@ export async function POST(req: NextRequest) {
   const onlyProject: string | undefined = body?.project ? String(body.project) : undefined;
   if (!slug) return NextResponse.json({ ok: false, error: "slug is required" }, { status: 400 });
 
+  const authToken = authTokenFrom(req);
   const entity = await resolveEntity();
 
   const status = await toolkitStatus(entity, slug);
@@ -47,39 +48,43 @@ export async function POST(req: NextRequest) {
 
   const cred = await connectionCredentials(entity, slug);
   if (!cred || Object.keys(cred.credentials).length === 0) {
-    await backend("/v1/integrations", team, {
+    await backend("/v1/integrations", team, authToken, {
       method: "POST",
       body: JSON.stringify({ provider: slug, name, kind: cred?.kind || "oauth", entity, credentials: {}, env: {} }),
-    }, authTokenFrom(req)).catch(() => {});
+    }).catch(() => {});
     return NextResponse.json({ ok: true, provider: slug, env: [], injected: 0, note: "connected; no extractable credentials" });
   }
 
   const env = envFor(slug, cred.credentials);
 
-  const regRes = await backend("/v1/integrations", team, {
+  const regRes = await backend("/v1/integrations", team, authToken, {
     method: "POST",
     body: JSON.stringify({ provider: slug, name, kind: cred.kind, entity, credentials: cred.credentials, env }),
-  }, authTokenFrom(req));
+  });
   if (!regRes.ok) {
     return NextResponse.json({ ok: false, error: `register failed (${regRes.status})` }, { status: 502 });
   }
   const resource = await regRes.json().catch(() => ({}));
 
   let injected = 0;
+  let injectionError: string | undefined;
   try {
-    const projRes = await backend("/v1/gitops/projects", team);
-    const projects: Array<{ project: string }> = projRes.ok ? await projRes.json() : [];
+    const projRes = await backend("/v1/gitops/projects", team, authToken);
+    if (!projRes.ok) throw new Error(`projects read answered HTTP ${projRes.status}`);
+    const projects: Array<{ project: string }> = await projRes.json();
     const targets = onlyProject ? projects.filter((p) => p.project === onlyProject) : projects;
     for (const p of targets) {
       for (const [key, value] of Object.entries(env)) {
-        const r = await backend(`/v1/projects/${encodeURIComponent(p.project)}/env`, team, {
+        const r = await backend(`/v1/projects/${encodeURIComponent(p.project)}/env`, team, authToken, {
           method: "POST",
           body: JSON.stringify({ key, value, target: "production", sensitive: true }),
-        }, authTokenFrom(req));
+        });
         if (r.ok) injected++;
       }
     }
-  } catch {}
+  } catch (e) {
+    injectionError = e instanceof Error ? e.message : String(e);
+  }
 
   return NextResponse.json({
     ok: true,
@@ -87,5 +92,6 @@ export async function POST(req: NextRequest) {
     resource: resource?.id || null,
     env: Object.keys(env),
     injected,
+    ...(injectionError ? { injectionError } : {}),
   });
 }

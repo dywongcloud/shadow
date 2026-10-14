@@ -11,7 +11,7 @@ export async function POST(req: NextRequest) {
   const team = (await req.json().catch(() => ({})))?.team || req.headers.get("x-hive-team") || "personal";
   const authToken = authTokenFrom(req);
 
-  const linkRes = await backend("/v1/gitops", team, undefined, authToken);
+  const linkRes = await backend("/v1/gitops", team, authToken);
   const link = linkRes.ok ? await linkRes.json() : null;
   if (!link?.repo || !link.repo.includes("/")) {
     return NextResponse.json({ skipped: true, reason: "no-config-repo" });
@@ -29,7 +29,7 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, path, authToken);
+  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, authToken, path);
   if (failures.length) {
     return NextResponse.json(
       { ok: false, error: `platform state unreadable (${failures.join(", ")}) — refusing to commit a partial config tree` },
@@ -49,10 +49,10 @@ export async function POST(req: NextRequest) {
   if (!result.ok) return NextResponse.json({ ok: false, error: result.error }, { status: 502 });
 
   if (!result.deletionsSkipped) {
-    await backend("/v1/gitops/synced", team, {
+    await backend("/v1/gitops/synced", team, authToken, {
       method: "POST",
       body: JSON.stringify({ commit: result.commit || "", hash }),
-    }, authToken).catch(() => {});
+    }).catch(() => {});
   }
 
   return NextResponse.json({

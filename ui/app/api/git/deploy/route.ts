@@ -24,12 +24,7 @@ export async function POST(req: NextRequest) {
     ]);
     if (token) body.git_token = token;
   }
-  const r = await backend(
-    "/v1/git/deploy",
-    team,
-    { method: "POST", body: JSON.stringify(body) },
-    authTokenFrom(req),
-  );
+  const r = await backend("/v1/git/deploy", team, authTokenFrom(req), { method: "POST", body: JSON.stringify(body) });
   const text = await r.text();
   return new NextResponse(text, {
     status: r.status,

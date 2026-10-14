@@ -1,6 +1,7 @@
 import { Suspense } from "react";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { resolveTeam, fetchMetricsSummary, fetchSpeedInsightsSummary } from "@/lib/observability-data";
+import { sessionAuthToken } from "@/lib/gitops-server";
 import { ObservabilityClient } from "./observability-client";
 
 const SEEDED_METRICS_MINUTES = 720;
@@ -25,12 +26,14 @@ export default async function ObservabilityPage({
 }
 
 async function ObservabilityData({ initialTab }: { initialTab: "overview" | "speed" }) {
-  const team = await resolveTeam(null);
-  const [metrics, speed] = await Promise.all([
-    initialTab === "overview" ? fetchMetricsSummary(team, SEEDED_METRICS_MINUTES).catch(() => null) : Promise.resolve(null),
-    initialTab === "speed"
-      ? fetchSpeedInsightsSummary(team, SEEDED_SPEED_MINUTES, SEEDED_SPEED_DEVICE).catch(() => null)
-      : Promise.resolve(null),
-  ]);
+  const [team, authToken] = await Promise.all([resolveTeam(null), sessionAuthToken()]);
+  const [metrics, speed] = authToken
+    ? await Promise.all([
+        initialTab === "overview" ? fetchMetricsSummary(team, SEEDED_METRICS_MINUTES, authToken).catch(() => null) : Promise.resolve(null),
+        initialTab === "speed"
+          ? fetchSpeedInsightsSummary(team, SEEDED_SPEED_MINUTES, authToken, SEEDED_SPEED_DEVICE).catch(() => null)
+          : Promise.resolve(null),
+      ])
+    : [null, null];
   return <ObservabilityClient initialTab={initialTab} initialMetrics={metrics} initialSpeedInsights={speed} />;
 }

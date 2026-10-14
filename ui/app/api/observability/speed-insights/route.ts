@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveTeam, fetchSpeedInsightsSummary, BackendFetchError } from "@/lib/observability-data";
+import { authTokenFrom } from "@/lib/gitops-server";
 
 // Cached Speed Insights summary, sibling of ../summary/route.ts (same cache policy, see its header): RUM aggregates over the multi-day windows Speed Insights
 // offers, with its own allow-lists so the two query shapes cannot drift together.
@@ -31,11 +32,13 @@ export async function GET(req: NextRequest) {
   }
   const device = rawDevice as "desktop" | "mobile" | undefined;
 
+  const authToken = authTokenFrom(req);
+  if (!authToken) return NextResponse.json({ ok: false, error: "sign in required" }, { status: 401, headers: { "cache-control": "no-store" } });
   const team = await resolveTeam(req.headers.get("x-hive-team"));
 
   let data: unknown;
   try {
-    data = await fetchSpeedInsightsSummary(team, minutes, device);
+    data = await fetchSpeedInsightsSummary(team, minutes, authToken, device);
   } catch (e: unknown) {
     const status = e instanceof BackendFetchError ? e.status : 502;
     const message = e instanceof Error ? e.message : String(e);

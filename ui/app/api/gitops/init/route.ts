@@ -60,12 +60,12 @@ export async function POST(req: NextRequest) {
   const path = "openedge.yaml";
 
   const authToken = authTokenFrom(req);
-  await backend("/v1/gitops", team, {
+  await backend("/v1/gitops", team, authToken, {
     method: "PUT",
     body: JSON.stringify({ repo: fullName, branch, path, scope }),
-  }, authToken);
+  });
 
-  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, path, authToken);
+  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, authToken, path);
   if (failures.length) {
     console.error(
       `[gitops/init] refusing to commit a partial tree repo=${fullName} team=${team}: platform state unreadable (${failures.join(", ")})`
@@ -91,10 +91,10 @@ export async function POST(req: NextRequest) {
   }
 
   if (!result.deletionsSkipped) {
-    await backend("/v1/gitops/synced", team, {
+    await backend("/v1/gitops/synced", team, authToken, {
       method: "POST",
       body: JSON.stringify({ commit: result.commit || "", hash }),
-    }, authToken).catch(() => {});
+    }).catch(() => {});
   }
 
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
