@@ -11,8 +11,11 @@ const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 export async function POST(req: NextRequest) {
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ ok: false, error: "not signed in" }, { status: 401 });
-  const body = await req.json().catch(() => ({}) as any);
-  const team = (body?.team as string) || "personal";
+  const requested = (await req.json().catch(() => null))?.team;
+  if (requested != null && typeof requested !== "string") {
+    return NextResponse.json({ ok: false, error: "team must be a string" }, { status: 400 });
+  }
+  const team = requested || "personal";
 
   const access = await teamAccess(team, userId);
   if (access === "unavailable") {
