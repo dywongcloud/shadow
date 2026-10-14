@@ -210,6 +210,19 @@ async fn delete_litebox_link(tun_dev: &str) {
         .await;
 }
 
+/// Recreates `tun_dev` from scratch. The leading `ip link del` of a device that does not exist yet
+/// exits non-zero, so the script must not run under `set -e`: only the `&&` chain after it decides
+/// the exit status.
+fn create_link_script(tun_dev: &str, host_ip: &str) -> String {
+    format!(
+        "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
+         ip link del {tun_dev} 2>/dev/null; \
+         ip tuntap add dev {tun_dev} mode tun && \
+         ip addr add {host_ip}/30 dev {tun_dev} && \
+         ip link set {tun_dev} up"
+    )
+}
+
 /// A function cell's runner: guest and runner are one host process, killed on `terminate`.
 struct LiteboxFunctionProcess {
     child: tokio::process::Child,
@@ -229,8 +242,6 @@ struct LiteboxExec {
 
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
-    /// Long-lived function processes (the litebox runner itself — guest and
-    /// runner are one process), keyed by cell, killed on terminate.
     funcs: Arc<AsyncMutex<HashMap<CellId, LiteboxFunctionProcess>>>,
     /// Live sandbox execs keyed by `ExecRequest.id` — see [`LiteboxExec`].
     execs: Arc<AsyncMutex<HashMap<String, LiteboxExec>>>,
@@ -240,14 +251,15 @@ pub struct LiteboxBackend {
     containers: Arc<AsyncMutex<HashMap<CellId, crate::ContainerLaunch>>>,
     /// Set up in `provision`, torn down in `terminate`; absent for container cells.
     cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
-    /// Monotonic allocator of `/30` link slots (same derivation as `FirecrackerBackend::net_idx`);
-    /// it wraps, since a slot only collides with a link that is somehow still alive.
+    /// Monotonic allocator of `/30` link slots (`LINK_SLOTS`, same derivation as
+    /// `FirecrackerBackend::net_idx`); it wraps, since a slot only collides with a link that is
+    /// somehow still alive.
     net_idx: Arc<std::sync::atomic::AtomicUsize>,
     /// Serializes artifact and reference publication and reaping, so one immutable generation is
     /// never written and reaped at once; request-driven acquisition stays outside it.
     artifact_lock: Arc<AsyncMutex<()>>,
-    /// Memo of app archives already hash-verified against their committed identity, keyed by image;
-    /// [`VerifiedArchive`] says what makes a hit safe.
+    /// Memo of app archives already hash-verified against their committed identity, keyed by image
+    /// (one entry per launched image); [`VerifiedArchive`] says what makes a hit safe.
     verified_archives: Arc<std::sync::Mutex<HashMap<String, VerifiedArchive>>>,
     sampler: Arc<crate::CpuSampler>,
 }
@@ -269,7 +281,7 @@ struct VerifiedArchive {
 const VERIFIED_ARCHIVE_TTL_MS: u64 = 300_000;
 
 /// Node bind-rewrite shim, embedded so the runtime binary needs no separate deploy step;
-/// `stage_bind_shim` writes it into the guest tar.
+/// `append_litebox_runtime_augmentation` writes it into the guest tar.
 const NODE_BIND_SHIM_JS: &str = include_str!("litebox-bind-shim.js");
 /// Where `NODE_OPTIONS=--require` finds the shim inside the guest (the tar root); the host scratch
 /// path is invisible to the guest.
@@ -290,6 +302,15 @@ const MAX_PACKAGE_SCRIPT_BYTES: usize = 16 * 1024;
 const MAX_GUEST_ENV_BYTES: usize = 1024 * 1024;
 const DEFAULT_ARTIFACT_GC_GRACE_SECS: u64 = 600;
 const DEFAULT_ARTIFACT_GC_MAX_REAP_FRACTION: f64 = 0.5;
+/// `/30` links in `10.88.0.0/16`: the slot space `allocate_link` wraps within.
+const LINK_SLOTS: usize = (1 << 16) / 4;
+/// Concurrent local connects per guest address, process-wide (`fluid_tunnel`): the guest's network
+/// stack re-arms one listener serially, so connects queue at the tunnel instead of being
+/// accept-closed by the guest.
+const GUEST_LOCAL_CONNECT_PERMITS: usize = 1;
+/// Archive hashing slower than this is logged: a cold start pays it once per deployment, node and
+/// TTL instead of once per launch.
+const SLOW_ARCHIVE_VERIFY_MS: u128 = 50;
 
 /// Guest-side half of the artifact handshake, run before tenant code in Node and Bun: it exits with
 /// `RUNTIME_GUARD_EXIT_CODE` unless the mounted marker matches the host's protocol, id and content
@@ -842,8 +863,6 @@ fn archive_stamp(path: &std::path::Path) -> Option<(u64, u64, u64, i128)> {
     ))
 }
 
-/// True when this archive's bytes were already verified against `expected`
-/// and nothing about the reference or the file has changed since.
 fn verified_archive_hit(
     memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>,
     image: &str,
@@ -870,8 +889,6 @@ fn verified_archive_hit(
     }
 }
 
-/// A verified app archive that stops being current (reference changed, file
-/// replaced, TTL lapsed) is dropped, never served stale.
 fn forget_verified_archive(memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>, image: &str) {
     if let Ok(mut m) = memo.lock() {
         m.remove(image);
@@ -890,7 +907,6 @@ fn remember_verified_archive(
         return;
     };
     if let Ok(mut m) = memo.lock() {
-        // Bounded: one entry per image a node has actually launched.
         m.insert(
             image.to_string(),
             VerifiedArchive {
@@ -906,15 +922,8 @@ fn remember_verified_archive(
     }
 }
 
-/// Open an app archive whose bytes match the committed identity, re-hashing
-/// only when the memo cannot vouch for this exact file.
-///
-/// Two call sites hash the same archive during one cold start
-/// (`runtime_artifact_identity` and `start_function`), and a third
-/// (`provision_runtime`) re-derives the identity the caller just resolved. All
-/// three funnel through here so the archive is hashed ONCE per deployment per
-/// [`VERIFIED_ARCHIVE_TTL_MS`] instead of up to three times per launch. The
-/// comparison itself is never skipped — only its recomputation.
+/// Open an app archive whose bytes match the committed identity, re-hashing only when the memo
+/// cannot vouch for this exact file; the comparison is never skipped, only its recomputation.
 async fn verified_app_archive(
     memo: &std::sync::Mutex<HashMap<String, VerifiedArchive>>,
     image: &str,
@@ -945,9 +954,7 @@ async fn verified_app_archive(
     let file = verify_immutable_open(directory, &name, expected).await?;
     let verify_ms = started.elapsed().as_millis();
     remember_verified_archive(memo, image, &reference_sha256, stamp, expected, now_ms);
-    if verify_ms >= 50 {
-        // Visible on purpose: this is the cost a cold start pays once per
-        // deployment per node (and per TTL) instead of once per launch.
+    if verify_ms >= SLOW_ARCHIVE_VERIFY_MS {
         tracing::info!(
             image = %image,
             bytes = stamp.map(|(_, _, len, _)| len).unwrap_or(0),
@@ -1028,9 +1035,8 @@ fn link_cache_entry(
     Ok(())
 }
 
-/// Hard-link the exact inode named by `source` without consulting its mutable
-/// cache pathname. Linux documents `/proc/self/fd/<fd>` plus
-/// `AT_SYMLINK_FOLLOW` as the unprivileged `linkat` form for this operation.
+/// Hard-link the exact inode `source` names, never its mutable cache pathname: `/proc/self/fd/<fd>`
+/// plus `AT_SYMLINK_FOLLOW` is the unprivileged `linkat` form.
 #[cfg(target_os = "linux")]
 fn link_open_file_alias(
     source: &File,
@@ -1180,36 +1186,26 @@ fn remove_cache_directory_contents(directory: &ArtifactDirectory) -> anyhow::Res
     Ok(())
 }
 
+/// Entries planted in the probe's read-only tar layer, shaped like a deployment's own `/workspace`
+/// tree and 0o444 like every platform entry: `.keep` is overwritten in place (the copy-up path),
+/// `seed.json` is replaced by write-tmp-then-rename (the rename-over-lower path).
+fn probe_write_entries() -> Vec<(PathBuf, Vec<u8>)> {
+    vec![
+        (
+            PathBuf::from(PROBE_WRITE_DIR.trim_start_matches('/')).join(".keep"),
+            b"hive litebox write probe\n".to_vec(),
+        ),
+        (
+            PathBuf::from(PROBE_WRITE_DIR.trim_start_matches('/')).join("seed.json"),
+            b"{\"seed\":true}\n".to_vec(),
+        ),
+    ]
+}
+
 impl LiteboxBackend {
     pub fn new(cfg: LiteboxConfig) -> Self {
-        // Reap guests orphaned by a previous hive-cloud incarnation. The
-        // service runs KillMode=process (load-bearing — see AGENTS.md) so
-        // systemd never kills runner children, and the controlled-restart path
-        // exits via `process::exit`, which skips every `kill_on_drop`
-        // destructor — each restart therefore stranded at least one guest,
-        // still bound to its TUN address and still serving its OLD build.
-        // When a fresh cell later reused the same net index, the two guests
-        // shared one /30 and requests interleaved between builds: corrupted
-        // compressed bodies (ERR_CONTENT_DECODING_FAILED in browsers),
-        // "function closed before headers" 502s, and stale chunk names —
-        // all witnessed live on nodes-wtf 2026-08-26. At construction this
-        // process owns every litebox cell on the node and none may be running,
-        // so any surviving runner is definitionally stale.
         Self::reap_orphaned_runners(&cfg.runner_bin);
-        // Litebox's own TCP accept backlog is real (up to 8 truly concurrent
-        // pending connections, litebox/src/net/mod.rs) — live packet-capture
-        // testing on fc-sanjose (2026-09-17) found the actual "function
-        // closed before headers" trigger elsewhere: the guest network stack
-        // drops its just-written response if the app closes the connection
-        // (as ours did, unconditionally, via `Connection: close`) before its
-        // poll loop flushes pending TX data to the TUN device -- fixed at the
-        // source in fluid_tunnel::server::proxy_local, which no longer asks
-        // the guest to close. This gate stays at 1 as a conservative default,
-        // not because concurrency is unsafe; raising it is a separate,
-        // deliberately unstarted follow-up (PRD `litebox-raise-connect-permits`).
-        // Process-wide is correct: a node runs exactly one backend, and every
-        // function on a litebox node is a litebox guest.
-        fluid_tunnel::set_local_connect_permits(1);
+        fluid_tunnel::set_local_connect_permits(GUEST_LOCAL_CONNECT_PERMITS);
         LiteboxBackend {
             cfg,
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -1224,30 +1220,10 @@ impl LiteboxBackend {
         }
     }
 
-    /// SIGKILL every process whose executable is this backend's runner binary.
-    /// Boot-time only: after construction, live runners belong to THIS process
-    /// and must never be swept. Identification is by `/proc/<pid>/exe` against
-    /// the configured runner path (never by name substring, which could match
-    /// a tenant process), and this process's own children cannot exist yet.
-    ///
-    /// **Must survive a runner BINARY swap, not just a hive-cloud restart.**
-    /// Every deploy of `/usr/local/bin/litebox-runner` (the ansible role, or
-    /// `mv -f` onto the running path — there is no other way to replace an
-    /// in-use executable on Linux, which refuses in-place overwrite with
-    /// `ETXTBSY`) unlinks the OLD inode while an old orphan still maps it, so
-    /// the kernel appends `" (deleted)"` to that orphan's `/proc/<pid>/exe`
-    /// readlink from then on — confirmed live (`cp`+`mv -f` over a running
-    /// `sleep`, va, 2026-09-22): `/tmp/x/a.bin` reads back as
-    /// `/tmp/x/a.bin (deleted)`, which string-equality with the canonical
-    /// path silently stops matching. Witnessed for real: two fc-phoenix
-    /// runners from an earlier hive-cloud incarnation survived TWO restarts
-    /// of the fixed-binary-path reaper above — each one immediately after a
-    /// runner binary swap — burning ~48% of a core apiece for nearly an hour
-    /// until killed by hand. `strip_deleted_exe_suffix` undoes exactly that
-    /// kernel annotation before comparing; it must never strip a REAL literal
-    /// `" (deleted)"` suffix a tenant path could have — `runner_bin` is a
-    /// platform-controlled config value, never tenant input, so there is no
-    /// path here for that ambiguity to matter.
+    /// SIGKILL every process whose executable is this backend's runner binary. Boot-time only:
+    /// afterwards live runners belong to this process. Matched by `/proc/<pid>/exe` against the
+    /// configured path (never by name), after `strip_deleted_exe_suffix`, so a runner binary swap
+    /// does not hide an orphan.
     fn reap_orphaned_runners(runner_bin: &Path) {
         #[cfg(target_os = "linux")]
         {
@@ -1377,11 +1353,9 @@ impl LiteboxBackend {
         anyhow::bail!("could not allocate a unique litebox artifact scratch directory")
     }
 
-    /// Give Litebox the lexical `.tar` pathname its CLI requires without ever
-    /// reopening the content-addressed cache name. The alias is a hard link
-    /// created from the already-verified open archive descriptor inside a
-    /// private held directory; the returned Drop guard removes both names on
-    /// every success, error, and cancellation path.
+    /// Give Litebox the lexical `.tar` pathname its CLI requires without reopening the
+    /// content-addressed cache name: a hard link of the verified open archive inside a private held
+    /// directory, whose Drop guard removes both names on every path.
     fn allocate_initial_files_alias(
         &self,
         temporary: &ArtifactDirectory,
@@ -1433,9 +1407,8 @@ impl LiteboxBackend {
         Ok(alias)
     }
 
-    /// Append the two platform-owned preloads to an existing canonical tar.
-    /// The helper removes the prior end marker and writes exactly one new marker
-    /// after both entries, so later tar readers cannot stop before augmentation.
+    /// Probe only: append the platform preloads and the probe's write-test entries to a canonical
+    /// tar; `append_litebox_runtime_augmentation` leaves exactly one end marker after them.
     async fn stage_bind_shim(
         &self,
         _directories: &ArtifactDirectories,
@@ -1446,40 +1419,14 @@ impl LiteboxBackend {
             Vec::new(),
             None,
             None,
-            // A directory that exists ONLY in the read-only tar layer, exactly
-            // the shape of a deployment's own `/workspace` tree: the probe's
-            // guest must be able to mkdir + create + read back INSIDE it.
-            // Two planted files, both 0o444 like every platform entry (and like every
-            // file of a sealed hive artifact): `.keep` is OVERWRITTEN in place (the
-            // copy-up path), `seed.json` is REPLACED by the write-tmp-then-rename
-            // atomic-save idiom every JSON store uses (the rename-over-lower path).
-            vec![
-                (
-                    PathBuf::from(PROBE_WRITE_DIR.trim_start_matches('/')).join(".keep"),
-                    b"hive litebox write probe\n".to_vec(),
-                ),
-                (
-                    PathBuf::from(PROBE_WRITE_DIR.trim_start_matches('/')).join("seed.json"),
-                    b"{\"seed\":true}\n".to_vec(),
-                ),
-            ],
+            probe_write_entries(),
         )
         .await
     }
 
-    /// Allocate a fresh TUN device + real `/30` for one cell — mirrors
-    /// `FirecrackerBackend::setup_cell_net`'s allocator exactly (same
-    /// `net_idx`-derived third/base octet split, same 16384-slot space,
-    /// `mode=tun` instead of `mode=tap`). No namespace or veth pair: since
-    /// `networking.patch` makes litebox's guest IP configurable per
-    /// invocation (see [`LiteboxNet`]'s doc), each cell can just own a real,
-    /// distinct address directly — the host routes to it the moment the
-    /// device's host-side address is assigned, no NAT/forwarding needed.
-    /// Returns `None` (never panics/propagates) on any setup failure so a
-    /// host missing `ip`/CAP_NET_ADMIN/`/dev/net/tun` degrades to "this cell
-    /// has no network" rather than failing the whole cell — the caller
-    /// (`provision`) is what turns that into a hard error for non-container
-    /// cells, since a networkless litebox cell cannot serve anything.
+    /// Allocate this cell's TUN link for its function process and record it in `cell_nets`; `None`
+    /// when link setup fails (no `ip`, `CAP_NET_ADMIN` or `/dev/net/tun`), which `provision` turns
+    /// into a hard error for non-container cells.
     async fn setup_cell_net(&self, id: &CellId) -> Option<LiteboxNet> {
         let (net, mut rollback) = self.allocate_link().await?;
         self.cell_nets.lock().await.insert(id.clone(), net.clone());
@@ -1487,51 +1434,13 @@ impl LiteboxBackend {
         Some(net)
     }
 
-    /// Allocate a fresh TUN device + `/30` that belongs to ONE runner, not to
-    /// the cell. A TUN device has a single owner: litebox's userland stack
-    /// attaches with `TUNSETIFF`, and a second runner attaching to the same
-    /// device gets `EBUSY` and panics at startup (`litebox_platform_linux_
-    /// userland/src/lib.rs:245 failed to set TUN interface flags: EBUSY`,
-    /// witnessed 2026-09-02 in a dashboard terminal: the interactive shell
-    /// held the cell's device, and a one-shot exec against the same cell — or
-    /// a second shell — died on the spot). So the cell's provision-time
-    /// device (`setup_cell_net`) serves ONLY the function process; every
-    /// `exec_command` and `exec_pty` runner gets its own link from here and
-    /// tears it down when it exits: the returned rollback stays ARMED and is
-    /// moved into the runner's waiter task, whose drop deletes the link —
-    /// the same "the guard belongs to the waiter" rule the guest tar follows.
-    /// `None` on any setup failure (no `ip`, no CAP_NET_ADMIN, no
-    /// `/dev/net/tun`), never a panic.
-    /// Idempotently enable IP forwarding + NAT so litebox guests (10.88/16) can
-    /// reach the internet.
-    ///
-    /// A litebox cell is a point-to-point TUN with no forwarding by design, so
-    /// without this a guest can talk to the host end of its link and nothing
-    /// else: outbound HTTPS from a tenant app — a hosted database, an external
-    /// API — never completes. Combined with the `resolv.conf` planted in the
-    /// guest tar, this is what makes `getaddrinfo` and `connect` work at all.
-    ///
-    /// Modelled on `FirecrackerBackend::ensure_host_nat`, including the two
-    /// properties that matter:
-    ///
-    /// TENANT ISOLATION: the cell↔cell DROP is installed BEFORE the ACCEPTs.
-    /// The host routes every per-cell /30, so a bare `-s 10.88/16 ACCEPT` would
-    /// also forward guest→guest and let one tenant reach another's guest.
-    /// Return traffic from the internet is unaffected (its source is external,
-    /// so the 10.88→10.88 pair never matches).
-    ///
-    /// HAIRPIN: a guest that calls its OWN deployment's public hostname
-    /// resolves the node's public IP, which sits on the cloud provider's 1:1
-    /// NAT and on no host interface — the packet would be masqueraded out and
-    /// dropped. Redirecting 80/443 to that address back into the host fixes it;
-    /// because REDIRECT lands on INPUT, the cell↔cell FORWARD drop is
-    /// untouched.
-    ///
-    /// Uses its own `hive_nat_litebox` table rather than sharing `hive_nat`,
-    /// which is keyed to the firecracker 172.16/16 range. `scripts/hive-
-    /// lockdown.sh` deletes only its own named tables and the generator
-    /// rewrites only the PEERS lines, so this table survives a lockdown
-    /// regeneration. Failures are non-fatal: cells simply get no egress.
+    /// Idempotently enable forwarding and NAT for litebox guests (`10.88.0.0/16`): internet egress
+    /// only (guest-to-guest traffic, private ranges, the metadata endpoint and the node's admin
+    /// port are dropped ahead of the ACCEPTs, inserted at the head of FORWARD), plus a hairpin
+    /// redirect of 80/443 for a guest calling its own public hostname. The hairpin address reaches
+    /// the script only as `$HAIRPIN_IP`, never interpolated. The nft branch keeps its own
+    /// `hive_nat_litebox` table, which a lockdown regeneration leaves alone. Failures are
+    /// non-fatal: cells simply get no egress.
     #[cfg(target_os = "linux")]
     async fn ensure_guest_nat() {
         use std::sync::atomic::Ordering;
@@ -1539,20 +1448,13 @@ impl LiteboxBackend {
         if NAT_READY.swap(true, Ordering::SeqCst) {
             return;
         }
-        let hairpin = match std::env::var("HIVE_PUBLIC_IP")
+        let hairpin_ip = match std::env::var("HIVE_PUBLIC_IP")
             .ok()
             .map(|s| s.trim().to_string())
         {
-            // `auto` is a configured value meaning "detect at runtime", not an
-            // address; an unset/unparseable value means this host has no
-            // inbound-reachable address to hairpin to.
             Some(ip) if ip.parse::<std::net::Ipv4Addr>().is_ok() => ip,
             _ => String::new(),
         };
-        // `HAIRPIN_IP` travels as an env var rather than being interpolated:
-        // the nft branch is full of `{ ... }` chain bodies, so a `format!`
-        // would need every brace escaped, and an env var leaves no
-        // shell-injection surface for a configured value.
         let script = r#"
             export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
             sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
@@ -1616,7 +1518,7 @@ impl LiteboxBackend {
         let _ = Command::new("/bin/sh")
             .arg("-c")
             .arg(script)
-            .env("HAIRPIN_IP", &hairpin)
+            .env("HAIRPIN_IP", &hairpin_ip)
             .kill_on_drop(true)
             .output()
             .await;
@@ -1625,11 +1527,14 @@ impl LiteboxBackend {
     #[cfg(not(target_os = "linux"))]
     async fn ensure_guest_nat() {}
 
+    /// One runner's TUN link (see [`LiteboxNet`]). A TUN device has one owner: a second runner
+    /// attaching gets `EBUSY` and panics, so the cell's provision-time link serves only the
+    /// function process and every `exec_command`/`exec_pty` runner allocates its own, whose armed
+    /// rollback its waiter task drops to delete the link. `None` on any setup failure.
     async fn allocate_link(&self) -> Option<(LiteboxNet, LiteboxLinkRollback)> {
         use std::sync::atomic::Ordering;
-        // Egress once per process, before the first guest could try to use it.
         Self::ensure_guest_nat().await;
-        let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % 16384;
+        let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % LINK_SLOTS;
         let third = ((i >> 6) & 0xff) as u8;
         let base = ((i & 0x3f) as u8) * 4;
         let host_ip = format!("10.88.{third}.{}", base + 1);
@@ -1637,25 +1542,7 @@ impl LiteboxBackend {
         let tun_dev = format!("lbt{i}");
         let rollback = LiteboxLinkRollback::new(tun_dev.clone());
 
-        // Recreate fresh every time (delete any stale device from a prior
-        // cell at this index) — same idempotency shape as
-        // FirecrackerBackend::setup_cell_net's tap recreation, deliberately
-        // WITHOUT `set -e`: `ip link del` on a not-yet-existing device (the
-        // overwhelmingly common case — `net_idx` only increases) exits
-        // non-zero even with its message silenced by `2>/dev/null`, and
-        // `set -e` would abort the whole script right there, before ever
-        // reaching `ip tuntap add` — reproduced live on fc-frankfurt
-        // (2026-08-08). Bare `&&` chaining (matching
-        // FirecrackerBackend::setup_cell_net exactly) makes the harmless
-        // `del` failure a non-issue: the script's own exit status is
-        // whatever the LAST command in the chain returns.
-        let script = format!(
-            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
-             ip link del {tun_dev} 2>/dev/null; \
-             ip tuntap add dev {tun_dev} mode tun && \
-             ip addr add {host_ip}/30 dev {tun_dev} && \
-             ip link set {tun_dev} up"
-        );
+        let script = create_link_script(&tun_dev, &host_ip);
         let ok = Command::new("/bin/sh")
             .arg("-c")
             .arg(&script)
@@ -1682,8 +1569,7 @@ impl LiteboxBackend {
         Some((net, rollback))
     }
 
-    /// Tear down a cell's TUN device (best-effort; no netns/veth/iptables
-    /// state exists to clean up alongside it).
+    /// Best-effort removal of the cell's TUN device.
     async fn teardown_cell_net(&self, id: &CellId) {
         if let Some(net) = self.cell_nets.lock().await.remove(id) {
             let script = format!(
@@ -1698,13 +1584,8 @@ impl LiteboxBackend {
         }
     }
 
-    /// Tier 1: cheap existence probe — mirrors
-    /// `FirecrackerBackend::is_supported`'s shape exactly (device/binary
-    /// existence only). This is NOT proof the sandbox actually works — see
-    /// [`smoke_test`](Self::smoke_test) for the real functional check, and
-    /// the module doc's "PVM kernels" cross-reference for why existence
-    /// alone is provably insufficient (a KVM host can pass an existence
-    /// check and still hard-reset on real use).
+    /// Tier 1: the runner binary exists on Linux. Not proof the sandbox works; [`Self::smoke_test`]
+    /// is the functional check.
     pub fn is_supported(&self) -> bool {
         cfg!(target_os = "linux") && self.cfg.runner_bin.exists()
     }
