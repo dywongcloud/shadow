@@ -5122,11 +5122,13 @@ impl CellBackend for LiteboxBackend {
 
     /// One argv command inside `cell` (Sandboxes `run_command`), through the same guest mechanism
     /// as `exec_pty`: a fresh runner on its own TUN link with a guest tar holding the fixed
-    /// shell/coreutils set plus the resolved program and its `ldd` closure. stdout and stderr
-    /// stream as separate `ExecOutput` lines, then exactly one `ExecDone { exit_code }`, `None`
-    /// when the runner died by signal (a `kill_exec`), never a fake `Some(0)`. The runner leads its
-    /// own process group, so `kill_exec` ends the whole guest tree by exec id. Returns once the
-    /// runner is spawned; the caller drains the channel.
+    /// shell/coreutils set plus the resolved program and its `ldd` closure (for a shebang script
+    /// also the script itself: `resolve_guest_argv` turns `npx` into `/usr/bin/node-22
+    /// /usr/bin/npx`). stdout and stderr stream as separate `ExecOutput` lines, then exactly one
+    /// `ExecDone { exit_code }` after every output line, `None` when the runner died by signal (a
+    /// `kill_exec`), never a fake `Some(0)`. The runner leads its own process group, so `kill_exec`
+    /// ends the whole guest tree by exec id; `sudo` is refused, since the runner is an unprivileged
+    /// host process. Returns once the runner is spawned; the caller drains the channel.
     async fn exec_command(
         &self,
         cell: &CellHandle,
@@ -5136,8 +5138,6 @@ impl CellBackend for LiteboxBackend {
             !req.id.is_empty(),
             "litebox exec requires a non-empty exec id"
         );
-        // The runner is an unprivileged host process; there is no `sudo` in
-        // the guest and no privilege to elevate to. Refuse loudly at start.
         anyhow::ensure!(
             !req.sudo,
             "litebox sandboxes cannot elevate privileges: sudo is not available inside a litebox guest"
@@ -5145,10 +5145,6 @@ impl CellBackend for LiteboxBackend {
         if self.execs.lock().await.contains_key(&req.id) {
             anyhow::bail!("exec id {} is already running on this node", req.id);
         }
-        // The cell must exist (its provision-time link proves it), but this
-        // runner gets its OWN link: a TUN device has one owner, and sharing
-        // the cell's with a live shell or function was `EBUSY` at startup
-        // (see `allocate_link`).
         anyhow::ensure!(
             self.cell_nets.lock().await.contains_key(&cell.id),
             "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
@@ -5175,10 +5171,6 @@ impl CellBackend for LiteboxBackend {
         let directories = self.prepare_artifact_dirs()?;
         directories.verify_bindings()?;
         let exec_tar = self.allocate_temp_file(&directories.temporary, "exec", ".tar")?;
-        // The program the runner first execs, plus (for a shebang script) the
-        // script itself: `resolve_guest_argv` turns `npx` into
-        // `/usr/bin/node-22 /usr/bin/npx`, and the script has to be in the
-        // guest for that argv to mean anything.
         let mut staged = vec![program.clone()];
         if !req.shell {
             if let Ok(named) = resolve_guest_program(&req.cmd) {
@@ -5216,19 +5208,12 @@ impl CellBackend for LiteboxBackend {
             .env("PATH", "/usr/bin:/bin")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            // Node honours this regardless of OpenSSL's compiled-in default
-            // path, which is what the planted bundle at
-            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
-            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
-            // 226 KiB bundle present, measured 2026-10-08).
             .envs(guest_ca_env())
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // Own process group: `kill_exec` sends SIGKILL to the GROUP, which
-        // reaches every process the guest forked, not only the runner.
         #[cfg(unix)]
         command.process_group(0);
 
@@ -5267,21 +5252,14 @@ impl CellBackend for LiteboxBackend {
         let exec_id = req.id.clone();
         tokio::spawn(async move {
             let status = child.wait().await;
-            // Every output line precedes the terminal event.
             let _ = stdout.await;
             let _ = stderr.await;
             execs.lock().await.remove(&exec_id);
-            // `code()` is `None` for a signal death — exactly the "killed"
-            // meaning the protocol reserves for `exit_code: None`.
             let exit_code = status.ok().and_then(|s| s.code());
             let _ = tx.send(hive_core::AgentEvent::ExecDone {
                 id: exec_id,
                 exit_code,
             });
-            // The runner has exited, so the guest tar and its private alias
-            // are provably no longer being read; their Drop guards unlink.
-            // The runner's own TUN link goes the same way: the armed rollback
-            // deletes the device (see `allocate_link`).
             drop(initial_files_alias);
             drop(exec_tar);
             drop(link);
@@ -5289,11 +5267,10 @@ impl CellBackend for LiteboxBackend {
         Ok(rx)
     }
 
-    /// Terminate a still-running `exec_command` by id: SIGKILL to the whole
-    /// process group the runner leads (the guest's forked descendants
-    /// included). Idempotent — an id that already finished is a no-op. The
-    /// waiter task then observes the signal death and emits
-    /// `ExecDone { exit_code: None }`.
+    /// Terminates a still-running `exec_command` by id: SIGKILL to the whole process group the
+    /// runner leads (the guest's forked descendants included). Idempotent: an id that already
+    /// finished is a no-op, and a group already gone (ESRCH, it raced its own exit) is success. The
+    /// waiter task then observes the signal death and emits `ExecDone { exit_code: None }`.
     async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
         let entry = self.execs.lock().await.get(exec_id).cloned();
         let Some(entry) = entry else {
@@ -5312,8 +5289,6 @@ impl CellBackend for LiteboxBackend {
             let rc = unsafe { libc::killpg(entry.pgid, libc::SIGKILL) };
             if rc != 0 {
                 let error = std::io::Error::last_os_error();
-                // ESRCH: the group is already gone (raced its own exit) —
-                // the waiter reports the real exit either way.
                 anyhow::ensure!(
                     error.raw_os_error() == Some(libc::ESRCH),
                     "killpg({}) for exec {exec_id} failed: {error}",
@@ -5328,6 +5303,23 @@ impl CellBackend for LiteboxBackend {
         }
     }
 
+    /// Opens an interactive shell in the cell. The guest is this host's own runner child (syscall
+    /// interception, not virtualization), so unlike Firecracker's vsock `exec_pty` no wire protocol
+    /// is needed: a REAL host pty handed to the runner gives the shell genuine raw-mode terminal
+    /// behavior, as over SSH. The shell's runner gets its own TUN link (`allocate_link`); its tool
+    /// set is the fixed one plus the caller's `programs`, and a requested program the host cannot
+    /// resolve is skipped with a warning, since a shell without `node` is still a shell. stdin and
+    /// stdout ride the pty but stderr is a PIPE pumped into the same terminal stream: litebox
+    /// answers the job-control ioctls with ENOSYS, and a shell whose stderr IS the pty runs
+    /// job-control setup and kills the runner (status 21) before the first prompt. `-i` asks for
+    /// the interactive shell that a non-tty stderr would suppress, and the staged rc (`ENV`,
+    /// `SHELL_RC_BYTES`) moves stderr onto the pty once job-control init is behind the shell. The
+    /// stderr pump forwards raw chunks, never lines (a prompt has no trailing newline), turns `\n`
+    /// into `\r\n` (the pipe bypasses the pty's output translation) and drops the two one-line
+    /// job-control warnings. The runner leads its own process group, tracked in `execs` under the
+    /// session id like a one-shot exec, so `terminate` kills a shell with its cell; the guest tar
+    /// and its alias are held by the waiter task until the runner exits, never dropped when this
+    /// function returns (the runner opens the alias path after spawn).
     async fn exec_pty(
         &self,
         cell: &CellHandle,
@@ -5336,23 +5328,6 @@ impl CellBackend for LiteboxBackend {
         tokio::sync::mpsc::UnboundedReceiver<hive_core::AgentEvent>,
         crate::PtyIo,
     )> {
-        // litebox has no separate guest kernel/agent — the guest IS this
-        // host's own `litebox-runner` child process (syscall interception,
-        // not virtualization), so unlike Firecracker's vsock-agent-protocol
-        // exec_pty, no wire protocol is needed at all: a REAL host pty
-        // allocated here and handed to the runner as its stdin/stdout/stderr
-        // gives the guest shell genuine raw-mode terminal behavior for free
-        // (the `AnEntrypoint/litebox` base this platform tracks also
-        // implements its own guest-internal /dev/ptmx pty subsystem — see
-        // ansible/roles/litebox/files/PATCHES.md's "litebox fork tracking"
-        // section — but wiring THIS host-side pty is simpler and needs none
-        // of that: the shell's own line discipline runs against a real
-        // kernel pty exactly as it would over SSH, the same technique
-        // `hive-cell-agent`'s Firecracker-guest PTY support uses on the
-        // OTHER side of the vsock boundary).
-        // The cell must exist, but the shell runner gets its OWN TUN link
-        // (one owner per device; sharing the cell's with a function or a
-        // one-shot exec was `EBUSY` — see `allocate_link`).
         anyhow::ensure!(
             self.cell_nets.lock().await.contains_key(&cell.id),
             "litebox: cell {} has no TUN device (provision should have set one up) — this is a bug, not a runtime condition",
@@ -5368,11 +5343,6 @@ impl CellBackend for LiteboxBackend {
         let directories = self.prepare_artifact_dirs()?;
         directories.verify_bindings()?;
         let shell_tar = self.allocate_temp_file(&directories.temporary, "shell", ".tar")?;
-        // The fixed tool set plus whatever the caller says this shell must be
-        // able to run (the sandbox's runtime — `node` for node22). A program
-        // the host cannot resolve is skipped with a warning rather than
-        // failing the shell: a shell without `node` is still a shell, and the
-        // warning names what the tenant will find missing.
         let mut extra: Vec<PathBuf> = Vec::new();
         for program in &req.programs {
             match resolve_guest_program(program) {
@@ -5396,23 +5366,6 @@ impl CellBackend for LiteboxBackend {
         } else {
             req.shell.clone()
         };
-        // Litebox does not implement the job-control tty ioctls (tcsetpgrp
-        // answers ENOSYS, -38). A shell whose stderr IS the pty goes
-        // interactive on its own, runs job-control setup, and the runner dies
-        // with status 21 before a single prompt byte — measured 2026-09-01 on
-        // fc-sanjose for `/bin/sh`, `+m`, `--norc +m` and `-i +m` alike. With
-        // stderr OFF the pty the very same shell (`-i`) prints its prompt,
-        // executes input and exits cleanly, warning once "cannot set terminal
-        // process group (-38)" / "no job control in this shell". So: stdin
-        // and stdout stay on the pty (echo, line discipline, readline all
-        // real), stderr is a PIPE pumped into the same terminal stream below,
-        // and `-i` asks for the interactive shell that stderr-not-a-tty would
-        // otherwise suppress. Every shell this platform offers (sh, bash,
-        // dash, zsh, fish) accepts `-i`. The pipe is only the STARTUP
-        // arrangement: `ENV` names the staged rc file whose `exec 2>&1`
-        // moves stderr onto the pty once job-control init is behind the
-        // shell, so prompts and output stop racing each other across two
-        // channels (`SHELL_RC_GUEST_PATH`).
         let shell_args: Vec<&str> = vec!["-i"];
         let cwd = if req.cwd.is_empty() {
             "/".to_string()
@@ -5442,17 +5395,9 @@ impl CellBackend for LiteboxBackend {
             .env("PATH", "/usr/bin:/bin")
             .env("TERM", "xterm-256color")
             .env("ENV", SHELL_RC_GUEST_PATH)
-            // No history file: the guest tree has no writable `$HOME`, and a
-            // failed create there is a litebox panic, not an EACCES (see
-            // `SHELL_RC_GUEST_PATH`).
             .env("HISTFILE", "")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            // Node honours this regardless of OpenSSL's compiled-in default
-            // path, which is what the planted bundle at
-            // /etc/ssl/certs/ca-certificates.crt was NOT being read from
-            // (UNABLE_TO_GET_ISSUER_CERT_LOCALLY persisted with a valid
-            // 226 KiB bundle present, measured 2026-10-08).
             .envs(guest_ca_env())
             .current_dir(&cwd)
             // SAFETY: dup'd fds are valid, open, and owned until this Stdio
@@ -5462,11 +5407,6 @@ impl CellBackend for LiteboxBackend {
             .stdout(Stdio::from(slave_fd))
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        // Own process group, tracked in `execs` under the session id exactly
-        // like a one-shot exec, so `terminate` can kill a shell (and whatever
-        // it forked) together with its cell. The runner already has no
-        // controlling terminal (no setsid/TIOCSCTTY), so job control is
-        // unchanged by the setpgid.
         #[cfg(unix)]
         command.process_group(0);
 
@@ -5493,25 +5433,11 @@ impl CellBackend for LiteboxBackend {
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        // The runner's stderr rides the same terminal stream, line by line,
-        // minus the two one-line litebox job-control warnings every session
-        // would otherwise open with (they describe the runner, not the
-        // tenant's shell, and are documented on `shell_args` above). Anything
-        // else the runner or the shell writes to stderr — a real error — is
-        // shown verbatim.
         if let Some(mut stderr) = child.stderr.take() {
             let tx_err = tx.clone();
             let id_err = session_id.clone();
             tokio::spawn(async move {
                 use tokio::io::AsyncReadExt;
-                // Raw chunks, never lines: an interactive shell writes its
-                // PROMPT to stderr without a trailing newline, so a line
-                // reader would hold it forever and the terminal would open
-                // blank (witnessed on the first cut of this pump: 101
-                // upgrade, runner alive, zero frames). The pipe bypasses the
-                // pty's output translation, so `\n` becomes `\r\n` here or
-                // xterm renders a staircase. The two litebox job-control
-                // warnings are whole lines and are dropped where they occur.
                 let mut buffer = [0_u8; 4096];
                 loop {
                     let n = match stderr.read(&mut buffer).await {
@@ -5520,13 +5446,6 @@ impl CellBackend for LiteboxBackend {
                     };
                     let chunk = &buffer[..n];
                     let mut out = Vec::with_capacity(n + 16);
-                    // A dropped warning owns the newline that FOLLOWS it:
-                    // `split` hands that newline to the next segment's
-                    // boundary, so it is swallowed there. Truncating the
-                    // CRLF BEFORE the dropped line instead left the final
-                    // warning's newline as a bare CRLF and every terminal
-                    // opened with a blank line above its first prompt
-                    // (witnessed on the roll that introduced this pump).
                     let mut swallow_newline = false;
                     for (i, segment) in chunk.split(|b| *b == b'\n').enumerate() {
                         if i > 0 {
@@ -5580,9 +5499,6 @@ impl CellBackend for LiteboxBackend {
                             break;
                         }
                     }
-                    // EIO on a pty master is the normal "slave closed" signal
-                    // once the shell (and everything else holding the slave
-                    // open) has exited — not a real error.
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
                     Err(_) => break,
                 }
@@ -5598,25 +5514,8 @@ impl CellBackend for LiteboxBackend {
                 id: id_waiter,
                 exit_code,
             });
-            // Drop this cell's placeholder from `funcs` if a real function
-            // launch never claimed the slot — best-effort, the interactive
-            // shell was never registered there to begin with, this just
-            // guards a hypothetical future caller that keys off cell_id.
             let _ = funcs.lock().await.remove(&cell_id);
-            // The shell runner's own TUN link goes with it: the armed rollback
-            // deletes the device now that no process holds it (`allocate_link`).
             drop(link);
-            // The guest tar and its descriptor-bound alias MUST outlive the
-            // runner: their Drop guards unlink the alias name and its scratch
-            // directory. Dropping them at the end of `exec_pty` (as this
-            // function once did) raced the runner's own open of
-            // `--initial-files=/proc/self/fd/N/initial-files.tar` — the entry
-            // was gone a few milliseconds after spawn, litebox died with a bare
-            // `No such file or directory (os error 2)` on the pty, and every
-            // dashboard terminal "instantly disconnected" (witnessed
-            // 2026-09-01 on fc-sanjose: 101 upgrade, then that error frame and
-            // `{"type":"exited","exit_code":1}`). `exec_command` has always
-            // held both in its waiter; this is the same discipline.
             drop(initial_files_alias);
             drop(shell_tar);
         });
@@ -5650,14 +5549,9 @@ impl CellBackend for LiteboxBackend {
     }
 }
 
-/// Allocate a real host pty (`openpty(3)`) sized to `cols`x`rows`, returned as
-/// a `(master, slave)` pair of owned fds. Used by `LiteboxBackend::exec_pty`
-/// to give an interactive sandbox shell genuine raw-mode terminal behavior —
-/// see that method's own doc comment for why a host-side pty is sufficient
-/// here (litebox's guest and this host process share one address space, so
-/// handing the slave straight to the spawned runner as its stdin/stdout/
-/// stderr works exactly like a real terminal session, no in-guest pty
-/// subsystem required).
+/// Allocates a real host pty (`openpty(3)`) of `cols`x`rows` as an owned `(master, slave)` pair for
+/// `exec_pty`: the guest is the runner, a plain host process, so its stdio can be a real pty and
+/// the shell gets genuine raw-mode terminal behavior with no in-guest pty subsystem.
 #[cfg(target_os = "linux")]
 fn open_pty_pair(cols: u16, rows: u16) -> anyhow::Result<(std::fs::File, std::fs::File)> {
     use std::os::fd::FromRawFd;
