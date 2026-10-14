@@ -681,8 +681,10 @@ fn persist_durable_blocking(cloud: &Arc<CloudState>) -> bool {
 /// final Guardian generation (wired to the shutdown path in `main`). A `persist()` after that
 /// boundary is refused without waiting (`admit_generation`); admission closes under the lock
 /// `persist()` registers under, so a concurrent `persist()` either forces another pass or is
-/// refused.
+/// refused. The audit log's writer thread is drained first (`audit::flush_blocking`): the audit
+/// line of every mutation the final snapshot covers must be on disk before the process exits.
 pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
+    crate::audit::flush_blocking();
     let Some(p) = PERSISTER.get() else {
         return crate::guardian::close_replication_admission(None);
     };
