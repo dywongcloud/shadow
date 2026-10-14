@@ -1,9 +1,9 @@
-//! OS-aware container CLI abstraction: Apple's `container` tool (Virtualization.framework, one VM
-//! per container) on macOS, `podman` everywhere else. The flag differences are hidden here (`rm -f`
-//! vs `delete -f`, `logs --tail` vs `-n`, volume listing shapes, podman-only `--pids-limit` /
-//! `--security-opt` / `--runtime`, `image pull`); `--ip`/`--add-host` have NO `container`
-//! equivalent, so multi-service compose deploys stay on podman even on macOS. Every function
-//! takes an explicit `apple: bool`; `is_apple_default()` is only the starting point.
+//! OS-aware container CLI abstraction: Apple's `container` tool (one VM per container) on macOS,
+//! `podman` everywhere else, with the flag differences hidden here (`rm -f` vs `delete -f`, `logs
+//! --tail` vs `-n`, volume listing shapes, podman-only
+//! `--pids-limit`/`--security-opt`/`--runtime`). `--ip`/`--add-host` have NO `container`
+//! equivalent, so multi-service compose deploys stay on podman even on macOS. Every function takes
+//! an explicit `apple: bool`; `is_apple_default()` is only the starting point.
 
 use std::process::Stdio;
 use tokio::process::Command;

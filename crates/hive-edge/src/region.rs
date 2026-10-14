@@ -173,14 +173,10 @@ pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     2.0 * r * h.sqrt().asin()
 }
 
-/// Fixed relay backstop used by [`select_relay_hint`] when no peer-owned relay is known.
-///
-/// It has to be a REAL iroh-relay endpoint, which means both halves are load-bearing: the relay
-/// serves HTTPS on **3343**, and its certificate is the `*.relay.shadw.app` wildcard. The
-/// port-less `https://relay.shadw.cloud` this used to name therefore resolved to a fleet node's
-/// own :443 — hive-cloud's public edge, which answers `/ping` with 404 `host-rejected`, one per
-/// probe — and `relay.shadw.cloud:3343` fails hostname verification against that cert. Measured
-/// live: `https://fc-virginia.relay.shadw.app:3343/ping` -> 200.
+/// Fixed relay backstop used by [`select_relay_hint`] when no peer-owned relay is known. It must be
+/// a REAL iroh-relay endpoint: HTTPS on **3343** under a host the `*.relay.shadw.app` wildcard
+/// certificate covers (a port-less `relay.shadw.cloud` URL reaches a fleet node's :443,
+/// hive-cloud's public edge, which answers `/ping` with 404 `host-rejected`).
 pub const CENTRAL_RELAY_URL: &str = "https://fc-virginia.relay.shadw.app:3343";
 
 /// Relay URL to hint when dialing `target`: its own `relay_url`, else the geographically nearest

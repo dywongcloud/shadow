@@ -39,15 +39,11 @@ pub mod anyhow_like {
 
 pub type Result<T> = std::result::Result<T, HiveError>;
 
-/// Stable markers a backend embeds in its `anyhow` error text so the gateway can classify a lease
-/// failure by CAUSE instead of by catch-all. The lease path erases types: every backend fault
-/// reaches `fluid-gateway::classify_lease_error` as a flat error string, and anything it does not
-/// name is reported as `CAPACITY_EXHAUSTED` (a missing base rootfs was once published as "the host
-/// is out of capacity" on a node with 923 GB free). These markers are the contract between the two
-/// crates and the ONLY thing keeping the classifier off substring-matching prose that a reword
-/// silently breaks, so treat each as public API: keep it in the error text and keep the matching
-/// arm in the classifier. Both crates depend on `hive-core` and neither on the other, so this is
-/// the one place both can name.
+/// Stable markers a backend embeds in its `anyhow` error text so the gateway classifies a lease
+/// failure by CAUSE: the lease path erases types, so every fault reaches
+/// `fluid-gateway::classify_lease_error` as a flat string and anything unnamed is reported as
+/// `CAPACITY_EXHAUSTED`. Each marker is public API (the contract between two crates that share only
+/// `hive-core`): keep it in the error text and keep the matching arm in the classifier.
 pub mod fault {
     /// A cell artifact this NODE must have is absent (per-image rootfs, shared
     /// base rootfs, guest kernel). Operator remedy: reprovision the node's
@@ -59,15 +55,13 @@ pub mod fault {
     /// This NODE's container lock pool is empty and nothing was reclaimable, so
     /// no container can start here until `num_locks` is raised + renumbered.
     pub const NODE_LOCK_POOL_EXHAUSTED: &str = "NodeLockPoolExhausted";
-    /// The interpreter/runtime this deployment declares is not installed on the filesystem this
-    /// NODE execs cells against. Operator remedy: provision the runtime (for Firecracker the GUEST
-    /// rootfs image, not the host). Not app breakage, not host exhaustion. Placement should make
-    /// this unreachable (`schedule::place` hard-filters on `NodeInfo::wasm_runtime` like on
-    /// `gpu_count`), so reaching it means the capability probe and the real filesystem disagree (a
-    /// rootfs replaced under a running node, a stale gossiped record, `HIVE_WASM_RUNTIME=1` on a
-    /// node without the binary); it exists so that disagreement surfaces as an operator-actionable
-    /// node fault, never as `CAPACITY_EXHAUSTED` or as advice to the tenant to debug their own
-    /// entrypoint.
+    /// The runtime this deployment declares is not installed on the filesystem this NODE execs
+    /// cells against (for Firecracker, the GUEST rootfs). Operator remedy: provision it; not app
+    /// breakage, not host exhaustion. Placement (`schedule::wasm_capable`/`bun_capable`) should
+    /// make it unreachable, so reaching it means the capability probe and the real filesystem
+    /// disagree (a rootfs replaced under a running node, a stale gossiped record,
+    /// `HIVE_WASM_RUNTIME=1` without the binary): a node fault, never `CAPACITY_EXHAUSTED` or
+    /// advice to debug the entrypoint.
     pub const NODE_RUNTIME_MISSING: &str = "NodeRuntimeMissing";
     /// The DEPLOYMENT's own process never reached a listening state (it exited, or never bound its
     /// port within the start budget): an app fault (bad entrypoint, missing env, a crash on boot).

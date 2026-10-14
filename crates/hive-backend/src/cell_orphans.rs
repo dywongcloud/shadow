@@ -1,11 +1,11 @@
 //! Tenant cells that outlive the process that launched them (`KillMode=process`). Ownership is TWO
 //! labels, `hive.owner` (a stable node identity) + `hive.boot`: a cell is current (this boot),
-//! stale (this owner, another boot — reaped), foreign (another owner — never touched, counted) or
-//! legacy (unlabelled — reaped only as the host's sole supervised instance or under
-//! `HIVE_CELL_ORPHAN_REAP_LEGACY=1`). [`reap_orphaned_cells`] runs once at boot (boot waits only
-//! for its urgent SIGKILL half), [`guard_volume_single_writer`] before every launch that mounts a
-//! named volume. Only `hive-cell-*` podman containers are ever touched; Apple `container` cells are
-//! neither labelled nor reaped.
+//! stale (this owner, another boot: reaped), foreign (another owner: never touched, counted) or
+//! legacy (unlabelled: reaped only as the host's sole supervised instance or under
+//! `HIVE_CELL_ORPHAN_REAP_LEGACY=1`). [`reap_orphaned_cells`] runs once at boot,
+//! [`guard_volume_single_writer`] before every launch that mounts a named volume; only
+//! `hive-cell-*` podman containers are ever touched (Apple `container` cells are neither labelled
+//! nor reaped).
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

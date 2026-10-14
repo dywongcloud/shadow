@@ -1,9 +1,8 @@
-//! Bounded capture of subprocess output. Every build/exec log line comes from a
-//! TENANT-CONTROLLED child, and `BufReader::lines()` has no length limit, so a child that never
-//! emits a newline (`\r` progress bars, one-line source maps) grows one `String` until the process
-//! dies. [`read_capped_line`] / [`read_capped_line_blocking`] keep DRAINING the pipe while
-//! RETAINING at most [`MAX_LOG_LINE_BYTES`]; every truncation is counted in [`LOG_CAP_STATS`] and
-//! marked with [`TRUNCATION_SUFFIX`].
+//! Bounded capture of tenant-controlled subprocess output: `BufReader::lines()` has no length
+//! limit, so a child that never emits a newline (`\r` progress bars, one-line source maps) would
+//! grow one `String` until the process dies. [`read_capped_line`] / [`read_capped_line_blocking`]
+//! keep DRAINING the pipe while RETAINING at most [`MAX_LOG_LINE_BYTES`]; each truncation is
+//! counted in [`LOG_CAP_STATS`] and marked with [`TRUNCATION_SUFFIX`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

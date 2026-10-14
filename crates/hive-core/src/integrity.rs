@@ -1,6 +1,6 @@
 //! Tamper-**evidence** for a deployment's build/publish/execution history: not tamper-prevention,
 //! and not hardware-rooted confidential computing (except the narrow Mac-node Secure Enclave
-//! signing step this vocabulary also describes, see `hive-backend::sep_signer`).
+//! signing step, see `hive-backend::sep_signer`).
 //!
 //! **Proves** that the recorded history (which build was accepted, which artifact published, which
 //! node ran it and when) was not silently altered after each entry was written: a verifier
@@ -8,17 +8,15 @@
 //! node's claimed chain head, then checks the node's signature over that head against its published
 //! public key.
 //!
-//! **Does NOT prove** that the recorded execution was itself uncompromised in real time (a root
-//! user can tamper with live memory while a workload runs), nor that the isolation backend was
-//! strong (a `Mock` entry is exactly as tamper-evident, and as silent about in-process tampering,
-//! as a `Firecracker` one: the chain records WHAT ran, never HOW STRONGLY it was isolated). On
-//! Linux nodes the signing key is software, node-local and extractable by root, so a compromised
-//! node could alter history AND forge a self-consistent signature. On the Mac node, entries signed
-//! with a Secure-Enclave-resident per-deployment key carry a categorically stronger guarantee for
-//! exactly that failure mode (the private key cannot be extracted even by root, so a compromised
-//! Mac node can tamper with a *running* workload but cannot retroactively forge a signature over an
-//! already-signed history). That asymmetry is real and must never be described as uniform
-//! "verifiable compute" across the fleet.
+//! **Does NOT prove** that the execution itself was uncompromised in real time (a root user can
+//! tamper with live memory while a workload runs), nor that the isolation backend was strong: a
+//! `Mock` entry is exactly as tamper-evident as a `Firecracker` one, the chain records WHAT ran,
+//! never HOW STRONGLY it was isolated. On Linux nodes the signing key is software, node-local and
+//! extractable by root, so a compromised node could alter history AND forge a self-consistent
+//! signature; on the Mac node a Secure-Enclave-resident per-deployment key cannot be extracted even
+//! by root, so a compromised Mac node cannot retroactively forge a signature over an already-signed
+//! history. That asymmetry is real and must never be described as uniform "verifiable compute"
+//! across the fleet.
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

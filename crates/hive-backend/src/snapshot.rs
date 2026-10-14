@@ -1,9 +1,9 @@
 //! Copy-on-write snapshots of per-deployment data disks via XFS `reflink=1` (the fleet has no ZFS):
-//! a reflink snapshot is instant and consumes only what later diverges. Capability is per NODE and
-//! probed functionally ([`snapshot_support`]); ext4 nodes degrade to a full copy and say so
-//! (`Method::Copy`). A snapshot of a live image is CRASH-consistent only — callers wanting
-//! application consistency quiesce the writer first, and [`SnapshotOutcome::consistency`] records
-//! which guarantee was obtained.
+//! instant, consuming only what later diverges. Capability is per NODE and probed functionally
+//! ([`snapshot_support`]); ext4 nodes degrade to a full copy and say so (`Method::Copy`). A
+//! snapshot of a live image is CRASH-consistent only (callers wanting application consistency
+//! quiesce the writer first); [`SnapshotOutcome::consistency`] records which guarantee was
+//! obtained.
 
 use std::path::{Path, PathBuf};
 
