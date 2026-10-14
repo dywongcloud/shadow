@@ -11508,7 +11508,8 @@ pub(crate) enum PlanChange<'a> {
     /// free-plan checkout shortcut, team creation).
     Request(Option<&'a crate::auth::Claims>),
     /// A payment was verified: a checkout confirmed with Stripe (`billing_confirm`, the Stripe
-    /// webhook), or the mock checkout of a node with no Stripe configured. The tier that was bought.
+    /// webhook), or the mock checkout of a developer's node (`billing::mock_checkout_allowed`: no
+    /// Stripe key and auth not enforced). The tier that was bought.
     Paid,
     /// The billing authority's own downgrade (a cancelled Stripe subscription): never raises.
     Cancellation,
@@ -15756,7 +15757,11 @@ async fn billing_addons(
 /// `confirm_checkout` -> `provision_from_checkout` sequence the paid path uses, just without the
 /// Stripe session a $0 amount could never produce; `provision_from_checkout` is idempotent on
 /// `ProjectSettings::dedicated_ipv4`, so hitting it more than once for the same project is safe.
-/// Otherwise it opens a real Stripe Checkout when configured and the local mock checkout when not.
+/// Otherwise it opens a real Stripe Checkout when configured. When Stripe cannot open one the record
+/// is DISCARDED and the buyer gets a 502: a mock session completes with no payment, so an amount
+/// Stripe refuses (over its limit, an outage) used to buy credits or a plan for nothing. The local
+/// mock checkout exists only where `billing::mock_checkout_allowed` (a developer's node: no Stripe key
+/// and auth not enforced); an enforced platform with no Stripe key refuses a paid checkout (503).
 async fn billing_checkout(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15867,10 +15872,15 @@ async fn billing_checkout(
             crate::tencent_eip::SKU,
             &target,
         );
-        let (co, _acc) = c.billing.confirm_checkout(&co.id).ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "checkout could not be confirmed".to_string(),
-        ))?;
+        let (co, _acc) = c
+            .billing
+            .confirm_checkout(&co.id, crate::billing::Payment::Unproven)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "checkout could not be confirmed".to_string(),
+                )
+            })?;
         match crate::tencent_eip::provision_from_checkout(&c, &co).await {
             Ok(alloc) => {
                 c.audit.record(
@@ -15900,11 +15910,20 @@ async fn billing_checkout(
     } else {
         ""
     };
+    let stripe = crate::billing::stripe_configured();
+    if !stripe && !crate::billing::mock_checkout_allowed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "billing is not set up on this platform (no payment provider is configured): \
+             nothing was purchased or charged"
+                .into(),
+        ));
+    }
     let co = c
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
-    if crate::billing::stripe_configured() {
+    if stripe {
         let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
         let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
             let enc =
@@ -15938,7 +15957,16 @@ async fn billing_checkout(
                 c.billing.attach_stripe_session(&co.id, &stripe_session_id);
                 return Ok(Json(json!({ "url": url, "mock": false, "session": co.id })));
             }
-            Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
+            Err(e) => {
+                tracing::warn!(error = %e, checkout = %co.id, tenant = %t, "stripe checkout failed; the checkout is discarded and nothing is applied");
+                c.billing.discard_checkout(&co.id);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "the payment provider could not open the checkout: nothing was purchased or \
+                     charged, try again shortly"
+                        .into(),
+                ));
+            }
         }
     }
     Ok(Json(
@@ -15979,7 +16007,10 @@ struct ConfirmReq {
 /// `confirm_checkout` itself (the same single-writer split as the "credits" branch). A provisioning
 /// failure after payment is surfaced as `addon_error` rather than failing the request: the payment
 /// already succeeded and the checkout is consumed, so an error status would read as "you weren't
-/// charged"; the caller can retry or contact support.
+/// charged"; the caller can retry or contact support. A checkout with NO Stripe session (a mock one)
+/// completes only where `billing::mock_checkout_allowed`; anywhere else it is 402, decided by
+/// `confirm_checkout` itself, so a record persisted or replicated from a developer's node cannot be
+/// spent on a platform.
 async fn billing_confirm(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15996,6 +16027,7 @@ async fn billing_confirm(
     }
     let mut stripe_customer = String::new();
     let mut stripe_subscription = String::new();
+    let mut payment = crate::billing::Payment::Unproven;
     if !co.stripe_session_id.is_empty() {
         let status = crate::billing::stripe_verify_session(&c.http, &co.stripe_session_id)
             .await
@@ -16005,11 +16037,13 @@ async fn billing_confirm(
         }
         stripe_customer = status.customer.unwrap_or_default();
         stripe_subscription = status.subscription.unwrap_or_default();
+        payment = crate::billing::Payment::Stripe;
     }
-    let (co, acc) = c
-        .billing
-        .confirm_checkout(&req.session)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let (co, acc) = match c.billing.confirm_checkout(&req.session, payment) {
+        Ok(done) => done,
+        Err(crate::billing::Unconfirmed::Unknown) => return Err(StatusCode::NOT_FOUND),
+        Err(crate::billing::Unconfirmed::Unpaid) => return Err(StatusCode::PAYMENT_REQUIRED),
+    };
     let mut addon_error: Option<String> = None;
     match co.kind.as_str() {
         "credits" => {}
@@ -16100,7 +16134,10 @@ async fn billing_webhook(
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
             if !checkout_id.is_empty() {
-                if let Some((co, _acc)) = c.billing.confirm_checkout(checkout_id) {
+                if let Ok((co, _acc)) = c
+                    .billing
+                    .confirm_checkout(checkout_id, crate::billing::Payment::Stripe)
+                {
                     match co.kind.as_str() {
                         "credits" => {}
                         "addon" => {

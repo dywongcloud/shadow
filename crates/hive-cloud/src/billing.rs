@@ -484,6 +484,28 @@ pub struct MeterWatermark {
 /// cleared by every restart.
 pub const CHECKOUT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
+/// What stands behind a checkout completing: [`BillingStore::confirm_checkout`] makes every caller name
+/// it, so a new completion path cannot apply a purchase without saying what paid for it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Payment {
+    /// Stripe vouches for it: the handler verified the session's payment with Stripe, or the delivery is
+    /// a signature-verified Stripe webhook.
+    Stripe,
+    /// Nothing but the caller's say-so (a mock checkout): completes an amount of zero, or any amount on a
+    /// node where [`mock_checkout_allowed`].
+    Unproven,
+}
+
+/// Why [`BillingStore::confirm_checkout`] applied nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Unconfirmed {
+    /// No such open checkout: never opened, already completed, past [`CHECKOUT_RETENTION_MS`], or held by
+    /// another node.
+    Unknown,
+    /// A payment is due and nothing proves it was made. The checkout stays open.
+    Unpaid,
+}
+
 #[derive(Default)]
 pub struct BillingStore {
     accounts: RwLock<HashMap<String, BillingAccount>>,
@@ -1130,24 +1152,46 @@ impl BillingStore {
         self.checkouts.read().get(id).cloned()
     }
 
+    /// Drops an open checkout the payment provider never accepted. Nothing was charged, so unlike
+    /// [`Self::confirm_checkout`] nothing is applied.
+    pub fn discard_checkout(&self, id: &str) {
+        self.checkouts.write().remove(id);
+    }
+
     /// Drops a tenant's billing account (its team was deleted). The LEDGER is left intact on
     /// purpose: it is the financial record and must outlive the account.
     pub fn remove_account(&self, tenant: &str) -> Option<BillingAccount> {
         self.accounts.write().remove(tenant)
     }
 
-    /// Completes a checkout (idempotent: it consumes the session). A CREDIT top-up is applied here;
-    /// a PLAN checkout deliberately is NOT: the caller applies it through
-    /// `admin::apply_plan_everywhere`, which writes BOTH the billing account and the team record
-    /// and audits it (this used to call `set_plan` itself, leaving a stale team record and no
+    /// Completes a checkout (idempotent: it consumes the session) once `payment` stands behind it.
+    /// A CREDIT top-up is applied here; a PLAN checkout deliberately is NOT: the caller applies it
+    /// through `admin::apply_plan_everywhere`, which writes BOTH the billing account and the team
+    /// record and audits it (this used to call `set_plan` itself, leaving a stale team record and no
     /// `plan_change` audit entry), and an addon is provisioned by the caller too. One writer only.
-    pub fn confirm_checkout(&self, id: &str) -> Option<(Checkout, BillingAccount)> {
-        let c = self.checkouts.write().remove(id)?;
+    ///
+    /// This is the ONE place a purchase becomes applied, so it is where "paid for" is decided: an
+    /// [`Payment::Unproven`] checkout with an amount due completes only where
+    /// [`mock_checkout_allowed`], whoever the caller is and whatever state a persisted or replicated
+    /// record is in. It is refused ([`Unconfirmed::Unpaid`]) without being consumed.
+    pub fn confirm_checkout(
+        &self,
+        id: &str,
+        payment: Payment,
+    ) -> Result<(Checkout, BillingAccount), Unconfirmed> {
+        let c = {
+            let mut open = self.checkouts.write();
+            let due = open.get(id).ok_or(Unconfirmed::Unknown)?;
+            if payment == Payment::Unproven && due.amount_cents > 0 && !mock_checkout_allowed() {
+                return Err(Unconfirmed::Unpaid);
+            }
+            open.remove(id).ok_or(Unconfirmed::Unknown)?
+        };
         let acc = match c.kind.as_str() {
             "credits" => self.add_credits(&c.tenant, c.amount_cents, "Credit top-up (checkout)"),
             _ => self.account(&c.tenant),
         };
-        Some((c, acc))
+        Ok((c, acc))
     }
 
     /// Persistence comes in FOUR pairs: `snapshot`/`load` (accounts + ledger),
@@ -1316,6 +1360,16 @@ pub fn stripe_configured() -> bool {
     std::env::var("STRIPE_SECRET_KEY")
         .map(|k| !k.is_empty())
         .unwrap_or(false)
+}
+
+/// Whether a checkout may complete with no payment behind it (the local "mock" checkout of a
+/// developer's machine): only on a node with NO Stripe key and NO identity layer
+/// (`auth::enforced()` false). With a Stripe key a checkout completes only through a verified Stripe
+/// session, and on an enforced platform without one billing is simply not set up: a paid checkout is
+/// refused, never mocked. One predicate for what may complete ([`BillingStore::confirm_checkout`])
+/// and what may open (`admin::billing_checkout`).
+pub fn mock_checkout_allowed() -> bool {
+    !stripe_configured() && !crate::auth::enforced()
 }
 
 #[cfg(test)]
