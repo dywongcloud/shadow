@@ -60,6 +60,8 @@ use tokio::time::Instant;
 use tokio_rustls::server::TlsStream;
 use tokio_rustls::TlsAcceptor;
 
+/// A wire the gateway fronts. Both are client-first (the Postgres `StartupMessage`, the first Redis
+/// command), which is what lets [`handle`] read the first client byte before it touches the backend.
 #[derive(Clone, Copy, Debug)]
 enum Wire {
     /// Postgres: the client sends an `SSLRequest` in plaintext, the server replies
@@ -526,8 +528,8 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
                 }
             };
             let Some((pending, evicted)) = PendingGuard::acquire(peer.ip()) else {
-                // `stream` drops here, closing the just-accepted socket immediately.
                 warn_refused_accept(&addr, wire, peer);
+                drop(stream);
                 continue;
             };
             enable_keepalive(&stream);
@@ -539,8 +541,6 @@ fn spawn_listener(cloud: Arc<CloudState>, addr: String, wire: Wire) {
                 peer: peer.ip(),
             };
             tokio::spawn(async move {
-                // Evicted (the budget was full and this connection was the oldest stuck one): the
-                // handler future is dropped, which closes both sockets.
                 let outcome = tokio::select! {
                     outcome = handle(cloud, stream, acceptor, wire, accounting) => outcome,
                     () = evicted.notified() => {
@@ -634,10 +634,6 @@ async fn handle(
         wire,
         db.connection.get("password").is_some_and(|p| !p.is_empty()),
     );
-    // The client must speak before the backend is touched: a client that handshakes with a valid SNI
-    // and then goes silent would otherwise hold a database connection slot (Postgres
-    // `max_connections`) while costing the attacker nothing. Both wires are client-first (the PG
-    // StartupMessage, the first RESP command), so a legitimate client sends this at once.
     let mut first = vec![0u8; 16 * 1024];
     let n = tokio::time::timeout(deadline, tls.read(&mut first))
         .await

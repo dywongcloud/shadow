@@ -3673,9 +3673,7 @@ async fn run_build(
                 .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
             let team = crate::admin::norm(&project_settings.team).to_string();
             let mut queue_env_written = false;
-            // The PLAINTEXT pair the project's functions receive: the project row holds the token
-            // sealed (`sensitive`), and the sealed form is no bearer.
-            let mut queue_env: Vec<(String, String)> = Vec::new();
+            let mut plaintext_queue_env: Vec<(String, String)> = Vec::new();
             if let Ok(queue_token) = crate::auth::issue_queue_client_token(&team) {
                 let endpoint_result = cloud.projects.put_env_exact(
                     &project,
@@ -3704,7 +3702,7 @@ async fn run_build(
                 match (endpoint_result, token_result) {
                     (Ok(()), Ok(())) => {
                         queue_env_written = true;
-                        queue_env = vec![
+                        plaintext_queue_env = vec![
                             ("HIVE_QUEUE_ENDPOINT".to_string(), queue_url),
                             ("HIVE_QUEUE_TOKEN".to_string(), queue_token),
                         ];
@@ -3727,7 +3725,7 @@ async fn run_build(
             }
             if queue_env_written {
                 for f in manifest.functions.iter_mut() {
-                    for (k, v) in &queue_env {
+                    for (k, v) in &plaintext_queue_env {
                         f.env.insert(k.clone(), v.clone());
                     }
                 }

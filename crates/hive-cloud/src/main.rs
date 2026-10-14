@@ -2095,12 +2095,8 @@ async fn admin_ingress(
     }
     if crate::auth::enforced() {
         let is_mutation = is_mutation_request(&req);
-        // The routes that authenticate by something other than a platform JWT are
-        // `auth::is_open_route`'s: the node's own gate asks the same function, so the two cannot
-        // drift (this list used to lack the Stripe webhook, `/v1/browser/admissions`,
-        // `/v1/zkauth/project-team` and, later, SCIM).
-        let open = crate::auth::is_open_route(req.uri().path());
-        if is_mutation && !open {
+        let has_own_credential = crate::auth::is_open_route(req.uri().path());
+        if is_mutation && !has_own_credential {
             let ok = crate::auth::extract_token(req.headers())
                 .map(|t| crate::auth::principal(&cloud, &t).is_some())
                 .unwrap_or(false);

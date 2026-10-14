@@ -578,19 +578,16 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     if declared.is_some_and(|len| len > max_bytes) {
         return Err("model exceeds the maximum download size".to_string());
     }
-    // The reserve is shared by every download in flight: this one is admitted only if the volume can
-    // hold what the others still expect to write, this file, and the reserve, all at once.
     let Some(mut claim) = DiskClaim::admit(&dir, declared.unwrap_or(0), reserve) else {
         return Err("insufficient disk space for the model".to_string());
     };
-    // Unique per download: two projects naming the same URL must never write one partial file.
-    let tmp = dir.join(format!(
+    let unique_part_path = dir.join(format!(
         "hive-{:016x}-{}.part",
         fnv(&url),
         uuid::Uuid::new_v4().simple()
     ));
-    let mut part = PartFile(Some(tmp.clone()));
-    let mut f = tokio::fs::File::create(&tmp)
+    let mut part = PartFile(Some(unique_part_path.clone()));
+    let mut f = tokio::fs::File::create(&unique_part_path)
         .await
         .map_err(|e| e.to_string())?;
     use tokio::io::AsyncWriteExt;
@@ -639,7 +636,7 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     let digest = hasher.finalize().to_hex().to_string();
     let file_name = format!("{digest}.gguf");
     let path = dir.join(&file_name);
-    tokio::fs::rename(&tmp, &path)
+    tokio::fs::rename(&unique_part_path, &path)
         .await
         .map_err(|e| e.to_string())?;
     part.0 = None;
@@ -659,7 +656,9 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     Ok((path, size))
 }
 
-/// Where a model URL's download stands, shared by every project naming that URL.
+/// Where a model URL's download stands, shared by every project naming that URL. A URL is recorded
+/// only once it holds its slots (one that finds none is tried again next tick), so `Running`
+/// always names a transfer that really started.
 enum Fetch {
     /// `since_ms` bounds how long a `Running` entry is believed: a task that died without recording
     /// its outcome must not park the URL forever.
@@ -712,11 +711,6 @@ async fn model_state(cloud: &Arc<CloudState>, project: &str, model: &str) -> Mod
             }
             _ => {}
         }
-        // At most `max_concurrent_downloads` run node-wide; a URL that finds no free slot is not
-        // recorded and is simply tried again next tick, so nothing queues and a `Running` entry
-        // always names a transfer that really started.
-        // One download per tenant at a time, then a node-wide slot: a tenant whose projects name
-        // several slow hosts holds one place, never the node's whole share.
         let tenant = crate::admin::record_tenant(&cloud.projects.team_of(project)).to_string();
         let Some(tenant_slot) = TenantSlot::acquire(&tenant) else {
             return ModelState::Downloading;
@@ -1081,7 +1075,6 @@ async fn reconcile_local(
         e.1.updated_ms = hive_core::now_ms();
     };
 
-    // Never awaits a download inline: this loop serves every project on the coordinator.
     let (model_path, model_bytes) = match model_state(cloud, project, &spec.model).await {
         ModelState::Ready(path, bytes) => (path, bytes),
         ModelState::Downloading => {

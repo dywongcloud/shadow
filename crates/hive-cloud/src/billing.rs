@@ -961,8 +961,6 @@ impl BillingStore {
         } else {
             tenant
         };
-        // Callers bound `cents` by MAX_AMOUNT_CENTS; a bare `as i64` would turn one above i64::MAX
-        // into a DEBIT, so the conversion saturates and the sum cannot wrap either.
         let credit = i64::try_from(cents).unwrap_or(i64::MAX);
         let bal;
         {
@@ -1033,8 +1031,6 @@ impl BillingStore {
             let included_left = acc.included_cents.saturating_sub(acc.used_cents);
             let from_included = cents.min(included_left);
             let owed = (cents - from_included) as i64;
-            // Decide BEFORE touching the account: a refused charge used to leave the allowance it
-            // had already started to consume.
             if owed > 0 && acc.balance_cents < owed && !spec.overage {
                 return Err(ChargeError::Insufficient);
             }
