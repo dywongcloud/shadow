@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Lock, Loader2 } from "lucide-react";
 import { Button, Input } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiGet, apiSend } from "@/lib/api";
 
 interface Checkout {
@@ -42,7 +43,7 @@ function CheckoutInner() {
         router.replace("/billing?success=1");
       }
     } catch (e) {
-      setErr(String(e));
+      setErr(e instanceof Error ? e.message : String(e));
       setPaying(false);
     }
   }
@@ -81,6 +82,7 @@ function CheckoutInner() {
             <div className="mb-1 text-sm text-secondary">{title}</div>
             <div className="mb-6 text-3xl font-semibold tabular-nums">{usd(co.amount_cents)}</div>
 
+            <RoleGate action="billing.pay" note>
             <label className="mb-1.5 block text-xs font-medium text-secondary">Card number</label>
             <Input defaultValue="4242 4242 4242 4242" className="mb-3 font-mono" />
             <div className="mb-5 grid grid-cols-2 gap-3">
@@ -97,6 +99,7 @@ function CheckoutInner() {
             <Button onClick={pay} disabled={paying} className="w-full justify-center bg-fg py-2.5 text-bg">
               {paying ? <Loader2 className="h-4 w-4 animate-spin" /> : `Pay ${usd(co.amount_cents)}`}
             </Button>
+            </RoleGate>
             <button onClick={cancel} className="mt-3 w-full text-center text-xs text-muted hover:text-fg">
               Cancel
             </button>

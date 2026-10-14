@@ -2,6 +2,7 @@ import "server-only";
 import { createHash } from "crypto";
 import { cookies } from "next/headers";
 import { buildArtifacts } from "@/lib/gitops-yaml";
+import { teamRoleOf, type TeamRole } from "@/lib/team-role";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const BACKEND_TIMEOUT_MS = 20_000;
@@ -40,6 +41,19 @@ export function authTokenFrom(req: {
   const bearer = req.headers.get("authorization");
   if (bearer && /^Bearer\s+/i.test(bearer)) return bearer.replace(/^Bearer\s+/i, "").trim() || null;
   return null;
+}
+
+/** The team role and operator status a platform JWT claims, read WITHOUT verifying it: a server route uses them only to refuse an action BEFORE a side effect the backend would refuse anyway (a GitHub repository created for a link
+ *  the matrix rejects); the backend verifies the token and stays the authority. `role: null` = absent or undecodable = UNKNOWN: the route proceeds and the backend answers. */
+export function claimedRole(token: string | null): { role: TeamRole | null; operator: boolean } {
+  try {
+    const part = token?.split(".")[1];
+    if (!part) return { role: null, operator: false };
+    const claims = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as { role?: unknown; platform_admin?: unknown };
+    return { role: teamRoleOf(typeof claims.role === "string" ? claims.role : null), operator: claims.platform_admin === true };
+  } catch {
+    return { role: null, operator: false };
+  }
 }
 
 /** The signed-in user's platform JWT for a Server Component (the httpOnly `hive_jwt` cookie), or null when the request carries none. */

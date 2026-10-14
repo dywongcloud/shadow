@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, CreditCard, Coins, Zap, Loader2 } from "lucide-react";
 import { Card, Button, PageHeader, Badge } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll, type BillingInfo, type LedgerEntry, type Invoice } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
@@ -31,6 +32,7 @@ function BillingInner() {
   const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", INVOICES_POLL_MS);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
 
   const returnedSession = params.get("success");
   useEffect(() => {
@@ -46,6 +48,7 @@ function BillingInner() {
 
   async function checkout(kind: "plan" | "credits", body: Record<string, unknown>) {
     setBusy(kind + JSON.stringify(body));
+    setErr("");
     try {
       const r = await apiSend<{ url: string; mock: boolean; applied?: boolean }>("POST", "/v1/billing/checkout", { kind, ...body });
       if (r.applied) {
@@ -57,7 +60,7 @@ function BillingInner() {
       // eslint-disable-next-line react-hooks/immutability
       window.location.href = r.url;
     } catch (e) {
-      setMsg(String(e));
+      setErr(e instanceof Error ? e.message : String(e));
       setBusy("");
     }
   }
@@ -74,6 +77,9 @@ function BillingInner() {
 
       {msg && (
         <div className="mb-5 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400">{msg}</div>
+      )}
+      {err && (
+        <div className="mb-5 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-500">{err}</div>
       )}
 
       {acc && (
@@ -135,6 +141,7 @@ function BillingInner() {
         </Card>
       )}
 
+      <RoleGate action="billing.pay" note>
       <div className="mb-3 text-base font-semibold">Plans</div>
       <div className="mb-8 grid grid-cols-1 gap-4 md:grid-cols-2">
         {plans.map((p) => {
@@ -182,6 +189,7 @@ function BillingInner() {
           </Button>
         ))}
       </Card>
+      </RoleGate>
 
       <div className="mb-3 text-base font-semibold">Invoices</div>
       <div className="mb-8 overflow-hidden rounded-xl border border-border bg-card">

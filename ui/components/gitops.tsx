@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { Github, GitBranch, Check, Loader2, X, ArrowRight, ExternalLink } from "lucide-react";
-import { currentTeam } from "@/lib/api";
+import { currentTeam, useCan } from "@/lib/api";
+import { roleHint, roleNote } from "@/lib/team-role";
 
 interface GhStatus {
   configured: boolean;
@@ -149,6 +150,7 @@ export function GitOps() {
   const [approveUrl, setApproveUrl] = useState("");
   const inited = useRef(false);
   const pathname = usePathname();
+  const mayLink = useCan()("repo.link");
 
   useEffect(() => {
     if (step !== "repo" || mode !== "existing" || !status.connected) return;
@@ -534,6 +536,7 @@ export function GitOps() {
                 )}
 
                 {error ? <p className="mt-3 text-xs text-red-500">{error}</p> : null}
+                {mayLink ? null : <p className="mt-3 text-xs text-muted">{roleNote("repo.link")}</p>}
                 {approveUrl ? (
                   <div className="mt-2 flex flex-col gap-1.5">
                     <p className="text-xs text-secondary">
@@ -568,7 +571,8 @@ export function GitOps() {
                   </button>
                   <button
                     onClick={link}
-                    disabled={busy || (mode === "existing" && !repo.includes("/")) || (scope === "org" && !orgLogin.trim())}
+                    disabled={busy || !mayLink || (mode === "existing" && !repo.includes("/")) || (scope === "org" && !orgLogin.trim())}
+                    title={mayLink ? undefined : roleHint("repo.link")}
                     className="flex items-center gap-2 rounded-md bg-fg px-3 py-2 text-sm font-medium text-bg hover:opacity-90 disabled:opacity-50"
                   >
                     {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowRight className="h-4 w-4" />}

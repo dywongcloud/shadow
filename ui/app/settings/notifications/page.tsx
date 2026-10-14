@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Bell, AtSign, Smartphone, Phone, BellOff, ArrowLeft, Trash2, Send, CheckCircle2, XCircle } from "lucide-react";
 import { Card, Switch, Badge, Button, Input } from "@/components/ui";
 import { WithIdentity } from "@/components/identity";
+import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll } from "@/lib/api";
 import {
   currentPushSubscription,
@@ -576,18 +577,22 @@ function PushSmsDelivery({
                 </div>
               </div>
             </div>
-            <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
-              <Input
-                type="password"
-                value={smsKey}
-                onChange={(e) => setSmsKey(e.target.value)}
-                placeholder="Textbelt API key (empty to revert to server env)"
-                aria-label="Textbelt API key"
-                className="sm:max-w-96"
-              />
-              <Button variant="outline" onClick={saveSmsKey} disabled={smsKeyBusy}>
-                {smsKeyBusy ? "Saving…" : "Save key"}
-              </Button>
+            <div className="mt-3">
+              <RoleGate action="sms.provider" note>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    type="password"
+                    value={smsKey}
+                    onChange={(e) => setSmsKey(e.target.value)}
+                    placeholder="Textbelt API key (empty to revert to server env)"
+                    aria-label="Textbelt API key"
+                    className="sm:max-w-96"
+                  />
+                  <Button variant="outline" onClick={saveSmsKey} disabled={smsKeyBusy}>
+                    {smsKeyBusy ? "Saving…" : "Save key"}
+                  </Button>
+                </div>
+              </RoleGate>
             </div>
             {smsKeyMsg && <div className="mt-2 text-sm text-secondary">{smsKeyMsg}</div>}
           </div>

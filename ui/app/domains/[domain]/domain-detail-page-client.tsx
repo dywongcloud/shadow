@@ -7,12 +7,17 @@ import {
   Pencil, X, DownloadCloud, FileUp, Check, AlertTriangle, Link2,
 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
-import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { apiGet, apiSend, usePoll, useCan, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type DomainAttachResult, type NsRoster } from "@/lib/api";
 import { useProjectNames } from "@/lib/projects";
+import { RoleGate } from "@/components/role-gate";
+import { roleHint } from "@/lib/team-role";
 import { toast } from "@/components/toast";
 import { timeAgo, copyText } from "@/lib/utils";
 
 interface ScanRecord { name: string; type: string; value: string; ttl: number; priority: number | null }
+
+/** A failure as one sentence: a role refusal already is one ("Your role can't do this. Ask a team admin."), never the raw `Error: ...` string. */
+const sentence = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 const RECORD_TYPES = ["A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "SRV"];
 
@@ -224,7 +229,9 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
   const [priority, setPriority] = useState("");
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
   const [editId, setEditId] = useState<string | null>(null);
+  const mayWrite = useCan()("dns.write");
   const needsPriority = type === "MX" || type === "SRV";
 
   function reset() {
@@ -240,6 +247,7 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
   async function submit() {
     if (!value.trim()) return;
     setBusy(true);
+    setErr("");
     const body = {
       name, type, value, ttl: parseInt(ttl) || 60,
       priority: needsPriority && priority ? parseInt(priority) : null,
@@ -253,14 +261,19 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
       }
       reset();
       onChange();
-    } finally { setBusy(false); }
+    } catch (e) { setErr(sentence(e)); } finally { setBusy(false); }
   }
   async function del(id: string) {
-    await apiSend("DELETE", `/v1/domains/${encodeURIComponent(domain)}/records/${encodeURIComponent(id)}`).then(onChange).catch(() => {});
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/domains/${encodeURIComponent(domain)}/records/${encodeURIComponent(id)}`);
+      onChange();
+    } catch (e) { setErr(sentence(e)); }
   }
 
   return (
     <Section title="DNS Records" desc="DNS records point to services your domain uses — forwarding, email (MX), subdomains (A/CNAME), wildcards (*), and more.">
+      <RoleGate action="dns.write" note>
       <Card className="mb-4 p-5">
         {editId && (
           <div className="mb-3 flex items-center gap-2 rounded-md bg-link/10 px-3 py-2 text-xs text-link">
@@ -289,6 +302,8 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
           </div>
         </div>
       </Card>
+      </RoleGate>
+      {err ? <p className="mb-4 text-sm text-red-500">{err}</p> : null}
 
       <Card className="p-0">
         <div className="grid grid-cols-[1.2fr_0.7fr_1.6fr_0.6fr_0.7fr_0.9fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
@@ -308,8 +323,8 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
               <span className="flex items-center justify-end gap-2">
                 {!r.system && (
                   <>
-                    <button onClick={() => startEdit(r)} title="Edit" className="text-muted hover:text-fg"><Pencil className="h-3.5 w-3.5" /></button>
-                    <button onClick={() => del(r.id)} title="Delete" className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
+                    <button onClick={() => startEdit(r)} disabled={!mayWrite} title={mayWrite ? "Edit" : roleHint("dns.write")} aria-label="Edit DNS record" className="text-muted hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"><Pencil className="h-3.5 w-3.5" /></button>
+                    <button onClick={() => del(r.id)} disabled={!mayWrite} title={mayWrite ? "Delete" : roleHint("dns.write")} aria-label="Delete DNS record" className="text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"><Trash2 className="h-3.5 w-3.5" /></button>
                   </>
                 )}
               </span>
@@ -338,7 +353,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
       setScanned(r.records || []);
       setPicked(new Set((r.records || []).map((_, i) => i)));
       if (!r.records?.length) setMsg("No public DNS records found for this domain yet.");
-    } catch (e) { setMsg(String(e)); } finally { setScanning(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setScanning(false); }
   }
   function toggle(i: number) {
     setPicked((s) => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; });
@@ -353,7 +368,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
       setMsg(`Imported ${r.imported} record(s).`);
       setScanned(null); setPicked(new Set());
       onChange();
-    } catch (e) { setMsg(String(e)); } finally { setBusy(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setBusy(false); }
   }
   async function importZone() {
     if (!zone.trim()) return;
@@ -363,11 +378,12 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
       setMsg(`Imported ${r.imported} record(s) from the zone file.`);
       setZone("");
       onChange();
-    } catch (e) { setMsg(String(e)); } finally { setBusy(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setBusy(false); }
   }
 
   return (
     <Section title="Migrate DNS" desc="Moving a domain from another provider? Detect its current records automatically, or paste your existing zone file — then import them here in one step.">
+      <RoleGate action="dns.write" note>
       <Card className="p-5">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -425,6 +441,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
 
         {msg && <p className="mt-4 text-sm text-secondary">{msg}</p>}
       </Card>
+      </RoleGate>
     </Section>
   );
 }
@@ -544,13 +561,19 @@ function Nameservers({ domain, nameservers, attached, onChange }: { domain: stri
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(nameservers.join("\n"));
   const [roster, setRoster] = useState<NsRoster | null>(null);
+  const [err, setErr] = useState("");
+  const mayWrite = useCan()("dns.write");
   useEffect(() => {
     fetchNsRoster().then(setRoster).catch(() => setRoster(null));
   }, []);
   async function write(ns: string[]) {
-    await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
-    setEditing(false); onChange();
+    setErr("");
+    try {
+      await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
+      setEditing(false); onChange();
+    } catch (e) { setErr(sentence(e)); }
   }
+  const hint = mayWrite ? undefined : roleHint("dns.write");
   const delegateDesc = "Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone.";
   if (attached) {
     return (
@@ -568,8 +591,8 @@ function Nameservers({ domain, nameservers, attached, onChange }: { domain: stri
         title="Custom nameservers"
         desc="Nameservers you have recorded for this domain. None are recorded until you add them."
         action={editing
-          ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><Button onClick={() => write(text.split("\n").map((s) => s.trim()).filter(Boolean))}>Save</Button></div>
-          : <div className="flex gap-2">{nameservers.length > 0 && <Button variant="outline" onClick={() => write([])}>Clear</Button>}<Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }}>Edit</Button></div>}
+          ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><span title={hint}><Button onClick={() => write(text.split("\n").map((s) => s.trim()).filter(Boolean))} disabled={!mayWrite}>Save</Button></span></div>
+          : <div className="flex gap-2">{nameservers.length > 0 && <span title={hint}><Button variant="outline" onClick={() => write([])} disabled={!mayWrite}>Clear</Button></span>}<span title={hint}><Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }} disabled={!mayWrite}>Edit</Button></span></div>}
       >
         <Card className="p-0">
           {editing ? (
@@ -582,6 +605,7 @@ function Nameservers({ domain, nameservers, attached, onChange }: { domain: stri
             <div className="px-4 py-3 text-sm text-secondary">No custom nameservers recorded.</div>
           )}
         </Card>
+        {err ? <p className="mt-3 text-sm text-red-500">{err}</p> : null}
       </Section>
     </>
   );

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Globe2, Server, Share2, ShieldCheck, Database, Network, Boxes } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll, type NodeInfo, type AnycastTable, type RateLimitStats } from "@/lib/api";
 import { SATELLITE_ONLINE_COLOR, SATELLITE_DEGRADED_COLOR } from "@/components/region-map";
 import type { BrowserPresence } from "@/lib/run-node-client";
@@ -562,7 +563,7 @@ function AnycastRouting() {
       });
       refresh();
     } catch (e) {
-      setSaveErr(String(e));
+      setSaveErr(e instanceof Error ? e.message : String(e));
     }
   }
 
@@ -597,6 +598,7 @@ function AnycastRouting() {
           <span className="text-secondary">Status</span>
           <Badge tone={rl?.enabled ? "green" : "default"}>{rl?.enabled ? "enabled" : "off"}</Badge>
         </div>
+        <RoleGate action="edge.security" note>
         <div className="mb-3 grid grid-cols-2 gap-2">
           <div>
             <label className="mb-1 block text-[11px] uppercase tracking-wide text-muted">Limit / IP</label>
@@ -615,6 +617,7 @@ function AnycastRouting() {
           <Button onClick={() => save(true)} className="flex-1">Apply</Button>
           <Button variant="outline" onClick={() => save(!rl?.enabled)}>{rl?.enabled ? "Disable" : "Enable"}</Button>
         </div>
+        </RoleGate>
         {saveErr && <p className="mt-2 text-xs text-red-500">{saveErr}</p>}
       </Card>
     </div>

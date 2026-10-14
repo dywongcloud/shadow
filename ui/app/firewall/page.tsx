@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Card, Badge, Button, Input, Switch, PageHeader, Table, Th, Td } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll, type WafRule } from "@/lib/api";
 
 type BotAction = "allow" | "log" | "block";
@@ -28,6 +29,17 @@ export default function FirewallPage() {
   const [desc, setDesc] = useState("");
   const [contains, setContains] = useState("");
   const [ip, setIp] = useState("");
+  const [err, setErr] = useState("");
+
+  /** Runs one write of the edge rules: a refusal (a role refusal already reads "Your role can't do this. Ask a team admin.") shows above the cards, never as an unhandled rejection. */
+  async function write(change: () => Promise<unknown>) {
+    setErr("");
+    try {
+      await change();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
 
   async function addRule() {
     if (!id) return;
@@ -41,15 +53,19 @@ export default function FirewallPage() {
         ip_prefix: ip || undefined,
       },
     };
-    await apiSend("POST", "/v1/waf/rules", rule);
-    setId(""); setDesc(""); setContains(""); setIp("");
-    refresh();
+    await write(async () => {
+      await apiSend("POST", "/v1/waf/rules", rule);
+      setId(""); setDesc(""); setContains(""); setIp("");
+      refresh();
+    });
   }
 
   return (
     <div>
       <PageHeader title="Firewall" desc="Web Application Firewall + bot management at the edge" />
 
+      <RoleGate action="edge.security" note>
+      {err ? <p className="mb-4 text-sm text-red-500">{err}</p> : null}
       <Card className="mb-4 flex items-center justify-between">
         <div>
           <div className="text-sm font-medium text-fg">Managed ruleset</div>
@@ -57,7 +73,7 @@ export default function FirewallPage() {
         </div>
         <Switch
           checked={!!waf?.managed}
-          onChange={async (v) => { await apiSend("PUT", "/v1/waf/managed", { enabled: v }); refresh(); }}
+          onChange={(v) => write(async () => { await apiSend("PUT", "/v1/waf/managed", { enabled: v }); refresh(); })}
         />
       </Card>
 
@@ -68,7 +84,7 @@ export default function FirewallPage() {
             <Switch
               label="Allow verified bots"
               checked={!!bot?.allow_good}
-              onChange={async (v) => { await apiSend("PUT", "/v1/bot", { ...bot, allow_good: v }); refreshBot(); }}
+              onChange={(v) => write(async () => { await apiSend("PUT", "/v1/bot", { ...bot, allow_good: v }); refreshBot(); })}
             />
             Allow verified bots (Googlebot, Slackbot…)
           </label>
@@ -76,7 +92,7 @@ export default function FirewallPage() {
             <Switch
               label="Block bad bots"
               checked={!!bot?.block_bad}
-              onChange={async (v) => { await apiSend("PUT", "/v1/bot", { ...bot, block_bad: v }); refreshBot(); }}
+              onChange={(v) => write(async () => { await apiSend("PUT", "/v1/bot", { ...bot, block_bad: v }); refreshBot(); })}
             />
             Block bad bots (scrapers, scanners)
           </label>
@@ -99,7 +115,7 @@ export default function FirewallPage() {
               </div>
               <Segmented
                 value={(bot?.[cat.key] as BotAction) ?? "log"}
-                onChange={async (v) => { await apiSend("PUT", "/v1/bot", { ...bot, [cat.key]: v }); refreshBot(); }}
+                onChange={(v) => write(async () => { await apiSend("PUT", "/v1/bot", { ...bot, [cat.key]: v }); refreshBot(); })}
               />
             </div>
           ))}
@@ -133,12 +149,13 @@ export default function FirewallPage() {
                 {r.when.path_regex ? ` path ~ ${r.when.path_regex}` : ""}
               </Td>
               <Td>{r.enabled ? <Badge tone="green">on</Badge> : <Badge>off</Badge>}</Td>
-              <Td><Button variant="danger" onClick={async () => { await apiSend("DELETE", `/v1/waf/rules/${r.id}`); refresh(); }}>Delete</Button></Td>
+              <Td><Button variant="danger" onClick={() => write(async () => { await apiSend("DELETE", `/v1/waf/rules/${r.id}`); refresh(); })}>Delete</Button></Td>
             </tr>
           ))}
           {!waf?.rules?.length && <tr><Td className="text-muted">No custom rules — the managed ruleset is active.</Td></tr>}
         </tbody>
       </Table>
+      </RoleGate>
     </div>
   );
 }

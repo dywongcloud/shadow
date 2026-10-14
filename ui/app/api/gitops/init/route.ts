@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
-import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
+import { authTokenFrom, backend, buildOrgArtifacts, claimedRole } from "@/lib/gitops-server";
+import { can, roleRefusalFor, roleRefusalSentence } from "@/lib/team-role";
 
 interface GitopsInitBody {
   team?: string;
@@ -26,6 +27,14 @@ export async function POST(req: NextRequest) {
   const entity = await resolveEntity();
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ ok: false, error: "GitHub not connected." }, { status: 400 });
+
+  // The repository link is an admin write (`PUT /v1/gitops`): refuse a role that misses it BEFORE creating a repository on the user's GitHub account that no link would point at. The role is read from the caller's own
+  // JWT only to decide that; the backend verifies it and answers the link below.
+  const authToken = authTokenFrom(req);
+  const claimed = claimedRole(authToken);
+  if (!claimed.operator && !can(claimed.role, "repo.link")) {
+    return NextResponse.json({ ok: false, error: roleRefusalFor("repo.link") }, { status: 403 });
+  }
 
   let fullName: string;
   let branch = (body?.branch && String(body.branch)) || "main";
@@ -59,11 +68,17 @@ export async function POST(req: NextRequest) {
   const [owner, repo] = fullName.split("/");
   const path = "openedge.yaml";
 
-  const authToken = authTokenFrom(req);
-  await backend("/v1/gitops", team, authToken, {
+  const linked = await backend("/v1/gitops", team, authToken, {
     method: "PUT",
     body: JSON.stringify({ repo: fullName, branch, path, scope }),
   });
+  if (!linked.ok) {
+    const refusal = linked.status === 403 ? roleRefusalSentence(await linked.text().catch(() => "")) : null;
+    return NextResponse.json(
+      { ok: false, repo: fullName, created, error: refusal ?? `the platform refused the repository link (HTTP ${linked.status})` },
+      { status: refusal ? 403 : 502 }
+    );
+  }
 
   const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, authToken, path);
   if (failures.length) {

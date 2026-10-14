@@ -5,7 +5,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check, Info } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
-import { apiGet, apiSend, usePoll, type Database } from "@/lib/api";
+import { apiGet, apiSend, usePoll, useCan, type Database } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 import { KindBadge } from "../kind";
@@ -44,6 +45,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
   const [openingStudio, setOpeningStudio] = useState(false);
+  const mayDestroy = useCan()("database.destroy");
 
   /** The UNMASKED credentials from the tenant-scoped `/credentials` endpoint (the list/detail poll masks url/password/token/secret keys), cached so a
    *  copy never depends on the user clicking Reveal. */
@@ -172,8 +174,12 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
 
   async function destroy() {
     if (!confirm(`Delete ${db?.name}? This tears down the backing service.`)) return;
-    await apiSend("DELETE", `/v1/databases/${id}`);
-    router.push("/storage");
+    try {
+      await apiSend("DELETE", `/v1/databases/${id}`);
+      router.push("/storage");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), {});
+    }
   }
 
   if (!db) {
@@ -199,7 +205,9 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         action={
           <div className="flex items-center gap-2">
             {db.status === "ready" ? <Badge tone="green">Ready{db.mode === "simulated" ? " · simulated" : " · live"}</Badge> : <Badge tone="amber">{db.status}</Badge>}
-            <Button variant="danger" onClick={destroy}><Trash2 className="h-4 w-4" /> Delete</Button>
+            <span title={mayDestroy ? undefined : roleHint("database.destroy")}>
+              <Button variant="danger" onClick={destroy} disabled={!mayDestroy}><Trash2 className="h-4 w-4" /> Delete</Button>
+            </span>
           </div>
         }
       />

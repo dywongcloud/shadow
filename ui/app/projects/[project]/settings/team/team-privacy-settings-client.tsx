@@ -230,7 +230,7 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
             const known = planScope === "team";
             const current = known && plan === p;
             const action = known ? planAction(plan, p, platformAdmin) : "none";
-            const needs = action === "switch" ? "team.plan" : "work";
+            const needs = action === "switch" ? "team.plan" : "billing.pay";
             const allowed = action === "none" || can(needs);
             return (
               <button

@@ -4,6 +4,7 @@ import { use, useEffect, useMemo, useState } from "react";
 import { Globe, Loader2, Plus, Server, Wifi, X, Zap } from "lucide-react";
 import { Badge, Button, SettingCard } from "@/components/ui";
 import { RawPortConnections } from "@/components/raw-port-connections";
+import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll, type Deployment, type ProjectSettings, type RawPortBinding } from "@/lib/api";
 import { deploymentHost } from "@/lib/deploy-url";
 import { timeAgo } from "@/lib/utils";
@@ -203,10 +204,12 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
             )}
             {ipErr && <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-500">{ipErr}</div>}
             <div>
-              <Button onClick={buyDedicatedIpv4} disabled={ipBusy || !!ipUnavailable}>
-                {ipBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
-                Buy Dedicated IPv4
-              </Button>
+              <RoleGate action="billing.pay" note>
+                <Button onClick={buyDedicatedIpv4} disabled={ipBusy || !!ipUnavailable}>
+                  {ipBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+                  Buy Dedicated IPv4
+                </Button>
+              </RoleGate>
             </div>
           </div>
         )}
