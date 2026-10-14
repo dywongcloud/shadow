@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { can, roleRefusalSentence, teamRoleOf, type TeamAction, type TeamRole } from "@/lib/team-role";
+import { announceMintFailure, lapsing, noteMinted, sessionClock, validFor } from "@/lib/session-clock";
 
 const BASE = "/cloud";
 
@@ -103,14 +104,33 @@ function teamHeaders(): Record<string, string> {
   return { "x-hive-team": currentTeam() };
 }
 
+/** The mint running or queued last in this tab: every mint funnels through `mintSessionToken`, ONE at a time per tab. */
+let mintInFlight: Promise<string | null> | null = null;
+
 /** Re-mints the httpOnly `hive_jwt` cookie for `team` (default: current) and resolves to the tenant the mint actually
  *  granted, or `null` on failure: callers must treat `null` as "no valid session for this tenant". Every automatic and
- *  explicit mint funnels through here; only the automatic ones consult the failure budget. */
-export async function mintSessionToken(team?: string): Promise<string | null> {
-  if (typeof window === "undefined") return null;
-  const granted = await mintOnce(team);
-  noteMintOutcome(granted);
-  return granted;
+ *  explicit mint funnels through here, ONE at a time per tab (a mint asked for while another runs waits its turn, so an
+ *  explicit one, a team switch or an identity sync, still fires after it); only the automatic ones consult the failure budget. */
+export function mintSessionToken(team?: string): Promise<string | null> {
+  if (typeof window === "undefined") return Promise.resolve(null);
+  const behind = mintInFlight;
+  const run: Promise<string | null> = (async () => {
+    if (behind) await behind.catch(() => null);
+    const minted = await mintOnce(team);
+    noteMintOutcome(minted?.tenant ?? null);
+    if (minted) noteMinted(minted.sentAt, minted.lifeMs, minted.tenant);
+    else announceMintFailure();
+    return minted?.tenant ?? null;
+  })().finally(() => {
+    if (mintInFlight === run) mintInFlight = null;
+  });
+  mintInFlight = run;
+  return run;
+}
+
+/** Re-mints for a caller that needs a fresh session, not a particular team (the periodic keeper, a rejected request): JOINS the mint already running or queued, which replaces the cookie after whatever the caller sent, else starts one. */
+export function renewSession(): Promise<string | null> {
+  return mintInFlight ?? mintSessionToken();
 }
 
 /** The browser's own Clerk session token (read from clerk-js in memory, never persisted): lets `/api/token` resolve the
@@ -127,10 +147,17 @@ async function clerkSessionToken(): Promise<string | null> {
   }
 }
 
-async function mintOnce(team?: string): Promise<string | null> {
+/** A mint that does not answer in this long fails (counted like any other failure): mints run one at a time per tab, so a hung one would otherwise hold up the queue and every request waiting on it. */
+const MINT_TIMEOUT_MS = 20_000;
+
+/** One mint round trip: the tenant it granted, when it was sent and the lifetime it reported (0 when it did not say), or null when it failed. */
+async function mintOnce(team?: string): Promise<{ tenant: string; sentAt: number; lifeMs: number } | null> {
   const t = team ?? currentTeam();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), MINT_TIMEOUT_MS);
   try {
     const clerkTok = await clerkSessionToken();
+    const sentAt = Date.now();
     const r = await fetch("/api/token", {
       method: "POST",
       headers: {
@@ -138,20 +165,26 @@ async function mintOnce(team?: string): Promise<string | null> {
         ...(clerkTok ? { authorization: `Bearer ${clerkTok}` } : {}),
       },
       body: JSON.stringify({ team: t, ...(clerkTok ? { clerk_token: clerkTok } : {}) }),
+      signal: ctrl.signal,
     });
     if (!r.ok) {
       const reason = await r.json().then((d) => d?.reason).catch(() => undefined);
       console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
       return null;
     }
-    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean; role?: string } | null;
+    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean; role?: string; expires_in?: number } | null;
     if (!d?.ok) return null;
     mirrorSession(d);
     const backendUnenforced = d.enforced === false;
-    if (backendUnenforced) return t;
-    return d.tenant ?? t;
+    return {
+      tenant: backendUnenforced ? t : (d.tenant ?? t),
+      sentAt,
+      lifeMs: typeof d.expires_in === "number" && d.expires_in > 0 ? d.expires_in * 1000 : 0,
+    };
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -181,14 +214,19 @@ async function isStaleEpochRefusal(r: Response): Promise<boolean> {
   return body.includes(STALE_EPOCH_MARKER);
 }
 
-/** Hard-timeout fetch behind every `/cloud` + `/ops` call: waits for the session mint, retries a stale-epoch 503 once after a
- *  short delay, and answers a 401, 403 or anonymous-tenant response (`x-hive-anon`, which a GET gets instead of a 401 when its
- *  cookie is missing) with ONE re-mint + retry, gated by a cooldown and the failure budget. */
+/** Hard-timeout fetch behind every `/cloud` + `/ops` call: waits for a session in good standing, retries a stale-epoch 503 once after a
+ *  short delay, and answers a rejection of the SESSION (a 401, an anonymous-tenant response, `x-hive-anon`, which a GET gets instead of a
+ *  401 when its cookie is missing, or a 403 on a session not known to be valid) with ONE retry: at once when the cookie was replaced after
+ *  the request left (this tab or another), after the mint already under way, else after a re-mint of its own, gated by a cooldown and
+ *  the failure budget. A 403 on a session known valid for the tenant is an authorization answer (the role matrix, an operator-only
+ *  route): no re-mint can change it, so it never mints. */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   await ensureSessionMinted();
+  let sentAt = 0;
   const once = async () => {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    sentAt = Date.now();
     try {
       return await fetch(url, { ...init, signal: ctrl.signal });
     } finally {
@@ -201,8 +239,12 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     r = await once();
   }
   const answeredAnonymously = r.headers.get("x-hive-anon") === "1";
-  const sessionRejected = r.status === 401 || r.status === 403 || answeredAnonymously;
+  const forbiddenWithoutCause = r.status === 403 && !validFor(sessionClock(), currentTeam(), Date.now());
+  const sessionRejected = r.status === 401 || answeredAnonymously || forbiddenWithoutCause;
   if (sessionRejected && typeof window !== "undefined" && MINT_ON) {
+    if ((sessionClock()?.at ?? 0) > sentAt) return once();
+    const underway = mintInFlight;
+    if (underway) return (await underway) === null ? r : once();
     const now = Date.now();
     if (mintState === "failed" || now < autoMintNotBeforeMs) return r;
     if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;
@@ -222,14 +264,17 @@ export type SessionMintState = "unattempted" | "ok" | "backoff" | "failed";
 let mintState: SessionMintState = "unattempted";
 let mintConsecutiveFailures = 0;
 let autoMintNotBeforeMs = 0;
+let lastMintAttemptMs = 0;
 
 /** Renderable mint state: `failed` = automatic re-mints suspended after repeated failures (the session cannot persist
- *  in this browser); reads then go out unauthenticated instead of retrying forever. */
-export function sessionMintStatus(): { state: SessionMintState; failures: number } {
-  return { state: mintState, failures: mintConsecutiveFailures };
+ *  in this browser); reads then go out unauthenticated instead of retrying forever. `notBeforeMs` is when the backoff
+ *  after the last failure ends (0 when there is none); `lastAttemptMs` is when the last mint of this tab ended. */
+export function sessionMintStatus(): { state: SessionMintState; failures: number; notBeforeMs: number; lastAttemptMs: number } {
+  return { state: mintState, failures: mintConsecutiveFailures, notBeforeMs: autoMintNotBeforeMs, lastAttemptMs: lastMintAttemptMs };
 }
 
 function noteMintOutcome(granted: string | null): void {
+  lastMintAttemptMs = Date.now();
   if (granted !== null) {
     mintConsecutiveFailures = 0;
     autoMintNotBeforeMs = 0;
@@ -252,23 +297,18 @@ function noteMintOutcome(granted: string | null): void {
   }
 }
 
-let sessionMintPromise: Promise<void> | null = null;
-
-/** Gates every `/cloud` + `/ops` request on ONE shared in-flight session mint, so a returning user's first fetch cannot beat the
- *  cookie and settle an anonymous-tenant 200 as real data; resolves at once while minting is in backoff or `failed`, and a failed
- *  mint resets the gate so a later caller can retry. */
+/** Gates every `/cloud` + `/ops` request on a session in good standing, so a returning user's first fetch cannot beat the cookie and
+ *  settle an anonymous-tenant 200 as real data, and a tab that wakes after the credential lapsed sends nothing anonymous: with no
+ *  mint yet, or a credential that has lapsed or is about to (`lapsing`, from the lifetime the mint reported), it waits for the ONE mint
+ *  under way and starts it when none is; a session in good standing lets requests go at once, even while a proactive re-mint runs.
+ *  Resolves at once while minting is in backoff or `failed`; a failed mint lets a later caller retry. */
 export function ensureSessionMinted(): Promise<void> {
   if (typeof window === "undefined" || !MINT_ON) return Promise.resolve();
-  if (sessionMintPromise) return sessionMintPromise;
-  if (mintState === "ok") return Promise.resolve();
-  if (mintState === "failed" || Date.now() < autoMintNotBeforeMs) {
-    return Promise.resolve();
-  }
-  sessionMintPromise = mintSessionToken().then(
-    (granted) => { if (granted === null) sessionMintPromise = null; },
-    () => { sessionMintPromise = null; },
-  );
-  return sessionMintPromise;
+  if (mintState === "ok" && !lapsing(sessionClock(), Date.now())) return Promise.resolve();
+  const underway = mintInFlight;
+  if (underway) return underway.then(() => undefined);
+  if (mintState === "failed" || Date.now() < autoMintNotBeforeMs) return Promise.resolve();
+  return mintSessionToken().then(() => undefined);
 }
 
 const DEFAULT_GET_TTL_MS = 2000;

@@ -19,6 +19,12 @@ function jwtPlatformAdmin(token: string): boolean | null {
   }
 }
 
+/** How long the `hive_jwt` cookie lives: the token's `expires_in` less 30 s, so the cookie lapses before the token does, never under a minute.
+ *  The answer carries it as `expires_in` (the cookie is httpOnly, so the browser cannot read its expiry) and the dashboard re-mints from it. */
+function cookieSeconds(expiresIn: number): number {
+  return Math.max(60, expiresIn - 30);
+}
+
 /** Parent-domain scope for the `hive_jwt` cookie (e.g. `.shadw.cloud`), so the same cookie also rides the sandbox shell's
  *  `wss://api.<domain>` handshake (a host-only cookie reaches no other subdomain, and a WebSocket cannot add a header).
  *  `undefined` for localhost and single-label hosts, where browsers reject a `Domain` attribute. */
@@ -65,14 +71,15 @@ export async function POST(req: NextRequest) {
       if (!token) {
         return NextResponse.json({ ok: true, tenant: team, enforced: false });
       }
-      const res = NextResponse.json({ ok: true, tenant: team, role: devRole, dev: true, platform_admin: jwtPlatformAdmin(token) ?? true });
+      const maxAge = cookieSeconds(expiresIn);
+      const res = NextResponse.json({ ok: true, tenant: team, role: devRole, dev: true, expires_in: maxAge, platform_admin: jwtPlatformAdmin(token) ?? true });
       res.cookies.set("hive_jwt", token, {
         httpOnly: true,
         secure: false,
         sameSite: "lax",
         domain: cookieDomain(req),
         path: "/",
-        maxAge: Math.max(60, expiresIn - 30),
+        maxAge,
       });
       return res;
     } catch {
@@ -209,7 +216,8 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
   } catch {}
 
   const platformAdmin = jwtPlatformAdmin(token);
-  const res = NextResponse.json({ ok: true, tenant, role, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
+  const maxAge = cookieSeconds(expiresIn);
+  const res = NextResponse.json({ ok: true, tenant, role, expires_in: maxAge, ...(platformAdmin !== null ? { platform_admin: platformAdmin } : {}) });
   const domain = cookieDomain(req);
   if (domain) {
     res.cookies.set("hive_jwt", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
@@ -220,7 +228,7 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
     sameSite: "lax",
     domain,
     path: "/",
-    maxAge: Math.max(60, expiresIn - 30),
+    maxAge,
   });
   return res;
 }
