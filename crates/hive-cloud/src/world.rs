@@ -68,12 +68,35 @@ pub fn has_world(cloud: &Arc<CloudState>, project: &str) -> bool {
 /// The most the node reads from one world REST reply.
 const WORLD_REPLY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// One Upstash REST command (`["GET","k"]` style) → its `result` value. The REST URL is the
-/// project's own env value (a tenant URL the node POSTs to), so it goes through `hive_outbound`:
-/// https, public addresses only, a bounded reply.
+/// Resolves a world Redis-REST URL to (parsed URL, client). Two shapes reach here: the platform's
+/// OWN locally-provisioned managed-redis sidecar (`databases.rs::provision_redis`, which always
+/// writes exactly `http://127.0.0.1:<port>`, no path or query) and a tenant's BYO URL
+/// (`WORKFLOW_REDIS_REST_URL`, or a tenant-set `UPSTASH_REDIS_REST_URL` naming their own external
+/// account). The platform's own shim is recognized by that EXACT shape and dialed over the
+/// no-redirect internal client — it is this host's own loopback, never attacker-reachable from
+/// outside — so routing it through the full tenant-URL guard (https + public-address-only) does not
+/// regress a node whose managed redis has no public/https front door. Anything else goes through
+/// the full `hive_outbound` guard.
+fn resolve_world_endpoint(raw: &str) -> Option<(reqwest::Url, reqwest::Client)> {
+    if let Ok(u) = reqwest::Url::parse(raw) {
+        let is_platform_loopback_shim = u.scheme() == "http"
+            && u.host_str() == Some("127.0.0.1")
+            && u.path() == "/"
+            && u.query().is_none();
+        if is_platform_loopback_shim {
+            return Some((u, hive_outbound::internal_client()));
+        }
+    }
+    hive_outbound::validate_url(raw)
+        .ok()
+        .map(|u| (u, hive_outbound::client()))
+}
+
+/// One Upstash REST command (`["GET","k"]` style) → its `result` value. See
+/// [`resolve_world_endpoint`] for which client/guard the URL gets.
 async fn cmd(_cloud: &Arc<CloudState>, url: &str, token: &str, parts: &[&str]) -> Option<Value> {
-    let target = hive_outbound::validate_url(url).ok()?;
-    let resp = hive_outbound::client()
+    let (target, client) = resolve_world_endpoint(url)?;
+    let resp = client
         .post(target)
         .bearer_auth(token)
         .json(&parts.to_vec())
@@ -88,17 +111,22 @@ async fn cmd(_cloud: &Arc<CloudState>, url: &str, token: &str, parts: &[&str]) -
         .cloned()
 }
 
-/// A pipeline of commands → vector of `result` values (errors map to Null).
+/// A pipeline of commands → vector of `result` values (errors map to Null). See
+/// [`resolve_world_endpoint`].
 async fn pipeline(
     _cloud: &Arc<CloudState>,
     url: &str,
     token: &str,
     cmds: Vec<Vec<String>>,
 ) -> Vec<Value> {
-    let Ok(target) = hive_outbound::validate_url(&format!("{url}/pipeline")) else {
+    let Some((target, client)) = resolve_world_endpoint(url).and_then(|(u, c)| {
+        let mut u = u;
+        u.path_segments_mut().ok()?.pop_if_empty().push("pipeline");
+        Some((u, c))
+    }) else {
         return Vec::new();
     };
-    let resp = hive_outbound::client()
+    let resp = client
         .post(target)
         .bearer_auth(token)
         .json(&cmds)
@@ -1211,18 +1239,25 @@ pub async fn list_hooks(
 /// not retried. Returns true only on a 2xx ack; the 60 s reconcile cycle is the outer retry
 /// cadence, so one slow or dead cell cannot wedge the pass.
 async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str) -> bool {
-    let domain = cloud.apps_domain.trim().trim_start_matches('.');
-    if domain.is_empty() {
+    if cloud.apps_domain.trim().is_empty() {
         return false;
     }
-    let url = format!("https://{project}.{domain}/.well-known/workflow/v1/flow?msg={msg_id}");
+    // `cloud.deploy_url` is the one hardened primitive for "this project's own host" (see
+    // `state.rs::host_scoped_https_url`); building the URL by hand here would repeat the exact
+    // userinfo/authority-override shape the queue-consumer and cron/workflow-step fixes close.
+    let Ok(mut url) = reqwest::Url::parse(&format!(
+        "{}/.well-known/workflow/v1/flow",
+        cloud.deploy_url(project)
+    )) else {
+        return false;
+    };
+    url.query_pairs_mut().append_pair("msg", msg_id);
     for attempt in 0..3u32 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(1200 * attempt as u64)).await;
         }
-        match cloud
-            .http
-            .post(&url)
+        match hive_outbound::same_origin_client()
+            .post(url.clone())
             .header("content-type", "application/json")
             .body("")
             .timeout(std::time::Duration::from_secs(12))
