@@ -98,7 +98,7 @@ impl CdnCache {
                 self.stale.fetch_add(1, Ordering::Relaxed);
                 return Lookup::Stale(e.clone());
             }
-            map.remove(key); // fully expired
+            map.remove(key);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         Lookup::Miss

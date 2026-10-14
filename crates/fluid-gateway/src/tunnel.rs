@@ -182,7 +182,7 @@ pub async fn read_head(conn: &mut Conn) -> anyhow::Result<Head> {
                 || k == "transfer-encoding"
                 || k == "x-fluid-wait-until-ms"
             {
-                continue; // not forwarded verbatim
+                continue;
             }
             if let (Ok(name), Ok(val)) = (
                 HeaderName::from_bytes(k.as_bytes()),
@@ -195,7 +195,7 @@ pub async fn read_head(conn: &mut Conn) -> anyhow::Result<Head> {
 
     let (framing, reusable) = match content_length {
         Some(n) if !conn_close && !chunked => (Framing::Length(n), true),
-        Some(n) => (Framing::Length(n), false), // length known but caller closes
+        Some(n) => (Framing::Length(n), false),
         None => (Framing::Close, false),
     };
 

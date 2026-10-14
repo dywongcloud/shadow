@@ -375,7 +375,7 @@ impl Hive {
                         image: c.image.clone(),
                         resources: c.resources.clone(),
                         tenant: String::new(),
-                        container: None, // build cell, not a container
+                        container: None,
                     },
                     None => return,
                 }
@@ -568,7 +568,7 @@ impl Hive {
                         *inner.warm_pending.entry(image.clone()).or_default() += 1;
                         Some(cell_id)
                     } else {
-                        None // no capacity for more warm cells right now
+                        None
                     }
                 };
                 match spawn_cell {
@@ -633,7 +633,7 @@ impl Hive {
                     image: c.image.clone(),
                     resources: c.resources.clone(),
                     tenant: String::new(),
-                    container: None, // build cell, not a container
+                    container: None,
                 },
                 None => return,
             }

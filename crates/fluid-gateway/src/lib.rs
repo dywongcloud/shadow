@@ -1334,17 +1334,6 @@ impl Gateway {
                 state = fluid_core::DeployState::Error;
             }
         }
-        // ONE classification, not two: `production` is the record's authoritative
-        // "is this the live production deployment" flag and it ANDs
-        // `publish_routes` with `state == Ready`, while `target` used to read the
-        // caller's `production` argument alone. A production-lane record staged
-        // before its routes published (or left non-Ready) therefore landed as
-        // `production: false, target: "production"`, and the edge preview gate —
-        // which classifies by `target` — served that NON-production deployment to
-        // anonymous callers. Measured on fc-sanjose 2026-10-13: 40 of 86 records
-        // had exactly that shape (`ughjh-58997df.shadw.app` answered 200 with no
-        // credentials, while `dpl-02afdaf3f0.shadw.app`, the same fleet's ordinary
-        // preview, correctly answered 401).
         let is_production = production && publish_routes && state == fluid_core::DeployState::Ready;
         let dep = Deployment {
             id: id.clone(),
@@ -2093,14 +2082,12 @@ impl Gateway {
     }
 
     /// Relocation-scoped removal: drop this node's PRODUCTION-lane deployment records for a project
-    /// (empty target = legacy production lane) and KEEP every preview — a preview was placed where it
-    /// was placed and only a user delete or retention policy may remove it. Returns the removed ids.
+    /// and KEEP every preview — a preview was placed where it was placed and only a user delete or
+    /// retention policy may remove it. Production lane = `production` OR a `target` other than
+    /// `preview` (an empty target is a legacy production record, and `promote_exact` flips
+    /// `production` without touching `target`, so a promoted record carries `target: "preview"`).
+    /// Returns the removed ids.
     pub async fn remove_project_superseded(&self, project: &str) -> Vec<String> {
-        // Production-lane = promoted (`production`) OR built for the production
-        // environment (`target`). `promote_exact` flips `production` without
-        // touching `target`, so a record promoted out of the staged lane carries
-        // `production: true, target: "preview"` and must still be reaped here —
-        // the same one-authoritative-answer rule `view_of` applies on read.
         let ids: Vec<String> = {
             let st = self.state.lock();
             st.deployments
@@ -2314,7 +2301,7 @@ impl Gateway {
                 })
         };
         if let Some(h) = host {
-            let h = h.split(':').next().unwrap_or(h); // strip port
+            let h = h.split(':').next().unwrap_or(h);
             if let Some(id) = st.aliases_full.get(&h.to_ascii_lowercase()) {
                 return selected(id);
             }
@@ -2951,7 +2938,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     if dep.manifest.clean_urls && path.ends_with(".html") {
         let mut clean = path.trim_end_matches(".html").to_string();
         if clean.ends_with("/index") {
-            clean.truncate(clean.len() - "index".len()); // ".../index" -> ".../"
+            clean.truncate(clean.len() - "index".len());
         }
         if clean.is_empty() {
             clean = "/".into();
@@ -4738,7 +4725,7 @@ async fn proxy_function(
             Ok(c) => c,
             Err(e) => {
                 last_err = e.to_string();
-                upstream_silent = false; // the transport itself never came up
+                upstream_silent = false;
                 tracing::debug!(cell = %cell, attempt, error = %last_err, "tunnel connect failed");
                 drop(lease);
                 gw.fluid.mark_dead(&key, &cell).await;
@@ -5073,6 +5060,10 @@ fn public_host(sub: &str) -> String {
     }
 }
 
+/// The public view of a record. `target` is normalized on read: `production` wins over a stored
+/// `target` that disagrees with it, and a stored `"production"` on a non-production record reads as
+/// `"preview"`, so the edge preview gate (which classifies by `target`) never treats a record that
+/// is not live production as production.
 fn view_of(d: &Deployment) -> DeploymentInfo {
     let has_static = d.manifest.static_dir.is_some();
     let has_fn = !d.manifest.functions.is_empty();
@@ -5108,12 +5099,6 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         commit_alias,
         branch_alias,
         id_alias: public_host(d.id.as_str()),
-        // `production` is authoritative over `target`. Records registered before
-        // the write site above was fixed can disagree (`target: "production"` on a
-        // `production: false` record), and the edge preview gate classifies by
-        // `target` — so without normalizing on read, every such already-registered
-        // record would keep serving anonymously until it was rebuilt. Normalizing
-        // here fixes the whole fleet's existing records at once, with no redeploy.
         target: if d.production {
             "production".into()
         } else if d.target.is_empty() || d.target.eq_ignore_ascii_case("production") {

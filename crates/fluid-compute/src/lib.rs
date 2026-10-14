@@ -30,6 +30,7 @@ struct Instance {
     inflight: u32,
     started_at_ms: u64,
     last_active_ms: u64,
+    /// No new requests are routed to it; it is terminated once idle.
     draining: bool,
     /// Lifetime request count — drives request-based recycling, so a long-lived warm instance is
     /// recycled to bound memory drift without a runtime heap signal.
@@ -93,6 +94,7 @@ struct FunctionPool {
     warm_fail_streak: u32,
     /// `now_ms()` of the last keep-warm cold start that RETURNED Ok — the backend accepted the launch,
     /// nothing more; paired with `crash_streak` to tell "warmed and healthy" from "died seconds later".
+    /// Zeroed once a death is counted, so each death counts once.
     last_warm_ok_ms: u64,
     /// Consecutive times an instance this pool successfully warmed VANISHED inside
     /// `CRASH_LOOP_WINDOW_MS` — the crash-loop signal `warm_fail_streak` cannot see (a container that
@@ -1627,7 +1629,7 @@ impl Fluid {
                     endpoint: endpoint.clone(),
                     udp_ports: launch.udp_ports.clone(),
                     tcp_ports: launch.tcp_ports.clone(),
-                    inflight: 1, // this lease
+                    inflight: 1,
                     started_at_ms: now_ms(),
                     last_active_ms: now_ms(),
                     draining: false,
@@ -1673,19 +1675,19 @@ impl Fluid {
     }
 
     /// Remove an instance the router/health check found unreachable, terminate it and account its
-    /// time; keep-warm/cold-start replaces it.
+    /// time; keep-warm/cold-start replaces it. Idempotent: an instance already removed is a no-op.
     pub async fn mark_dead(self: &Arc<Self>, key: &str, cell_id: &CellId) {
         let (handle, requests_served) = {
             let mut reg = self.registry.lock();
             let Some(pool) = reg.get_mut(key) else { return };
             let Some(pos) = pool.instances.iter().position(|i| &i.cell_id == cell_id) else {
-                return; // already removed (idempotent)
+                return;
             };
             let inst = pool.instances.remove(pos);
             pool.dead_reaped += 1;
             let now = now_ms();
             if now.saturating_sub(pool.unhealthy_reap_ms) > UNHEALTHY_REAP_WINDOW_MS {
-                pool.unhealthy_reaps = 0; // previous failure aged out of the run
+                pool.unhealthy_reaps = 0;
             }
             pool.unhealthy_reaps = pool.unhealthy_reaps.saturating_add(1);
             pool.unhealthy_reap_ms = now;
@@ -1802,7 +1804,7 @@ impl Fluid {
                     && now.saturating_sub(pool.last_warm_ok_ms) < CRASH_LOOP_WINDOW_MS
                 {
                     pool.crash_streak = pool.crash_streak.saturating_add(1);
-                    pool.last_warm_ok_ms = 0; // count each death exactly once
+                    pool.last_warm_ok_ms = 0;
                     let backoff_ms = 1000u64 << pool.crash_streak.min(6);
                     pool.warm_backoff_until_ms = now + backoff_ms;
                     warn!(
@@ -1844,7 +1846,7 @@ impl Fluid {
                     }
                     let age_ms = now.saturating_sub(inst.started_at_ms);
                     if instance_recyclable(inst.requests_served, age_ms, max_req, max_age_ms) {
-                        inst.draining = true; // stop new requests now; terminate when idle
+                        inst.draining = true;
                         recycled_add += 1;
                         retired_add += age_ms;
                         if inst.inflight == 0 {
@@ -1910,7 +1912,8 @@ impl Fluid {
     }
 
     /// CPU-driven adaptive concurrency: per pool, the MAX CPU across live instances steps the
-    /// safe-concurrency ceiling via [`aimd_step`]; a backend that cannot report CPU is left untouched.
+    /// safe-concurrency ceiling via [`aimd_step`]; a backend that cannot report CPU is left untouched
+    /// (concurrency is never inferred from latency).
     async fn adapt_concurrency(&self) {
         let targets: Vec<(String, Vec<hive_backend::CellHandle>, u32, u32)> = {
             let reg = self.registry.lock();
@@ -1951,7 +1954,7 @@ impl Fluid {
                 }
             }
             if !sampled {
-                continue; // backend gives no CPU signal → hold (never guess from latency)
+                continue;
             }
             let next = aimd_step(max_cpu, current, max);
             if let Some(pool) = self.registry.lock().get_mut(&key) {

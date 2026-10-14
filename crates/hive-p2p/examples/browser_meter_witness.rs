@@ -9,11 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use hive_browser_proto::{check_len, encode_reply, encode_request, split_request, Op};
 
+/// The fleet-ALPN target `serve_tunnels_full` is handed; this witness never reaches it.
+const UNUSED_FLEET_TARGET: &str = "http://127.0.0.1:1";
+
 /// The stand-in admission store: endpoint_id → tenant.
 #[derive(Default, Clone)]
 struct TenantMap {
     by_endpoint: Arc<Mutex<HashMap<String, String>>>,
-    meters: Arc<Mutex<BTreeMap<String, (u64, u64, u64)>>>, // tenant → (in, out, reports)
+    /// tenant -> (inbound, outbound, reports).
+    meters: Arc<Mutex<BTreeMap<String, (u64, u64, u64)>>>,
 }
 
 impl TenantMap {
@@ -131,7 +135,7 @@ async fn main() -> anyhow::Result<()> {
     });
     tokio::spawn(hive_p2p::serve_tunnels_full(
         fleet_ep.clone(),
-        "http://127.0.0.1:1".into(), // fleet-ALPN target; unused by this witness
+        UNUSED_FLEET_TARGET.into(),
         32,
         None,
         None,

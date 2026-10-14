@@ -180,8 +180,9 @@ pub fn parse_vc_config(v: &serde_json::Value) -> anyhow::Result<FunctionConfig> 
 /// `.prerender-config.json` — ISR / on-demand revalidation metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrerenderConfig {
+    /// Either a number or `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expiration: Option<serde_json::Value>, // number | false
+    pub expiration: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<u64>,
     #[serde(rename = "bypassToken", skip_serializing_if = "Option::is_none")]

@@ -33,14 +33,15 @@ impl CellState {
     }
 
     /// Validate a transition. Returns false for illegal moves so the control
-    /// plane can refuse to corrupt its own bookkeeping.
+    /// plane can refuse to corrupt its own bookkeeping. A `Warm` cell may drain
+    /// while idle (it is reaped from the pool).
     pub fn can_transition_to(self, next: CellState) -> bool {
         use CellState::*;
         match (self, next) {
             (Provisioning, Warm)
             | (Provisioning, Failed)
             | (Warm, Assigned)
-            | (Warm, Draining) // reaped from the pool while idle
+            | (Warm, Draining)
             | (Warm, Failed)
             | (Assigned, Running)
             | (Assigned, Failed)

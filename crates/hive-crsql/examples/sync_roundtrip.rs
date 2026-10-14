@@ -250,7 +250,7 @@ fn scenario_interruption(dir: &std::path::Path) -> anyhow::Result<()> {
             "[3] d applied batch 1/3 -> {out:?}; watermark before crash = {applied_before_crash}"
         );
         assert!(matches!(out, ApplyOutcome::Applied { applied: 1, .. }));
-    } // d dropped here: the "process" is gone.
+    }
 
     let d = hive_crsql::open(dir.join("d.db"))?;
     let durable = hive_crsql::watermark_for(&d, &c_site)?;

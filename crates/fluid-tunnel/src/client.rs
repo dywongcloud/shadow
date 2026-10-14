@@ -90,7 +90,7 @@ impl TunnelClient {
                         }
                     }
                     FrameKind::RespEnd => {
-                        s.pending.lock().remove(&frame.stream_id); // drops body sender
+                        s.pending.lock().remove(&frame.stream_id);
                     }
                     FrameKind::Nack => {
                         if let Some(mut p) = s.pending.lock().remove(&frame.stream_id) {

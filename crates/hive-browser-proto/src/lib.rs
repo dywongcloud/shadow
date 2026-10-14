@@ -47,15 +47,15 @@ pub const fn protocol_fit(client_version: u16) -> ProtocolFit {
 }
 
 /// Cap on a single request frame, checked by both sides before allocating.
-pub const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
+pub const BROWSER_MAX_FRAME: usize = 1024 * 1024;
 
 /// Echo is diagnostic, not bulk transfer; its payload cap stays far below function/asset frames.
-pub const BROWSER_MAX_ECHO: usize = 64 << 10; // 64 KiB
+pub const BROWSER_MAX_ECHO: usize = 64 * 1024;
 
 /// Frame cap for [`Op::CrrSync`]: one CRR value may be up to the deployment's `max_value_bytes`
 /// (default 1 MiB) plus a batch and watermarks, checked BEFORE allocation; a value cap raised
 /// past this gets a typed refusal, never truncation.
-pub const BROWSER_MAX_CRR_FRAME: usize = 4 << 20; // 4 MiB
+pub const BROWSER_MAX_CRR_FRAME: usize = 4 * 1024 * 1024;
 
 /// Stream reset codes shared by both sides.
 pub mod reset {
@@ -96,7 +96,7 @@ pub const ASSET_REPLY_META_LEN: usize = 8;
 pub const ASSET_CHUNK_MAX: usize = BROWSER_MAX_FRAME - ASSET_REPLY_META_LEN;
 
 /// Maximum complete asset the whole-object browser API (`assetOn`, one `Uint8Array`) returns.
-pub const BROWSER_MAX_ASSET: usize = 64 << 20; // 64 MiB
+pub const BROWSER_MAX_ASSET: usize = 64 * 1024 * 1024;
 
 /// The op selector, first byte of every request. An unknown byte is refused with
 /// [`reset::UNKNOWN_OP`], never defaulted to [`Op::Echo`].

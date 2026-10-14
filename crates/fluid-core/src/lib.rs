@@ -405,8 +405,9 @@ fn default_max_instances() -> u32 {
 fn default_idle_ttl() -> u64 {
     30
 }
+/// Vercel Fluid's default max duration, in seconds (5 minutes).
 fn default_max_duration() -> u64 {
-    300 // Vercel Fluid default max duration (5 minutes)
+    5 * 60
 }
 
 impl Default for FunctionConfig {
@@ -2551,7 +2552,7 @@ impl ReqCtx {
     }
 }
 
-/// Evaluate one condition against the request.
+/// Evaluate one condition against the request; a condition without a value matches on presence alone.
 fn cond_matches(c: &RuleCondition, ctx: &ReqCtx) -> bool {
     let actual: Option<String> = match c.kind.as_str() {
         "host" => Some(ctx.host.clone()),
@@ -2561,7 +2562,7 @@ fn cond_matches(c: &RuleCondition, ctx: &ReqCtx) -> bool {
         _ => None,
     };
     match (&c.value, actual) {
-        (None, Some(_)) => true, // presence only
+        (None, Some(_)) => true,
         (None, None) => false,
         (Some(v), Some(a)) => v.matches(&a),
         (Some(_), None) => false,
@@ -3143,7 +3144,7 @@ impl Manifest {
             return None;
         }
         let req = path.split(['?', '#']).next().unwrap_or(path);
-        let mut best: Option<(&RoutePolicy, u32)> = None; // (policy, specificity)
+        let mut best: Option<(&RoutePolicy, u32)> = None;
         for p in &self.route_policies {
             if let Some(spec) = next_route_match(&p.pattern, req) {
                 match best {
@@ -3221,7 +3222,7 @@ impl Manifest {
         if want && !has_slash {
             let last = path.rsplit('/').next().unwrap_or("");
             if last.contains('.') {
-                return None; // file with extension
+                return None;
             }
             Some(format!("{path}/"))
         } else if !want && has_slash {
@@ -3281,6 +3282,16 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
+/// Specificity a matched exact segment adds in [`next_route_match`]; it outranks a dynamic one.
+const EXACT_SEGMENT_SCORE: u32 = 100;
+/// Specificity a matched `[seg]` segment adds in [`next_route_match`].
+const DYNAMIC_SEGMENT_SCORE: u32 = 10;
+/// Specificity a `[...seg]` catch-all adds: it must consume at least one segment.
+const CATCH_ALL_SCORE: u32 = 2;
+/// Specificity a `[[...seg]]` catch-all adds: it matches the rest of the path, none included, and ranks
+/// lowest.
+const OPTIONAL_CATCH_ALL_SCORE: u32 = 1;
+
 /// Match a request path against a Next.js route pattern (exact segments, `[seg]`, `[...seg]` /
 /// `[[...seg]]`), returning a specificity score (static > single-dynamic > catch-all) or `None`;
 /// used only for per-route policy lookup.
@@ -3303,11 +3314,11 @@ pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
     while i < pseg.len() {
         let p = pseg[i];
         if p.starts_with("[[...") && p.ends_with("]]") {
-            return Some(score + 1); // optional catch-all matches the rest (incl. none)
+            return Some(score + OPTIONAL_CATCH_ALL_SCORE);
         }
         if p.starts_with("[...") && p.ends_with(']') {
             return if i < rseg.len() {
-                Some(score + 2)
+                Some(score + CATCH_ALL_SCORE)
             } else {
                 None
             };
@@ -3316,9 +3327,9 @@ pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
             return None;
         }
         if p.starts_with('[') && p.ends_with(']') {
-            score += 10; // dynamic single segment
+            score += DYNAMIC_SEGMENT_SCORE;
         } else if p == rseg[i] {
-            score += 100; // exact segment is most specific
+            score += EXACT_SEGMENT_SCORE;
         } else {
             return None;
         }

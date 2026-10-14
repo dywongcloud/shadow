@@ -55,9 +55,10 @@ pub fn sign(deployment_id: &str, message: &[u8]) -> anyhow::Result<Vec<u8>> {
 
 /// Permanently delete `deployment_id`'s SEP key — genuinely destructive (a new key at the same tag is
 /// a NEW key), so callers apply the same blast-radius discipline every GC in this codebase uses.
+/// A key that is already gone is success.
 pub fn delete_for_deployment(deployment_id: &str) -> anyhow::Result<()> {
     let Some(key) = lookup(deployment_id)? else {
-        return Ok(()); // already gone — idempotent
+        return Ok(());
     };
     key.delete()
         .map_err(|e| anyhow::anyhow!("SecItemDelete failed for {deployment_id}: {e}"))

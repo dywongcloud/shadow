@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 
 /// Vercel runtime-cache limits.
-pub const MAX_ITEM_BYTES: usize = 2 * 1024 * 1024; // 2 MB
+pub const MAX_ITEM_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TAGS_PER_ITEM: usize = 64;
 pub const MAX_TAG_LEN: usize = 256;
 

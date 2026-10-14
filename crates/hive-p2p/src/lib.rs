@@ -4442,7 +4442,7 @@ pub async fn serve_silent(ep: Endpoint) {
             };
             while let Ok((send, recv)) = conn.accept_bi().await {
                 tokio::spawn(async move {
-                    let _keep = (send, recv); // hold open, never respond
+                    let _keep = (send, recv);
                     std::future::pending::<()>().await;
                 });
             }

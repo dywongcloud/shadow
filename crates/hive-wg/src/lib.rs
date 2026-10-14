@@ -179,7 +179,7 @@ impl SecureLink {
         let params = PARAMS.parse().map_err(|e| format!("params: {e}"))?;
         let mut initiator = Builder::new(params)
             .local_private_key(init_priv)
-            .remote_public_key(resp_pub) // IK: initiator knows the gateway's static key
+            .remote_public_key(resp_pub)
             .psk(2, &psk)
             .build_initiator()
             .map_err(|e| format!("init: {e}"))?;

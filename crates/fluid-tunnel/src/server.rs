@@ -362,6 +362,9 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
     false
 }
 
+/// Relay one framed request to the local hop over a fresh connection as a `RespHead` frame then
+/// `RespBody` frames, marking `head_sent` as the head frame is sent. A chunked body is re-framed
+/// chunk by chunk and its trailers are ignored.
 async fn proxy_local(
     id: u64,
     payload: &[u8],
@@ -518,9 +521,9 @@ async fn proxy_local(
             let hex = line.split(|&b| b == b';').next().unwrap_or(line);
             let size = usize::from_str_radix(std::str::from_utf8(hex)?.trim(), 16)
                 .map_err(|_| anyhow::anyhow!("invalid chunk size"))?;
-            buf.drain(..line_end + 2); // consume "<size>\r\n"
+            buf.drain(..line_end + 2);
             if size == 0 {
-                break; // last chunk (any trailers are ignored)
+                break;
             }
             while buf.len() < size + 2 {
                 let r = conn.read(&mut tmp).await?;
@@ -532,7 +535,7 @@ async fn proxy_local(
                 FrameKind::RespBody,
                 Bytes::copy_from_slice(&buf[..size]),
             ))?;
-            buf.drain(..size + 2); // consume data + trailing CRLF
+            buf.drain(..size + 2);
         }
     } else {
         let mut sent = 0usize;

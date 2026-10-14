@@ -175,7 +175,7 @@ impl ProcIndex {
     /// `None` if `root` isn't present (process gone).
     fn subtree_cpu_ns(&self, root: u32) -> Option<u64> {
         use std::collections::{HashSet, VecDeque};
-        self.cpu.get(&root)?; // root must exist
+        self.cpu.get(&root)?;
         let mut sum = 0u64;
         let mut seen = HashSet::new();
         let mut q = VecDeque::new();
@@ -383,6 +383,14 @@ impl Default for ContainerLimits {
     }
 }
 
+/// `HIVE_CONTAINER_MEMORY_MAX_MIB` fallback: 16 GiB, generous for a real monolith and still a real
+/// ceiling.
+const DEFAULT_MEMORY_MAX_MIB: u32 = 16 * 1024;
+/// `HIVE_CONTAINER_CPUS_MAX` fallback: 4x the default `2.0` cpus.
+const DEFAULT_CPUS_MAX: f64 = 8.0;
+/// `HIVE_CONTAINER_PIDS_MAX` fallback: 4x the default 1024 pids.
+const DEFAULT_PIDS_MAX: u32 = 4096;
+
 impl ContainerLimits {
     /// Limits for a specific container function: the deployment's requested memory/cpus/pids when
     /// set, else the env-tunable defaults — and EACH request is CLAMPED to its fleet-wide maximum, so
@@ -394,7 +402,7 @@ impl ContainerLimits {
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(16_384); // 16 GiB — generous for a real monolith, still a real ceiling
+                .unwrap_or(DEFAULT_MEMORY_MAX_MIB);
             l.memory = Some(format!("{}m", memory_mib.min(max)));
         }
         if cpus > 0.0 {
@@ -402,7 +410,7 @@ impl ContainerLimits {
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|v| *v > 0.0)
-                .unwrap_or(8.0); // 4x the "2.0" default — generous, still a real ceiling
+                .unwrap_or(DEFAULT_CPUS_MAX);
             l.cpus = Some(format!("{}", cpus.min(max)));
         }
         if pids > 0 {
@@ -410,7 +418,7 @@ impl ContainerLimits {
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .filter(|v| *v > 0)
-                .unwrap_or(4096); // 4x the 1024 default — generous, still a real ceiling
+                .unwrap_or(DEFAULT_PIDS_MAX);
             l.pids = Some(pids.min(max));
         }
         l
@@ -590,6 +598,10 @@ pub async fn sweep_container_locks(path_env: &str) -> Option<(u64, usize, usize)
     Some((free, vols, cells))
 }
 
+/// Whether podman's `stderr` blames the PINNED static `--ip` (never true when `net` pins none): an
+/// IPAM refusal, an address outside the subnet (`requested static ip X not in any subnet on network
+/// Y`), an exhausted range (`no available addresses in range`), or a network that was removed or
+/// leaked and could not be recreated with the pinned subnet.
 fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
     let pinned = net
         .as_ref()
@@ -604,11 +616,11 @@ fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
     e.contains("ipam")
         || e.contains("already allocated")
         || e.contains("requested ip")
-        || e.contains("static ip") // "requested static ip X not in any subnet on network Y"
+        || e.contains("static ip")
         || e.contains("not in subnet")
         || e.contains("not in any subnet")
-        || e.contains("no available") // "no available addresses in range"
-        || e.contains("network not found") // net was rm'd/leaked and couldn't be recreated with the pinned subnet
+        || e.contains("no available")
+        || e.contains("network not found")
 }
 
 /// Make a logical image name safe as a single filename component.
@@ -1173,7 +1185,7 @@ pub(crate) async fn podman_run_container(
                 let mut it = base.iter();
                 while let Some(a) = it.next() {
                     if a == "--ip" {
-                        let _ = it.next(); // skip the address that follows
+                        let _ = it.next();
                         continue;
                     }
                     dyn_base.push(a.clone());

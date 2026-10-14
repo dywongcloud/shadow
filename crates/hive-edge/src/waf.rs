@@ -151,7 +151,7 @@ impl Waf {
                         reason: c.rule.description.clone(),
                     }
                 }
-                WafAction::Log => { /* fall through */ }
+                WafAction::Log => {}
             }
         }
         if *self.managed.read() {
