@@ -266,7 +266,10 @@ impl PushStore {
         else {
             return false;
         };
-        let ok = t.pending_code.as_deref() == Some(code)
+        let ok = t
+            .pending_code
+            .as_deref()
+            .is_some_and(|pending| crate::admin::ct_eq(pending, code))
             && !code.is_empty()
             && now.saturating_sub(t.code_sent_ms) < SMS_CODE_TTL_MS;
         if ok {

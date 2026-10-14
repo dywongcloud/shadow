@@ -192,7 +192,7 @@ fn require_internal_hop(
         if headers
             .get("x-hive-internal")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|got| got == expected)
+            .is_some_and(|got| crate::admin::ct_eq(got, expected))
         {
             return Ok(());
         }

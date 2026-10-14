@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-13 — three secret comparisons now run in constant time
+
+The mesh hot-join proof (`join_handler` in `main.rs`: `HMAC(HIVE_JWT_SECRET, the
+caller's own endpoint id)`), the sandbox internal-hop token (`require_internal_hop`,
+`x-hive-internal` against `HIVE_INTERNAL_TOKEN`) and the SMS verification code
+(`verify_sms`) were compared with `==`/`!=`, which exits on the first differing byte,
+while every other secret or MAC compare in `hive-cloud` already used `admin::ct_eq`.
+The join proof is the one that mattered: it is the HMAC of an endpoint id the caller
+chooses, so a caller able to time the comparison could recover a valid proof for its
+own id byte by byte and admit itself into the trust set (hard over QUIC, but the
+textbook reason for a constant-time MAC compare). All three now use `ct_eq`. A scan of
+`hive-cloud`, `hive-core`, `hive-p2p`, `hive-browser` and `hive-zkauth` found no other
+comparison of an attacker-supplied secret: the rest compare ids, hostnames, content
+digests and public Fiat-Shamir values, and the API-key lookup compares the SHA-256 of
+the presented key, not the key. Witnessed on a throwaway three-node loopback mesh over
+real iroh with peer trust enforced: a node holding the fleet secret is admitted by
+`join_handler` (the joiner receives the roster and the admitting node's trust set grows
+by one), a node holding a different secret is rejected with `invalid proof` and the
+trust set does not change. Not rolled.
+
 ## 2026-10-13 — /v1/anycast no longer hands every signed-in user the mesh addressing /v1/nodes withholds
 
 `anycast_table` (`admin.rs`) returned `c.registry.routing_table()`, the FULL `NodeInfo`

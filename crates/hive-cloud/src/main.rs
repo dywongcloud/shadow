@@ -1367,10 +1367,7 @@ async fn async_main() -> anyhow::Result<()> {
                     let secret = secret.clone();
                     Box::pin(async move {
                         let expect = crate::admin::hmac_sha256_hex(secret.as_bytes(), remote_id.as_bytes());
-                        // Constant-time-ish compare is overkill here (proof is an
-                        // HMAC over a public value; the secret never leaves HMAC),
-                        // but never admit on empty/short input.
-                        if proof.len() != expect.len() || proof != expect {
+                        if !crate::admin::ct_eq(&proof, &expect) {
                             tracing::warn!(peer = %remote_id, "REJECTED mesh join: invalid proof");
                             return Vec::new();
                         }
