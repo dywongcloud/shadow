@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-10-13 — `/api/tv/hls` decodes raw deflate, and an empty body under a content-coding is an empty body
+
+Two regressions in the content-coding decoder added a few commits earlier, from the round-3
+adversarial review. `deflate` was decoded as zlib-wrapped only, so an origin that sends raw RFC
+1951 deflate under `Content-Encoding: deflate` (undici and browsers accept it by sniffing the
+first byte) failed with "incorrect header check" after the 200 headers: a stream error with no
+bytes on the segment lane, a 502 on the playlist and key lanes. And an empty body under a coding
+(a 204, `content-length: 0`, a chunked body with no chunks) ended in `Z_BUF_ERROR` "unexpected
+end of file" instead of being an empty body. `safe-fetch.ts` now makes the decoder on the first
+non-empty chunk (`LazyDecoder`): a deflate body is zlib-wrapped when `(firstByte & 0x0f) === 8`
+and raw otherwise, and a stream that never carries a byte is an empty body (one rule for 204,
+`content-length: 0` and chunked-empty, no separate status check; an incomplete stream still
+errors). The decoder is paused while the wrapper's readable side is full, so it still never runs
+ahead of the reader, destroying the wrapper destroys it, and every cap (encoded and decoded) is
+unchanged. `role=key` stays client-supplied and unsigned on purpose, and the route's contract
+line now says so: a caller can add it to any proxy URL to relabel at most 4096 bytes of a public
+body as inert `application/octet-stream` (`nosniff`, `no-store`) past the media-type allowlist,
+which any upstream that labels its bytes `application/octet-stream` already gets at 64 MiB, so an
+HMAC would only couple an anonymous relay to `HIVE_INTERNAL_TOKEN`. Witnessed with the previous
+code (loaded from git, or built as a production `next start` scratch app) against this code: 71
+module-level checks with real zlib streams, 13 failed before (raw deflate, empties) and none
+after, including 600 random raw-deflate bodies (every level and strategy, odd chunk sizes) and
+300 zlib-wrapped ones that all decode (the first byte of a raw stream was never `x8`), endless
+empty stored deflate blocks and a 256 MiB raw-deflate bomb ending at the caps, and a slow reader
+of a 2 GiB raw-deflate bomb that pulled 192 KiB; 15 over-the-wire empty-body checks through a
+cloudflared quick tunnel (the edge strips `Content-Encoding: deflate` in every spelling, so raw
+deflate can only be witnessed at module level and the wire runs use `x-gzip`), 7 failed before on
+`next dev` and on a production build (a socket error on the segment lane, 502 on the playlist and
+key lanes) and none after. The reviewer's "empties run to the 25 s deadline pinning a core" did
+not reproduce in either version: empties end in under a second at under 100 ms of server CPU, and
+a body that stalls after its headers ends at about 20 s (two 10 s idle timeouts) at 20 to 50 ms
+of CPU, plain or encoded alike. The 47-row hostile-URL table (0 recorded connections), the
+10-row key table, 53 of 53 bound checks, 27 of 27 encoding checks and real hls.js playing six
+AES-128 variants all hold. Not rolled.
+
 ## 2026-10-13 — mesh-RPC team scoping, sandbox cap/isolation, API-key role gates, project_preview redirects
 
 Four findings from an adversarial review landed together in admin.rs (a705fe33c3): `require_mesh_rpc(.., None)`
