@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-10-13 — the dashboard's TV stream proxy can no longer be pointed at a private address
+
+`GET /api/tv/hls?url=` (`ui/app/api/tv/hls/route.ts`) fetched any `https:` URL for any
+caller (`proxy.ts` leaves `/api/*` public): a visitor could make the dashboard node dial
+loopback, RFC1918, CGNAT or link-local (`169.254.169.254`) hosts and read the answer back,
+follow a public redirector to a private address (undici followed a 5-hop chain and an
+`http:` hop) and pull unbounded bodies through the node's egress (found by the ui
+comment sweep). Every outbound fetch now goes through one server-only primitive,
+`safeGet` (`lib/safe-fetch.ts`): the address check is the connect-time `lookup` of
+`node:https`, so the check and the connection share one resolution (no pre-check followed
+by `fetch`, no DNS-rebinding window) and ONE non-public address among the answers refuses
+the target; IP-literal hosts (the URL parser has already normalised the decimal, hex,
+octal, short and bracketed forms) are validated before dialing; `localhost`,
+`*.localhost`, `*.internal`, `*.local` and single-label names are refused; only https
+without userinfo; redirects are followed by hand, at most 3, every hop re-validated. The
+policy is `isPublicAddress` (`lib/public-address.ts`): all IPv4 special-use ranges, IPv6
+only inside 2000::/3 minus 2001::/23, 2001:db8::/32, 2002::/16 and 3fff::/20, and the
+IPv4-mapped and NAT64 forms unwrapped to the IPv4 check. The route keeps its contract
+(playlists rewritten to point back at it, now against the FINAL url after redirects) and
+adds bounds: a playlist is at most 2 MiB and must start with `#EXTM3U`, every other body
+at most 64 MiB (declared length refused up front, the stream and the upstream socket torn
+down past the cap or when the client cancels), content types limited to HLS playlists,
+`video/*`, `audio/*`, `application/octet-stream`, `binary/octet-stream`, `application/mp4`
+and `text/vtt` (else 415; a `.ts` served as `text/vnd.trolltech.linguist` or `text/plain`,
+the IANA mapping of that extension and 10 of 600 surveyed catalog channels, is relabelled
+`video/mp2t`), only a single `range` forwarded (never cookies or authorization),
+`nosniff`, a 25 s total deadline and a 10 s socket idle timeout. The two GitHub REST
+helpers (`gh` in `lib/github-rest.ts`, `appFetch` in `lib/github-installation.ts`) lost
+their `path.startsWith("http")` branch, which no caller used and which would have sent
+the user or App token to a caller-chosen host. Witnessed through `next dev` with
+recording listeners on 127.0.0.1 and ::1: of 43 hostile URLs (loopback v4/v6, `localhost`
+forms, decimal/hex/octal/mapped/NAT64/6to4 literals, `127.0.0.1.nip.io` and
+`localtest.me`, RFC1918, CGNAT, metadata, multicast, reserved, userinfo, non-https, and
+public `httpbin.org` redirectors to loopback with 301/302/303/307/308) 20 reached a
+listener before the fix (40 connections, the old code retrying once); after the fix all
+47 table rows are refused with 400/403 (the 5-hop chain is a 502) and the listeners
+recorded zero connections, and the same holds for redirects served from a synthetic
+public origin through a cloudflared quick tunnel (53 bound checks: header forwarding,
+range, rewrite against the final url, 2 MiB and 64 MiB caps, content-type refusals and
+relabels, client-cancel teardown of the upstream socket, idle stall). The feature still
+works: of 60 random iptv-org catalog channels 47 playlists were proxied and rewritten and
+36 first segments streamed before, 46 and 35 after (two `stream8.cinerama.uz` channels
+whose origin started answering this IP with a 302 to a "blocked" slate between the runs,
+curl sees the same; one flapping channel came back), and a 300-channel run played 168
+first segments, including the three `.ts`-as-`text/vnd.trolltech.linguist` channels the
+bare allowlist had refused. One catalog host,
+`folxsloapp.b-cdn.net`, publishes an A record of 127.0.0.1 and used to be dialed on the
+node's own loopback. Not rolled.
+
 ## 2026-10-13 — three secret comparisons now run in constant time
 
 The mesh hot-join proof (`join_handler` in `main.rs`: `HMAC(HIVE_JWT_SECRET, the

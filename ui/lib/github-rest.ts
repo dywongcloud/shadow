@@ -17,7 +17,7 @@ interface GhResponse {
  *  upstream cannot reject a deploy flow. The token only travels in the Authorization header. */
 async function gh(token: string, path: string, init?: RequestInit): Promise<GhResponse> {
   try {
-    const r = await fetch(path.startsWith("http") ? path : `${BASE}${path}`, {
+    const r = await fetch(`${BASE}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${token}`,

@@ -50,7 +50,7 @@ async function appFetch(
   init?: RequestInit
 ): Promise<{ status: number; json: any }> {
   try {
-    const r = await fetch(path.startsWith("http") ? path : `${API_BASE}${path}`, {
+    const r = await fetch(`${API_BASE}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${jwt}`,
