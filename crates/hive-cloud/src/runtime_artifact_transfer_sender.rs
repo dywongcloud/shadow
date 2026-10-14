@@ -50,11 +50,10 @@ pub struct TargetMaterializationReceipt {
     pub state: TransferState,
 }
 
-/// Proof one target holds a HIDDEN, launched, readiness-proven candidate for
-/// this exact generation. The `hidden_deployment_id`/`readiness_sha256` pair
-/// is what Commit must echo back — a receiver refuses to commit any other
-/// prepared incarnation, and `participant_boot_nonce` pins the proof to the
-/// exact process that holds the armed staged handle.
+/// Proof that one target holds a HIDDEN, launched, readiness-proven candidate for this exact
+/// generation. The `hidden_deployment_id`/`readiness_sha256` pair is what Commit must echo back (a
+/// receiver refuses to commit any other prepared incarnation), and `participant_boot_nonce` pins
+/// the proof to the exact process that holds the armed staged handle.
 #[derive(Clone, Debug)]
 pub struct TargetPreparationReceipt {
     pub target_node: String,
@@ -104,8 +103,6 @@ impl TransferGeneration {
         let snapshot_bytes = snapshot
             .canonical_contract_bytes()
             .context("encode deployment build snapshot before transfer")?;
-        // Dual-algorithm on the read side for the same reason the receiver is:
-        // a sealed authority minted under either hash must still re-prove.
         if !fluid_core::verify_normalized_manifest(
             &manifest_bytes,
             snapshot.contract().authority.normalized_manifest_sha256(),
@@ -276,11 +273,12 @@ pub async fn send_verified_runtime_artifact(
     Ok(receipts)
 }
 
-/// Ask every remote target of one materialized generation to PREPARE: deliver
-/// the exact artifact to its backend, stage the canonical manifest as a hidden
-/// candidate, launch it, and prove bounded readiness. Fails unless EVERY
-/// remote target returns a prepared receipt — partial preparation never
-/// publishes anything, and the coordinator can abort or retry the whole set.
+/// Asks every remote target of one materialized generation to PREPARE: deliver the exact artifact
+/// to its backend, stage the canonical manifest as a hidden candidate, launch it and prove bounded
+/// readiness. Fails unless EVERY remote target returns a prepared receipt: partial preparation
+/// never publishes anything, and the coordinator can abort or retry the whole set. `Failed` on
+/// Prepare is RETRYABLE by contract (the receiver keeps the record `Materialized` and names the
+/// launch or readiness failure in the message), like `QueueFull` and `Internal`.
 pub async fn prepare_transferred_targets(
     cloud: &Arc<CloudState>,
     generation: &TransferGeneration,
@@ -354,9 +352,6 @@ async fn prepare_target(
             Ok(reply)
                 if matches!(
                     reply.code,
-                    // `Failed` on Prepare is RETRYABLE by contract: the
-                    // receiver keeps the record Materialized and names the
-                    // launch/readiness failure in the message.
                     ReplyCode::QueueFull | ReplyCode::Internal | ReplyCode::Failed
                 ) =>
             {
@@ -412,10 +407,9 @@ fn prepared_receipt(
     })
 }
 
-/// Commit every prepared remote target of one generation, echoing each
-/// target's EXACT prepared authority. Requires one receipt per remote target
-/// — a coordinator that cannot show a full prepared set has no business
-/// publishing anything.
+/// Commits every prepared remote target of one generation, echoing each target's EXACT prepared
+/// authority. Requires one receipt per remote target: a coordinator that cannot show a full
+/// prepared set has no business publishing anything.
 pub async fn commit_prepared_targets(
     cloud: &Arc<CloudState>,
     generation: &TransferGeneration,
@@ -574,11 +568,10 @@ fn committed_receipt(
     })
 }
 
-/// Best-effort abort of every remote participant of one generation: prepared
-/// candidates roll back (their hidden staging is dropped), committed targets
-/// refuse the abort and keep serving, unknown transactions are a no-op. Never
-/// fails the caller — a target that cannot be told to abort is reaped by its
-/// own lease expiry.
+/// Best-effort abort of every remote participant of one generation: prepared candidates roll back
+/// (their hidden staging is dropped), committed targets refuse the abort and keep serving, and
+/// unknown transactions are a no-op. Never fails the caller: a target that cannot be told to abort
+/// is reaped by its own lease expiry.
 pub async fn abort_generation_targets(
     cloud: &Arc<CloudState>,
     generation: &TransferGeneration,

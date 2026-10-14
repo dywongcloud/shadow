@@ -1,12 +1,10 @@
-//! Project-scoped Microfrontends HTTP API — group + membership CRUD, config
-//! generation, and the per-project settings surface backing the dashboard's
-//! Project Settings → Microfrontends tab.
+//! Project-scoped Microfrontends HTTP API: group and membership CRUD, config generation, and the
+//! per-project settings surface behind the dashboard's Project Settings > Microfrontends tab.
 //!
-//! Storage is [`crate::enterprise::EnterpriseStore`] (`mfe`), the single source of
-//! truth (persisted + gossiped). Every mutation is validated with
-//! [`crate::microfrontends::validate_group`] BEFORE it is committed (validate the
-//! candidate group, then `set_mfe_group`), so the store never holds an invalid
-//! group. All writes enforce tenant ownership of every referenced project.
+//! Storage is [`crate::enterprise::EnterpriseStore`] (`mfe`), the single source of truth (persisted
+//! and gossiped). Every mutation validates the candidate group with
+//! [`crate::microfrontends::validate_group`] BEFORE committing it (`commit_group`), so the store
+//! never holds an invalid group. All writes enforce tenant ownership of every referenced project.
 
 use axum::{
     extract::{Path, State},
@@ -29,12 +27,10 @@ type Claims = Option<axum::Extension<crate::auth::Claims>>;
 
 pub fn routes() -> Router<Arc<CloudState>> {
     Router::new()
-        // Per-project settings surface (dashboard Project Settings > Microfrontends).
         .route(
             "/v1/projects/:project/settings/microfrontends",
             get(project_mfe_get).put(project_mfe_put),
         )
-        // Group CRUD.
         .route(
             "/v1/microfrontends/groups",
             get(groups_list).post(group_create),
@@ -47,7 +43,6 @@ pub fn routes() -> Router<Arc<CloudState>> {
             "/v1/microfrontends/groups/:groupId/config",
             get(group_config),
         )
-        // Membership CRUD.
         .route(
             "/v1/microfrontends/groups/:groupId/members",
             post(member_add),
@@ -57,10 +52,6 @@ pub fn routes() -> Router<Arc<CloudState>> {
             axum::routing::patch(member_patch).delete(member_remove),
         )
 }
-
-// ---------------------------------------------------------------------------
-// Error mapping — MfeError -> HTTP status + {code, error} JSON body
-// ---------------------------------------------------------------------------
 
 fn mfe_err(e: MfeError) -> (StatusCode, String) {
     let status = match &e {
@@ -83,14 +74,15 @@ fn bad(msg: &str) -> (StatusCode, String) {
 
 /// Every referenced project (default + members) must belong to `team`, else the
 /// group could compose another tenant's deployments.
+///
+/// The check is fleet-aware (`project_owned_by`): settings rows are node-local, so a remotely
+/// placed project's ownership is judged from its deployment tenant tags.
 fn ensure_team_owns(
     c: &Arc<CloudState>,
     team: &str,
     projects: impl IntoIterator<Item = String>,
 ) -> Result<(), (StatusCode, String)> {
     for p in projects {
-        // Fleet-aware ownership (settings rows are node-local; remotely-placed
-        // projects are judged from their deployment tenant tags).
         if !crate::admin::project_owned_by(c, &p, team) {
             return Err(mfe_err(MfeError::Unauthorized(format!(
                 "project '{p}' belongs to a different team"
@@ -150,10 +142,6 @@ fn commit_group(
     Ok(saved)
 }
 
-// ---------------------------------------------------------------------------
-// Group CRUD
-// ---------------------------------------------------------------------------
-
 async fn groups_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -171,6 +159,8 @@ struct GroupCreateReq {
     default_project: String,
 }
 
+/// Creates a group around its default (host) project. First-implementation constraint: a project
+/// belongs to at most one group, so a project already in one answers 409.
 async fn group_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -183,7 +173,6 @@ async fn group_create(
         return Err(bad("name and defaultProjectId are required"));
     }
     ensure_team_owns(&c, &t, [b.default_project.clone()])?;
-    // First-implementation constraint: a project belongs to at most one group.
     if let Some(existing) = c.enterprise.mfe_group_of_project(&t, &b.default_project) {
         return Err(mfe_err(MfeError::ProjectAlreadyInGroup {
             project: b.default_project,
@@ -246,6 +235,8 @@ struct GroupPatchReq {
     enabled: Option<bool>,
 }
 
+/// Patches a group's settings. Promoting a different member to default (`defaultProjectId`)
+/// requires it to be a member already (`UnknownMember` otherwise).
 async fn group_patch(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -264,7 +255,6 @@ async fn group_patch(
     }
     if let Some(dp) = b.default_project.filter(|s| !s.trim().is_empty()) {
         let dp = dp.trim().to_string();
-        // Promoting a different member to default: it must already be a member.
         if g.member(&dp).is_none() {
             return Err(mfe_err(MfeError::UnknownMember(dp)));
         }
@@ -293,6 +283,8 @@ async fn group_patch(
     Ok(Json(json!(saved)))
 }
 
+/// Deletes a group. Only the OWNING node may authoritatively delete (local groups): a gossiped copy
+/// is read-only here, so an id outside the local set answers not-found.
 async fn group_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -301,8 +293,6 @@ async fn group_delete(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     require_plan(&c, &t)?;
-    // Only the OWNING node may authoritatively delete (local groups); a gossiped
-    // copy is read-only here.
     if c.enterprise
         .mfe_groups_local(&t)
         .iter()
@@ -316,10 +306,6 @@ async fn group_delete(
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true })))
 }
-
-// ---------------------------------------------------------------------------
-// Membership CRUD
-// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct MemberAddReq {
@@ -351,6 +337,8 @@ impl RouteReq {
     }
 }
 
+/// Adds a project to a group, as a child or (`role: "default"`) as the new default. At most one
+/// group per project across the team; adding a project already in this group answers 409 too.
 async fn member_add(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -369,7 +357,6 @@ async fn member_add(
         .enterprise
         .mfe_group(&t, &group_id)
         .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
-    // At most one group per project (across the team).
     if let Some(existing) = c.enterprise.mfe_group_of_project(&t, &project) {
         if existing.id != g.id {
             return Err(mfe_err(MfeError::ProjectAlreadyInGroup {
@@ -444,13 +431,14 @@ struct DevelopmentReq {
 }
 
 /// Apply the membership patch to `g`'s member `project` in place.
+///
+/// Promotion to default (`role: "default"`) rewires the group's `host_project`.
 fn apply_member_patch(
     g: &mut MfeGroup,
     project: &str,
     b: MemberPatchReq,
     now: u64,
 ) -> Result<(), (StatusCode, String)> {
-    // Promotion to default rewires the group's host_project.
     if b.role.as_deref() == Some("default") {
         g.host_project = project.to_string();
     }
@@ -522,6 +510,9 @@ async fn member_patch(
     Ok(Json(json!(saved)))
 }
 
+/// Removes a project from a group. The default app cannot be removed while children remain
+/// (`can_remove_member`, answered 409 with the promote-or-remove hint); removing the last member
+/// deletes the group outright rather than persisting a defaultless shell.
 async fn member_remove(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -534,7 +525,6 @@ async fn member_remove(
         .enterprise
         .mfe_group(&t, &group_id)
         .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
-    // The default app cannot be removed while children remain (pure guard).
     crate::microfrontends::can_remove_member(&g, &project).map_err(|e| match e {
         MfeError::MissingDefaultApp => (
             StatusCode::CONFLICT,
@@ -548,7 +538,6 @@ async fn member_remove(
     })?;
     g.members.retain(|m| m.project != project);
     if g.members.is_empty() {
-        // Emptied the group: delete it outright rather than persist a defaultless shell.
         c.enterprise.remove_mfe_group(&t, &group_id);
         c.audit
             .record(&t, "user", "delete", "microfrontend_group", &group_id, "");
@@ -558,10 +547,6 @@ async fn member_remove(
     let saved = commit_group(&c, &t, g, "remove_member")?;
     Ok(Json(json!(saved)))
 }
-
-// ---------------------------------------------------------------------------
-// Per-project settings surface
-// ---------------------------------------------------------------------------
 
 /// GET the current project's microfrontends state: whether it is in a group, its
 /// role, and the group (if any) — the payload the settings tab renders.
@@ -577,7 +562,6 @@ async fn project_mfe_get(
         .as_ref()
         .and_then(|g| g.member(&project))
         .map(|m| m.role.clone());
-    // Sibling projects in the team available to add to a group (not already in one).
     Ok(Json(json!({
         "project": project,
         "in_group": group.is_some(),

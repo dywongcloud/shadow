@@ -438,6 +438,12 @@ pub fn decode_reply(frame: &[u8]) -> anyhow::Result<TransferReply> {
     Ok(reply)
 }
 
+/// Validates a decoded request's shape before anything acts on it. A chunk carries
+/// 1..=`MAX_CHUNK_BYTES` bytes and a digest that verifies them under EITHER algorithm
+/// (`verify_raw_content`): the sender mints the digest, so a sender still on the legacy SHA-256
+/// mint and one already minting BLAKE3 hand over the same bytes behind different digests, and
+/// rejecting either would be a false "digest does not match its bytes" on every chunk of every
+/// transfer, not a safety property (the bytes are already in hand).
 pub fn validate_request(request: &TransferRequest) -> anyhow::Result<()> {
     validate_key(request.key())?;
     match request {
@@ -447,12 +453,6 @@ pub fn validate_request(request: &TransferRequest) -> anyhow::Result<()> {
                 bail!("runtime artifact transfer chunk must contain 1..={MAX_CHUNK_BYTES} bytes");
             }
             validate_digest(&request.chunk_sha256, "chunk digest")?;
-            // Dual-algorithm: the sender mints this digest, so a sender still
-            // on the legacy SHA-256 mint and one already minting BLAKE3 hand
-            // over the same bytes behind different digests. Rejecting either
-            // one is a false "chunk digest does not match its bytes" on every
-            // chunk of every transfer, not a safety property — the bytes are
-            // already in hand here.
             if !fluid_core::verify_raw_content(&request.bytes, &request.chunk_sha256) {
                 bail!("runtime artifact transfer chunk digest does not match its bytes");
             }
@@ -513,19 +513,17 @@ pub fn validate_begin(request: &BeginRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decode and independently re-prove the canonical final manifest a Begin
-/// envelope carries: exact digest, exact round-trip canonical bytes, exact
-/// project identity, and a named sealed image — everything a receiver needs
-/// before it may stage this generation without any local reconstruction.
+/// Decodes and independently re-proves the canonical final manifest a Begin envelope carries: exact
+/// digest, exact round-trip canonical bytes, exact project identity and a named sealed image,
+/// everything a receiver needs before it may stage this generation without any local
+/// reconstruction. The digest check is dual-algorithm on purpose (`verify_normalized_manifest`): a
+/// peer may seal its manifest under BLAKE3 once it has moved forward and this node must still
+/// accept it, and keep accepting the SHA-256 seals every ledger and generation already holds;
+/// rejecting one algorithm is how a mixed-version fleet turns a roll into an outage.
 pub fn decode_verified_manifest(request: &BeginRequest) -> anyhow::Result<fluid_core::Manifest> {
     if request.manifest_bytes.is_empty() || request.manifest_bytes.len() > MAX_MANIFEST_BYTES {
         bail!("canonical manifest bytes must contain 1..={MAX_MANIFEST_BYTES} bytes");
     }
-    // Dual-algorithm on purpose: a peer may seal its manifest under BLAKE3
-    // once it has moved forward, and this node must still accept it — and keep
-    // accepting the SHA-256 seals every ledger and generation already holds.
-    // Rejecting one algorithm is how a mixed-version fleet turns a roll into
-    // an outage.
     if !fluid_core::verify_normalized_manifest(
         &request.manifest_bytes,
         &request.normalized_manifest_sha256,

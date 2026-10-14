@@ -1,10 +1,10 @@
-//! Identity registry — orgs & users indexed in the platform store, referenced by
-//! tenant id so they live in the right per-namespace collections/documents.
+//! Identity registry: orgs and users indexed in the platform store, referenced by tenant id so they
+//! live in the right per-namespace collections and documents.
 //!
-//! These records mirror the identity provider (Clerk): the dashboard syncs the
-//! signed-in user and their active organization, and we persist them scoped to
-//! the org's tenant (its slug). This makes orgs/users first-class, queryable
-//! collections in the data browser alongside projects/deployments/databases.
+//! These records mirror the identity provider (Clerk): the dashboard syncs the signed-in user and
+//! their active organization, and we persist them scoped to the org's tenant (its slug). That makes
+//! orgs and users first-class, queryable collections in the data browser alongside projects,
+//! deployments and databases.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -126,12 +126,11 @@ impl IdentityStore {
         *self.users.write() = users.into_iter().map(|u| (u.id.clone(), u)).collect();
     }
 
-    /// Combined orgs+users snapshot for the fleet follower sync. The Clerk
-    /// webhook (`identity_sync`) only runs on the control-plane leader, so
-    /// without this a follower's org/user directory stays empty — breaking the
-    /// operator data view (and any cross-node membership check) on that node.
-    /// Sorted by id for deterministic wire bytes (the sync change-gate is a raw
-    /// byte compare).
+    /// Combined orgs+users snapshot for the fleet follower sync. The Clerk webhook
+    /// (`identity_sync`) only runs on the control-plane leader, so without this a follower's
+    /// org/user directory stays empty, breaking the operator data view (and any cross-node
+    /// membership check) on that node. Sorted by id for deterministic wire bytes (the sync's
+    /// change-gate is a raw byte compare).
     pub fn snapshot(&self) -> IdentitySnapshot {
         let mut orgs = self.orgs();
         let mut users = self.users();

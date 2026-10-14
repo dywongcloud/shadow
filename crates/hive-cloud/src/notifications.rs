@@ -1,9 +1,9 @@
-//! Notifications — derived from real platform signals (failed deploys, error /
-//! usage anomalies) with per-notification read & archived state, scoped per team.
+//! Notifications: derived from real platform signals (failed deploys, error and usage anomalies),
+//! with per-notification read and archived state, scoped per team.
 //!
-//! Notifications are computed live from current state every read; the only thing
-//! we persist is which ids the user has read or archived, so the inbox reflects
-//! reality without a separate event pipeline.
+//! Notifications are computed live from current state on every read; the only thing persisted is
+//! which ids the user has read or archived, so the inbox reflects reality without a separate event
+//! pipeline.
 
 use parking_lot::RwLock;
 use serde::Serialize;
@@ -57,12 +57,11 @@ impl NotificationStore {
         }
     }
 
-    /// Read/archived state for the fleet follower sync. Notifications
-    /// themselves are recomputed live per node; only this read/archived
-    /// bookkeeping is stateful and leader-authored (mark-read/archive
-    /// mutations forward to the leader), so it must replicate or a follower
-    /// shows already-read items as unread. Sorted for deterministic wire bytes
-    /// (the sync's change-gate is a raw byte compare).
+    /// Read/archived state for the fleet follower sync. Notifications themselves are recomputed
+    /// live per node; only this bookkeeping is stateful and leader-authored (mark-read and archive
+    /// mutations forward to the leader), so it must replicate or a follower shows already-read
+    /// items as unread. Sorted for deterministic wire bytes (the sync's change-gate is a raw byte
+    /// compare).
     pub fn snapshot(&self) -> NotificationState {
         let mut archived: Vec<String> = self.archived.read().iter().cloned().collect();
         let mut read: Vec<String> = self.read.read().iter().cloned().collect();

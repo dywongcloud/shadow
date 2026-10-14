@@ -1,10 +1,8 @@
-//! Cloudflare Queues REST surface — 1:1 with
-//! `/accounts/{account_id}/queues` (this platform's tenant IS the account),
-//! consumer CRUD, pull-consumer messages/pull + messages/ack, producer send,
-//! and the realtime metrics endpoint. See `crate::queues` for the model +
-//! store.
+//! Cloudflare Queues REST surface, 1:1 with `/accounts/{account_id}/queues` (this platform's tenant
+//! IS the account): queue and consumer CRUD, pull-consumer `messages/pull` and `messages/ack`,
+//! producer `send` and the realtime metrics endpoint. See `crate::queues` for the model and store.
 //!
-//! Response envelope matches Cloudflare's own shape everywhere:
+//! The response envelope matches Cloudflare's own shape everywhere:
 //! `{"success":bool,"errors":[...],"messages":[...],"result":...}`.
 
 use axum::{
@@ -47,8 +45,6 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route("/v1/queues/:queue_id/metrics", get(queue_metrics))
 }
 
-// ---- Cloudflare-shaped envelope helpers ----
-
 fn ok_envelope(result: Value) -> Json<Value> {
     Json(json!({
         "success": true,
@@ -76,8 +72,6 @@ fn not_found(what: &str) -> (StatusCode, Json<Value>) {
     err_envelope(StatusCode::NOT_FOUND, 10007, &format!("{what} not found"))
 }
 
-// ---- Queue CRUD ----
-
 async fn queues_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -98,6 +92,9 @@ struct QueueCreateReq {
     queue_name: String,
 }
 
+/// Creates a queue. Cloudflare scopes `queue_name` uniqueness per account, so unlike this
+/// platform's GLOBAL project-name rule a different tenant's same-named queue does NOT collide; the
+/// same tenant gets 409.
 async fn queue_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -113,9 +110,6 @@ async fn queue_create(
             "queue_name is required",
         ));
     }
-    // Cloudflare scopes queue_name uniqueness per-account — unlike this
-    // platform's GLOBAL project-name rule, a different tenant's same-named
-    // queue must NOT collide (queues-adversarial-edge-cases).
     if c.queues.find_by_name(&t, name).is_some() {
         return Err(err_envelope(
             StatusCode::CONFLICT,
@@ -233,8 +227,6 @@ fn consumer_view(c: &crate::queues::Consumer) -> Value {
     })
 }
 
-// ---- Consumer CRUD ----
-
 async fn consumers_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -269,6 +261,9 @@ fn default_consumer_type() -> ConsumerType {
     ConsumerType::Worker
 }
 
+/// Creates a consumer (`script_name` is the Worker project the push loop POSTs batches to). A
+/// `dead_letter_queue`, when named, must exist AND belong to the same tenant, as in Cloudflare's
+/// own consumer-create validation.
 async fn consumer_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -280,8 +275,6 @@ async fn consumer_create(
     if c.queues.get(&t, &queue_id).is_none() {
         return Err(not_found("queue"));
     }
-    // A dead_letter_queue must exist AND belong to the same tenant — matches
-    // Cloudflare's own consumer-create validation.
     if let Some(dlq_name) = &body.dead_letter_queue {
         let dlq = c.queues.find_by_name(&t, dlq_name).ok_or_else(|| {
             err_envelope(
@@ -324,17 +317,19 @@ async fn consumer_delete(
     Ok(ok_envelope(json!({"id": consumer_id})))
 }
 
-// ---- Producer send ----
-
 #[derive(Deserialize)]
 struct MessageSendReq {
     body: Value,
-    /// Per-message override. When absent, the queue's own configured
-    /// `delivery_delay` applies (Cloudflare's own default-delay semantics —
-    /// a queue-level delay is meaningless if every send silently ignores it).
+    /// Per-message override. When absent, the queue's own `delivery_delay` applies (Cloudflare's
+    /// default-delay semantics: a queue-level delay would be meaningless if every send silently
+    /// ignored it).
     delay_seconds: Option<u32>,
 }
 
+/// Enqueues one message (the body is capped at `MAX_MESSAGE_BODY_BYTES`, 413 over it).
+/// `delivery_paused` does NOT gate producer sends: it gates DELIVERY (the push-consumer loop and
+/// `messages/pull`), which is why the field is `delivery_paused` and not `send_paused`: a producer
+/// must be able to keep enqueueing while delivery is held.
 async fn message_send(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -343,10 +338,6 @@ async fn message_send(
     Json(req): Json<MessageSendReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // `delivery_paused` gates DELIVERY (checked by the push-consumer loop and
-    // the pull-consumer's messages/pull below), not producer sends — the
-    // field name is specifically "delivery_paused", not "send_paused", and a
-    // producer must be able to keep enqueueing while delivery is held.
     let queue = c
         .queues
         .get(&t, &queue_id)
@@ -367,14 +358,14 @@ async fn message_send(
     Ok(ok_envelope(json!({"id": id})))
 }
 
-// ---- Pull consumer: pull / ack ----
-
 #[derive(Deserialize, Default)]
 struct PullReq {
     batch_size: Option<u32>,
     visibility_timeout_ms: Option<u64>,
 }
 
+/// Leases up to `batch_size` messages. A paused queue holds delivery: a pull returns an honestly
+/// empty batch rather than leasing messages a paused consumer is not meant to see yet.
 async fn messages_pull(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -395,8 +386,6 @@ async fn messages_pull(
         .visibility_timeout_ms
         .unwrap_or(VISIBILITY_TIMEOUT_DEFAULT_MS)
         .clamp(1000, crate::queues::VISIBILITY_TIMEOUT_MAX_MS);
-    // A paused queue holds delivery: a pull returns an honestly-empty batch
-    // rather than leasing messages a paused consumer isn't meant to see yet.
     let leased = if queue.settings.delivery_paused {
         Vec::new()
     } else {
@@ -467,8 +456,6 @@ async fn messages_ack(
     }
     Ok(ok_envelope(json!({"acked": acked, "retried": retried})))
 }
-
-// ---- Metrics ----
 
 async fn queue_metrics(
     State(c): State<Arc<CloudState>>,

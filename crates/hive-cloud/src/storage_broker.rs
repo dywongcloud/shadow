@@ -21,19 +21,20 @@
 //! 2. **Identifier safety**: [`hive_backend::snapshot::snapshot_image`]'s own `safe_component`
 //! gate, invoked here too so a caller of THIS module gets the same rejection before any filesystem
 //! call, not just inside the primitive.
-//! 3. **Quota**: a per-tenant snapshot-COUNT ceiling, deliberately not bytes: there is no cheap way
-//! to attribute reflink-shared bytes to one tenant (two snapshots share extents, so "bytes used by
-//! snapshot X" is not well defined once anything has diverged), and an unbounded count is still a
-//! real resource-exhaustion vector (podman lock-pool exhaustion is the standing example of what an
+//! 3. **Quota**: a snapshot-COUNT ceiling per deployment (the caller passes the size of that
+//! deployment's snapshot directory), deliberately not bytes: there is no cheap way to attribute
+//! reflink-shared bytes to one tenant (two snapshots share extents, so "bytes used by a snapshot"
+//! is not well defined once anything has diverged), and an unbounded count is still a real
+//! resource-exhaustion vector (podman lock-pool exhaustion is the standing example of what an
 //! uncapped per-tenant resource does to a shared host).
 
 use std::sync::Arc;
 
 use crate::state::CloudState;
 
-/// Default ceiling on live snapshots per project; `HIVE_SNAPSHOT_QUOTA` tunes it fleet-wide. There
-/// is no per-tenant override yet: add one the way the `team_plan`-driven limits work elsewhere
-/// before it is needed.
+/// Default ceiling on live snapshots per deployment; `HIVE_SNAPSHOT_QUOTA` tunes it fleet-wide.
+/// There is no per-tenant override yet: add one the way the `team_plan`-driven limits work
+/// elsewhere before it is needed.
 fn snapshot_quota() -> usize {
     std::env::var("HIVE_SNAPSHOT_QUOTA")
         .ok()
@@ -48,7 +49,7 @@ pub enum BrokerError {
     NotOwner,
     /// The snapshot id itself is unsafe (see `snapshot::safe_component`).
     InvalidId(String),
-    /// The project is already at its snapshot ceiling.
+    /// The deployment is already at its snapshot ceiling.
     QuotaExceeded { limit: usize, have: usize },
 }
 

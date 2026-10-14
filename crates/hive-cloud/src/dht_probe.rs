@@ -1,22 +1,20 @@
-//! **`--dht-probe <64hex>` — can THIS host find THAT node id, from cold?**
+//! **`--dht-probe <64hex>`: can THIS host find THAT node id, from cold?**
 //!
-//! Same operator-diagnostic family as [`crate::dns_probe`]'s `--dns-probe`: it
-//! answers one question with real network I/O, prints the evidence, and exits
-//! without starting a node or touching any port a running node owns.
+//! Same operator-diagnostic family as [`crate::dns_probe`]'s `--dns-probe`: it answers one question
+//! with real network I/O, prints the evidence and exits without starting a node or touching any
+//! port a running node owns.
 //!
-//! The question it answers is deliberately narrow. `hive_p2p::dht::probe` binds
-//! no iroh endpoint and registers no other address-lookup provider, so a hit
-//! here CANNOT be explained by a bootstrap seed, a Seer pkarr relay, a cached
-//! `peer_iroh.json` or an inbound gossip join — the three explanations that
-//! make "the mesh converged" worthless as proof that the DHT did anything. A
-//! hit means the target node's pkarr record is live on the public DHT and this
-//! host's egress can read it.
+//! The question is deliberately narrow. `hive_p2p::dht::probe` binds no iroh endpoint and registers
+//! no other address-lookup provider, so a hit here CANNOT be explained by a bootstrap seed, a Seer
+//! pkarr relay, a cached `peer_iroh.json` or an inbound gossip join, the three explanations that
+//! make "the mesh converged" worthless as proof that the DHT did anything. A hit means the target
+//! node's pkarr record is live on the public DHT and this host's egress can read it.
 //!
-//! It retries until the budget expires (`HIVE_DHT_PROBE_TIMEOUT_MS`, default
-//! 30s) because a cold DHT routing table legitimately misses the first attempts
-//! and succeeds seconds later; a single-shot probe manufactures false negatives.
-//!
-//! Non-zero exit on a miss, so it composes into a shell check.
+//! It retries until the budget expires (`HIVE_DHT_PROBE_TIMEOUT_MS`, default 30 s) because a cold
+//! DHT routing table legitimately misses the first attempts and succeeds seconds later; a
+//! single-shot probe manufactures false negatives. A tiny gap separates multiple targets so a
+//! multi-target probe does not hammer the same bootstrap nodes back to back. Non-zero exit on a
+//! miss, so it composes into a shell check.
 
 use std::time::Duration;
 
@@ -54,8 +52,6 @@ pub async fn run_cli(targets: &[String]) -> anyhow::Result<()> {
                 println!("{t:<64} ERROR    {e}");
             }
         }
-        // A tiny gap between targets so a multi-target probe does not hammer the
-        // same bootstrap nodes back-to-back.
         if targets.len() > 1 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }

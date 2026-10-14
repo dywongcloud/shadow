@@ -1,9 +1,9 @@
-//! Teams — the top-level ownership/tenancy unit. Every project belongs to a
-//! team; access to previews and dashboards is gated by team membership. This
-//! mirrors Vercel/Railway's team model (owner > admin > member > viewer).
+//! Teams: the top-level ownership/tenancy unit. Every project belongs to a team, and access to
+//! previews and dashboards is gated by team membership, mirroring Vercel/Railway's team model
+//! (owner > admin > member > viewer).
 //!
-//! Membership is keyed by email so it lines up with Clerk identities in the UI.
-//! The store is in-memory + persisted via the platform snapshot.
+//! Membership is keyed by email so it lines up with Clerk identities in the UI. The store is
+//! in-memory and persisted via the platform snapshot.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -63,9 +63,9 @@ pub struct Team {
     /// `0` is a legacy row and is never promoted merely by loading it.
     #[serde(default)]
     pub updated_ms: u64,
-    /// A locally-created availability fallback, not authoritative tenant state.
-    /// It never crosses a persistence or replication boundary, so an older
-    /// binary cannot strip provenance and relay the placeholder as real.
+    /// A locally created availability fallback, not authoritative tenant state. It never crosses a
+    /// persistence or replication boundary, so an older binary cannot strip provenance and relay
+    /// the placeholder as real.
     #[serde(skip)]
     pub(crate) synthetic_seed: bool,
 }
@@ -96,8 +96,8 @@ struct TeamState {
 }
 
 pub struct TeamStore {
-    // Rows and tombstones share one lock so no snapshot can observe the gap
-    // between removing a row and recording why it is absent.
+    /// Rows and tombstones share one lock so no snapshot can observe the gap between removing a row
+    /// and recording why it is absent.
     state: RwLock<TeamState>,
 }
 
@@ -105,10 +105,11 @@ fn time_ceiling(now: u64) -> u64 {
     now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2)
 }
 
+/// The next causal version of a row: a Lamport floor with wall-clock readability (never below the
+/// wall clock, the previous version or the tombstone), not a wall-clock timestamp that may move
+/// backward. Remote future values are rejected at ingress (`time_ceiling`), and a generation held
+/// locally is never rebased down.
 fn next_version(previous: u64, tombstone: u64) -> u64 {
-    // This is a Lamport floor with wall-clock readability, not a wall-clock
-    // timestamp that may move backward. Remote future values are rejected at
-    // ingress; once a generation is held locally it must never be rebased down.
     now_ms()
         .max(previous.saturating_add(1))
         .max(tombstone.saturating_add(1))
@@ -122,10 +123,9 @@ fn tie_break_take(local: &Team, remote: &Team) -> bool {
     }
 }
 
-/// Synthetic boot availability must never outrank real tenant state, including
-/// a legacy real row whose causal version is still zero. Within one provenance
-/// class, generation then canonical whole-row bytes form the deterministic
-/// total order used by every observer.
+/// Synthetic boot availability must never outrank real tenant state, including a legacy real row
+/// whose causal version is still zero. Within one provenance class, generation then canonical
+/// whole-row bytes form the deterministic total order every observer uses.
 fn row_take(local: &Team, remote: &Team) -> bool {
     match (local.synthetic_seed, remote.synthetic_seed) {
         (true, false) => true,
@@ -216,12 +216,12 @@ impl TeamStore {
         self.state.read().teams.clone()
     }
 
+    /// The replicated snapshot: live rows plus tombstones. The synthetic personal seed is a
+    /// node-local availability placeholder and is never published, since an older peer would ignore
+    /// the provenance field and could relay it back as authoritative real tenant state.
     pub fn snapshot_synced(&self) -> SyncedTeams {
         let state = self.state.read();
         SyncedTeams {
-            // Synthetic personal is a node-local availability placeholder. Never
-            // publish it: an older peer would ignore the provenance field and
-            // could relay it back as authoritative real tenant state.
             rows: state
                 .teams
                 .iter()
@@ -262,16 +262,15 @@ impl TeamStore {
             .retain(|slug, team| survives_tombstone(team, tombstones.get(slug).copied()));
     }
 
-    /// Per-team generation merge for live gossip. Absence never deletes; a
-    /// tombstone at or after a row does. Implausibly future live inputs are
-    /// refused at this ingress boundary.
+    /// Per-team generation merge for live gossip. Absence never deletes; a tombstone at or after a
+    /// row does. Implausibly future live inputs are refused at this ingress boundary.
     pub fn merge_synced(&self, remote: SyncedTeams) -> usize {
         self.merge(remote, false)
     }
 
-    /// Merge a previously durable snapshot. Already-held Lamport generations
-    /// remain valid across a local wall-clock rollback and must not be rebased
-    /// or discarded merely because they now look future-dated.
+    /// Merges a previously durable snapshot. Already-held Lamport generations remain valid across a
+    /// local wall-clock rollback and must not be rebased or discarded merely because they now look
+    /// future-dated.
     pub fn merge_recovered(&self, remote: SyncedTeams) -> usize {
         self.merge(remote, true)
     }
@@ -331,13 +330,13 @@ impl TeamStore {
         changed
     }
 
+    /// Creates a team owned by `owner_email`. The slug is `slugify(name)`, extended with a nonce
+    /// and then a sequence until it is unique among LIVE rows, so an insert can never overwrite an
+    /// existing aggregate (the old one-shot `% 10000` suffix could collide).
     pub fn create(&self, name: &str, plan: &str, owner_email: &str) -> Team {
         let base = slugify(name);
         let mut slug = base.clone();
         let mut state = self.state.write();
-        // Ensure unique among LIVE rows. The old one-shot `% 10000` suffix
-        // could collide and overwrite an existing aggregate. Keep extending a
-        // deterministic candidate until insertion is provably non-destructive.
         if state.teams.contains_key(&slug) {
             let nonce = now_ms() % 10000;
             slug = format!("{base}-{nonce}");

@@ -1,7 +1,7 @@
-//! Outbound webhooks — alert your own code/services on platform events
-//! (deployment lifecycle, database provisioning, etc). Each delivery is signed
-//! with HMAC-SHA256 over the JSON body so receivers can verify authenticity, the
-//! same scheme Vercel/GitHub use (`X-Hive-Signature: sha256=<hex>`).
+//! Outbound webhooks: alert your own code or services on platform events (deployment lifecycle,
+//! database provisioning, ...). Each delivery is signed with HMAC-SHA256 over the JSON body so
+//! receivers can verify authenticity, the scheme Vercel and GitHub use (`X-Hive-Signature:
+//! sha256=<hex>`).
 
 use hive_core::now_ms;
 use hmac::{Hmac, Mac};
@@ -16,7 +16,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Event types a webhook can subscribe to (Vercel-style catalog).
 pub const ALL_EVENTS: &[&str] = &[
-    // Deployment
     "deployment.created",
     "deployment.building",
     "deployment.ready",
@@ -27,26 +26,20 @@ pub const ALL_EVENTS: &[&str] = &[
     "deployment.rollback",
     "deployment.checks.failed",
     "deployment.checks.succeeded",
-    // Project
     "project.created",
     "project.removed",
     "project.renamed",
     "project.env-variable.created",
     "project.env-variable.updated",
     "project.env-variable.deleted",
-    // Domain
     "domain.added",
     "domain.created",
     "domain.dns.records.changed",
     "project.domain.verified",
-    // Data
     "database.created",
     "database.ready",
-    // Observability
     "alerts.triggered",
-    // Firewall
     "firewall.attack",
-    // Incidents
     "incident.opened",
     "incident.resolved",
 ];
@@ -54,9 +47,9 @@ pub const ALL_EVENTS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Webhook {
     pub id: String,
-    /// Owning team/tenant. `#[serde(default)]` keeps pre-existing persisted
-    /// webhooks loadable (they normalize to "personal"), so adding tenant
-    /// ownership is backward-compatible with on-disk state.
+    /// Owning team/tenant. `#[serde(default)]` keeps pre-existing persisted webhooks loadable (they
+    /// normalize to "personal"), so adding tenant ownership is backward-compatible with on-disk
+    /// state.
     #[serde(default)]
     pub team: String,
     /// Project this webhook belongs to ("*" = all projects in the team).
@@ -80,10 +73,9 @@ impl Webhook {
     fn subscribed(&self, event: &str) -> bool {
         self.enabled && (self.events.is_empty() || self.events.iter().any(|e| e == event))
     }
-    /// For API responses TO THE OWNING TENANT ONLY: decrypt `secret` back to
-    /// its real value (they need it to verify signatures on their receiving
-    /// endpoint) — the stored/persisted form is AEAD-sealed. `decrypt` is a
-    /// safe no-op passthrough for an already-plaintext legacy record.
+    /// For API responses TO THE OWNING TENANT ONLY: decrypts `secret` back to its real value (they
+    /// need it to verify signatures on their receiving endpoint); the stored form is AEAD-sealed.
+    /// `decrypt` is a passthrough for an already-plaintext legacy record.
     pub fn decrypted(mut self) -> Self {
         self.secret = crate::secrets::decrypt(&self.secret);
         self
@@ -129,11 +121,10 @@ impl WebhookStore {
         }
     }
 
-    /// Move this project's subscriptions to its new name. A webhook row whose
-    /// `project` no longer matches any project is silently undeliverable —
-    /// every future event for the renamed project would match nothing, and the
-    /// settings page would still show a webhook that can never fire. `*` rows
-    /// (team-wide) are untouched.
+    /// Moves this project's subscriptions to its new name. A webhook row whose `project` no longer
+    /// matches any project is silently undeliverable (every future event for the renamed project
+    /// would match nothing, and the settings page would still show a webhook that can never fire).
+    /// `*` rows (team-wide) are untouched.
     pub fn rename_project(&self, from: &str, to: &str) -> usize {
         if from == to {
             return 0;
@@ -155,6 +146,11 @@ impl WebhookStore {
         *self.hooks.write() = data;
     }
 
+    /// Registers a webhook, minting its id and a `whsec_` signing secret when absent, and
+    /// AEAD-seals the secret before it is stored or persisted (`secrets::encrypt`, idempotent:
+    /// re-adding an already sealed secret is safe). A webhook secret leaked from a snapshot, backup
+    /// or GuardianDB replica lets an attacker forge signed deliveries, which is why it sits under
+    /// the primitive that protects sensitive project env vars.
     pub fn add(&self, mut w: Webhook) -> Webhook {
         if w.id.is_empty() {
             w.id = format!("wh_{}", uuid::Uuid::new_v4().simple());
@@ -162,14 +158,6 @@ impl WebhookStore {
         if w.secret.is_empty() {
             w.secret = format!("whsec_{}", uuid::Uuid::new_v4().simple());
         }
-        // AEAD-encrypt the HMAC signing secret before it's stored/persisted —
-        // this platform already has this exact primitive wired in for
-        // sensitive project env vars (secrets.rs), but the webhook secret
-        // (which, if leaked from a snapshot/backup/GuardianDB replica, lets
-        // an attacker forge signed webhook deliveries) was persisted in
-        // plaintext in the same snapshot files that primitive protects
-        // everything else in. `encrypt` is idempotent (passthrough if already
-        // sealed), so re-adding an already-encrypted secret is safe.
         w.secret = crate::secrets::encrypt(&w.secret);
         w.created_ms = now_ms();
         self.hooks.write().push(w.clone());
@@ -231,9 +219,10 @@ pub fn dispatch(store: &Arc<WebhookStore>, project: &str, event: &str, payload: 
     });
 }
 
-/// Deliver one durable lifecycle-outbox entry. The stable event id and creation
-/// time survive retries, and success means every currently subscribed endpoint
-/// acknowledged with 2xx (or there were no subscribers).
+/// Delivers one durable lifecycle-outbox entry. The stable event id and creation time survive
+/// retries, and success means every currently subscribed endpoint acknowledged with 2xx (or there
+/// were no subscribers). Each delivery is signed with the webhook's secret, decrypted per delivery
+/// (a passthrough for a legacy plaintext secret).
 pub async fn dispatch_durable(
     store: &Arc<WebhookStore>,
     event_id: &str,
@@ -274,8 +263,6 @@ pub async fn dispatch_durable(
         let event = event.to_string();
         let event_id = event_id.to_string();
         async move {
-            // decrypt() is a safe no-op passthrough for an already-plaintext
-            // legacy secret (backward compatible with pre-existing webhooks).
             let signature = sign(&crate::secrets::decrypt(&webhook.secret), &body_str);
             let response = store
                 .http

@@ -8,9 +8,9 @@ use crate::runtime_artifact_transfer_wire::{
 
 const SENTINEL: &[u8] = b"HIVE_RUNTIME_ARTIFACT_TRANSFER_STATE_V1\n";
 const CHECKSUM_DOMAIN: &[u8] = b"hive-runtime-artifact-transfer-state-v1\0";
-// The embedded Begin frame now carries the canonical manifest (up to
-// `wire::MAX_BEGIN_BYTES` ≈ 1.6 MiB), so the record ceiling leaves real
-// headroom for the contiguous chunk journal beside it.
+/// Ceiling of one durable record: above the embedded Begin frame (the canonical manifest, up to
+/// `wire::MAX_BEGIN_BYTES`, about 1.6 MiB), leaving real headroom for the contiguous chunk journal
+/// beside it.
 const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHUNKS: usize = 1024 * 1024;
 

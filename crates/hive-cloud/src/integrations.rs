@@ -1,16 +1,15 @@
 //! Connected third-party integrations as **consumable platform resources**.
 //!
-//! When a user links an integration on the Integrations tab (OAuth via Composio),
-//! the dashboard registers it here as a team-scoped resource holding the
-//! provider's credentials (OAuth token / connection params) plus the env vars they
-//! map to. Deployments consume them two ways:
-//!   * **auto-injected env vars** (written into the team's projects on link), and
-//!   * the **Vercel-compatible SDK** (`packages/vercel-sdk`, repointed at this API
-//!     and authenticated with a `hive_…` platform key) reading them back via
-//!     `GET /v1/integrations` + `/v1/integrations/:id/credentials`.
+//! When a user links an integration on the Integrations tab (OAuth via Composio), the dashboard
+//! registers it here as a team-scoped resource holding the provider's credentials (OAuth token or
+//! connection params) plus the env vars they map to. Deployments consume them two ways:
+//! * **auto-injected env vars** (written into the team's projects on link), and
+//! * the **Vercel-compatible SDK** (`packages/vercel-sdk`, repointed at this API and authenticated
+//! with a `hive_...` platform key) reading them back through `GET /v1/integrations` and
+//! `/v1/integrations/:id/credentials`.
 //!
-//! Secrets (`credentials`) are returned ONLY from the explicit credentials
-//! endpoint; the list/get views are redacted (env var names + masked values).
+//! Secrets (`credentials`) are returned ONLY from the explicit credentials endpoint; the list and
+//! get views are redacted (env var names and masked values).
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -53,7 +52,6 @@ impl IntegrationResource {
             "provider": self.provider,
             "name": self.name,
             "kind": self.kind,
-            // Env var names are safe to expose (values are not).
             "env_keys": self.env.keys().cloned().collect::<Vec<_>>(),
             "has_credentials": !self.credentials.is_empty(),
             "created_ms": self.created_ms,

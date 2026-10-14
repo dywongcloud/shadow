@@ -1,8 +1,7 @@
-//! Platform API keys — tenant-scoped bearer tokens for programmatic access to
-//! the control API (à la Vercel access tokens). A key is shown in full exactly
-//! once at creation; only its SHA-256 hash is stored. Presenting a key on a
-//! request (`Authorization: Bearer hive_…`) scopes that request to the key's
-//! team/tenant.
+//! Platform API keys: tenant-scoped bearer tokens for programmatic access to the control API (like
+//! Vercel access tokens). A key is shown in full exactly once at creation and only its SHA-256 hash
+//! is stored. Presenting a key on a request (`Authorization: Bearer hive_...`) scopes that request
+//! to the key's team/tenant.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -15,8 +14,10 @@ fn sha256_hex(s: &str) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A fresh token: two UUIDv4s (244 random bits), prefixed `hive_` so it is recognizable and
+/// greppable in logs. The prefix is also the gate in `auth::api_key_claims`: a bearer without it is
+/// never looked up as a key.
 fn rand_token() -> String {
-    // 256 bits of entropy, prefixed so it's recognizable + greppable in logs.
     format!(
         "hive_{}{}",
         uuid::Uuid::new_v4().simple(),

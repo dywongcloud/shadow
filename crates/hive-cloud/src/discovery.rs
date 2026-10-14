@@ -1,24 +1,24 @@
-//! Discovery (Plane B, node↔node) — the platform's own iroh discovery service
-//! (self-hosted pkarr relay). NOTE: this is NOT "Seer". Seer (Plane A) is the
-//! client-facing authoritative DNS in `dnsserver.rs` that hands browsers the public
-//! IPs of healthy nodes. This server speaks pkarr to *iroh daemons*; they are
-//! different protocols, consumers, and jobs — the names once collided, keep them apart.
+//! Discovery (Plane B, node to node): the platform's own iroh discovery service (a self-hosted
+//! pkarr relay). NOTE: this is NOT "Seer". Seer (Plane A) is the client-facing authoritative DNS in
+//! `dnsserver.rs` that hands browsers the public IPs of healthy nodes. This server speaks pkarr to
+//! *iroh daemons*; they are different protocols, consumers and jobs, and the names once collided,
+//! so keep them apart.
 //!
-//! Replaces the dependency on n0's public pkarr/DNS for NodeId→address resolution.
-//! A node PUBLISHES its signed address record here (via iroh's `PkarrPublisher`
-//! pointed at a discovery URL) and RESOLVES peers here (via `PkarrResolver`), so a
-//! fresh/wiped node can find the mesh entirely on platform-owned infra.
+//! Replaces the dependency on n0's public pkarr/DNS for NodeId -> address resolution. A node
+//! PUBLISHES its signed address record here (via iroh's `PkarrPublisher` pointed at a discovery
+//! URL) and RESOLVES peers here (via `PkarrResolver`), so a fresh or wiped node can find the mesh
+//! entirely on platform-owned infra.
 //!
 //! Wire protocol = exactly what iroh's `PkarrRelayClient` speaks (a pkarr relay):
-//!   * `PUT /<z32-pubkey>`  body = relay payload  → verify signature, store (newest wins)
-//!   * `GET /<z32-pubkey>`                         → stored relay payload, or 404
+//! * `PUT /<z32-pubkey>` body = relay payload: verify the signature, store (newest wins);
+//! * `GET /<z32-pubkey>`: the stored relay payload, or 404.
 //!
-//! Records are self-verifying (ed25519-signed by the owning node), so no auth is
-//! needed: `from_relay_payload` rejects any body whose signature doesn't match the
-//! z32 key in the path. State is in-memory + TTL-pruned — small (fleet-sized) and
-//! continuously republished by each node, so it needs no persistence or DHT.
-//! Run on the stable PUBLIC nodes (the same ones used as bootstrap seeds); point
-//! the fleet at them with `HIVE_DISCOVERY_DNS`.
+//! Records are self-verifying (ed25519-signed by the owning node), so no auth is needed:
+//! `from_relay_payload` rejects any body whose signature does not match the z32 key in the path
+//! (that z32 IS the public key), so a forged or altered record, or a wrong key, is refused. State
+//! is in-memory and TTL-pruned: small (fleet-sized) and continuously republished by each node, so
+//! it needs no persistence or DHT. Run it on the stable PUBLIC nodes (the same ones used as
+//! bootstrap seeds) and point the fleet at them with `HIVE_DISCOVERY_DNS`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -107,8 +107,6 @@ async fn put_record(
     Path(z32): Path<String>,
     body: Bytes,
 ) -> StatusCode {
-    // The z32 in the path IS the public key; `from_relay_payload` verifies the body's
-    // signature against it, so a forged/altered record (or wrong key) is rejected.
     let Ok(pubkey) = pkarr::PublicKey::try_from(z32.as_str()) else {
         return StatusCode::BAD_REQUEST;
     };
