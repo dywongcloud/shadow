@@ -155,6 +155,8 @@ pub struct InferenceRuntime {
     /// (see `member_rtts`). Only ever populated on an elected coordinator, because only
     /// `reconcile_local` reads it.
     rtt_probe_cache: parking_lot::Mutex<HashMap<String, (u64, u64)>>,
+    /// model URL -> its download's state (see [`model_state`]); shared by every project naming it.
+    fetches: parking_lot::Mutex<HashMap<String, Fetch>>,
 }
 
 impl InferenceRuntime {
@@ -245,22 +247,135 @@ struct ModelRef {
     file: String,
 }
 
-/// Download-and-cache the model file. The URL is tenant input (`fluid.json` `inference.model`) that
-/// reaches a real fetch, so it goes through the same `hive_outbound` guard as every other
-/// tenant-URL fetcher (public addresses only, redirects re-validated per hop — HuggingFace's CDN
-/// redirects legitimately) and a size cap; a failure is one fixed, generic reason, never the
-/// upstream status or body (no oracle for an internal address). The stored blob is named by the
-/// BLAKE3 content hash of its OWN bytes (a NEW content identity, hashed incrementally as it
-/// downloads so a multi-GB model is never held in memory at once) rather than a hash of the URL:
-/// the old `fnv(url)` filename let two different URLs that happened to collide on 64 bits silently
-/// share a cache slot. Returns (path, size_bytes).
-async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> {
+/// Longest ONE model download may take end to end (`HIVE_INFERENCE_MODEL_TOTAL_SECS`, default 2 h).
+fn model_total_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_TOTAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2 * 3600),
+    )
+}
+
+/// Longest the transfer may go without receiving a single byte (`HIVE_INFERENCE_MODEL_STALL_SECS`,
+/// default 60 s); also bounds the connect-and-headers phase.
+fn model_stall_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_STALL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(60),
+    )
+}
+
+/// How long a FAILED download of a model URL is remembered before the next reconcile tick retries
+/// it (`HIVE_INFERENCE_MODEL_RETRY_SECS`, default 300 s): a dead or hostile URL must not be hammered
+/// every tick.
+fn model_retry_cooldown_ms() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        * 1000
+}
+
+/// Free space a download must always leave on the models volume
+/// (`HIVE_INFERENCE_MODEL_DISK_RESERVE_BYTES`, default 2 GiB): a model that would fill the disk
+/// fails its own endpoint, it never takes the node's other writers (state, logs, builds) with it.
+fn disk_reserve_bytes() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_DISK_RESERVE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
+/// Free bytes on the volume holding `dir` (the mount whose path is the longest prefix of it), or
+/// `None` when no mount covers it (a probe that cannot answer must not block a download).
+fn free_bytes_on(dir: &std::path::Path) -> Option<u64> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| dir.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// A partial download that deletes itself on EVERY exit — an error, a timeout, a cap, or the future
+/// being dropped mid-transfer (the load watchdog and a shutdown both cancel it). Only the rename
+/// that publishes the finished blob disarms it.
+struct PartFile(Option<std::path::PathBuf>);
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Deletes what nothing references any more, on every download: partial downloads untouched for 15
+/// minutes (a live one is rewritten continually), the blobs of the retired `fnv(url)`-named cache
+/// (`hive-<16 hex>.gguf`, never read again once the cache is content-addressed) and content blobs
+/// (`<64 hex>.gguf`) that no `*.ref.json` pointer names (the previous blob of a ref whose content
+/// changed, a blob whose pointer write failed) — all only past an hour/15 min of age so a download
+/// that has just published is never raced.
+async fn sweep_orphans(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut files: Vec<(String, std::time::Duration)> = Vec::new();
+    let mut referenced = std::collections::HashSet::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let age = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        if name.ends_with(".ref.json") {
+            if let Ok(raw) = tokio::fs::read(entry.path()).await {
+                if let Ok(pointer) = serde_json::from_slice::<ModelRef>(&raw) {
+                    referenced.insert(pointer.file);
+                }
+            }
+        }
+        files.push((name, age));
+    }
+    for (name, age) in files {
+        let stem = name.strip_suffix(".gguf");
+        let orphan = if name.starts_with("hive-") && name.ends_with(".part") {
+            age > Duration::from_secs(15 * 60)
+        } else if stem
+            .and_then(|s| s.strip_prefix("hive-"))
+            .is_some_and(|s| is_hex(s, 16))
+        {
+            age > Duration::from_secs(3600)
+        } else if stem.is_some_and(|s| is_hex(s, 64)) {
+            !referenced.contains(&name) && age > Duration::from_secs(3600)
+        } else {
+            false
+        };
+        if orphan && tokio::fs::remove_file(dir.join(&name)).await.is_ok() {
+            tracing::info!(file = %name, "inference: removed an orphaned model cache file");
+        }
+    }
+}
+
+/// The cached blob for `model` when a pointer for exactly this URL names a non-empty file (no
+/// network); `Err` only for a ref that resolves to no URL.
+async fn cached_model(model: &str) -> Result<Option<(std::path::PathBuf, u64)>, String> {
     let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
     let dir = models_dir();
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| e.to_string())?;
-
     let ref_path = dir.join(format!("hive-{:016x}.ref.json", fnv(&url)));
     if let Ok(raw) = tokio::fs::read(&ref_path).await {
         if let Ok(r) = serde_json::from_slice::<ModelRef>(&raw) {
@@ -268,32 +383,69 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
                 let path = dir.join(&r.file);
                 if let Ok(md) = tokio::fs::metadata(&path).await {
                     if md.len() > 0 {
-                        return Ok((path, md.len()));
+                        return Ok(Some((path, md.len())));
                     }
                 }
             }
         }
     }
+    Ok(None)
+}
 
+/// Download-and-cache the model file. The URL is tenant input (`fluid.json` `inference.model`) that
+/// reaches a real fetch, so it goes through the same `hive_outbound` guard as every other
+/// tenant-URL fetcher (public addresses only, redirects re-validated per hop — HuggingFace's CDN
+/// redirects legitimately) and a size cap; a failure is one fixed, generic reason, never the
+/// upstream status or body (no oracle for an internal address). The transfer is bounded in TIME
+/// (a stall timeout between chunks and a total timeout) and in DISK (the models volume must keep a
+/// reserve, checked up front against the declared length and again as bytes land), and the partial
+/// file is removed on every outcome. The stored blob is named by the BLAKE3 content hash of its OWN
+/// bytes (a NEW content identity, hashed incrementally as it downloads so a multi-GB model is never
+/// held in memory at once) rather than a hash of the URL: the old `fnv(url)` filename let two
+/// different URLs that happened to collide on 64 bits silently share a cache slot. Returns
+/// (path, size_bytes).
+async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> {
+    if let Some(hit) = cached_model(model).await? {
+        return Ok(hit);
+    }
+    let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
+    let dir = models_dir();
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    sweep_orphans(&dir).await;
+
+    let ref_path = dir.join(format!("hive-{:016x}.ref.json", fnv(&url)));
     let target = hive_outbound::validate_fetch_url(&url)
         .map_err(|_| "model URL refused by the outbound policy".to_string())?;
     tracing::info!(%url, "inference: downloading model");
-    let tmp = dir.join(format!("hive-{:016x}.part", fnv(&url)));
-    // No overall request timeout: a multi-GB model legitimately takes minutes to transfer. The
-    // shared client's own connect timeout still bounds the handshake phase, and the size cap below
-    // bounds the transfer.
-    let mut resp = hive_outbound::following_client()
-        .get(target)
-        .send()
-        .await
-        .map_err(|_| "model fetch failed".to_string())?;
+    let (total, stall) = (model_total_timeout(), model_stall_timeout());
+    let started = std::time::Instant::now();
+    let mut resp =
+        tokio::time::timeout(stall, hive_outbound::following_client().get(target).send())
+            .await
+            .map_err(|_| "model fetch timed out".to_string())?
+            .map_err(|_| "model fetch failed".to_string())?;
     if !resp.status().is_success() {
         return Err("model fetch failed".to_string());
     }
     let max_bytes = max_model_bytes();
-    if resp.content_length().is_some_and(|len| len > max_bytes) {
+    let reserve = disk_reserve_bytes();
+    let declared = resp.content_length();
+    if declared.is_some_and(|len| len > max_bytes) {
         return Err("model exceeds the maximum download size".to_string());
     }
+    if free_bytes_on(&dir).is_some_and(|free| free < declared.unwrap_or(0).saturating_add(reserve))
+    {
+        return Err("insufficient disk space for the model".to_string());
+    }
+    // Unique per download: two projects naming the same URL must never write one partial file.
+    let tmp = dir.join(format!(
+        "hive-{:016x}-{}.part",
+        fnv(&url),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut part = PartFile(Some(tmp.clone()));
     let mut f = tokio::fs::File::create(&tmp)
         .await
         .map_err(|e| e.to_string())?;
@@ -301,16 +453,26 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     let mut hasher = blake3::Hasher::new();
     hasher.update(MODEL_BLOB_DOMAIN);
     let mut written: u64 = 0;
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|_| "model fetch failed".to_string())?
-    {
+    let mut disk_checked_at: u64 = 0;
+    loop {
+        let left = total.saturating_sub(started.elapsed());
+        let next = match tokio::time::timeout(stall.min(left), resp.chunk()).await {
+            Ok(r) => r.map_err(|_| "model fetch failed".to_string())?,
+            Err(_) if left <= stall => {
+                return Err("model download exceeded the time limit".to_string())
+            }
+            Err(_) => return Err("model download stalled".to_string()),
+        };
+        let Some(chunk) = next else { break };
         written += chunk.len() as u64;
         if written > max_bytes {
-            drop(f);
-            let _ = tokio::fs::remove_file(&tmp).await;
             return Err("model exceeds the maximum download size".to_string());
+        }
+        if written - disk_checked_at >= 256 * 1024 * 1024 {
+            disk_checked_at = written;
+            if free_bytes_on(&dir).is_some_and(|free| free < reserve) {
+                return Err("insufficient disk space for the model".to_string());
+            }
         }
         hasher.update(&chunk);
         f.write_all(&chunk).await.map_err(|e| e.to_string())?;
@@ -324,6 +486,7 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     tokio::fs::rename(&tmp, &path)
         .await
         .map_err(|e| e.to_string())?;
+    part.0 = None;
     let size = tokio::fs::metadata(&path)
         .await
         .map_err(|e| e.to_string())?
@@ -338,6 +501,83 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
         }
     }
     Ok((path, size))
+}
+
+/// Where a model URL's download stands, shared by every project naming that URL.
+enum Fetch {
+    /// `since_ms` bounds how long a `Running` entry is believed: a task that died without recording
+    /// its outcome must not park the URL forever.
+    Running {
+        since_ms: u64,
+    },
+    Failed {
+        error: String,
+        at_ms: u64,
+    },
+}
+
+/// What the reconcile loop learns about a project's model.
+enum ModelState {
+    Ready(std::path::PathBuf, u64),
+    Downloading,
+    Failed(String),
+}
+
+/// The model for `model`, WITHOUT ever blocking the reconcile loop on a download: a cached blob is
+/// returned at once; otherwise the download runs in its own task (bounded by `ensure_model`'s
+/// timeouts) and the loop moves on to every other project, polling again next tick. The loop used
+/// to await the transfer inline, so one slow-drip URL stalled every tenant's endpoint on the
+/// coordinator. A failed URL is remembered for [`model_retry_cooldown_ms`] before it is retried, and
+/// a URL two projects share is fetched once.
+async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
+    match cached_model(model).await {
+        Ok(Some((path, bytes))) => return ModelState::Ready(path, bytes),
+        Err(e) => return ModelState::Failed(e),
+        Ok(None) => {}
+    }
+    let Some(url) = model_url(model) else {
+        return ModelState::Failed(format!("unresolvable model ref '{model}'"));
+    };
+    {
+        let mut fetches = cloud.inference.fetches.lock();
+        let now = hive_core::now_ms();
+        match fetches.get(&url) {
+            Some(Fetch::Running { since_ms })
+                if now.saturating_sub(*since_ms)
+                    < model_total_timeout().as_millis() as u64 + 300_000 =>
+            {
+                return ModelState::Downloading;
+            }
+            Some(Fetch::Failed { error, at_ms })
+                if now.saturating_sub(*at_ms) < model_retry_cooldown_ms() =>
+            {
+                return ModelState::Failed(error.clone());
+            }
+            _ => {}
+        }
+        fetches.insert(url.clone(), Fetch::Running { since_ms: now });
+    }
+    let (cloud, model) = (cloud.clone(), model.to_string());
+    tokio::spawn(async move {
+        let outcome = ensure_model(&model).await;
+        let mut fetches = cloud.inference.fetches.lock();
+        match outcome {
+            Ok(_) => {
+                fetches.remove(&url);
+            }
+            Err(error) => {
+                tracing::warn!(%url, %error, "inference: model download failed");
+                fetches.insert(
+                    url,
+                    Fetch::Failed {
+                        error,
+                        at_ms: hive_core::now_ms(),
+                    },
+                );
+            }
+        }
+    });
+    ModelState::Downloading
 }
 
 /// A member link slower than this (`HIVE_INFERENCE_MAX_MEMBER_RTT_MS`, default 20 ms) is a last
@@ -670,9 +910,14 @@ async fn reconcile_local(
         e.1.updated_ms = hive_core::now_ms();
     };
 
-    let (model_path, model_bytes) = match ensure_model(&spec.model).await {
-        Ok(v) => v,
-        Err(e) => {
+    // Never awaits a download inline: this loop serves every project on the coordinator.
+    let (model_path, model_bytes) = match model_state(cloud, &spec.model).await {
+        ModelState::Ready(path, bytes) => (path, bytes),
+        ModelState::Downloading => {
+            set_status(cloud, "starting".into(), &[]);
+            return;
+        }
+        ModelState::Failed(e) => {
             tracing::warn!(project, error = %e, "inference: model unavailable");
             set_status(cloud, format!("failed: {e}"), &[]);
             return;
