@@ -1,13 +1,23 @@
-//! Control-plane gossip transport selection.
+//! Control-plane gossip transport selection and mesh dispatch.
 //!
-//! Gossip (roster, serve-hosts, fleet view, container leases) can ride EITHER the
-//! legacy HTTP-over-SSH-tunnel path OR the authenticated iroh QUIC mesh (the same
-//! transport the data plane uses). iroh is preferred when `HIVE_GOSSIP_IROH` is set
-//! AND we know a peer's iroh address (learned from a prior roster exchange); HTTP is
-//! always the bootstrap + fallback, so a node with no iroh address yet — or a failed
-//! QUIC attempt — still converges. The iroh side reuses the connection-level peer
-//! trust gate (#20), so gossip is authenticated by the peer's cryptographic identity
-//! rather than by the SSH tunnel.
+//! Gossip (roster, serve-hosts, fleet view, container leases) can ride EITHER the legacy
+//! HTTP-over-SSH-tunnel path OR the authenticated iroh QUIC mesh (the transport the data plane
+//! uses). iroh is preferred when `HIVE_GOSSIP_IROH` is set AND a peer's iroh address is known
+//! (learned from a prior roster exchange); HTTP is always the bootstrap and fallback, so a node
+//! with no iroh address yet, or a failed QUIC attempt, still converges. The iroh side reuses the
+//! connection-level peer trust gate, so gossip is authenticated by the peer's cryptographic
+//! identity rather than by the SSH tunnel.
+//!
+//! Inbound requests are served by [`dispatch`]: an ordered table of arms that run this node's own
+//! admin handlers, the SAME endpoints that answer HTTP gossip, so the two transports are
+//! byte-equivalent. Rules every arm relies on: arms match in order and must stay
+//! LONGEST-PREFIX-FIRST (the bare `/v1/billing` arm after `/v1/billing/ledger`, `/detach` before
+//! its siblings); the transport carries no HTTP headers, so the tenant rides in the query as a
+//! signed short-lived delegation token (`?tok=`, verified by [`team_claims`]) with a raw `?team=`
+//! only when auth is not enforced; an unknown path answers an empty body, which a sender reads as
+//! NO_HANDLER, and that is what makes a new arm safe against a pre-upgrade peer; and a forwarded
+//! call is served LOCALLY with no further proxying (`local=true` or a dedicated single-hop arm), so
+//! a proxy loop is impossible.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,13 +58,16 @@ pub fn iroh_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Active health probe to a specific node over the iroh mesh, addressed DIRECTLY by
-/// (node_id, addr) from the registry — bypassing the URL-keyed `peer_iroh` map so the
-/// health loop can probe EVERY known peer, not just configured `--peer` targets. Tight
-/// timeout, no HTTP fallback (health is a mesh-transport signal; we want to know if the
-/// QUIC path to the peer is alive). Returns round-trip ms on success, `None` on
-/// failure / when no mesh transport is bound. Reuses `/v1/nodes` (the same path the
-/// gossip loop already treats as the liveness signal) so no new endpoint is added.
+/// Active health probe to a specific node over the iroh mesh, addressed DIRECTLY by (node_id, addr)
+/// from the registry, bypassing the URL-keyed `peer_iroh` map so the health loop can probe EVERY
+/// known peer, not just configured `--peer` targets. Tight timeout and no HTTP fallback (health is
+/// a mesh-transport signal: we want to know whether the QUIC path to the peer is alive). Returns
+/// round-trip ms on success, `None` on failure or when no mesh transport is bound. It reuses
+/// `/v1/nodes` (the path the gossip loop already treats as the liveness signal), so no new endpoint
+/// is added. A failed or timed-out probe drops any cached trunk so the NEXT probe re-dials fresh:
+/// critical for FAST RECOVERY, because after a peer restarts with new socket addrs the stale QUIC
+/// trunk lingers until idle-timeout (~tens of seconds), and evicting it lets the next dial resolve
+/// the peer's CURRENT addr via discovery (Seer pkarr) and reconnect within an interval or two.
 pub async fn probe(
     cloud: &Arc<CloudState>,
     node_id: &str,
@@ -71,47 +84,35 @@ pub async fn probe(
     {
         Ok(Ok(_)) => Some(hive_core::now_ms().saturating_sub(t0)),
         _ => {
-            // Probe failed/timed out → drop any cached trunk so the NEXT probe re-dials
-            // fresh. Critical for FAST RECOVERY: after a peer restarts with new socket
-            // addrs, the stale QUIC trunk lingers until idle-timeout (~tens of seconds);
-            // evicting it lets the next dial resolve the peer's CURRENT addr via
-            // discovery (Seer pkarr) and reconnect within an interval or two.
             pool.close_peer(node_id).await;
             None
         }
     }
 }
 
-/// Relay-selection-algorithm wiring: steer `addr_json`'s relay transport toward
-/// the best LIVE relay for the peer identified by iroh `node_id`, instead of
-/// trusting whatever relay was serialized into the cached hint at gossip time
-/// (which — for a peer only ever learned second/third-hand — may be stale or
-/// simply absent). Preference (see `hive_edge::select_relay_hint`): the target's
-/// OWN gossiped `relay_url` > the geographically nearest OTHER healthy peer's
-/// `relay_url` > the central [`hive_edge::CENTRAL_RELAY_URL`] backstop (a real
-/// `https://<node>.relay.shadw.app:3343` relay, never a port-less name). Every caller of
-/// `request_to`/`fetch` below inherits this automatically (including
-/// `admin::fetch_from_host`, `acme.rs`, `db_replicate.rs`, `git.rs`'s mesh
-/// fanout — every one of them dials by `(node_id, addr_json)` through these two
-/// functions). Falls back to `addr_json` unchanged when `node_id` isn't found in
-/// the registry (e.g. a bootstrap seed never gossiped as a full `NodeInfo`).
+/// Relay-selection wiring: steers `addr_json`'s relay transport toward the best LIVE relay for the
+/// peer identified by iroh `node_id`, instead of trusting whatever relay was serialized into the
+/// cached hint at gossip time (for a peer only ever learned second- or third-hand it may be stale
+/// or simply absent). Preference (see `hive_edge::select_relay_hint`): the target's OWN gossiped
+/// `relay_url` > the geographically nearest OTHER healthy peer's `relay_url` > the central
+/// [`hive_edge::CENTRAL_RELAY_URL`] backstop (a real `https://<node>.relay.shadw.app:3343` relay,
+/// never a port-less name). Every caller of `request_to`/`fetch` inherits it (including
+/// `admin::fetch_from_host`, `acme.rs`, `db_replicate.rs` and `git.rs`'s mesh fanout: all dial by
+/// `(node_id, addr_json)` through these two functions). It falls back to `addr_json` unchanged when
+/// `node_id` is not found in the registry (e.g. a bootstrap seed never gossiped as a full
+/// `NodeInfo`).
+///
+/// The hint is applied ONLY to an addr that carries no relay at all (a peer learned second-hand
+/// before it ever gossiped its home relay). A relay already in `addr_json` is the peer's OWN home
+/// relay, the one it is actually attached to, and a relay only carries traffic to peers attached to
+/// it: steering away from it to `relay_url` (the embedded relay the peer SERVES,
+/// `http://<public-ip>:3341`) replaced a live transport with one that is TCP-unreachable between
+/// Tencent hosts (the security group, not the listener), so a dial to a peer whose only other path
+/// was direct UDP timed out whenever that path flapped. `node_id` is matched against the endpoint
+/// id OR the node name: `request_to`'s callers pass a 64-hex `peer_id`, but `fetch` takes its tuple
+/// from `peer_iroh`, whose entries for peers learned over the HTTP `/v1/nodes` path hold the node
+/// NAME (`ps.id`), which can never equal a hex endpoint id.
 fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) -> String {
-    // A relay in `addr_json` is the peer's OWN home relay — the one it is
-    // actually attached to, straight from its signed gossip (`iroh_addr`) —
-    // and a relay only carries traffic to peers attached to it. Steering the
-    // dial away from it to `relay_url` (the embedded relay the peer SERVES,
-    // `http://<public-ip>:3341`) replaced a live transport with a dead one
-    // fleet-wide: measured 2026-09-01 from fc-frankfurt, fc-sanjose and
-    // fc-sanjose-3, every Tencent host's :3341 is TCP-unreachable from every
-    // other Tencent host (and from itself via its public IP — the security
-    // group, not the listener), while every `*.relay.shadw.app:3343` answers
-    // 200 from all three. With the dead hint substituted, a dial to
-    // fc-frankfurt had exactly one path (direct UDP) and timed out at the 5s
-    // cached-hint budget ~10 times a minute whenever that path flapped — the
-    // eight failed express deploys. So: keep the peer's own relay when it has
-    // one; steer ONLY an addr that carries no relay at all (a peer learned
-    // second-hand before it ever gossiped its home relay), which is the case
-    // `with_relay_hint` was written for.
     if serde_json::from_str::<iroh::EndpointAddr>(addr_json)
         .map(|a| {
             a.addrs
@@ -123,15 +124,6 @@ fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) ->
         return addr_json.to_string();
     }
     let nodes = cloud.registry.nodes();
-    // Match on endpoint id OR node name. `node_id` here is whatever the caller had:
-    // `request_to`'s callers pass a 64-hex `peer_id`, but `fetch` pulls its tuple
-    // from `peer_iroh`, whose entries for peers learned over the HTTP `/v1/nodes`
-    // path hold the node NAME (`ps.id`). A name can never equal a hex endpoint id,
-    // so the old peer_id-only match ALWAYS missed on that path and returned
-    // `addr_json` untouched — meaning relay-hint steering silently did nothing for
-    // every peer learned that way, while appearing to work because the other
-    // caller set passed ids. Accepting both makes the hint apply wherever the
-    // caller's label actually identifies a real registry node.
     let Some(target) = nodes
         .iter()
         .find(|n| n.peer_id.as_deref() == Some(node_id) || n.id == node_id)
@@ -216,11 +208,9 @@ async fn dispatch_verified(
             }
             Vec::new()
         }
-        // A prewarm hint forwarded from an entry node that does NOT host the
-        // deployment (public hosts are round-robin DNS, so the handshake
-        // usually lands elsewhere). Served here only: never re-forwarded, and
-        // the local gates in `Gateway::warm_host`/`Fluid::warm` decide whether
-        // a start actually happens.
+        // Prewarm hint from an entry node that does not host the deployment (public hosts are
+        // round-robin DNS): served here only, never re-forwarded, and the local gates in
+        // `Gateway::warm_host`/`Fluid::warm` decide whether a start happens.
         "/v1/warm-hint" if method == hive_p2p::GOSSIP_POST => {
             if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
                 if let Some(host) = v.get("host").and_then(|h| h.as_str()) {
@@ -235,10 +225,8 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // `?since=<gen>` is the incremental form (see admin::serve_hosts_with):
-        // a peer that already holds this node's generation gets a generation and
-        // no host list. Accepted here as well as on the HTTP route so both
-        // transports stay byte-equivalent.
+        // `?since=<gen>` is the incremental form (see `admin::serve_hosts_with`), accepted as on
+        // the HTTP route so both transports stay byte-equivalent.
         p if p == "/v1/serve-hosts" || p.starts_with("/v1/serve-hosts?") => {
             let since = p
                 .split_once("since=")
@@ -246,38 +234,21 @@ async fn dispatch_verified(
                 .and_then(|v| v.parse::<u64>().ok());
             jb(axum::Json(crate::admin::serve_hosts_with(&cloud, since)))
         }
-        // Full TeamStore snapshot for the leader->follower teams sync (see
-        // spawn_relational_mirror_loop's follower branch). Team mutations only
-        // ever land on the control-plane leader (admin_ingress forward), so a
-        // follower's local store otherwise diverges forever -- live-witnessed
-        // as sj=5 / bkk=4 / va=2 teams across nodes, which let a failover
-        // stand-in leader corrupt the relational teams mirror with its stale
-        // list. Mesh-authenticated peers only (same trust surface as every
-        // other arm here); team data carries no secrets beyond member emails,
-        // which already ride /v1/nodes-adjacent surfaces mesh-wide.
+        // Compat shim for pre-registry followers: the full TeamStore as the old bare map,
+        // authoritative rows only (publishing the synthetic local fallback would let an older peer
+        // strip its provenance and relay it back as real). The generic `/v1/store-snapshot/` arm
+        // below supersedes it; remove once the fleet is uniform.
         "/v1/teams/snapshot" if method == hive_p2p::GOSSIP_GET => {
-            // Rolling-upgrade shim expects the old bare-map shape. Feed it only
-            // authoritative rows; publishing the synthetic local fallback lets
-            // an older peer strip its provenance and relay it back as real.
             serde_json::to_vec(&cloud.teams.snapshot_synced().rows).unwrap_or_default()
         }
-        // Full IncidentStore snapshot for the same leader->follower sync
-        // (identical shape and rationale as /v1/teams/snapshot above): incident
-        // mutations only ever land on the control-plane leader via
-        // admin_ingress, so a follower's local store stays empty forever --
-        // live-witnessed as the admin incidents page showing nothing (and
-        // creates "not working") whenever the dashboard's multi-A DNS landed
-        // the read on any non-leader node while the 2 real incidents sat on
-        // the leader alone.
+        // The same compat shim for the IncidentStore snapshot.
         "/v1/incidents/snapshot" if method == hive_p2p::GOSSIP_GET => {
             serde_json::to_vec(&cloud.incidents.snapshot()).unwrap_or_default()
         }
-        // Browser artifact BYTES (browser-function-artifact-delivery): the
-        // content-addressed GET proxies here when round-robin ingress landed
-        // it on a node that never ran the build. Prefix-disjoint with the
-        // admissions/presence arms below; the owner re-runs the tenant gate
-        // against ITS deployment state before serving (mesh_tenant carries the
-        // signed delegation token). Returns raw bytes; empty = not servable.
+        // Browser artifact BYTES, proxied here when round-robin ingress landed the
+        // content-addressed GET on a node that never ran the build. The owner re-runs the tenant
+        // gate against ITS deployment state (`mesh_tenant` carries the signed delegation token); an
+        // empty reply means not servable.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/artifacts/") => {
             let digest = p
                 .trim_start_matches("/v1/browser/artifacts/")
@@ -291,12 +262,10 @@ async fn dispatch_verified(
                 crate::browser_artifacts::mesh_get(cloud, &tenant, digest).await
             }
         }
-        // shadw drive (bn-shadw-drive-v1) file bytes: the tenant-gated
-        // `GET /v1/drive/:project/file` proxy's mesh fallback for a NAT'd
-        // owner node. The owner re-runs `project_owned_by` against its own
-        // replicated state before serving (the `browser_artifacts::mesh_get`
-        // precedent) — `mesh_tenant` carries the signed delegation token, so
-        // an empty tenant (unsigned/expired) never resolves anything.
+        // shadw drive file bytes: the mesh fallback of the tenant-gated
+        // `GET /v1/drive/:project/file` proxy for a NAT'd owner node. The owner re-runs
+        // `project_owned_by` against its own replicated state, and an empty tenant (unsigned or
+        // expired token) never resolves anything.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/drive/mesh-file/") => {
             let tenant = mesh_tenant(p);
             let project = qparam(p, "project").unwrap_or_default();
@@ -313,10 +282,9 @@ async fn dispatch_verified(
                 crate::drive_api::mesh_get_file(cloud, &tenant, &project, &path).await
             }
         }
-        // shadw drive share-link bytes: deliberately UNAUTHENTICATED (the
-        // token hash itself is the capability, re-derived independently by
-        // the owner from the SAME replicated `drive_shares` row — no tenant
-        // to carry at all).
+        // shadw drive share-link bytes: deliberately UNAUTHENTICATED, the token hash itself is the
+        // capability (re-derived by the owner from the SAME replicated `drive_shares` row), so
+        // there is no tenant to carry.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/drive/mesh-share/") => {
             let token = qparam(p, "token").unwrap_or_default();
             if token.is_empty() {
@@ -325,8 +293,8 @@ async fn dispatch_verified(
                 crate::drive_api::mesh_share_get(&token).await
             }
         }
-        // Accept-side browser admission recheck is identity-only and must
-        // precede the tenant-scoped endpoint arm below.
+        // The accept-side browser admission recheck is identity-only and must precede the
+        // tenant-scoped endpoint arm below.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/accept/") => {
             let endpoint_id = p
                 .trim_start_matches("/v1/browser/admissions/accept/")
@@ -335,9 +303,8 @@ async fn dispatch_verified(
                 .unwrap_or("");
             crate::browser_admission::mesh_accept(cloud, endpoint_id)
         }
-        // Browser admission first-read leader fallback. The endpoint-specific
-        // arm must precede the list arm. Tenant comes from the verified,
-        // short-lived mesh delegation token appended by fetch_from_host.
+        // Browser admission first-read leader fallback: the endpoint-specific arm must precede the
+        // list arm, and the tenant comes from the verified mesh delegation token.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/") => {
             let endpoint_id = p
                 .trim_start_matches("/v1/browser/admissions/")
@@ -359,15 +326,12 @@ async fn dispatch_verified(
                 crate::browser_admission::mesh_list(cloud, &tenant)
             }
         }
-        // Fast-path revoke echo (bn-p2p-revocation-latency): the leader fans
-        // this out right after a real revoke so every follower applies the
-        // relay-deny + routing-removal side effects within one mesh round
-        // trip instead of waiting up to the ~60s periodic store_sync
-        // snapshot pull. No tenant check here -- the leader already made and
-        // validated the authoritative decision; a follower just echoes it
-        // for this specific endpoint_id. Never touches versioned
-        // active/tombstone state (see mark_denied's doc), so it cannot race
-        // or corrupt this follower's own later adopt() ordering.
+        // Fast-path revoke echo: the leader fans it out right after a real revoke so every follower
+        // applies the relay-deny and routing-removal side effects within one mesh round trip
+        // instead of waiting for the ~60 s store_sync pull. No tenant check (the leader already
+        // made the authoritative decision), and it never touches versioned active/tombstone state
+        // (see `mark_denied`), so it cannot race or corrupt this follower's own later adopt()
+        // ordering.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/browser/admissions/mesh-revoke/") =>
         {
@@ -381,14 +345,10 @@ async fn dispatch_verified(
             }
             Vec::new()
         }
-        // Fresh-admission deny-CLEAR echo (bn-relay-denylist-restart-friction):
-        // the exact inverse of the mesh-revoke arm above — the leader fans
-        // this out right after a validated admission supersedes a stale
-        // stop()-created denylist entry, so follower relays let the
-        // re-admitted endpoint reconnect within one mesh round trip instead
-        // of waiting out the snapshot-pull interval. Denylist-only on the
-        // receiving side; same "leader already decided" trust posture as the
-        // revoke echo.
+        // The inverse of the revoke echo: fanned out right after a validated admission supersedes a
+        // stale denylist entry, so follower relays let the re-admitted endpoint reconnect within
+        // one mesh round trip. Denylist-only on the receiving side, with the same "leader already
+        // decided" trust posture.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/browser/admissions/mesh-deny-clear/") =>
         {
@@ -402,11 +362,9 @@ async fn dispatch_verified(
             }
             Vec::new()
         }
-        // Fleet<->fleet browser-db anti-entropy (see `browser_db::mesh_crr_sync`).
-        // Prefix-disjoint from every `/v1/browser/*` arm — note the hyphen — so it
-        // neither shadows nor is shadowed by them. Body and reply are the raw
-        // `Op::CrrSync` encodings, which is why this rides the binary gossip
-        // dispatch rather than a JSON arm.
+        // Fleet<->fleet browser-db anti-entropy (`browser_db::mesh_crr_sync`): body and reply are
+        // the raw `Op::CrrSync` encodings, which is why it rides the binary dispatch.
+        // Prefix-disjoint from every `/v1/browser/*` arm (note the hyphen).
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/browser-db/mesh-sync/") => {
             let project = p.trim_start_matches("/v1/browser-db/mesh-sync/");
             if project.is_empty() {
@@ -415,15 +373,11 @@ async fn dispatch_verified(
                 crate::browser_db::mesh_crr_sync(cloud, project, body).await
             }
         }
-        // Presence write-through to the leader (see `echo_presence_to_leader`).
-        // Ordered BEFORE the GET arm below only for readability — the two are
-        // already disjoint by method — but it must stay ahead of any future
-        // broader `/v1/browser/presence` arm, per the longest-prefix-first rule.
+        // Presence write-through to the leader (`echo_presence_to_leader`); keep it ahead of any
+        // broader `/v1/browser/presence` arm (longest-prefix-first).
         p if method == hive_p2p::GOSSIP_POST && p == "/v1/browser/presence/mesh-echo" => {
             crate::browser_presence::mesh_echo(cloud, body)
         }
-        // Coarse browser presence first-read leader fallback (constellation
-        // satellites) — tenant-scoped the same way as the admissions list arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/presence") => {
             let tenant = mesh_tenant(p);
             if tenant.is_empty() {
@@ -432,20 +386,13 @@ async fn dispatch_verified(
                 crate::browser_presence::mesh_list(cloud, &tenant)
             }
         }
-        // Per-tenant relay byte metering local slice (bn-impl-relay-byte-metering)
-        // — the iroh-only-peer path for the fleet fanout; mirrors the
-        // `/v1/functions` arm's "the outer request already enforced operator"
-        // posture. Prefix-disjoint with the other /v1/browser/* arms.
+        // Per-tenant relay byte metering, local slice: the iroh-only-peer path of the fleet fanout.
+        // Like `/v1/functions`, the outer request already enforced operator.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/metering") => {
             crate::browser_metering::mesh_local(cloud)
         }
-        // Generic leader->follower store snapshot: `GET /v1/store-snapshot/<name>`
-        // serves any store registered in `store_sync::REGISTRY` (teams,
-        // incidents, apikeys, webhooks, databases, domains, integrations,
-        // gitops, docs, notifications, identity, enterprise). Supersedes the
-        // two bespoke arms above (kept only as rolling-upgrade compat shims for
-        // followers still on the pre-registry build; remove once the fleet is
-        // uniform). See `crate::store_sync`.
+        // Generic leader->follower store snapshot, `GET /v1/store-snapshot/<name>`, for any store
+        // in `store_sync::REGISTRY`; it supersedes the two bespoke compat arms above.
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with(crate::store_sync::SNAPSHOT_PATH_PREFIX) =>
         {
@@ -455,9 +402,9 @@ async fn dispatch_verified(
                 .unwrap_or("");
             crate::store_sync::serve(cloud, name)
         }
-        // TLS bundle distribution over the authenticated mesh (see acme.rs::
-        // bundle_for_mesh — key decrypted in transit inside peer-authenticated
-        // QUIC only; receiver re-encrypts with its own node key).
+        // TLS bundle distribution over the authenticated mesh (`acme::bundle_for_mesh`): the key is
+        // decrypted in transit inside peer-authenticated QUIC only, and the receiver re-encrypts
+        // with its own node key.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/tls/bundle") => {
             let name = p
                 .split_once("name=")
@@ -465,29 +412,23 @@ async fn dispatch_verified(
                 .unwrap_or("");
             crate::acme::bundle_for_mesh(&cloud, name)
         }
-        // NON-SECRET directory of gateway-addressable DBs hosted on this node
-        // ({id, db_host, host_node, kind} — no credentials). The DNS leader fans
-        // this out to publish per-DB `<slug>.{db_domain}` A records for DBs that
-        // provisioned on other nodes (DB records themselves are not gossiped).
-        // Prefix match: fetch_from_host appends `?team=`.
+        // NON-SECRET directory of gateway-addressable DBs hosted on this node (`{id, db_host,
+        // host_node, kind}`, no credentials): the DNS leader fans it out to publish per-DB
+        // `<slug>.{db_domain}` A records for DBs provisioned on other nodes. Prefix match, because
+        // `fetch_from_host` appends `?team=`.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/db-directory") => {
             serde_json::to_vec(&cloud.databases.directory()).unwrap_or_default()
         }
-        // Local per-function usage stats (each node meters its own compute) — the
-        // billing meter loop on the coordinator fans this out to sum fleet usage
-        // ACROSS EVERY TENANT (main.rs's billing-meter loop builds its own
-        // per-tenant totals from the unfiltered list via `FunctionStats.tenant`).
-        // Calls `c.fluid.stats()` directly rather than the dashboard-facing
-        // `admin::functions` handler, which is now tenant-scoped to a single
-        // caller (matching `databases_list`) — this internal fan-out needs the
-        // full, unfiltered per-node list instead. Prefix match: `fetch_from_host`
-        // appends `?team=` so an exact arm misses.
+        // Local per-function usage stats (each node meters its own compute) for the coordinator's
+        // billing fan-out, UNFILTERED across tenants (the billing meter builds per-tenant totals
+        // through `FunctionStats.tenant`): it calls `c.fluid.stats()` directly, not the
+        // tenant-scoped dashboard handler `admin::functions`. Prefix match, because
+        // `fetch_from_host` appends `?team=`.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/functions") => {
             serde_json::to_vec(&cloud.fluid.stats()).unwrap_or_default()
         }
-        // Tenant's LOCAL custom domains for the fleet-aggregation fan-out (domains
-        // live in node-local ProjectSettings; the coordinator merges each host's).
-        // Team rides as `?team=`; always local-only (the caller already fanned out).
+        // The tenant's LOCAL custom domains for the fleet-aggregation fan-out (domains live in
+        // node-local ProjectSettings); always local-only, the caller already fanned out.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/domains") => {
             jb(crate::admin::domains_list(
                 State(cloud.clone()),
@@ -501,12 +442,11 @@ async fn dispatch_verified(
             serde_json::to_vec(&serde_json::json!({ "delete_generation": "v1" }))
                 .unwrap_or_default()
         }
-        // Relocation reap (single hop): remove THIS node's superseded
-        // PRODUCTION-lane records of the project — previews and settings stay.
-        // A deliberately separate arm from the full delete below so a
-        // pre-upgrade peer answers NO_HANDLER (safe no-op) instead of running
-        // the full teardown the reaper used to trigger (which is how preview
-        // records and node-local team tags were being destroyed fleet-wide).
+        // Relocation reap (single hop): removes THIS node's superseded PRODUCTION-lane records of
+        // the project; previews and settings stay. It is a separate arm from the full delete below
+        // so a pre-upgrade peer answers NO_HANDLER (a safe no-op) instead of running the full
+        // teardown, which is how preview records and node-local team tags were once destroyed
+        // fleet-wide.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/reap-deployments") =>
@@ -517,16 +457,7 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             let owner = cloud.projects.team_of(&project);
             let owns_settings = !team.is_empty() && crate::admin::norm(&owner) == team;
             let owns_deploys = !team.is_empty()
@@ -541,22 +472,16 @@ async fn dispatch_verified(
             serde_json::to_vec(&serde_json::json!({ "project": project, "reaped": reaped }))
                 .unwrap_or_default()
         }
-        // Mesh domain activation / detach for owner nodes reachable only over
-        // iroh (the HTTP-admin-less fleet reality). Ordered LONGEST-PREFIX-
-        // FIRST so the /detach arm can't shadow the /activate one. Both run
-        // the same local helpers as the HTTP arms; team must own the project
-        // on this node's evidence (settings tag or a deployment record).
+        // Mesh domain detach/activate for owner nodes reachable only over iroh: the same local
+        // helpers as the HTTP arms, and the team must own the project on this node's evidence
+        // (settings tag or a deployment record). /detach comes first (longest-prefix-first). Suffix
+        // matches and trims run on the query-stripped path: the forwarded path always carries
+        // `?team=…` or `?tok=…`.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/domains/")
             && p.split('?').next().unwrap_or("").ends_with("/detach") =>
         {
-            // The forwarded path carries the team query (`/detach?team=…` or
-            // `?tok=…`), so suffix matches and suffix trims must run on the
-            // query-stripped path — the bare ends_with("/detach") guard and
-            // trim_end_matches("/detach") previously matched/parsed NOTHING
-            // with a query attached, the arm never fired, and the caller
-            // read an empty reply as a forward failure (live witness 502).
             let rest = p
                 .split('?')
                 .next()
@@ -573,16 +498,7 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             let owner = cloud.projects.team_of(&project);
             let owns = !team.is_empty()
                 && (crate::admin::norm(&owner) == team
@@ -607,8 +523,6 @@ async fn dispatch_verified(
             && p.contains("/domains/")
             && p.split('?').next().unwrap_or("").ends_with("/activate") =>
         {
-            // Query-stripped matching, same as the /detach arm above (the
-            // forwarded path always carries the team query).
             let rest = p
                 .split('?')
                 .next()
@@ -625,16 +539,7 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             let owner = cloud.projects.team_of(&project);
             let owns = !team.is_empty()
                 && (crate::admin::norm(&owner) == team
@@ -645,10 +550,8 @@ async fn dispatch_verified(
                 return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
                     .unwrap_or_default();
             }
-            // The stored challenge must belong to THIS attach — the arm
-            // applies routing for whatever challenge is stored, and a
-            // mismatched one would pin another attach's proof onto this
-            // project (the HTTP arm's binding, applied fleet-side too).
+            // The stored challenge must belong to THIS attach: a mismatched one would pin another
+            // attach's proof onto this project (the HTTP arm's binding, applied fleet-side too).
             if !cloud
                 .domains
                 .verify_of(&domain)
@@ -664,13 +567,10 @@ async fn dispatch_verified(
             )
             .unwrap_or_default()
         }
-        // Mesh project-RENAME (single hop): the coordinator's cross-node rewrite
-        // for nodes reachable only over iroh. Team must OWN the project on THIS
-        // node (settings tag, a local deployment, or the relational fallback) —
-        // the same three tiers the delete arm checks, because a rename hands the
-        // caller another project's URLs. Ordered BEFORE the `/delete` arm and
-        // alongside the other `/v1/projects/` arms (longest-prefix-first); no
-        // other arm matches `/rename`.
+        // Mesh project RENAME (single hop): the coordinator's cross-node rewrite for iroh-only
+        // nodes. The team must OWN the project on THIS node (settings tag, a local deployment or
+        // the relational fallback: the same three tiers the delete arm checks, because a rename
+        // hands the caller another project's URLs).
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.split('?').next().unwrap_or("").ends_with("/rename") =>
@@ -681,26 +581,13 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            // Verified-token parse, never a raw `split_once("?team=")` — under
-            // enforcement that swallowed the token into the team string and
-            // every ownership compare below missed silently.
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             let new = qparam(p, "name")
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_lowercase();
-            // Same shape rules as the HTTP route: a name that sanitizes
-            // differently would produce a volume/checkout path that does not
-            // match its own lookup prefix.
+            // Same shape rules as the HTTP route: a name that sanitizes differently would not match
+            // its own volume/checkout lookup prefix.
             if crate::admin::invalid_project_name(&new).is_some() {
                 return serde_json::to_vec(&serde_json::json!({ "error": "invalid project name" }))
                     .unwrap_or_default();
@@ -755,9 +642,9 @@ async fn dispatch_verified(
             }))
             .unwrap_or_default()
         }
-        // Mesh project-delete cascade (single hop): the coordinator's cross-node
-        // teardown for hosting nodes reachable only over iroh. Team must OWN the
-        // project on THIS node (or the project must be absent — idempotent).
+        // Mesh project-delete cascade (single hop): the coordinator's cross-node teardown for
+        // iroh-only hosting nodes. The team must OWN the project on THIS node, or the project must
+        // be absent (idempotent).
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/delete") =>
@@ -768,21 +655,7 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            // Same verified-token parse as the settings arm: under enforcement
-            // the query is `team=<t>&tok=<jwt>`, so the old raw
-            // `split_once("?team=")` swallowed the token into the team string
-            // and the ownership compares below always missed — silently
-            // breaking the cross-node delete cascade on enforced fleets.
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             let owner = cloud.projects.team_of(&project);
             let owns_settings = !team.is_empty() && crate::admin::norm(&owner) == team;
             let owns_deploys = !team.is_empty()
@@ -821,11 +694,10 @@ async fn dispatch_verified(
             };
             let outcome =
                 crate::admin::delete_project_local(&cloud, &project, &team, delete_ms).await;
-            // Echo the STORED generation, never the requested one: a receiver
-            // that clamped an over-ceiling stamp must not let the coordinator
-            // record acceptance of a value this node did not store — the
-            // fleet would split on which records the generation dominates
-            // (adversarial finding).
+            // Echo the STORED generation, never the requested one: a receiver that clamped an
+            // over-ceiling stamp must not let the coordinator record acceptance of a value this
+            // node did not store, or the fleet would split on which records the generation
+            // dominates.
             let stored_ms = cloud.projects.tombstone_of(&project).unwrap_or(delete_ms);
             serde_json::to_vec(&serde_json::json!({
                 "project": project,
@@ -837,19 +709,16 @@ async fn dispatch_verified(
         }
         "/v1/fleet-deployments" => jb(crate::admin::fleet_deployments(State(cloud.clone())).await),
         "/v1/leases" => jb(crate::admin::leases_get(State(cloud.clone())).await),
-        // design-head-cid-exchange-rpc: per-namespace GuardianDB HEAD map (key,
-        // content-hash, timestamp — never value bytes) for the anti-entropy
-        // loop's peer-diff round. Same unauthenticated-read posture as
-        // /v1/serve-hosts and /v1/leases above.
+        // Per-namespace GuardianDB HEAD map (key, content hash, timestamp, never value bytes) for
+        // the anti-entropy loop's peer diff; the same unauthenticated-read posture as
+        // `/v1/serve-hosts` and `/v1/leases` above.
         "/v1/guardian/heads" => jb(crate::admin::guardian_heads(State(cloud.clone())).await),
         #[cfg(feature = "zkauth")]
         "/v1/zkauth/roster-export" => jb(crate::zkauth::roster_export().await),
-        // Mint a preview-membership proof ON THIS NODE for a peer that received
-        // the unlock request but doesn't serve the preview host. A ring proof
-        // only verifies against the exact ring it was signed over, so the mint
-        // has to happen where the verification will (see `zkauth::preview_proof`).
-        // Modelled as a GET because minting is idempotent, which lets it reuse
-        // the existing cross-node read helper rather than a new POST path.
+        // Mints a preview-membership proof ON THIS NODE for a peer that received the unlock request
+        // but does not serve the preview host: a ring proof only verifies against the exact ring it
+        // was signed over (see `zkauth::preview_proof`). Modelled as a GET because minting is
+        // idempotent, which reuses the existing cross-node read helper.
         #[cfg(feature = "zkauth")]
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/zkauth/mint") => {
             let team = qparam(p, "team")
@@ -863,12 +732,11 @@ async fn dispatch_verified(
                 .unwrap_or_default();
             jb(crate::zkauth::mint_rpc(&team, &user, &project).await)
         }
-        // Bounded immutable runtime-artifact transfer. Exact versioned operation
-        // paths must stay ahead of every broader runtime/deploy arm: old peers
-        // answer an unknown path with an empty body, which the sender treats as
-        // NO_HANDLER rather than letting a legacy deploy handler rebuild source.
-        // Unlike `team_claims`, this arm accepts only a verified short-lived
-        // service token and the iroh transport's verified endpoint signer.
+        // Bounded immutable runtime-artifact transfer. The exact versioned paths must stay ahead of
+        // every broader runtime/deploy arm: an old peer answers an unknown path with an empty body,
+        // which the sender treats as NO_HANDLER instead of letting a legacy deploy handler rebuild
+        // source. Unlike `team_claims`, this arm accepts only a verified short-lived service token
+        // and the transport's verified endpoint signer.
         p if method == hive_p2p::GOSSIP_POST
             && matches!(
                 p.split('?').next(),
@@ -894,12 +762,10 @@ async fn dispatch_verified(
             )
             .await
         }
-        // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
-        // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
-        // since the iroh transport carries no HTTP headers. The versioned path is
-        // intentionally outside `/v1/git/deploy`: a pre-protocol binary's broad
-        // legacy prefix arm therefore cannot consume a deployment whose runtime
-        // artifact/workdir semantics it does not understand.
+        // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes) dispatches
+        // the per-target build here, with the team in `?team=`. The versioned path is deliberately
+        // outside `/v1/git/deploy`, so a pre-protocol binary's broad legacy prefix arm cannot
+        // consume a deployment whose runtime artifact/workdir semantics it does not understand.
         p if method == hive_p2p::GOSSIP_POST
             && matches!(
                 p.split('?').next(),
@@ -931,29 +797,17 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Region-aware database placement fanout: `admin::database_create`
-        // proxies the actual provisioning work here when it chose a DIFFERENT
-        // node than the one that received the client's request (see that
-        // function's doc — podman containers only run where the process that
-        // spawns them lives, so relabeling `host_node` alone would create a
-        // record claiming a node that never got any containers). No re-proxy
-        // loop: `database_provision_local` always provisions locally. Reached
-        // here (not just via `post_body_to_host`'s HTTP-first attempt) because
-        // admin ports are loopback-only fleet-wide — cross-node dispatch for
-        // this path is mesh-only in practice. Gated by the mesh's own peer-
-        // trust boundary (this arm only runs for an already-authenticated
-        // gossip peer), same as every other arm here — `x-hive-internal` is
-        // set anyway so `require_operator_or_internal` passes without relying
-        // on synthesized claims.
+        // Region-aware database placement fanout: `admin::database_create` proxies the provisioning
+        // here when it chose a DIFFERENT node than the one that received the request (podman
+        // containers only run where the process that spawns them lives, so relabeling `host_node`
+        // alone would claim a node that never got any containers). It never re-proxies, and it is
+        // mesh-only in practice because admin ports are loopback-only fleet-wide. Gated by the
+        // mesh's own peer-trust boundary; `x-hive-internal` is set anyway so
+        // `require_operator_or_internal` passes without relying on synthesized claims.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/internal/databases/provision-local") =>
         {
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
-                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
-                    headers.insert("x-hive-internal", hv);
-                }
-            }
+            let headers = internal_hop_headers();
             match serde_json::from_slice::<crate::databases::ProvisionReq>(body) {
                 Ok(req) => match crate::admin::database_provision_local(
                     State(cloud.clone()),
@@ -971,16 +825,14 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Sandbox owner hops (leader -> owner), the mesh half of
-        // `sandboxes_api::internal_hop`: a delegated CREATE on a node whose
-        // backend can exec (the leader's cannot), and the ONE typed owner RPC
-        // every cell-touching mutation rides (stop/delete/run/kill). Both
-        // handlers re-derive authority on the receiving node (fleet service
-        // credential + tenant binding via `require_internal_hop`, owner ==
-        // self via the record) and never re-proxy. A handler refusal is
-        // wrapped in `refused_envelope` so the leader can tell a typed "no"
-        // (nothing applied) from a dead transport (unknown). Same
-        // `x-hive-internal` posture as the provision-local arm above.
+        // Sandbox owner hops (leader -> owner), the mesh half of `sandboxes_api::internal_hop`: a
+        // delegated CREATE on a node whose backend can exec (the leader's cannot), and the ONE
+        // typed owner RPC every cell-touching mutation rides (stop/delete/run/kill). Both handlers
+        // re-derive authority on the receiving node (fleet service credential and tenant binding
+        // via `require_internal_hop`, owner == self via the record) and never re-proxy. A handler
+        // refusal is wrapped in `refused_envelope` so the leader can tell a typed "no" (nothing
+        // applied) from a dead transport (unknown). Same `x-hive-internal` posture as the
+        // provision-local arm.
         p if method == hive_p2p::GOSSIP_POST
             && matches!(
                 p.split('?').next(),
@@ -988,12 +840,7 @@ async fn dispatch_verified(
                     | Some(crate::sandboxes_api::OWNER_OP_PATH)
             ) =>
         {
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
-                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
-                    headers.insert("x-hive-internal", hv);
-                }
-            }
+            let headers = internal_hop_headers();
             let is_create = p.split('?').next() == Some(crate::sandboxes_api::DELEGATE_CREATE_PATH);
             let parsed = match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(v) => v,
@@ -1039,19 +886,13 @@ async fn dispatch_verified(
                 Err((status, body)) => crate::sandboxes_api::refused_envelope(status, &body),
             }
         }
-        // Companion to the provision-local arm above: `admin::database_delete`
-        // proxies backing-container/volume teardown here when the record's
-        // `host_node` is a peer (the same gap the create-side fix opened —
-        // see `teardown_db_backing`'s doc). No re-proxy loop.
+        // Companion of the provision-local arm: `admin::database_delete` proxies
+        // backing-container/volume teardown here when the record's `host_node` is a peer (see
+        // `teardown_db_backing`). It never re-proxies.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/internal/databases/teardown-local") =>
         {
-            let mut headers = axum::http::HeaderMap::new();
-            if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
-                if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
-                    headers.insert("x-hive-internal", hv);
-                }
-            }
+            let headers = internal_hop_headers();
             match serde_json::from_slice::<String>(body) {
                 Ok(id) => match crate::admin::database_teardown_local(
                     State(cloud.clone()),
@@ -1069,9 +910,9 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Instant rollback to a placed deployment: the coordinator proxies the
-        // promote (a mutation) to the host node over the mesh. The host runs it
-        // locally (it holds the deployment), so there's no re-proxy loop.
+        // Instant rollback to a placed deployment: the coordinator proxies the promote (a mutation)
+        // to the host node, which runs it locally (it holds the deployment), so there is no
+        // re-proxy loop.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/deployments/")
             && p.contains("/promote") =>
@@ -1094,14 +935,11 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Network-settings edit forward: the requesting node proxies a
-        // body-carrying `PUT /v1/projects/:project/network` mutation to the
-        // project's actual hosting node over the mesh (deployment records
-        // are node-local — see `admin::project_network_put`'s doc comment
-        // and `admin::put_to_host`). Body is the validated
-        // `NetworkPutBody` JSON; team rides via `?team=`/`?tok=` since the
-        // mesh transport carries no HTTP headers. The host runs it locally
-        // (it holds the record), so there's no re-proxy loop.
+        // Network-settings edit forward: the requesting node proxies the body-carrying
+        // `PUT /v1/projects/:project/network` to the project's hosting node (deployment records are
+        // node-local, see `admin::project_network_put` and `admin::put_to_host`). The body is the
+        // validated `NetworkPutBody`, the team rides via `?team=`/`?tok=`, and the host runs it
+        // locally.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.contains("/network") =>
@@ -1151,8 +989,8 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Build status/log polling for the fanout mirror (coordinator streams the
-        // target's build into its own record so the dashboard UX is unchanged).
+        // Build status/log polling for the fanout mirror (the coordinator streams the target's
+        // build into its own record).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/builds/") => {
             let id = p
                 .trim_start_matches("/v1/builds/")
@@ -1172,10 +1010,9 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Per-deployment + per-project READ VIEWS the coordinator proxies to the host
-        // node over the mesh (the NAT'd coordinator has no HTTP admin path to FC nodes).
-        // Team rides as `?team=`. The host serves these LOCALLY (it hosts the project),
-        // and the coordinator always requests `local=true` so there's no re-proxy loop.
+        // Per-deployment and per-project READ VIEWS the coordinator proxies to the host node (a
+        // NAT'd coordinator has no HTTP admin path to FC nodes). The host serves them LOCALLY and
+        // the coordinator always requests `local=true`, so there is no re-proxy loop.
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/deployments/")
             && p.contains("/resources") =>
@@ -1194,15 +1031,9 @@ async fn dispatch_verified(
             )
             .await)
         }
-        // Project settings for a project whose (node-local, never-gossiped) row
-        // lives on THIS node — proxied by whichever node answered the dashboard
-        // read without a local row. Ownership is checked against THIS node's row
-        // or its own hosted deployments' tenant tags (the delete-cascade arm's
-        // exact gate); serving is local-only so there is no re-proxy loop.
-        // Preview card for a project hosted on THIS node, answered for a peer
-        // that received the dashboard read but doesn't host the deployment.
-        // Ownership is enforced by `project_preview` itself from the verified
-        // delegation token, exactly as the `/settings` arm below does.
+        // Preview card for a project hosted on THIS node, answered for a peer that received the
+        // dashboard read; `project_preview` enforces ownership itself from the verified delegation
+        // token.
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/projects/")
             && p.contains("/preview") =>
@@ -1223,6 +1054,11 @@ async fn dispatch_verified(
             )
             .await)
         }
+        // Project settings for a project whose (node-local, never-gossiped) row lives on THIS node,
+        // proxied by whichever node answered the dashboard read without a local row. Ownership is
+        // checked against this node's row or its own hosted deployments' tenant tags (the
+        // delete-cascade arm's exact gate), and serving is local-only, so there is no re-proxy
+        // loop.
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/projects/")
             && p.contains("/settings") =>
@@ -1233,20 +1069,7 @@ async fn dispatch_verified(
                 .next()
                 .unwrap_or("")
                 .to_string();
-            // Tenant from the VERIFIED mesh delegation token (`?tok=`), never a
-            // raw `?team=` parse — under enforcement the query is
-            // `team=<t>&tok=<jwt>`, so `split_once("?team=")` swallows the
-            // token into the team string and every ownership compare misses.
-            let team = team_claims(p)
-                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| {
-                    if crate::auth::enforced() {
-                        None
-                    } else {
-                        qparam(p, "team")
-                    }
-                })
-                .unwrap_or_default();
+            let team = mesh_tenant(p);
             if project.is_empty()
                 || team.is_empty()
                 || !crate::admin::project_owned_by(&cloud, &project, &team)
@@ -1256,8 +1079,6 @@ async fn dispatch_verified(
             serde_json::to_vec(&serde_json::json!(cloud.projects.get_masked(&project)))
                 .unwrap_or_default()
         }
-        // Build record + logs for a deployment hosted on THIS node (proxied by the
-        // coordinator when the deployment was placed here — build logs live where it built).
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/deployments/")
             && p.contains("/build") =>
@@ -1280,7 +1101,6 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Intelligent service graph for a deployment hosted on THIS node (scanned here).
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/deployments/")
             && p.contains("/service-graph") =>
@@ -1303,8 +1123,6 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Project's latest service graph, served LOCALLY (the coordinator fans this
-        // out to the node that built the project). Local-only → no re-proxy loop.
         p if method == hive_p2p::GOSSIP_GET
             && p.starts_with("/v1/projects/")
             && p.contains("/service-graph") =>
@@ -1316,8 +1134,8 @@ async fn dispatch_verified(
                 .unwrap_or("")
                 .to_string();
             let team = qparam(p, "team").unwrap_or_default();
-            // Only return it to the owning tenant (this node built it, so it has the
-            // project→team mapping). Empty team = trusted/no-scope caller.
+            // Only returned to the owning tenant (this node built it, so it has the project->team
+            // mapping); an empty team is a trusted/no-scope caller.
             let owner = cloud.projects.team_of(&project);
             let owner_ns = if owner.trim().is_empty() {
                 "personal".to_string()
@@ -1329,7 +1147,6 @@ async fn dispatch_verified(
             } else {
                 team
             };
-            // On-demand scan if not yet stored (backfills existing/failed deployments).
             match crate::admin::local_project_graph(&cloud, &project).await {
                 Some(g) if team_ns.is_empty() || team_ns == owner_ns => {
                     jb(axum::Json(serde_json::json!(g)))
@@ -1396,9 +1213,9 @@ async fn dispatch_verified(
             )
             .await)
         }
-        // Request/routing event log: recorded on the SERVING node, so the coordinator
-        // proxies here to read a placed project's logs. `local=true` rides in the query
-        // so this node returns only its own events (no re-fan-out → no loop).
+        // Request/routing event log, recorded on the SERVING node: the coordinator proxies here to
+        // read a placed project's logs, with `local=true` in the query so this node returns only
+        // its own events (no re-fan-out, no loop).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => jb_logs(
             crate::admin::logs(
                 State(cloud.clone()),
@@ -1408,9 +1225,8 @@ async fn dispatch_verified(
             )
             .await,
         ),
-        // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY
-        // its own jobs (local=true) for the requesting team. Same tenant-scoped
-        // shape as /v1/logs above.
+        // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY its own jobs
+        // (`local=true`) for the requesting team, the same tenant-scoped shape as /v1/logs.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/cron") => {
             jb(crate::admin::cron_list(
                 State(cloud.clone()),
@@ -1420,15 +1236,11 @@ async fn dispatch_verified(
             )
             .await)
         }
-        // Sandbox READS: every sandbox MUTATION forwards through admin_ingress to the
-        // single current control-plane owner (no independent placement), so that node
-        // is the sole holder of sandbox state. sandboxes_api.rs's own `fetch_from_host`
-        // fallback tries an HTTP admin URL first, then this iroh-mesh path — which,
-        // before this arm existed, had NO dispatch entry for any `/sandboxes` path, so
-        // the fallback silently returned nothing and every non-owner node 404'd on
-        // every sandbox read (live-reproduced). One consolidated arm dispatches on
-        // segment shape rather than N ordered prefix-checks, so there is no
-        // most-specific-first ordering hazard to maintain as sandbox routes grow.
+        // Sandbox READS: every sandbox mutation forwards through admin_ingress to the single
+        // current control-plane owner, so that node alone holds sandbox state, and
+        // `sandboxes_api`'s `fetch_from_host` fallback reaches it over this arm. One consolidated
+        // arm dispatches on segment shape rather than N ordered prefix checks, so there is no
+        // most-specific-first ordering hazard as sandbox routes grow.
         p if method == hive_p2p::GOSSIP_GET
             && p.split('?').next().unwrap_or(p).contains("/sandboxes") =>
         {
@@ -1572,10 +1384,8 @@ async fn dispatch_verified(
                 _ => Vec::new(),
             }
         }
-        // Storage broker: snapshot LIST for a deployment hosted on THIS node
-        // (proxied here by `storage_api::list_snapshots` when the requesting
-        // node doesn't host the deployment itself — see storage_api.rs's
-        // module doc on why this is per-node, not leader-forwarded).
+        // Storage broker: snapshot LIST for a deployment hosted on THIS node (per-node, not
+        // leader-forwarded: see storage_api.rs's module doc).
         p if method == hive_p2p::GOSSIP_GET
             && p.split('?').next().unwrap_or(p).contains("/deployments/")
             && p.split('?').next().unwrap_or(p).contains("/snapshots") =>
@@ -1593,10 +1403,8 @@ async fn dispatch_verified(
                 Err(_) => Vec::new(),
             }
         }
-        // Storage broker: snapshot CREATE (no trailing id segment) and DELETE
-        // (with one) both ride GOSSIP_POST — see `snapshot_path_parts`'s doc
-        // comment for why. One consolidated arm, same style as the sandboxes
-        // GET arm above, rather than N ordered prefix checks.
+        // Storage broker: snapshot CREATE (no trailing id) and DELETE (with one) both ride
+        // GOSSIP_POST (see `snapshot_path_parts`); one consolidated arm, like the sandbox GET arm.
         p if method == hive_p2p::GOSSIP_POST
             && p.split('?').next().unwrap_or(p).contains("/deployments/")
             && p.split('?').next().unwrap_or(p).contains("/snapshots") =>
@@ -1639,10 +1447,9 @@ async fn dispatch_verified(
                 }
             }
         }
-        // Run operations (console 3-dots) forwarded to the project's HOST node
-        // over the mesh: the host runs the world write locally (env decrypts
-        // here). `local:true` in the body prevents a re-forward loop. Match
-        // before any generic `/v1/workflows` arm.
+        // Run operations (console 3-dots) forwarded to the project's HOST node, which runs the
+        // world write locally (env decrypts there); `local:true` in the body prevents a re-forward
+        // loop. Match before any generic `/v1/workflows` arm.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/workflows/runs/")
             && (p.contains("/cancel")
@@ -1660,7 +1467,7 @@ async fn dispatch_verified(
             let op = it.next().unwrap_or("");
             let mut parsed: crate::admin::RunOpBody =
                 serde_json::from_slice(body).unwrap_or_default();
-            parsed.local = Some(true); // host executes without re-forwarding
+            parsed.local = Some(true);
             match crate::admin::wf_run_op_dispatch(
                 cloud,
                 &team_headers(p),
@@ -1675,17 +1482,12 @@ async fn dispatch_verified(
                 Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
             }
         }
-        // Operator-only run event/attributes ops, forwarded to the project's
-        // HOST node exactly like the run-op arm above. These are gated by
-        // `require_operator_or_internal` (platform_admin), unlike cancel/
-        // replay/reenqueue/wakeup — so the synthesized claims here mirror
-        // `mesh_operator_claims`'s rationale (a peer reaching this dispatch
-        // already passed the P2P trust/admission gate, which is what the
-        // ORIGINATING node's `require_operator` check already gated on before
-        // it ever forwarded here) while still carrying the real tenant from
-        // `team_claims` (needed for the `wf_in_team` ownership check these
-        // ops also enforce, unlike the fully-global `require_operator`
-        // call sites `mesh_operator_claims` was built for).
+        // Operator-only run event/attributes ops, forwarded to the project's HOST node like the
+        // run-op arm above. They are gated by `require_operator_or_internal` (platform_admin), so
+        // the claims are synthesized as in `mesh_operator_claims` (a peer reaching this dispatch
+        // already passed the P2P trust/admission gate that the ORIGINATING node's
+        // `require_operator` relied on) while still carrying the real tenant from `team_claims`,
+        // which the `wf_in_team` ownership check these ops also enforce needs.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/workflows/runs/")
             && (p.contains("/events") || p.contains("/attributes")) =>
@@ -1748,33 +1550,30 @@ async fn dispatch_verified(
                 _ => Vec::new(),
             }
         }
-        // SMS egress relay (see push::send_sms): a node whose Textbelt call was
-        // rejected for egress geography forwards the send here; this node runs
-        // the DIRECT send (never re-relays) and returns {success, error?}.
+        // SMS egress relay (see `push::send_sms`): a node whose Textbelt call was rejected for
+        // egress geography forwards the send here; this node runs the DIRECT send (never re-relays)
+        // and returns `{success, error?}`.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/push/sms-relay") => {
             match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(v) => jb(axum::Json(crate::push::sms_relay_exec(cloud, v).await)),
                 Err(_) => Vec::new(),
             }
         }
-        // Direct-MX carrier-gateway SMS relay: the leader (cloud node, :25
-        // blocked) forwards a direct-MX send here to an NA-egress peer (LA Mac,
-        // :25 open) whose IP a carrier gateway accepts. Runs the blast locally.
+        // Direct-MX carrier-gateway SMS relay: the leader (cloud node, :25 blocked) forwards a
+        // direct-MX send here to an NA-egress peer (:25 open) whose IP a carrier gateway accepts;
+        // this node runs the blast locally.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/push/sms-direct-mx") => {
             match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(v) => jb(axum::Json(crate::push::sms_direct_mx_exec(v).await)),
                 Err(_) => Vec::new(),
             }
         }
-        // libsql/Hrana OWNER PROXY: a managed SQLite database is a FILE on one
-        // node, and every other node forwards here rather than opening a
-        // second, empty copy of it. Longest-prefix-first against the
-        // `/v1/databases/replica` arm below — the two are disjoint (this one
-        // requires the `/hrana-mesh` suffix), but the ordering makes that
-        // explicit rather than incidental. The envelope carries the CLIENT's
-        // own database bearer, which `hrana::mesh_serve` re-checks against
-        // THIS node's replicated record before touching the file (the
-        // `proxy_to_owner` re-check precedent), and refuses to re-proxy.
+        // libsql/Hrana OWNER PROXY: a managed SQLite database is a FILE on one node, and every
+        // other node forwards here rather than opening a second, empty copy of it. The envelope
+        // carries the CLIENT's own database bearer, which `hrana::mesh_serve` re-checks against
+        // THIS node's replicated record before touching the file (the `proxy_to_owner` re-check
+        // precedent), and it refuses to re-proxy. Disjoint from the `/v1/databases/replica` arm
+        // below (this one requires the `/hrana-mesh` suffix).
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/databases/")
             && p.split('?')
@@ -1793,11 +1592,9 @@ async fn dispatch_verified(
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
-        // Supabase Studio OWNER PROXY: the container lives on one node, and
-        // per-DB DNS now publishes the full healthy node set (not a single
-        // fixed IP) so any other edge forwards here rather than answering
-        // MISDIRECTED_REQUEST. Same envelope/re-check shape as the
-        // `/hrana-mesh` arm just above.
+        // Supabase Studio OWNER PROXY: the container lives on one node and per-DB DNS publishes the
+        // full healthy node set, so any other edge forwards here rather than answering
+        // MISDIRECTED_REQUEST. Same envelope and re-check shape as the `/hrana-mesh` arm above.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/databases/")
             && p.split('?')
@@ -1818,12 +1615,10 @@ async fn dispatch_verified(
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
-        // browser_db libsql/Hrana + Upstash REST OWNER PROXY
-        // (bn-browser-db-rest): the exact `/v1/databases/*/hrana-mesh` shape
-        // above, addressed by project instead of database id since there is
-        // no `Database` record here — `browser_db_rest::mesh_serve`
-        // re-derives the elected owner and the credential scope from THIS
-        // node's own replicated state before touching the file.
+        // browser_db libsql/Hrana + Upstash REST OWNER PROXY: the `/hrana-mesh` shape addressed by
+        // project instead of database id (there is no `Database` record), where
+        // `browser_db_rest::mesh_serve` re-derives the elected owner and the credential scope from
+        // THIS node's own replicated state before touching the file.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/projects/")
             && p.split('?')
@@ -1856,9 +1651,9 @@ async fn dispatch_verified(
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
-        // Mirrored storage writes over the mesh (replication data plane). The team
-        // rides as `?team=` and is applied to the SAME tenant namespace on this
-        // replica; these NEVER re-mirror (they're already replicated writes).
+        // Mirrored storage writes (the replication data plane): the team rides as `?team=` and is
+        // applied to the SAME tenant namespace on this replica; they NEVER re-mirror, being already
+        // replicated writes.
         p if method == hive_p2p::GOSSIP_POST
             && p.starts_with("/v1/storage/")
             && (qparam(p, "mirror").as_deref() == Some("1")) =>
@@ -1866,18 +1661,13 @@ async fn dispatch_verified(
             crate::admin::apply_mirrored_write(&cloud, p, body).await;
             jb(axum::Json(serde_json::json!({ "ok": true })))
         }
-        // Billing authority reads, proxied here by `admin::fetch_from_host` /
-        // `admin::proxy_billing_read` whenever the CALLING node isn't the billing
-        // authority (`billing_authority_node`) — this is the OTHER end of that
-        // proxy: without these three arms every `/v1/billing*` gossip call fell
-        // through to the catch-all `_ => Vec::new()` below, so `fetch_from_host`
-        // got back an empty body, failed to parse it as JSON, and the caller
-        // silently fell back to ITS OWN local (non-authoritative) billing state —
-        // on a perfectly healthy mesh connection, not just during a QUIC flap.
-        // Longest-prefix arms first so `/v1/billing/invoices` and
-        // `/v1/billing/ledger` don't get shadowed by the bare `/v1/billing` arm.
-        // MUST precede the bare `/v1/billing` arm below, which would otherwise
-        // shadow it (longest-prefix-first ordering, same as invoices/ledger).
+        // Billing authority reads, the other end of `admin::fetch_from_host` /
+        // `admin::proxy_billing_read` whenever the CALLING node is not the billing authority
+        // (`billing_authority_node`): without these arms every `/v1/billing*` gossip call fell
+        // through to the catch-all, `fetch_from_host` got an empty body it could not parse, and the
+        // caller silently served ITS OWN non-authoritative billing state on a perfectly healthy
+        // mesh connection. Longest-prefix-first: `/v1/billing/checkout/`, `/invoices` and `/ledger`
+        // must precede the bare `/v1/billing` arm, which would otherwise shadow them.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/checkout/") => {
             let id = p
                 .trim_start_matches("/v1/billing/checkout/")
@@ -1903,13 +1693,10 @@ async fn dispatch_verified(
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => jb(
             crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await,
         ),
-        // Fleet-global raw-port allocation coordination (closes the F1
-        // node-local-registry-vs-fleet-global-port-space race): the actual
-        // claim decision runs ONLY on the control-plane leader — a non-leader
-        // receiving this (stale routing, or a peer with an out-of-date view of
-        // who the leader is) refuses rather than racing its own local
-        // registry against the real leader's. See `raw_ports.rs` module doc
-        // and `allocate_raw_ports_coordinated`.
+        // Fleet-global raw-port allocation: the claim decision runs ONLY on the control-plane
+        // leader, and a non-leader receiving this (stale routing, or a peer with an out-of-date
+        // view of who the leader is) refuses rather than racing its own local registry against the
+        // real leader's (see `raw_ports.rs` and `allocate_raw_ports_coordinated`).
         "/v1/raw-ports/allocate" if method == hive_p2p::GOSSIP_POST => {
             if !cloud.is_control_plane_leader() {
                 return jb(axum::Json(
@@ -1934,10 +1721,9 @@ async fn dispatch_verified(
                 )),
             }
         }
-        // Mirror of the allocate arm above, for permanent retirement — the
-        // `/release` path and additive `released` response field are retained
-        // for rolling compatibility, but the allocator never re-grants a
-        // retired number. See `release_raw_ports_coordinated`.
+        // The mirror of the allocate arm, for permanent retirement: the `/release` path and the
+        // additive `released` response field are kept for rolling compatibility, but the allocator
+        // never re-grants a retired number (see `release_raw_ports_coordinated`).
         "/v1/raw-ports/release" if method == hive_p2p::GOSSIP_POST => {
             if !cloud.is_control_plane_leader() {
                 return jb(axum::Json(
@@ -1950,14 +1736,11 @@ async fn dispatch_verified(
             }
             match serde_json::from_slice::<Req>(body) {
                 Ok(req) => {
-                    // Retire only when this leader holds NO live settings row
-                    // for the project (tombstoned or absent): retirement is
-                    // PERMANENT (numbers are never re-granted), so releasing
-                    // a LIVE project's ports on any trusted peer's say-so
-                    // would force a port swap nobody asked for (adversarial
-                    // finding). The legitimate flow always reaches here after
-                    // the project's delete, so a live row is exactly the
-                    // attack/bug case.
+                    // Retire only when this leader holds NO live settings row for the project
+                    // (tombstoned or absent): retirement is PERMANENT (numbers are never
+                    // re-granted), so releasing a LIVE project's ports on any trusted peer's say-so
+                    // would force a port swap nobody asked for. The legitimate flow always arrives
+                    // after the project's delete, so a live row is exactly the attack/bug case.
                     if cloud.projects.get_if_set(&req.project).is_some() {
                         return jb(axum::Json(serde_json::json!({
                             "error": "project is live on this leader — refusing permanent port retirement"
@@ -1978,7 +1761,10 @@ async fn dispatch_verified(
     }
 }
 
-/// Reconstruct the logs `Query<LimitQ>` from a dispatched path's query string.
+/// The tenant of a dispatched mesh call: the VERIFIED delegation token's tenant ([`team_claims`]),
+/// else a raw `?team=` only when auth is not enforced; empty when neither resolves. Never a raw
+/// `split_once("?team=")` parse: under enforcement the query is `team=<t>&tok=<jwt>`, so that
+/// swallows the token into the team string and every ownership compare misses silently.
 fn mesh_tenant(path: &str) -> String {
     team_claims(path)
         .map(|axum::Extension(claims)| crate::admin::norm(&claims.tenant).to_string())
@@ -1992,11 +1778,26 @@ fn mesh_tenant(path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Reconstruct the logs `Query<LogsQ>` from a dispatched path's query string.
-/// EVERY field `admin::LogsQ` declares must be mirrored here: a parameter the
-/// mesh arm does not read is a parameter the peer never applies, so the filter
-/// works on the owner node and silently returns unfiltered rows on every other
-/// node — the exact bug class this endpoint is being fixed for.
+/// Headers for an in-process call into a handler gated by `require_operator_or_internal` or
+/// `require_internal_hop`: the fleet's `HIVE_INTERNAL_TOKEN` as `x-hive-internal` (empty when the
+/// token is unset), so the handler passes without relying on synthesized claims.
+fn internal_hop_headers() -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&t) {
+            headers.insert("x-hive-internal", hv);
+        }
+    }
+    headers
+}
+
+/// Reconstructs the logs `Query<LogsQ>` from a dispatched path's query string. EVERY field
+/// `admin::LogsQ` declares must be mirrored here: a parameter the mesh arm does not read is a
+/// parameter the peer never applies, so the filter works on the owner node and silently returns
+/// unfiltered rows on every other node, the exact bug class this endpoint is being fixed for.
+/// `range=` is not forwarded by the coordinator (it sends resolved absolute bounds) but is parsed
+/// so a direct mesh dispatch that still carries one is honoured; `offset` is coordinator-only
+/// (paging happens once, after the merge), so it is deliberately not read.
 fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LogsQ> {
     axum::extract::Query(crate::admin::LogsQ {
         limit: qparam(path, "limit").and_then(|v| v.parse().ok()),
@@ -2004,9 +1805,6 @@ fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LogsQ> {
         deployment: qparam(path, "deployment"),
         q: qparam(path, "q"),
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
-        // `range=` is intentionally NOT forwarded by the coordinator (it sends
-        // resolved absolute bounds), but it is parsed here so a direct mesh
-        // dispatch that still carries one is honoured rather than ignored.
         range: qparam(path, "range"),
         since_ms: qparam(path, "since_ms").and_then(|v| v.parse().ok()),
         until_ms: qparam(path, "until_ms").and_then(|v| v.parse().ok()),
@@ -2018,8 +1816,6 @@ fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LogsQ> {
         cache: qparam(path, "cache"),
         env: qparam(path, "env"),
         resource: qparam(path, "resource"),
-        // `offset` is coordinator-only (paging happens once, after the merge),
-        // so it is deliberately not read here.
         offset: None,
         cursor: None,
     })
@@ -2114,21 +1910,23 @@ fn snapshot_path_parts(path: &str) -> (String, String, Option<String>) {
     (project, deployment_id, snapshot_id)
 }
 
-/// Build a verified-claims extension for a mesh-internal admin call. The iroh
-/// transport carries no HTTP headers and the calling peer is already trusted
-/// (peer-trust allowlist + mesh auth), so the team that rides as `?team=` is
-/// injected as authoritative [`crate::auth::Claims`]. Handlers resolve the tenant
-/// from these claims — under enforced JWT auth the synthesized `x-hive-team`
-/// header is ignored, so without this the tenant would be lost on the host node.
+/// Builds a verified-claims extension for a mesh-internal admin call. The iroh transport carries no
+/// HTTP headers and the calling peer is already trusted (peer-trust allowlist + mesh auth), so the
+/// tenant that rides in the query is injected as authoritative [`crate::auth::Claims`]: handlers
+/// resolve the tenant from claims, and under enforced JWT auth a synthesized `x-hive-team` header
+/// is ignored, so without this the tenant would be lost on the host node.
+///
+/// The PREFERRED form is a signed, short-lived delegation token (`?tok=`) minted by the originating
+/// node from the verified user tenant. Verifying it yields an AUTHORITATIVE, integrity-protected,
+/// expiring tenant assertion (`platform_admin` is always stripped) and closes the raw-`?team=`
+/// spoofing class: the value can no longer be an arbitrary attacker-set query parameter, it must be
+/// a validly signed unexpired JWT, and an INVALID token under enforcement is rejected outright (no
+/// claims). Residual, inherent to a shared `HIVE_JWT_SECRET` mesh: a compromised TRUSTED PEER node
+/// can still mint any tenant; closing that needs per-node signing keys and is bounded by the
+/// peer-trust allowlist gate. The FALLBACK is a raw `?team=`, retained for dev/unenforced mode and
+/// rolling upgrades (an origin node predating token-minting sends only `team=`); under enforcement
+/// it is accepted with a warning.
 fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
-    // PREFERRED: a signed, short-lived delegation token (`?tok=`) minted by the
-    // originating node from the verified user tenant. Verifying it here yields an
-    // AUTHORITATIVE, integrity-protected, expiring tenant assertion — closing the
-    // raw-`?team=` spoofing class: the value can no longer be an arbitrary
-    // attacker-set query param, it must be a validly-signed unexpired JWT.
-    // (Residual, inherent to a shared HIVE_JWT_SECRET mesh: a compromised
-    // *trusted peer node* can still mint any tenant — that requires per-node
-    // signing keys to close and is bounded by the peer-trust allowlist gate.)
     if let Some(tok) = qparam(path, "tok") {
         if let Ok(mut claims) = crate::auth::verify(&tok) {
             claims.platform_admin = false;
@@ -2144,8 +1942,6 @@ fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
     if team.is_empty() {
         return None;
     }
-    // FALLBACK: raw `?team=`. Retained for dev/unenforced mode and rolling
-    // upgrades (an origin node predating token-minting sends only `team=`).
     if crate::auth::enforced() {
         tracing::warn!(%path, "mesh call carried raw team= without a signed token (rolling-upgrade fallback)");
     }
@@ -2200,35 +1996,28 @@ fn wf_query(path: &str) -> axum::extract::Query<crate::admin::WfQuery> {
     })
 }
 
-/// The iroh gossip handler `serve_tunnels` invokes for inbound `STREAM_GOSSIP`.
-/// Pure core of the mesh-mutation authorization decision (no CloudState/env
-/// deps, unit-testable directly). `signer_trusted`: `None` when no trust set
-/// is configured at all (nothing to check against — permissionless, today's
-/// default); `Some(bool)` when a trust set IS configured, carrying whether
-/// the (possibly-absent, mapped to `false`) verified signer is a member.
+/// Pure core of the mesh-mutation authorization decision (no CloudState/env deps, unit-testable
+/// directly). `signer_trusted` is `None` when no trust set is configured at all (nothing to check
+/// against: permissionless, today's default) and `Some(bool)` when a trust set IS configured,
+/// carrying whether the (possibly absent, mapped to `false`) verified signer is a member. Reads are
+/// always allowed here (each handler still applies its own tenant/team scoping), mirroring the HTTP
+/// side's "reads are always allowed" policy.
 fn mesh_mutation_authorized(method: u8, signer_trusted: Option<bool>) -> bool {
     method == hive_p2p::GOSSIP_GET || signer_trusted.unwrap_or(true)
 }
 
+/// The iroh gossip handler `serve_tunnels` invokes for inbound `STREAM_GOSSIP`; `signer` is the
+/// message's VERIFIED ed25519 identity (Some only when the request carried a valid signature bound
+/// to the QUIC peer). The iroh gossip transport carries no HTTP headers, so it never passes through
+/// `auth::require_auth`: an operator who secured the API by setting `HIVE_JWT_SECRET` had secured
+/// only the HTTP admin surface, while this mesh path answered the same privileged handlers (deploy,
+/// project delete, database_replica, storage mirror writes, promote) with NO authorization check.
+/// The only authorization signal this transport can carry is a verified, trust-set-member signer,
+/// so when a trust set is actually configured (non-empty, matching the HTTP side's "only enforce
+/// what is actually configured" pattern, e.g. `require_auth`/`require_operator`) it is required for
+/// every MUTATING call; reads stay open. With no trust set configured (today's default) this is
+/// permissionless.
 pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
-    // `signer` is the message's VERIFIED ed25519 identity (Some only when the
-    // request carried a valid signature bound to the QUIC peer).
-    //
-    // The iroh gossip transport carries no HTTP headers, so it never passes
-    // through `auth::require_auth` (the JWT middleware) at all — an operator
-    // who believes they've secured the API by setting HIVE_JWT_SECRET has
-    // only secured the HTTP admin surface; this mesh path answered the exact
-    // same privileged handlers (deploy, project delete, database_replica,
-    // storage mirror writes, promote) with NO authorization check whatsoever,
-    // regardless of that configuration. The only authorization signal this
-    // transport can carry is a verified, trust-set-member signer, so: when a
-    // trust set is actually configured (non-empty — matches the HTTP side's
-    // "only enforce what's actually configured" pattern, e.g. `require_auth`/
-    // `require_operator`), require it for every MUTATING call. Reads remain
-    // open here (each handler still applies its own tenant/team scoping) —
-    // this mirrors the HTTP side's "reads are always allowed" policy rather
-    // than introducing an inconsistent new read-side gate. With no trust set
-    // configured (today's default), this is unchanged/permissionless.
     Arc::new(move |method, path, body, signer: Option<String>| {
         let cloud = cloud.clone();
         Box::pin(async move {
@@ -2257,6 +2046,17 @@ pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
         })
     })
 }
+
+/// Cap on the iroh attempt when an HTTP fallback can actually run. Dialing a peer's STALE identity
+/// (e.g. after it restarted with a new key) can hang on connect/relay-retry, and without a cap a
+/// dead cached addr would stall the whole gossip loop and the HTTP fallback would never run, so the
+/// node could never re-learn the peer's new address; on timeout or error the stale mapping is
+/// dropped and the attempt falls through to HTTP, which re-learns the fresh addr. A non-URL peer
+/// (notably the `seed:<64hex>` form used before a seed has gossiped a full NodeInfo) has no HTTP
+/// path at all, so capping its dial below `dial_fallback_ceiling` would cancel `acquire`'s
+/// fresh-discovery fallback mid-flight (the same cancellation that once made mesh join impossible
+/// for a new node) and leave NO recovery path: those peers get the full ceiling instead.
+const IROH_ATTEMPT_BUDGET_WITH_HTTP_FALLBACK: Duration = Duration::from_secs(3);
 
 /// Fetch a gossip endpoint from `peer`, preferring iroh when enabled + the peer's
 /// iroh address is known, else HTTP-over-SSH (also the bootstrap/fallback path).
@@ -2301,7 +2101,18 @@ fn is_dial_failure(e: &anyhow::Error) -> bool {
         || e.downcast_ref::<hive_p2p::PeerRefused>().is_some()
 }
 
-/// [`fetch`], classified (see [`FetchOutcome`]).
+/// [`fetch`], classified (see [`FetchOutcome`]). The HTTP-over-SSH fallback presents a short-lived
+/// mesh-internal Bearer (the SAME mechanism `db_replicate.rs`'s `send_mirrored` uses for this class
+/// of node-to-node call) on EVERY gossip method. The receiving node's admin router wraps every
+/// mutation in `auth::require_auth` once `HIVE_JWT_SECRET` is set (the documented production
+/// posture), and guards the fleet-wide READ handlers this loop pulls (`/v1/serve-hosts`,
+/// `/v1/fleet-deployments`, `/v1/leases`, `/v1/guardian/heads`) with `admin::require_fleet_read`,
+/// which accepts exactly this signed `service` delegation: without it, a round that fell back to
+/// HTTP (bootstrap, or a stale or dead cached iroh addr) was answered 401/403 and the node silently
+/// stopped learning its peers' routes, deployments and leases. The receiving handlers on this path
+/// do not read claims, so any validly signed token clears the gate without granting a tenant-scoped
+/// privilege; with `HIVE_JWT_SECRET` unset `issue()` errors and no header is added (dev/single-node
+/// behaviour).
 pub async fn fetch_outcome(
     cloud: &Arc<CloudState>,
     peer: &str,
@@ -2311,34 +2122,13 @@ pub async fn fetch_outcome(
 ) -> FetchOutcome {
     let mut dial_failed = false;
     if iroh_enabled() {
-        // Clone out of the locks and DROP the guards before awaiting (parking_lot
-        // guards aren't Send and can't be held across `.await`).
         let target = cloud.peer_iroh.read().get(peer).cloned();
         let pool = cloud.mesh.read().clone();
         if let (Some((node_id, addr)), Some(pool)) = (target, pool) {
-            // Relay-selection-algorithm: steer toward the peer's own/nearest-peer's
-            // live relay_url instead of whatever relay `addr` was cached with — see
-            // `relay_hinted_addr`.
             let addr = relay_hinted_addr(cloud, &node_id, &addr);
-            // BOUND the iroh attempt: dialing a peer's STALE identity (e.g. after it
-            // restarted with a new key) can hang on connect/relay-retry. Without this
-            // cap, a dead cached addr would stall the whole gossip loop and the HTTP
-            // fallback below would never run — so the node could never re-learn the
-            // peer's new address. On timeout/error we drop the stale mapping and fall
-            // through to HTTP, which re-learns the fresh addr.
-            //
-            // ...but that reasoning only holds when the HTTP fallback CAN run. `peer`
-            // is used verbatim as a URL prefix below, so a non-URL peer (notably the
-            // `seed:<64hex>` form used before a seed has gossiped a full NodeInfo) has
-            // no HTTP path at all. Capping those below `dial_fallback_ceiling` cancels
-            // `acquire`'s fresh-discovery fallback mid-flight — the same cancellation
-            // bug that made mesh join impossible for a new node — and leaves NO
-            // recovery path, since the HTTP branch cannot work either. So: keep the
-            // fast cap only where the fallback is real, and give the dial its full
-            // budget where iroh is the only way through.
             let http_fallback_viable = peer.starts_with("http://") || peer.starts_with("https://");
             let budget = if http_fallback_viable {
-                Duration::from_secs(3)
+                IROH_ATTEMPT_BUDGET_WITH_HTTP_FALLBACK
             } else {
                 hive_p2p::dial_fallback_ceiling()
             };
@@ -2362,7 +2152,6 @@ pub async fn fetch_outcome(
             }
         }
     }
-    // HTTP-over-SSH (bootstrap + fallback).
     let url = format!("{peer}{path}");
     let mut req = if method == hive_p2p::GOSSIP_POST {
         cloud
@@ -2373,29 +2162,6 @@ pub async fn fetch_outcome(
     } else {
         cloud.http.get(&url)
     };
-    // Live-witnessed real bug (bn-impl-mesh-admission investigation): this path
-    // is a plain, unauthenticated reqwest::Client call, but the receiving
-    // node's admin router (main.rs) wraps EVERY mutation in auth::require_auth
-    // once HIVE_JWT_SECRET is set -- the DOCUMENTED normal production posture.
-    // POST /v1/nodes/announce (and any other gossip mutation reached only via
-    // this HTTP fallback, before an iroh mapping exists to use the auth-free
-    // iroh gossip path instead) 401'd unconditionally, silently disabling the
-    // "bootstrap + fallback" this comment promises on any JWT-enforced node.
-    // Mint a short-lived mesh-internal token via the SAME mechanism
-    // db_replicate.rs's send_mirrored already uses for exactly this class of
-    // node-to-node call, and present it as a normal Bearer -- the receiving
-    // handlers on this path (node_announce, nodes) don't read claims at all,
-    // so any validly-signed token clears require_auth's gate without granting
-    // any tenant-scoped privilege. A no-op when HIVE_JWT_SECRET is unset
-    // (issue() returns Err, so no header is added -- matching dev/single-node
-    // behavior exactly as before).
-    // Minted for EVERY gossip method, not just POST: the fleet-wide READ
-    // handlers this loop pulls (`/v1/serve-hosts`, `/v1/fleet-deployments`,
-    // `/v1/leases`, `/v1/guardian/heads`) are now guarded on their public HTTP
-    // route by `admin::require_fleet_read`, which accepts exactly this signed
-    // `service` delegation. Without it, any round that fell back to HTTP
-    // (bootstrap, or a stale/dead cached iroh addr) got a 403 and the node
-    // silently stopped learning its peers' routes, deployments and leases.
     if let Ok(tok) = crate::auth::issue(
         "mesh-internal",
         "mesh",
