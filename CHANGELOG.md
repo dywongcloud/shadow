@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-13 — the dashboard's Plan card buys an upgrade through checkout and explains a refusal instead of alerting a raw 403 (691cf48a67)
+
+`f00b3ebe32` made raising a plan a purchase or an operator grant: `PUT /v1/teams/:slug/plan` keeps or
+lowers a tier for an owner or admin and `apply_plan_everywhere` answers a raise 403. The Plan &
+Enterprise card (`team-privacy-settings-client.tsx`) still sent every tier through that route and
+`alert()`ed the raw body, so a non-operator owner's Pro and Enterprise buttons ended in a browser
+alert reading "Error: raising the plan to 'pro' needs a paid checkout (POST /v1/billing/checkout) or
+a platform operator". `ui/lib/plan-change.ts` now routes by authority (`planAction`): the current tier
+does nothing, an operator (`usePlatformAdmin()` true) and any lower tier use the direct PUT, and a
+raise by anyone else (operator status false or unknown) opens the Billing page's own checkout,
+`POST /v1/billing/checkout {kind: "plan", plan}`, and follows its `url` (Stripe's page, or the mock
+checkout; `applied` means a free plan took effect). A failure is worded by `planRefusal`: a 403 is
+explained (a higher plan is bought on the Billing page, only a platform operator can change a plan
+without paying), the node's own sentences (billing is not set up, the provider could not open the
+checkout) pass through, and a raw request line, markup or anything long never does; the card shows it
+inline with an Open Billing link and a team with no plan record (a personal account) shows plain
+disabled tiers and the link instead of buttons that 404. `apiSend` now throws `ApiError(status, text)`
+so a caller can tell a 403 from a 502; its message is byte-identical, so no other caller changes.
+Witnessed on a real enforced throwaway node behind `next dev`, headless Chrome over CDP: before, a
+non-operator owner's click on Pro or Enterprise sent two PUTs (the second is the re-mint retry), both
+403, and raised the alert; after, it sends one checkout request, and since that node has no Stripe key
+the node answers 503 "billing is not set up on this platform ... nothing was purchased or charged",
+which the card shows with the Billing link (no PUT, no alert, plan unchanged); downgrades (pro to
+hobby, enterprise to pro) are PUT 200 and update the card; a stale operator claim gets the node's 403
+and the explanation; an operator session switches hobby to enterprise directly (PUT 200, no
+checkout). On an unenforced mock-billing node with no session mint (operator unknown) Upgrade to Pro
+opens the checkout (200), the browser follows `/billing/checkout?session=...`, Pay confirms and
+`/billing?success=1` shows team and billing on pro. Stripe's hosted leg cannot run offline
+(`billing::stripe_checkout` calls api.stripe.com directly) and was not exercised. On an unenforced dev
+node without a session mint a raise now opens the mock checkout instead of switching instantly.
+Not rolled.
+
 ## 2026-10-13 — a model download never blocks the reconcile loop, is bounded in time and disk, and leaves no partial or orphaned file (c43d864248)
 
 `fluid.json`'s `inference.model` is tenant input that reaches a real network fetch, and `reconcile_local`
