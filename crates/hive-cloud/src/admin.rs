@@ -143,7 +143,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/builds/:id/cancel", post(build_cancel))
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
-        .route("/v1/nodes/announce", post(node_announce))
+        .route("/v1/nodes/announce", post(node_announce_public))
         .route("/v1/mesh/roster", get(mesh_roster_get))
         .route("/v1/mesh/admit", post(mesh_admit))
         .route("/v1/token", post(mint_token))
@@ -7753,6 +7753,21 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     res
 }
 
+/// HTTP mount of [`node_announce`]: a self-report rewrites the registry entry for any node name
+/// (public address, health, peer id: what Seer, placement and the leader election read) and
+/// raises the fencing epoch, so only a node may send it ([`require_mesh_rpc`]: the HTTP fallback of
+/// `gossip::fetch` carries a `mesh-internal` delegation). The gossip arm calls the inner handler
+/// directly, behind the transport's signer and trust gate.
+async fn node_announce_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(node): Json<hive_edge::NodeInfo>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    Ok(node_announce(State(c), Json(node)).await)
+}
+
 pub(crate) async fn node_announce(
     State(c): State<Arc<CloudState>>,
     Json(node): Json<hive_edge::NodeInfo>,
@@ -11060,10 +11075,72 @@ struct SandboxResp {
     duration_ms: u64,
 }
 
+/// Longest a single-use `/v1/sandbox` cell may run; the caller's `timeout_secs` is clamped to it.
+const SANDBOX_TIMEOUT_MAX_SECS: u64 = 120;
+/// Single-use cells one tenant may have running on this node at once.
+const SANDBOX_TENANT_MAX_JOBS: usize = 2;
+
+static SANDBOX_INFLIGHT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// One running `/v1/sandbox` cell charged to a tenant; the slot is released on drop, so a client
+/// that leaves mid-run (axum drops the future) never leaks it.
+struct SandboxSlot(String);
+
+impl SandboxSlot {
+    fn acquire(tenant: &str) -> Option<SandboxSlot> {
+        let mut inflight = SANDBOX_INFLIGHT.lock();
+        let running = inflight.entry(tenant.to_string()).or_insert(0);
+        if *running >= SANDBOX_TENANT_MAX_JOBS {
+            return None;
+        }
+        *running += 1;
+        Some(SandboxSlot(tenant.to_string()))
+    }
+}
+
+impl Drop for SandboxSlot {
+    fn drop(&mut self) {
+        let mut inflight = SANDBOX_INFLIGHT.lock();
+        if let Some(running) = inflight.get_mut(&self.0) {
+            *running = running.saturating_sub(1);
+            if *running == 0 {
+                inflight.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// The dashboard's single-use terminal cell (`POST /v1/sandbox`). Any signed-in tenant may run
+/// commands in a cell of the platform's default image: the image name selects a rootfs and the
+/// data drive named like it on the node, so choosing one is a platform-operator action, the
+/// run time is capped at [`SANDBOX_TIMEOUT_MAX_SECS`] and a tenant holds at most
+/// [`SANDBOX_TENANT_MAX_JOBS`] cells at once.
 async fn sandbox(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<SandboxReq>,
-) -> Json<SandboxResp> {
+) -> Result<Json<SandboxResp>, (StatusCode, String)> {
+    let claims = claims.as_ref().map(|e| &e.0);
+    let t = tenant(&c, &headers, claims);
+    if t == ANON_TENANT {
+        return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
+    }
+    if req.image != default_image() {
+        require_operator(claims).map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                "choosing the sandbox image requires a platform operator".into(),
+            )
+        })?;
+    }
+    let _slot = SandboxSlot::acquire(&t).ok_or((
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("at most {SANDBOX_TENANT_MAX_JOBS} sandboxes may run at once"),
+    ))?;
+    let timeout_secs = req.timeout_secs.clamp(5, SANDBOX_TIMEOUT_MAX_SECS);
     let started = now_ms();
     let job = BuildJob::builder(req.image)
         .commands(req.commands)
@@ -11071,13 +11148,15 @@ async fn sandbox(
             vcpus: 1,
             mem_mib: 512,
             disk_mib: 1024,
-            timeout_secs: req.timeout_secs,
+            timeout_secs,
         })
         .build();
     let id = c.hive.submit(job);
+    c.audit
+        .record(&t, "user", "run", "sandbox", &id.to_string(), "");
 
     let mut state = JobState::Queued;
-    for _ in 0..(req.timeout_secs.max(5) * 20) {
+    for _ in 0..(timeout_secs * 20) {
         if let Some(v) = c.hive.job_view(&id) {
             state = v.state;
             if v.state.is_terminal() {
@@ -11092,13 +11171,13 @@ async fn sandbox(
         .subscribe_logs(&id)
         .map(|(backlog, _rx)| backlog.into_iter().map(|l| l.line).collect())
         .unwrap_or_default();
-    Json(SandboxResp {
+    Ok(Json(SandboxResp {
         job_id: id.to_string(),
         state: format!("{state:?}"),
         exit_code: view.and_then(|v| v.exit_code),
         logs,
         duration_ms: now_ms().saturating_sub(started),
-    })
+    }))
 }
 
 #[derive(Deserialize)]
@@ -14136,19 +14215,29 @@ async fn status_incidents(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 /// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT send from THIS node so a
 /// regional key is presented from an NA-classified IP. Reached via `put_to_host` (HTTP admin in
-/// dev, gossip arm on the mesh).
-async fn push_sms_relay(State(c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
-    Json(crate::push::sms_relay_exec(&c, v).await)
+/// dev, gossip arm on the mesh), so it spends the platform's Textbelt key for whoever calls it:
+/// [`require_mesh_rpc`] keeps every tenant token out.
+async fn push_sms_relay(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(v): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    Ok(Json(crate::push::sms_relay_exec(&c, v).await))
 }
 
 /// Direct-MX carrier-gateway SMS relay: run the direct-MX blast on THIS node
 /// (chosen by the caller for its open outbound :25). Same node-to-node relay
-/// shape as `/v1/push/sms-relay`; the leader forwards here to an NA-egress peer.
+/// shape and gate as `/v1/push/sms-relay`; the leader forwards here to an NA-egress peer.
 async fn push_sms_direct_mx(
     State(_c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
-) -> Json<Value> {
-    Json(crate::push::sms_direct_mx_exec(v).await)
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), None)?;
+    Ok(Json(crate::push::sms_direct_mx_exec(v).await))
 }
 
 /// Leader-forward for mutations of leader-to-follower REGISTRY-synced stores (incidents, push): a
