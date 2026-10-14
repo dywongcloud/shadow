@@ -6,8 +6,7 @@ import {
   ChevronRight, RefreshCw, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
   Pencil, X, DownloadCloud, FileUp, Check, AlertTriangle, Link2,
 } from "lucide-react";
-import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
-import { Switch } from "@/components/ui";
+import { Card, Button, Input, Badge } from "@/components/ui";
 import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type DomainAttachResult, type NsRoster } from "@/lib/api";
 import { useProjectNames } from "@/lib/projects";
 import { toast } from "@/components/toast";
@@ -16,6 +15,10 @@ import { timeAgo, copyText } from "@/lib/utils";
 interface ScanRecord { name: string; type: string; value: string; ttl: number; priority: number | null }
 
 const RECORD_TYPES = ["A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "SRV"];
+
+function NotAvailable() {
+  return <span className="text-muted">Not available for DNS-only domains</span>;
+}
 
 function fmtDate(ms: number) {
   return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
@@ -46,16 +49,15 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       <div className="mb-6 flex items-start justify-between">
         <h1 className="text-3xl font-semibold tracking-tight">{domain}</h1>
         <div className="flex items-center gap-2">
-          {!attached && <Button>Renew Domain</Button>}
           <button className="flex h-9 w-9 items-center justify-center rounded-md border border-border-strong text-muted hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
         </div>
       </div>
 
       <div className="mb-8 grid grid-cols-2 gap-y-4 border-b border-border pb-6 text-sm sm:grid-cols-3 lg:grid-cols-6">
-        <Meta label="Expiration Date" value={<span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span>} />
-        {!attached && <Meta label="Renewal Price" value={d.renewal_price} />}
-        {!attached && <Meta label="Registrar" value={<span className="flex items-center gap-1.5"><Triangle className="h-4 w-4" /> {d.registrar}</span>} />}
-        {!attached && <Meta label="Auto Renewal" value={<AutoRenew domain={domain} on={d.auto_renew} onChange={refresh} />} />}
+        <Meta label="Expiration Date" value={attached ? <span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span> : <NotAvailable />} />
+        {!attached && <Meta label="Renewal Price" value={<NotAvailable />} />}
+        {!attached && <Meta label="Registrar" value={<NotAvailable />} />}
+        {!attached && <Meta label="Auto Renewal" value={<NotAvailable />} />}
         <Meta label="Age" value={timeAgo(d.created_ms)} />
         <Meta label="OpenEdge CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
       </div>
@@ -86,29 +88,14 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
       <Nameservers domain={domain} nameservers={d.nameservers} attached={attached} onChange={refresh} />
 
       {!attached && (
-      <Section title="SSL Certificates" desc="By default, OpenEdge issues and auto-renews a free SSL certificate for your domains.">
-        <Card className="p-0">
-          <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-            <span>ID</span><span>CNs</span><span>Renewal</span><span>Expiration</span><span>Age</span>
-          </div>
-          <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] items-center gap-2 px-4 py-3 text-sm">
-            <span className="flex items-center gap-2 font-mono text-xs"><Lock className="h-3.5 w-3.5 text-muted" /> {d.ssl.id}</span>
-            <span className="flex flex-wrap gap-1">{d.ssl.cns.map((c) => <span key={c} className="rounded bg-subtle px-1.5 py-0.5 text-[11px] text-secondary">{c}</span>)}</span>
-            <span className="capitalize text-secondary">{d.ssl.renewal}</span>
-            <span className="text-secondary">{fmtDate(d.ssl.expires_ms)}</span>
-            <span className="text-muted">{timeAgo(d.ssl.issued_ms)}</span>
-          </div>
-          <div className="flex items-center justify-between border-t border-border px-4 py-2.5 text-xs text-muted">
-            <span className="flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5 text-emerald-500" /> Provided free by {d.ssl.provider}</span>
-            <button onClick={() => apiSend("POST", `/v1/domains/${encodeURIComponent(domain)}/ssl/renew`).then(refresh)} className="rounded-md border border-border-strong px-2.5 py-1 hover:bg-subtle">Renew now</button>
-          </div>
-        </Card>
+      <Section title="SSL Certificates" desc="Certificates are issued once the domain is attached to a project.">
+        <Card className="px-4 py-6 text-sm"><NotAvailable /></Card>
       </Section>
       )}
 
       {!attached && (
-      <Section title="Registrant Information" desc="We collect this information to meet ICANN requirements and establish you as the legal domain holder." action={<Button variant="outline">Manage WHOIS Privacy</Button>}>
-        <Card className="p-5 text-sm text-secondary">WHOIS privacy is enabled — your contact details are protected.</Card>
+      <Section title="Registrant Information" desc="Registrant details are held by your domain's registrar.">
+        <Card className="px-4 py-6 text-sm"><NotAvailable /></Card>
       </Section>
       )}
 
@@ -230,13 +217,6 @@ function Section({ title, desc, action, children }: { title: string; desc?: stri
       </div>
       {children}
     </div>
-  );
-}
-
-function AutoRenew({ domain, on, onChange }: { domain: string; on: boolean; onChange: () => void }) {
-  const [v, setV] = useState(on);
-  return (
-    <Switch checked={v} onChange={(next) => { setV(next); apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/auto-renew`, { on: next }).then(onChange).catch(() => setV(on)); }} />
   );
 }
 

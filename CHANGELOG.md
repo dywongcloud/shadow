@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-13 — the DNS-only domain page and the preview unlock page no longer show invented data
+
+A DNS-only domain's detail page (`app/domains/[domain]/domain-detail-page-client.tsx`)
+rendered the node's creation defaults as if they were facts: an expiration date one year
+after the record was first seen, a "$13 per year" renewal price, "OpenEdge" as registrar,
+an auto-renewal toggle that renews nothing, an SSL certificate row built from the pending
+placeholder (empty id, "Dec 31, 1969", "497761h ago", "Provided free by OpenEdge (Let's
+Encrypt)" and a "Renew now" button) and "WHOIS privacy is enabled — your contact details
+are protected" with a "Manage WHOIS Privacy" button, none of which has a source (the
+platform is no registrar, and a certificate exists only for an attached, verified domain).
+The preview unlock interstitial (`app/preview-unlock/page.tsx`) played a scripted
+zero-knowledge transcript (random `commit`, `proof` and `nullifier` hex, "verifier: checking
+ring signature over team roster", "verifier: constraints 1/1 satisfied") for a fixed 2.2 s
+whatever the server said, so a denied visitor watched a verification succeed and then read
+"Access denied" (both found by the ui comment sweep, against the rule that numbers are
+measured or absent). Now every invented value reads "Not available for DNS-only domains"
+with the layout and the real fields (age, CDN, DNS records, nameservers) untouched, the
+dead Renew, Renew now, Manage WHOIS Privacy and auto-renew controls are gone, and the
+interstitial shows "Verifying membership…" until `/api/preview-unlock` answers, then the
+real result at once (the artificial 2.2 s floor is gone with the transcript). Witnessed in
+headless Chrome: the DNS-only page before and after (DOM dump and screenshot), and the
+interstitial in a production build of the old and the new page against a stub answering
+immediately, after 3 s or with a grant: before, a denied visitor saw "$ zkauth: opening
+membership session", random hex values and "« verifier: checking ring signature over team
+roster" for 2.2 s and then "Access denied"; after, "Access denied" at once, "Verifying
+membership…" for the whole 3 s of a slow answer, and "Membership verified — access
+granted" followed by the redirect for a grant. Not rolled. Still invented on the node, not
+in the dashboard: `default_domain` seeds `registrar`, `renewal_price`, `auto_renew` and a
+one-year `expires_ms` (the Expiration Date of an attached domain still shows that last one).
+
 ## 2026-10-13 — a tenant token can no longer register or remove another tenant's database replica
 
 `POST /v1/databases/replica` (the primary's cross-region replica fanout) took only the request

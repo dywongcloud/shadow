@@ -5,10 +5,8 @@ import { useUser } from "@clerk/nextjs";
 import Link from "next/link";
 
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
-const LOG_LINE_INTERVAL_MS = 270;
 
-/** Protected-preview unlock interstitial: `/api/preview-unlock` does the real work while a staged, purely decorative terminal-style proof log plays, then the page
- *  redirects into the preview. */
+/** Protected-preview unlock interstitial: `/api/preview-unlock` verifies membership and mints the proof, then the page redirects into the preview. */
 export default function PreviewUnlockPage() {
   return clerkEnabled ? <ClerkGate /> : <Authenticating signedIn loaded />;
 }
@@ -29,10 +27,8 @@ function SpokeSpinner() {
   );
 }
 
-const randomHex = (n: number) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
-
 function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boolean }) {
-  const [lines, setLines] = useState<string[]>([]);
+  const [verified, setVerified] = useState(false);
   const [error, setError] = useState("");
   const started = useRef(false);
 
@@ -52,45 +48,22 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
     }
     started.current = true;
 
-    const stagedLog = [
-      "$ zkauth: opening membership session",
-      "» deriving witness from secret key",
-      `» commit     0x${randomHex(40)}`,
-      `» proof      0x${randomHex(56)}`,
-      `» nullifier  0x${randomHex(24)}`,
-      "→ transmitting proof to verifier",
-      "« verifier: checking ring signature over team roster",
-      "« verifier: constraints 1/1 satisfied",
-    ];
-    let i = 0;
-    const tick = setInterval(() => {
-      setLines((l) => (i < stagedLog.length ? [...l, stagedLog[i]] : l));
-      i += 1;
-      if (i >= stagedLog.length) clearInterval(tick);
-    }, LOG_LINE_INTERVAL_MS);
-
-    const minShow = new Promise((r) => setTimeout(r, stagedLog.length * LOG_LINE_INTERVAL_MS));
-    const work = fetch(`/api/preview-unlock${qs}`, { cache: "no-store" })
+    fetch(`/api/preview-unlock${qs}`, { cache: "no-store" })
       .then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }))
-      .catch(() => ({ status: 0, body: { error: "network error" } as any }));
-
-    Promise.all([work, minShow]).then(([res]) => {
-      clearInterval(tick);
-      const { status, body } = res as { status: number; body: any };
-      if (status === 401 && body?.signin) {
-        // eslint-disable-next-line @next/next/no-location-assign-relative-destination
-        window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
-        return;
-      }
-      if (!body?.ok || !body?.url) {
-        setError(body?.error || "Could not unlock this preview.");
-        return;
-      }
-      setLines((l) => [...l, "✓ membership verified — access granted", "→ entering deployment"]);
-      setTimeout(() => (window.location.href = body.url), 650);
-    });
-
-    return () => clearInterval(tick);
+      .catch(() => ({ status: 0, body: { error: "network error" } as any }))
+      .then(({ status, body }) => {
+        if (status === 401 && body?.signin) {
+          // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+          window.location.href = `/sign-in?redirect_url=${encodeURIComponent(window.location.pathname + qs)}`;
+          return;
+        }
+        if (!body?.ok || !body?.url) {
+          setError(body?.error || "Could not unlock this preview.");
+          return;
+        }
+        setVerified(true);
+        setTimeout(() => (window.location.href = body.url), 650);
+      });
   }, [loaded, signedIn]);
 
   return (
@@ -104,9 +77,9 @@ function Authenticating({ signedIn, loaded }: { signedIn: boolean; loaded: boole
           <Link href="/" className="mt-6 rounded-full border border-border px-4 py-2 text-sm hover:bg-subtle">Back to dashboard</Link>
         </>
       ) : (
-        <pre className="mt-7 max-w-[90vw] whitespace-pre-wrap break-all text-left font-mono text-[12px] font-semibold leading-relaxed text-green-700 dark:text-[#3dfa7e] sm:text-[13px]">
-          {lines.join("\n")}
-        </pre>
+        <p className="mt-7 max-w-[90vw] text-center font-mono text-[12px] font-semibold leading-relaxed text-green-700 dark:text-[#3dfa7e] sm:text-[13px]">
+          {verified ? "Membership verified — access granted. Entering deployment…" : "Verifying membership…"}
+        </p>
       )}
     </div>
   );
