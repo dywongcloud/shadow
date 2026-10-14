@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-14 — a deployment's integrity chain is served only to the team that owns the deployment: one predicate gates every read keyed by a deployment id (fa7fe5bf57)
+
+`GET /v1/deployments/:id/integrity` admitted a caller whose tenant slug equalled the project's NAME
+(`record_tenant(&acceptance.input.project)`: `record_tenant` reads a stored tenant tag and the ledger input has no tenant field).
+`TeamStore::create` slugifies the name its creator types and any signed-in user may create a team, so a user who named a team
+after another team's project read that project's integrity chain, chain head and node signature with only the deployment id (an
+id alias host carries it), before and after the project moved. The first clause read raw `team_of`, so the owner of a project
+whose row had lost its tag (`__untagged__`, the state `POST /v1/admin/projects/:p/team` repairs) was locked out of its own chain
+while the team named after the project was not. `admin::deployment_owned_by(c, project, deployment_id, t)` is now the one gate
+for a read keyed by a deployment id: the project row decides when its tag is real, else the deployment record's own tag (this
+node's gateway, then a peer copy; a copy whose tag was lost is skipped), never optimistic (`project_owned_by` stays so for a
+project nobody has created yet), and the anonymous and untagged sentinels own nothing. `deployment_integrity`,
+`deployment_build`, `deployment_resources` and `build_owned_by` (GET and cancel of `/v1/builds/:id`) call it; `deployment_build`
+and `build_owned_by` each carried an inline copy. The cross-node fall-through is untouched. Witnessed on real enforced nodes
+(`scratch2/work/secfix7-integrity.sh`; the deployments are built through `POST /v1/git/deploy` because only the build pipeline
+writes a ledger entry, and the attacker creates its team the ordinary way): before, 3 defects (the team `pa` read project `pa`'s
+chain head and signature with the project in `ta`, again after it moved to `tc`, and again with its row at the sentinel, where
+the owner was refused its own chain); after, 0 (the team `pa`, an unrelated team and an anonymous caller get 404 on integrity,
+build, build record and cancel and the empty shape on resources; the owner 200; after the move the new team 200 and the old team
+404; the untagged row is served to its owner through the record's tag); PASS=30 FAIL=0 before, PASS=31 FAIL=0 after. What an
+operator must know: nothing narrows for a legitimate caller; one widening, a project whose row is untagged is now served to the
+team its deployment record names. Not changed: the browser lane's deployment-id gates (`browser_admission::deployment_status`,
+the digest resolvers) and the mutating mesh arms (`reap-deployments`, domain `detach` and `activate`) still read the raw record
+tag, so after a transfer the old team passes them on a host the row has not reached, up to `HIVE_DEPLOYMENT_RETAG_SECS`;
+`project_owned_by` stays optimistic in the list reads over logs, builds and events; the ledger never drops an entry, so a team
+that recreates a deleted project's name reads the old chains of ids it already knows; `/v1/deployments/:id/integrity` has no
+`gossip::dispatch` arm, so a node reaches a peer's chain only over its HTTP admin URL. The cross-node hop was not witnessed: two
+loopback nodes did not converge state, and the non-hosting node answered the owner 404 on the pre-fix binary as well. Not
+rolled.
+
 ## 2026-10-14 — billing, DNS, database delete, edge security, the SMS provider and the repository link are offered to an admin only, and the link refuses a member before it creates a repository (979c91b7b1)
 
 `roles.rs` (`3e737fa9c6`) made a write nobody lists ADMIN and named every member route, so billing checkout, confirm and
