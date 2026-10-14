@@ -53,7 +53,7 @@ function requestOnce(url: URL, headers: Record<string, string>, signal: AbortSig
       resolve,
     );
     outgoing.once("timeout", () => outgoing.destroy(new Error("upstream timed out")));
-    outgoing.once("error", reject);
+    outgoing.on("error", reject);
     outgoing.end();
   });
 }
