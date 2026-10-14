@@ -62,8 +62,9 @@ fn is_platform_loopback_shim(raw: &str) -> bool {
 /// Resolved world connection for a project: (rest_url, token, key_prefix).
 ///
 /// The URL comes from the project's env, which a TENANT writes, so a loopback one is trusted ONLY
-/// when it is exactly the REST URL recorded on the project's own managed Redis database that this
-/// node hosts (`DatabaseStore::local_redis_rest_url`): the env may name the platform's sidecar, it
+/// when it is exactly the REST URL recorded on ONE of the project's own managed Redis databases that
+/// this node hosts (`DatabaseStore::local_redis_rest_urls`; each database's egress overwrites the
+/// env key, so with two the env names the last one): the env may name the platform's sidecar, it
 /// can never introduce a loopback destination (confirmed live: a tenant-set
 /// `WORKFLOW_REDIS_REST_URL=http://127.0.0.1:<port>` made the control plane POST, with the tenant's
 /// bearer, to any listener on this host — admin ports, other tenants' sidecars). Any other loopback
@@ -84,8 +85,8 @@ fn world_config(cloud: &Arc<CloudState>, project: &str) -> Option<(String, Strin
         let team = cloud.projects.team_of(project);
         let owned = cloud
             .databases
-            .local_redis_rest_url(project, &team, &cloud.node_name);
-        if owned.as_deref() != Some(url.as_str()) {
+            .local_redis_rest_urls(project, &team, &cloud.node_name);
+        if !owned.iter().any(|own| own == &url) {
             return None;
         }
     }
@@ -102,8 +103,8 @@ const WORLD_REPLY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 /// Resolves a world Redis-REST URL to (parsed URL, client). Two shapes reach here, both already
 /// vetted by [`world_config`]: the platform's OWN locally-provisioned managed-redis sidecar
-/// (`databases.rs::provision_redis`, exactly `http://127.0.0.1:<port>`, and only ever the one
-/// recorded on the project's own database), dialed over the no-redirect internal client — it is
+/// (`databases.rs::provision_redis`, exactly `http://127.0.0.1:<port>`, and only ever one
+/// recorded on the project's own databases), dialed over the no-redirect internal client — it is
 /// this host's own loopback, so the full tenant-URL guard (https + public-address-only) would
 /// regress a node whose managed redis has no public/https front door — and a tenant's BYO URL
 /// (`WORKFLOW_REDIS_REST_URL`, or a tenant-set `UPSTASH_REDIS_REST_URL` naming their own external

@@ -564,26 +564,30 @@ impl DatabaseStore {
             .cloned()
     }
 
-    /// The REST URL of `project`'s OWN managed Redis database, read from the database RECORD: the one
-    /// source the world client may dial over loopback (`provision_redis` writes
-    /// `http://127.0.0.1:<port>` there on a node with no db host). A project env var is
-    /// tenant-writable, so it may only NAME this URL, never introduce a loopback destination.
+    /// The REST URLs of ALL of `project`'s OWN managed Redis databases hosted on `node`, read from the
+    /// database RECORDS: the only sources the world client may dial over loopback (`provision_redis`
+    /// writes `http://127.0.0.1:<port>` there on a node with no db host). A project env var is
+    /// tenant-writable, so it may only NAME one of these URLs, never introduce a loopback
+    /// destination. Every managed Redis database's egress writes its own `UPSTASH_REDIS_REST_URL`
+    /// into the project env (the last attached wins the key), so with several databases the env
+    /// names any one of them: a record of the project is as good as another, none is "the" URL.
     /// `team` must be the project's current owner (a database registered for a not-yet-existing
     /// project name by another tenant is not this project's) and `node` must host the database (a
     /// loopback URL means this host's own port: a record hosted elsewhere names a port that is some
     /// other service here).
-    pub fn local_redis_rest_url(&self, project: &str, team: &str, node: &str) -> Option<String> {
+    pub fn local_redis_rest_urls(&self, project: &str, team: &str, node: &str) -> Vec<String> {
         self.dbs
             .read()
             .iter()
-            .find(|d| {
+            .filter(|d| {
                 d.kind == DbKind::Redis
                     && d.project == project
                     && crate::admin::norm(&d.team) == crate::admin::norm(team)
                     && d.host_node == node
             })
-            .and_then(|d| d.connection.get("UPSTASH_REDIS_REST_URL"))
+            .filter_map(|d| d.connection.get("UPSTASH_REDIS_REST_URL"))
             .map(|u| u.trim().trim_end_matches('/').to_string())
+            .collect()
     }
 
     /// Unmasked connection for trusted internal consumers.
