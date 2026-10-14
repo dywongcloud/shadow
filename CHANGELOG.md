@@ -1,5 +1,69 @@
 # Changelog
 
+## 2026-10-13 — mesh-RPC team scoping, sandbox cap/isolation, API-key role gates, project_preview redirects
+
+Four findings from an adversarial review landed together in admin.rs (a705fe33c3): `require_mesh_rpc(.., None)`
+accepted a mesh-internal delegation minted for ANY tenant's own team on `node_announce_public`/`push_sms_relay`/
+`push_sms_direct_mx` (fleet-wide RPCs with no per-tenant meaning) — now `Some("mesh")`, no real sender affected.
+`/v1/sandbox` now refuses outright (503) on a Mock backend, which previously ran every command on the HOST's own
+`/bin/sh` with zero isolation; separately its per-tenant cap was released by the HTTP request's Drop guard, not the
+submitted job, so six dropped connections left six live cells while the cap still showed room — the slot now moves
+into a detached watcher tied to the job's own terminal state. `apikey_revoke` and `project_env_put`/`_delete` had no
+role gate beyond tenancy (a bare viewer could revoke the team's owner key or write/clear env vars); both now call
+`require_team` with an explicit floor. `project_preview` now fetches through `same_origin_client()` instead of the
+bare 10-redirect client, so a tenant's own previewed app can no longer redirect that server-side fetch to an
+internal address and have the body echoed back as "preview". Witnessed live on a throwaway auth-enforced node for
+all four; operator note: a viewer/member key doing any of these now gets 403/503 instead of succeeding.
+
+## 2026-10-13 — workflow/cron step invoker no longer lets a step path redirect to an arbitrary host (1ddd73eaab)
+
+`main.rs::invoke` built its request URL as `format!("{public_base}{path}")` with `path` a tenant-controlled workflow
+step field; a step path `@127.0.0.1:PORT/x` made the node GET an internal listener with the body returned in the run
+output (confirmed live). Fixed via `Url::join` plus an explicit same-authority check, over `same_origin_client()`.
+
+## 2026-10-13 — outbound guard closes a SIIT address gap and refuses its own dev escape on an enforced node (cc55b1a4f5)
+
+`is_public`'s IPv6 handling recognized standard v4-mapped and NAT64 embeddings but not SIIT's `::ffff:0:a.b.c.d`
+form, which read as public regardless of the embedded v4 address. `HIVE_OUTBOUND_ALLOW_PRIVATE=1` is now refused
+outright on a node with auth enforced (mirrors `HIVE_JWT_SECRET` set) and logs a boot WARN either way.
+
+## 2026-10-13 — web-push endpoint allow-list parses the URL instead of hand-splitting it (66873f7b1f)
+
+`allowed_push_host` read everything before the first `:` after `://` as the host, which is exactly what userinfo
+looks like: `https://fcm.googleapis.com:x@127.0.0.1:PORT/ep` passed the allow-list while dialing the attacker's own
+loopback listener (confirmed live). Now parses with the real URL parser and refuses any userinfo outright; the send
+path also re-validates through `hive_outbound` at send time instead of trusting the subscribe-time check alone.
+
+## 2026-10-13 — edge forward never follows a redirect and no longer lets a visitor's request path redirect the candidate dial (fe27627bd2)
+
+The HTTP-direct forward leg and `spawn_revalidate` used the bare 10-redirect shared client, so a deployment
+candidate's 3xx was followed server-side (SSRF) instead of relayed to the visitor's own browser; both now use
+`hive_outbound::internal_client()`/`same_origin_client()`. The forward leg's URL was also `format!`-built from the
+visitor's own request path, vulnerable to the same userinfo/authority-override class the queue-consumer and
+cron/workflow-step fixes close — rebuilt via `Url::join` plus a same-authority check.
+
+## 2026-10-13 — world-redis cmd/pipeline route through the outbound guard without breaking the platform's own managed-redis sidecar (c6bcee01ed)
+
+`cmd`/`pipeline` dialed a tenant-settable Redis-REST URL through a bare client with no guard at all. Now resolved
+through `resolve_world_endpoint`: the platform's own `provision_redis` loopback shim (exact shape match) goes over
+`internal_client()`, anything else through the full `hive_outbound` guard — fixing what would otherwise have been a
+regression (the guard alone would refuse the platform's own loopback http sidecar). `deliver_orphan_job` now reuses
+the hardened `deploy_url` instead of hand-building its host string.
+
+## 2026-10-13 — inference model download goes through the outbound guard, a size cap, a generic error, and a content-addressed cache name (20cd9a7ad2)
+
+`ensure_model` downloaded a tenant-controlled `fluid.json` model ref through an unguarded client with no size bound
+and an error that echoed the raw upstream status back to the caller (an oracle for internal addresses). Now
+`hive_outbound::validate_fetch_url`/`following_client()`, a `HIVE_INFERENCE_MAX_MODEL_BYTES` cap (default 200 GiB)
+checked against both `Content-Length` and the running byte count, two fixed generic error strings, and a cache
+filename keyed by the BLAKE3 digest of the downloaded bytes themselves (hashed incrementally) rather than an FNV
+hash of the URL, which was not collision-resistant.
+
+## 2026-10-13 — `shadw keys create` defaults to a role every team role can mint (dc79d6746a)
+
+The CLI's `--role` default was "owner", which 403'd for every member/admin caller once the API-key role matrix
+started enforcing "no higher than the caller's own role" (ccd6714edb). Default changed to "member".
+
 ## 2026-10-13 — the preview unlock binds the proof's team to the project's owner and `next` cannot leave the origin (f8ad2eadbb)
 
 `zkauth::bootstrap` (`GET /_shadw/zk` on a preview host) verified a membership proof against whichever
