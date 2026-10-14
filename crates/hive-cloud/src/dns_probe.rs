@@ -411,6 +411,13 @@ async fn doh_answer(
     else {
         return Answer::Unavailable;
     };
+    // An HTTP error is this vantage having no opinion, whatever its body says. Without this the
+    // body is parsed anyway, and one that is valid JSON with no `Status` reads as "answered, zero
+    // records" — an erroring resolver casting a veto instead of an abstention, the exact failure
+    // the quorum exists to prevent.
+    if !resp.status().is_success() {
+        return Answer::Unavailable;
+    }
     let Ok(v) = resp.json::<serde_json::Value>().await else {
         return Answer::Unavailable;
     };
