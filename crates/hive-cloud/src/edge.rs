@@ -810,23 +810,15 @@ async fn edge_pipeline_inner(
                         break 'cands;
                     }
                     attempted = true;
-                    // `path_q` is the VISITOR's own request path+query, a raw TCP client can put
-                    // almost anything in it (the HTTP request-line grammar allows `@`/`:` in a
-                    // path segment), so it is joined onto the gossiped `cand.gateway` base via
-                    // `Url::join` (never `format!`) and the result is required to stay on that
-                    // exact authority — the same userinfo/authority-override class of bug the
-                    // queue-consumer and cron/workflow-step fixes close, here on the path a hostile
-                    // visitor controls instead of a tenant config field. `cand.gateway` is this
-                    // node's own gossiped routing table, never attacker input.
+                    // `path_q` is the VISITOR's own request path+query: a raw TCP client can put
+                    // almost anything in it (the HTTP request-line grammar allows `@`/`:`/`//` in a
+                    // path), so it is set as the PATH and QUERY of the gossiped `cand.gateway`
+                    // base (`with_request_target`), never concatenated into a URL string and never
+                    // resolved as a reference: the authority cannot change by construction, and a
+                    // legitimate `//assets/x.js` request still reaches the backend as that path.
                     let Some(url) = reqwest::Url::parse(cand.gateway.trim_end_matches('/'))
                         .ok()
-                        .and_then(|base| {
-                            let joined = base.join(&path_q).ok()?;
-                            (joined.scheme() == base.scheme()
-                                && joined.host_str() == base.host_str()
-                                && joined.port_or_known_default() == base.port_or_known_default())
-                            .then_some(joined)
-                        })
+                        .map(|base| with_request_target(base, &path_q))
                     else {
                         continue;
                     };
@@ -1483,24 +1475,39 @@ fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: Cache
     resp
 }
 
+/// `base` with a request target (`path[?query]`, the visitor's own) set as its PATH and QUERY.
+///
+/// The visitor controls this string, so it is never formatted into a URL (a leading `@`/`#`/`:`
+/// would become userinfo, a fragment or a port) and never resolved as a URL REFERENCE (`Url::join`
+/// treats a `//host/..` target as a network-path reference that replaces the authority, and an
+/// ordinary `//assets/x.js` request, which sloppy asset-URL joins really do produce, would then
+/// be refused or misrouted). `set_path` takes the whole string as a path on the unchanged
+/// authority, so the destination cannot move; dot segments and percent-encoding are normalized
+/// exactly as `Url::parse` does for the previous concatenated form. A path prefix on `base`
+/// (a gateway served below a prefix) is kept.
+fn with_request_target(mut base: reqwest::Url, path_q: &str) -> reqwest::Url {
+    let (path, query) = match path_q.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path_q, None),
+    };
+    let joined = format!("{}{}", base.path().trim_end_matches('/'), path);
+    base.set_path(&joined);
+    base.set_query(query);
+    base
+}
+
 /// Background stale-while-revalidate refresh through our own gateway. Every early return is a
 /// FAILED revalidation and must call `note_revalidation_failed`, keeping the stale entry and
 /// engaging the 30 s retry backoff instead of letting the next request re-fire a refresh.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
-        // `path_q` is the original cached REQUEST's path+query (visitor-derived); joined onto
-        // `public_base` via `Url::join` and required to stay on that authority, the same guard as
-        // `invoke`'s cron/workflow-step fix, never a raw `format!` a crafted path could redirect.
-        let target = reqwest::Url::parse(&cloud.public_base)
+        // `path_q` is the original cached REQUEST's path+query (visitor-derived): set as the path
+        // and query of `public_base` (`with_request_target`), the same construction as the
+        // forward leg, never a raw `format!` a crafted path could redirect.
+        let Some(target) = reqwest::Url::parse(&cloud.public_base)
             .ok()
-            .and_then(|base| {
-                let joined = base.join(&path_q).ok()?;
-                (joined.scheme() == base.scheme()
-                    && joined.host_str() == base.host_str()
-                    && joined.port_or_known_default() == base.port_or_known_default())
-                .then_some(joined)
-            });
-        let Some(target) = target else {
+            .map(|base| with_request_target(base, &path_q))
+        else {
             cloud.cdn.note_revalidation_failed(&key);
             return;
         };
@@ -1745,7 +1752,12 @@ fn preview_gate(
         if let Some(submitted) = query_param(query, "__shadw_pw") {
             if cloud.enterprise.verify_password(project, &submitted) {
                 let cookie = cloud.enterprise.seal_password_cookie(project, &submitted);
-                let mut resp = axum::response::Redirect::temporary(path).into_response();
+                // `path` is the visitor's own request path: a `//host/..` or `/\host` one would
+                // make this Location protocol-relative to another host. Only a same-origin path
+                // is a safe redirect target (anything else lands on the site root).
+                let mut resp =
+                    axum::response::Redirect::temporary(crate::auth::same_origin_path(path, "/"))
+                        .into_response();
                 set(
                     &mut resp,
                     "set-cookie",
@@ -1775,11 +1787,11 @@ fn preview_gate(
                 project,
             );
             cloud.record(ev);
-            return Some(password_page(project, path, region, true));
+            return Some(password_page(project, region, true));
         }
         let ev = cloud.event(region, method, host, path, 401, "deploy-password", project);
         cloud.record(ev);
-        return Some(password_page(project, path, region, false));
+        return Some(password_page(project, region, false));
     }
 
     let team = cloud.projects.team_of(project);
@@ -1852,16 +1864,37 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         .find_map(|kv| kv.strip_prefix(&prefix).map(|v| percent_decode(v)))
 }
 
+/// Escapes text for an HTML text node or a quoted attribute value.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Vercel-style deployment-password prompt: a self-contained page that GET-submits `__shadw_pw`
-/// back to the same path (the gate seals a cookie and redirects); `bad` shows the
+/// back to the document's own URL (the gate seals a cookie and redirects); `bad` shows the
 /// incorrect-password state.
-fn password_page(project: &str, path: &str, region: &str, bad: bool) -> Response {
+///
+/// The form deliberately has NO `action`: an absent action submits to the current URL, so the
+/// visitor's own request path (attacker-controlled: a `//evil.example/..` path or one with a `"` in
+/// it, which the request-line parser tolerates) is never interpolated into the page — as an
+/// `action="{path}"` it sent the typed password to another host and broke out of the attribute.
+fn password_page(project: &str, region: &str, bad: bool) -> Response {
     let err = if bad {
         "<p style=\"color:#f87171;font-size:13px;margin:0 0 12px\">Incorrect password. Try again.</p>"
     } else {
         ""
     };
-    let action = path;
+    let project = html_escape(project);
     let html = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1879,7 +1912,7 @@ fn password_page(project: &str, path: &str, region: &str, bad: bool) -> Response
 <h1>This deployment is password protected</h1>
 <p class="sub">Enter the password for <strong>{project}</strong> to continue.</p>
 {err}
-<form method="GET" action="{action}">
+<form method="GET">
   <input type="password" name="__shadw_pw" placeholder="Password" autofocus autocomplete="current-password" required>
   <button type="submit">Continue</button>
 </form>
