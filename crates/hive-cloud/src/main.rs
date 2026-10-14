@@ -1,9 +1,7 @@
-//! `hive-cloud` — one node of a unified, multi-MacBook cloud.
-//!
-//! A single binary that runs, behind one public gateway + one admin API:
-//! builds & sandbox (Hive control plane), serving with Fluid compute, an edge
-//! pipeline (WAF, bot management, CDN), cron, workflows, previews, and a
-//! region-aware node registry that meshes with peer nodes over HTTP gossip.
+//! `hive-cloud`: one node of the Hive cloud. A single binary runs, behind one public gateway and
+//! one admin API, the control plane (builds, sandboxes), Fluid compute serving, the edge pipeline
+//! (WAF, bot management, CDN), cron, workflows, previews and a region-aware node registry that
+//! meshes with its peers.
 
 mod acme;
 mod admin;
@@ -18,7 +16,6 @@ mod browser_artifacts;
 mod browser_esm;
 mod browser_db;
 mod browser_db_rest;
-// bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
 mod browser_metering;
 mod browser_presence;
 mod build_coordinates;
@@ -151,9 +148,13 @@ use hive_edge::{
 
 use state::CloudState;
 
-/// The embedded relay's `AccessControl` (bn-p2p-revocation-latency) — see the
-/// doc comment at its construction site (in `main`, right before the relay is
-/// spawned) for why it's denylist-shaped and why `cloud` is a deferred cell.
+/// The embedded relay's `AccessControl`: denylist-shaped, so it denies only the (handshake-PROVEN)
+/// endpoint ids that this node's `browser_admissions` store has revoked and allows everyone else,
+/// every fleet node relaying through the same server included. Routing-layer revocation only stops
+/// NEW invocations from picking a revoked target; this is what keeps a revoked browser endpoint
+/// from reconnecting and sitting on the relay. `cloud` is a deferred cell because the relay starts
+/// before `CloudState` exists; it holds a `Weak` so this impl never keeps `CloudState` alive, and
+/// while the cell is unfilled or already dropped the relay fails OPEN.
 #[derive(Debug)]
 struct BrowserRelayAccess {
     cloud: Arc<std::sync::OnceLock<std::sync::Weak<CloudState>>>,
@@ -165,10 +166,6 @@ impl iroh_relay::server::AccessControl for BrowserRelayAccess {
         request: &iroh_relay::server::ClientRequest,
     ) -> iroh_relay::server::Access {
         let Some(cloud) = self.cloud.get().and_then(|w| w.upgrade()) else {
-            // Either CloudState isn't constructed yet (a connection landing in
-            // the narrow startup window) or it has already been dropped
-            // (shutdown) — fail open, matching this relay's existing
-            // best-effort convention.
             return iroh_relay::server::Access::Allow;
         };
         let endpoint_id = request.endpoint_id().to_string();
@@ -184,35 +181,25 @@ impl iroh_relay::server::AccessControl for BrowserRelayAccess {
     }
 }
 
-// Heap profiling, Linux only. jemalloc replaces the system allocator so a heap
-// profile can be taken from a LIVE node, which is the capability whose absence
-// left the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon before the kernel killed
-// it) permanently un-root-caused: nothing on the node could answer "which
-// allocation site is growing?".
-//
-// `prof:true` compiles the machinery in; `prof_active:false` leaves it OFF, so
-// the steady-state cost is jemalloc-vs-system-malloc and nothing more — no
-// sampling, no per-allocation bookkeeping. Sampling is enabled at runtime via
-// the admin endpoint (see `admin::heap_profile`), against the one node actually
-// misbehaving, with no rebuild and no restart. lg_prof_sample:19 = sample every
-// ~512KiB, the usual production-safe default.
+/// Linux builds run on jemalloc with the profiler compiled in but switched off (`malloc_conf`
+/// below), so a heap profile can be taken from a live node (`admin::heap_profile` turns sampling
+/// on) with no rebuild or restart; the steady-state cost is jemalloc versus system malloc and
+/// nothing more.
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// `prof:true` compiles the profiler in and `prof_active:false` keeps it off (no sampling, no
+/// per-allocation bookkeeping); `lg_prof_sample:19` samples about every 512 KiB, the usual
+/// production-safe rate.
 #[cfg(target_os = "linux")]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]
 pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
 
-/// The public HTTPS listener's `axum_server::Handle`, set once at listener
-/// startup so the SIGTERM handler (defined earlier in `main`, run before the
-/// listener spawns in source order but racing it at runtime) can reach it
-/// without threading an extra parameter through every intervening call. A
-/// `OnceLock` rather than a plain global `Handle` because the listener is only
-/// created in the `cloud.ingress != "ngrok"` branch — ngrok ingress has no
-/// public listener here to drain, and the shutdown handler already treats
-/// "not set" as that case, not an error.
+/// The public HTTPS listener's `axum_server::Handle`, set once when the listener starts so the
+/// SIGTERM handler can drain it. Unset under ngrok ingress, which has no listener here; the
+/// shutdown path treats that as "nothing to drain", not an error.
 static SHUTDOWN_HTTPS_HANDLE: std::sync::OnceLock<axum_server::Handle> = std::sync::OnceLock::new();
 
 #[repr(u8)]
@@ -221,9 +208,8 @@ pub(crate) enum RestartReason {
     MemoryPressure = 1,
     MeshIsolation = 2,
     MeshDegradation = 3,
-    /// meshwatch's `establishment_wedge` trigger: the endpoint stopped
-    /// forming new connections in either direction while the fleet stayed
-    /// audible over warm trunks.
+    /// meshwatch's `establishment_wedge` trigger: the endpoint stopped forming new connections in
+    /// either direction while warm trunks kept the fleet audible.
     EstablishmentWedge = 4,
 }
 
@@ -249,13 +235,12 @@ impl RestartReason {
         }
     }
 
-    /// The per-reason restart policy: at most `(cap, window_ms)` restarts for
-    /// this reason, counted from `restart_history.json`; `None` = uncapped.
-    /// Memory pressure is uncapped because the kernel ends that process
-    /// anyway. The isolation and degradation triggers each re-arm only after
-    /// the NEW process converged (or saw a peer, or ran its boot budget), so
-    /// their own guards already space them; the establishment trigger has no
-    /// such re-arming state, so the cap is its loop guard.
+    /// The per-reason restart policy: at most `cap` restarts inside `window_ms`, counted from
+    /// `restart_history.json` across boots ([`ControlledRestart::request`] persists the reason
+    /// before the graceful tail starts); `None` = uncapped. Memory pressure is uncapped because the
+    /// kernel ends that process anyway; the isolation and degradation triggers re-arm only after
+    /// the NEW process converged (or saw a peer, or ran its boot budget), so only the establishment
+    /// trigger needs the cap as its loop guard.
     fn rate_cap(self) -> Option<(usize, u64)> {
         match self {
             Self::MemoryPressure | Self::MeshIsolation | Self::MeshDegradation => None,
@@ -263,21 +248,13 @@ impl RestartReason {
         }
     }
 
-    /// Whether an automatic restart for this reason may happen NOW — the gates
-    /// every trigger shares, checked in the one chokepoint
-    /// ([`ControlledRestart::request`]) so no current or future trigger can
-    /// skip them. `Err` names the first that holds it back.
-    ///
-    /// 1. The cell-orphan interlock (every reason but memory pressure, which
-    ///    ends the process whatever is decided here): until
-    ///    `hive_backend::orphan_reap_ran()` confirms this boot's reap, a
-    ///    restart adds one more concurrent writer per stateful tenant volume
-    ///    (the reap runs at the NEXT boot only for cells it can attribute).
-    ///    False on macOS by design and when `HIVE_CELL_ORPHAN_REAP=0`, so
-    ///    those nodes only WARN.
-    /// 2. The reason's [`rate_cap`](Self::rate_cap), which fails CLOSED when
-    ///    the persisted history cannot be trusted
-    ///    (`restart_audit::controlled_restarts_within`).
+    /// Whether an automatic restart for this reason may happen NOW; `Err` names the first shared
+    /// gate that holds it back. [`ControlledRestart::request`] is the one chokepoint, so no current
+    /// or future trigger can skip them: the cell-orphan interlock
+    /// (`hive_backend::orphan_reap_ran()`, false on macOS and under `HIVE_CELL_ORPHAN_REAP=0`, so
+    /// those nodes only WARN; exempt for memory pressure, which ends the process anyway), then the
+    /// reason's [`rate_cap`](Self::rate_cap), which fails CLOSED when the persisted history cannot
+    /// be trusted.
     pub(crate) fn admissible(self) -> Result<(), String> {
         if !matches!(self, Self::MemoryPressure) && !hive_backend::orphan_reap_ran() {
             return Err(
@@ -323,10 +300,9 @@ impl ControlledRestart {
         }
     }
 
-    /// Request the controlled exit-17 for `reason`. `false` when refused —
-    /// by [`RestartReason::admissible`] (with a WARN at most once per 5 min
-    /// per reason) or because another reason already won the latch — and
-    /// the caller keeps watching.
+    /// Request the controlled exit-17 for `reason`; `false` when [`RestartReason::admissible`]
+    /// refuses (WARN at most once per 5 min per reason) or another reason already won the latch,
+    /// and the caller keeps watching.
     pub(crate) fn request(&self, reason: RestartReason) -> bool {
         if let Err(blocker) = reason.admissible() {
             use std::sync::atomic::AtomicU64;
@@ -363,9 +339,6 @@ impl ControlledRestart {
         {
             return false;
         }
-        // Persist the reason before the graceful tail starts: the next boot's
-        // restart record carries it, so per-reason rate caps count restarts
-        // across the very process boundaries they limit.
         restart_audit::note_controlled_restart(reason.as_str());
         self.inner.notify.notify_one();
         true
@@ -376,10 +349,9 @@ impl ControlledRestart {
         RestartReason::from_u8(state & Self::REASON_MASK)
     }
 
-    /// Atomically close the request latch and consume the winning reason. A
-    /// watchdog racing this boundary either wins before the seal and changes
-    /// the exit code, or observes the sealed state and reports `false`; it can
-    /// never report a successful request after main committed to exit zero.
+    /// Atomically closes the request latch and consumes the winning reason: a watchdog racing this
+    /// boundary either wins before the seal and changes the exit code, or sees the sealed state and
+    /// gets `false`, never a successful request after main committed to exit zero.
     fn seal(&self) -> Option<RestartReason> {
         let state = self
             .inner
@@ -516,33 +488,30 @@ struct Args {
     guardian_writer_cadence_diagnostic: bool,
 }
 
-// Explicit runtime instead of #[tokio::main] for ONE reason: worker stack
-// size. run_build's async pipeline compiles to poll frames large enough to
-// blow tokio's default 2 MiB worker stack — witnessed live: every deploy on a
-// debug binary died `thread 'tokio-rt-worker' has overflowed its stack` the
-// moment the build task started (the CI acceptance node crashed on its first
-// deploy, red since f75aa2c5), and release binaries sit close enough to the
-// edge that the same class killed nodes under real load. 16 MiB is virtual
-// address space per worker, not resident memory — pages are only committed
-// when touched — so the cost is nil and the whole failure class is gone.
+/// Tokio worker stack size, the one reason for an explicit runtime instead of `#[tokio::main]`:
+/// `run_build`'s async pipeline compiles to poll frames large enough to overflow tokio's default 2
+/// MiB worker stack (every deploy on a debug binary died
+/// `thread 'tokio-rt-worker' has overflowed its stack`, and release binaries sit close enough to
+/// the edge that the same class killed nodes under real load). It is virtual address space per
+/// worker, committed only when touched, so it costs nothing.
+const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
 fn main() -> anyhow::Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(16 * 1024 * 1024)
+        .thread_stack_size(WORKER_STACK_BYTES)
         .build()
         .expect("build tokio runtime")
         .block_on(async_main())
 }
 
-/// Whether a Seer bind is reachable by external resolvers on :53.
-///
-/// Requiring a literal `0.0.0.0`/`::`/`[::]` bind silently disqualified a node
-/// bound to its OWN address behind 1:1 NAT — the only bind that leaves wildcard
-/// :53 free for netavark/aardvark-dns, which is what lets the isolated
-/// BuildExecutor be provisioned. Such a node answers correctly through NAT yet
-/// vanished from the geo/api NS set, so the reconciler reported few proven
-/// nameservers and HELD the delegation. Loopback/dev binds must still never
-/// count: advertising one would publish a black hole in the delegated zone.
+/// Whether a Seer bind is reachable by external resolvers on :53: a wildcard bind, or a specific
+/// non-loopback address while `HIVE_PUBLIC_IP` is set (the platform publishes it, and without a
+/// public IP nothing forwards :53 to this node). The specific-address case matters: it is the only
+/// bind that leaves wildcard :53 free for netavark/aardvark-dns, which provisioning the isolated
+/// BuildExecutor needs, and requiring a wildcard bind silently dropped such nodes from the geo/api
+/// NS set, so the reconciler HELD the delegation. Loopback and dev binds never count: advertising
+/// one would publish a black hole in the delegated zone.
 fn dns_bind_reaches_internet(addr: &str) -> bool {
     if addr.rsplit(':').next() != Some("53") {
         return false;
@@ -554,12 +523,46 @@ fn dns_bind_reaches_internet(addr: &str) -> bool {
     if host == "0.0.0.0" || host == "::" || host == "[::]" {
         return true;
     }
-    // A specific non-loopback address is reachable only because the platform
-    // publishes it: without a public IP nothing forwards :53 to this node.
     std::env::var("HIVE_PUBLIC_IP")
         .map(|value| !value.trim().is_empty())
         .unwrap_or(false)
 }
+
+/// The gateway URL this node gossips as `gateway`, which peers use for HTTP mesh routing:
+/// `HIVE_PUBLIC_IP` when set, because the `--listen` bind address (usually 0.0.0.0) would make
+/// every cross-node proxy dial localhost and silently break the mesh.
+fn gateway_base_url(args: &Args) -> String {
+    let port = args.listen.port();
+    match std::env::var("HIVE_PUBLIC_IP")
+        .ok()
+        .map(|s| s.trim().to_string())
+    {
+        Some(v) if !v.is_empty() && v != "0.0.0.0" => format!("http://{}:{}", v, port),
+        _ => format!("http://{}", args.listen),
+    }
+}
+
+/// Installs the process-level rustls `CryptoProvider` (ring). It must run before any rustls user:
+/// the dependency tree links both `ring` and `aws-lc-rs`, so rustls cannot pick a default on its
+/// own and a task that gets there first panics (witnessed on the ngrok-ingress path, where the dead
+/// task leaked a redb open handle and wedged guardian init until the next restart). Later installs
+/// are idempotent no-ops.
+fn install_ring_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+/// Per-client relay ingress backstop (`HIVE_RELAY_CLIENT_BPS`, `0` disables), far above what a
+/// relayed control-plane peer or tunnel pulls, so only an abusive client is clipped. The relay is
+/// public-facing and browser/WASM iroh clients are relay-ONLY by construction, so their traffic
+/// always lands on it.
+const RELAY_CLIENT_BYTES_PER_SECOND: u64 = 16 * 1024 * 1024;
+/// Burst allowance as a multiple of the steady relay rate, so a short legitimate spike (a deploy
+/// artifact moving over a relayed trunk) is not clipped.
+const RELAY_CLIENT_BURST_FACTOR: u32 = 2;
+/// Default hard deadline for the whole graceful stop (`HIVE_SHUTDOWN_DEADLINE_SECS`); it must stay
+/// below systemd's `TimeoutStopSec` (90 s in hive-node.service) so the exit is ours, never
+/// SIGKILL's.
+const SHUTDOWN_DEADLINE_DEFAULT_SECS: u64 = 75;
 
 async fn async_main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -567,18 +570,8 @@ async fn async_main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
-    // The runtime stall detector runs on its own OS thread from the first
-    // moment the runtime exists, before any store or loop: a freeze during boot
-    // is attributed too. See `runtime_watch`.
     runtime_watch::spawn(tokio::runtime::Handle::current());
-    // Install the process-level rustls CryptoProvider FIRST (later installs
-    // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
-    // rustls features, so any rustls user that runs before one of the lazy
-    // installs in spawned tasks panics "Could not automatically determine the
-    // process-level CryptoProvider" — witnessed at boot on the ngrok-ingress
-    // path, where the panicking task leaked a redb open handle and wedged
-    // guardian init ("Database already open") until the next restart.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_ring_crypto_provider();
     let args = Args::parse();
 
     #[cfg(debug_assertions)]
@@ -592,9 +585,6 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Operator diagnostic — answered and exited BEFORE any node state exists,
-    // so it can be run safely from a laptop, a bastion or a live fleet node
-    // without joining the mesh or touching a port.
     if !args.dns_probe.is_empty() {
         return dns_probe::run_cli(&args.dns_probe).await;
     }
@@ -693,37 +683,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // Restart audit — FIRST thing after the diagnostics, before any subsystem
-    // can wedge or overwrite state. A node killed by the cgroup OOM killer is
-    // restarted by systemd within a second and the platform records NOTHING:
-    // the killed process cannot log its own death and the new one starts
-    // clean, so the only evidence is a kernel line in `dmesg` on that host.
-    // Measured cost of that silence: a node cycling every 2-3h presented as
-    // "random unhealthy nodes" for a whole session, with every downstream
-    // symptom investigated separately. This reads the previous run's marker,
-    // reaches a verdict, and says so loudly. Pure local file I/O — it cannot
-    // fail the boot. See restart_audit.rs.
     restart_audit::audit_boot(&args.name);
 
-    // Shared isolation backend: a ranked chain, Firecracker -> Litebox -> Mock.
-    // `HIVE_FORCE_MOCK=1` suppresses Firecracker specifically (its ORIGINAL,
-    // still-preserved purpose: fc-frankfurt sets this because its `/dev/kvm` +
-    // firecracker binary both pass the existence check below while a real
-    // microVM *boot* has hard-reset that host three times — see AGENTS.md's
-    // "PVM kernels" section). It does NOT mean "force mock no matter what":
-    // when a verified Litebox backend is available it is a strictly better
-    // fallback than the mock's zero isolation, so it is tried first. A node
-    // with no Litebox binary/verification falls through to mock exactly as
-    // before — zero behavior change for every node except one deliberately
-    // opted in via `HIVE_LITEBOX_VERIFIED=1`.
-    let force_mock = std::env::var("HIVE_FORCE_MOCK")
+    let firecracker_suppressed = std::env::var("HIVE_FORCE_MOCK")
         .map(|v| v == "1")
         .unwrap_or(false);
-    // Guest kernel cmdline override. Some hosts need extra args — e.g. PVM
-    // (software-virtualized KVM on a cloud VM) wants the i8042 probes disabled:
-    //   HIVE_FC_BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off i8042.noaux \
-    //     i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/sbin/hive-cell-agent"
-    // Must keep `init=/sbin/hive-cell-agent` so the cell agent runs as PID 1.
     let mut fc_cfg = FirecrackerConfig::default();
     if let Ok(ba) = std::env::var("HIVE_FC_BOOT_ARGS") {
         if !ba.trim().is_empty() {
@@ -733,28 +697,12 @@ async fn async_main() -> anyhow::Result<()> {
     let firecracker = Arc::new(FirecrackerBackend::new(fc_cfg.clone()));
     let firecracker_runtime_capabilities =
         resources::RuntimeCapabilitySource::firecracker(firecracker.clone(), &fc_cfg);
-    // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
-    // backend — gossiped so the placement scheduler only auto-targets
-    // production isolation backends (never the local/mock Mac nodes).
-    let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
-    // Litebox Tier 2: NEVER auto-detected live (see `LiteboxBackend::smoke_test`'s
-    // doc comment and AGENTS.md's PVM two-tier precedent) — an operator runs
-    // `--litebox-probe` once during bring-up on an idle node and only then
-    // sets `HIVE_LITEBOX_VERIFIED=1`. Tier 1 (`is_supported`, existence-only)
-    // still gates it so a verified-elsewhere env var copied onto a node that
-    // never got the runner binary staged doesn't silently no-op into mock.
+    let sandbox_fc_supported = firecracker.is_supported() && !firecracker_suppressed;
     let litebox = Arc::new(LiteboxBackend::default());
     let litebox_verified = std::env::var("HIVE_LITEBOX_VERIFIED")
         .map(|v| v == "1")
         .unwrap_or(false);
     let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
-    // Sandboxes' own backend selection mirrors the main isolation-backend
-    // ranking one step behind (Firecracker -> Litebox -> none, never Mock —
-    // an unsandboxed dev host reports EngineUnavailable instead of a fake
-    // "sandbox" that doesn't isolate anything). `exec_command`/`exec_pty` are
-    // now generic `CellBackend` trait methods (previously Firecracker-only
-    // inherent methods), so this can hold a trait object like every other
-    // subsystem instead of the concrete Firecracker type.
     let sandbox_backend: Option<Arc<dyn CellBackend>> = if sandbox_fc_supported {
         Some(firecracker.clone())
     } else if litebox_supported {
@@ -773,9 +721,6 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
         (firecracker, "firecracker", firecracker_runtime_capabilities)
     } else if litebox_supported {
-        // See `hive_backend::litebox`'s module doc for the full, honest
-        // security posture — this beats mock's zero isolation but is NOT
-        // Firecracker/gVisor-grade; never silently substituted for either.
         tracing::warn!(
             "isolation backend: Litebox (unprivileged syscall sandbox, HIVE_LITEBOX_VERIFIED=1) \
              — real microVMs unavailable/suppressed on this host. NOT a hardware isolation \
@@ -783,9 +728,9 @@ async fn async_main() -> anyhow::Result<()> {
         );
         (litebox, "litebox", litebox_runtime_capabilities)
     } else {
-        if force_mock && !litebox_verified {
+        if firecracker_suppressed && !litebox_verified {
             tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1, no verified Litebox) — runtime is mocked for local development");
-        } else if force_mock {
+        } else if firecracker_suppressed {
             tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — Litebox verified but its runner binary is missing on this host (Tier 1 check failed)");
         } else {
             tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
@@ -795,8 +740,6 @@ async fn async_main() -> anyhow::Result<()> {
                 root: std::env::temp_dir().join("hive-cloud-cells"),
                 provision_latency: Duration::from_millis(200),
                 cache_root: std::env::temp_dir().join("hive-cloud-cache"),
-                // Durable: must survive a hive-node restart, unlike root/cache_root
-                // above. Lives next to the sealed artifacts it describes.
                 receipts_dir: crate::persist::data_dir().join("runtime-artifacts-v1"),
             })),
             "mock",
@@ -805,20 +748,6 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let backend_name = backend_name.to_string();
 
-    // Cell-orphan reap, started BEFORE anything can launch or route to a
-    // cell. With `KillMode=process` every tenant cell survives a hive-cloud
-    // restart and nothing ever adopted it, so each restart left one more running
-    // instance of every stateful project on the same named volume (fc-sanjose:
-    // 511 leaked cells, 64 on one minecraft volume). This process holds zero
-    // cells yet, so every `hive-cell-*` of THIS node (`hive.owner`) from another
-    // boot is an orphan — never a co-hosted process's cell — see
-    // `hive_backend::cell_orphans`. Boot waits (below, right before Fluid can
-    // launch anything) only for the reap's URGENT half — listing plus the
-    // SIGKILL of duplicate writers on a shared volume — and at most
-    // `CELL_REAP_BOOT_WAIT`; geolocation runs meanwhile, and the graceful stops,
-    // removals and confirming re-list finish in the background. Until they do,
-    // `orphan_reap_ran()` is false and every volume-mounting launch runs the
-    // per-volume guard. `HIVE_CELL_ORPHAN_REAP=0` opts out.
     hive_backend::set_cell_owner(&args.name, &crate::persist::data_dir());
     let reap_urgent = if std::env::var("HIVE_CELL_ORPHAN_REAP")
         .map(|v| v.trim() != "0")
@@ -845,23 +774,16 @@ async fn async_main() -> anyhow::Result<()> {
         None
     };
 
-    // Auto-detect this node's real-world location (IP geolocation) so it reports
-    // its true position for the regions map + the function-region picker.
     let geo = geolocate().await;
     if let Some(g) = &geo {
         tracing::info!(city = %g.2, country = %g.3, lat = g.0, lon = g.1, "node geolocated");
     }
-    // The node's REGION reflects where it actually is. When `--region` is left at
-    // the default ("auto"), derive a stable id from the geolocation (e.g. a node
-    // in Los Angeles → "los-angeles") instead of a hard-coded label like "iad1".
-    // Co-located nodes share the id (same region, multiple nodes).
     let region = if args.region == "auto" {
         region_id_from_geo(geo.as_ref())
     } else {
         args.region.clone()
     };
 
-    // The reap's urgent half (see above) before Fluid can cold-start anything.
     if let Some(urgent) = reap_urgent {
         if tokio::time::timeout(CELL_REAP_BOOT_WAIT, urgent).await.is_err() {
             tracing::warn!(
@@ -873,7 +795,6 @@ async fn async_main() -> anyhow::Result<()> {
         }
     }
 
-    // Serving (Fluid) + builds (Hive control plane).
     let fluid = Fluid::start(backend.clone(), FluidConfig::default());
     let gw = Gateway::new(fluid.clone(), args.image.clone());
     let hive = Hive::start(
@@ -885,7 +806,6 @@ async fn async_main() -> anyhow::Result<()> {
         backend.clone(),
     );
 
-    // Edge subsystems.
     let waf = Waf::new();
     let bot = Arc::new(BotManager::new());
     let cdn = Arc::new(CdnCache::new());
@@ -900,38 +820,14 @@ async fn async_main() -> anyhow::Result<()> {
     let router = Router::new();
     let cron = Arc::new(CronScheduler::new());
     let workflows = WorkflowEngine::new();
-    // public_base is gossiped as `gateway` in serve_hosts and used for HTTP mesh
-    // routing between nodes.  Using the `--listen` bind address (usually 0.0.0.0)
-    // makes every cross-node proxy connect to localhost instead of the remote peer,
-    // silently breaking the mesh.  Prefer HIVE_PUBLIC_IP when it is set so the
-    // gateway URL carries a real address other nodes can actually reach.
-    let public_base = {
-        let port = args.listen.port();
-        match std::env::var("HIVE_PUBLIC_IP")
-            .ok()
-            .map(|s| s.trim().to_string())
-        {
-            Some(v) if !v.is_empty() && v != "0.0.0.0" => format!("http://{}:{}", v, port),
-            _ => format!("http://{}", args.listen),
-        }
-    };
+    let public_base = gateway_base_url(&args);
     let cap = resources::capacity();
-    // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
-    // gossip so placement can target GPU hosts for gpu-requesting functions.
     let gpus = resources::detect_gpus();
-    // Observe all three runtime capabilities from the backend that was actually
-    // selected above. Firecracker reuses its provision-time exact-rootfs proof;
-    // Litebox answers only after its selected instance remains supported (and
-    // NEVER advertises Bun regardless — its syscall shim panics on Bun's own
-    // boot probe); Mock never advertises runtime-artifact isolation.
     let runtime_capabilities = runtime_capability_source.detect().await;
     let wasm_rt = runtime_capabilities.wasm_runtime;
     let bun_rt = runtime_capabilities.bun_runtime;
     let runtime_artifact_protocol = runtime_capabilities.runtime_artifact_protocol;
     let build_toolchains = runtime_capabilities.build_toolchains.clone();
-    // A declaration is never enough: initialization re-hashes runsc and the
-    // nft policy, checks the exact network/image/runtime, then executes a real
-    // runsc + quota + nested-Buildah probe. Any fault advertises no capability.
     let build_isolation_protocol = match build_executor::init_installed().await {
         Ok(protocol) => {
             tracing::info!(protocol, "BuildExecutor live probe passed");
@@ -947,16 +843,7 @@ async fn async_main() -> anyhow::Result<()> {
             None
         }
     };
-    // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
-    // node has a real peer id and can serve/accept Hive tunnels across networks.
-    // Best-effort with a timeout: if it can't bind (offline), the node still boots
-    // and the HTTP mesh keeps working.
-    // Persistent iroh identity: a stable EndpointId across restarts so peers' cached
-    // addresses stay valid (enables gossip-over-iroh + retiring SSH tunnels).
     let iroh_key_path = persist::data_dir().join("iroh_secret.key");
-    // Cold-start bootstrap seeds: stable public nodes a wiped/fresh node rendezvous
-    // with over iroh (no SSH, no prior state). From `HIVE_BOOTSTRAP_PEERS` (CSV) or a
-    // `$HIVE_DATA/bootstrap_peers` file. Registered with iroh so seeds dial by NodeId.
     let bootstrap_seeds = {
         let csv = std::env::var("HIVE_BOOTSTRAP_PEERS")
             .ok()
@@ -969,9 +856,6 @@ async fn async_main() -> anyhow::Result<()> {
         csv.map(|c| hive_p2p::parse_bootstrap_seeds(&c))
             .unwrap_or_default()
     };
-    // Self-hosted discovery (Seer): pkarr relay URLs the node publishes to + resolves
-    // from, instead of depending on n0's public pkarr/DNS. Added alongside n0 (the
-    // mesh keeps working if Seer is down). Run Seer itself with HIVE_SEER_ADDR.
     let discovery_urls: Vec<String> = std::env::var("HIVE_DISCOVERY_DNS")
         .ok()
         .map(|s| {
@@ -981,8 +865,6 @@ async fn async_main() -> anyhow::Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    // HIVE_DISCOVERY_N0=0 drops n0's public pkarr/DNS (Seer-only discovery, n0 relay
-    // kept). Default keeps n0 (Seer additive).
     let n0_discovery = std::env::var("HIVE_DISCOVERY_N0")
         .map(|v| v != "0" && v != "false")
         .unwrap_or(true);
@@ -1010,12 +892,6 @@ async fn async_main() -> anyhow::Result<()> {
             None
         }
     };
-    // Reachable PUBLIC IP for the client-facing DNS (Seer). Authoritative source is
-    // HIVE_PUBLIC_IP (set on nodes with a real inbound-reachable address). These cloud
-    // nodes sit behind 1:1 NAT (private NIC IP), so the public IP can't be sniffed off
-    // the interface — it MUST be configured. `HIVE_PUBLIC_IP=auto` opts into ip-api
-    // detection (correct for 1:1-NAT cloud nodes; do NOT use on home-NAT'd nodes, where
-    // the detected IP is the ISP gateway, not reachable inbound). Unset → None (NAT-safe).
     let public_ip = resolve_public_ip(geo.as_ref().and_then(|g| g.4.clone()));
     let public_ip6 = std::env::var("HIVE_PUBLIC_IP6")
         .ok()
@@ -1030,18 +906,6 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!(%ip, ip6 = ?public_ip6, "node public IP (advertised to client DNS / Seer)");
     }
 
-    // Embedded iroh-relay server: every hived instance runs its OWN relay listener
-    // in-process (a real HTTP relay/NAT-traversal fallback for the mesh — see
-    // `iroh_relay::server`'s module docs: it's a genuine in-process server API,
-    // not just the CLI binary, via `Server::spawn`). This is additive alongside
-    // the standalone `iroh-relay` binaries already running on bkk/va/sj (:3340)
-    // during the transition — a different default port (3341) means an embedded
-    // listener never collides with a standalone one on the same host. Started
-    // PLAIN HTTP (no TLS/QUIC address-discovery yet): the CLI binary's
-    // self-signed-cert generation for that isn't exposed as a public library call
-    // in this iroh-relay version, so wiring it up is a deliberate, separate
-    // follow-up. Best-effort + fail-open: a bind failure here must NEVER block
-    // this node's own admin/gateway serving.
     let relay_port: u16 = std::env::var("HIVE_OWN_RELAY_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1050,20 +914,6 @@ async fn async_main() -> anyhow::Result<()> {
         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         relay_port,
     );
-    // Deny revoked browser endpoints AT THE RELAY (bn-p2p-revocation-latency):
-    // routing-layer revocation (`fluid_gateway`'s browser target removal)
-    // stops NEW invocations from picking a revoked target, but a revoked
-    // endpoint could still reconnect and sit on the relay indefinitely. This
-    // is a real `AccessControl` (iroh-relay 1.0.2's `RelayConfig.access`,
-    // `Arc<dyn DynAccessControl>`, default `AllowAll`) keyed on the
-    // handshake-PROVEN `EndpointId`, denylist-shaped so it never affects
-    // fleet-mesh peers relaying through this SAME server (only endpoint_ids
-    // this node's OWN `browser_admissions` store has explicitly revoked are
-    // ever denied — everyone else, including every fleet node, is Allow).
-    // `CloudState` doesn't exist yet at this point in boot, so the impl reads
-    // through a `Weak` cell filled in once it does (`browser_relay_access_cell`
-    // below) — until then it fails OPEN (Allow), matching this whole relay
-    // block's existing best-effort/fail-open convention.
     let browser_relay_access_cell: Arc<std::sync::OnceLock<std::sync::Weak<CloudState>>> =
         Arc::new(std::sync::OnceLock::new());
     let mut embedded_relay_cfg = iroh_relay::server::ServerConfig::default();
@@ -1071,31 +921,11 @@ async fn async_main() -> anyhow::Result<()> {
     relay_cfg.access = Arc::new(BrowserRelayAccess {
         cloud: browser_relay_access_cell.clone(),
     });
-    // PER-CLIENT INGRESS RATE LIMIT. This relay is PUBLIC-FACING on :3340 on
-    // every node and previously ran with `Limits::default()`, i.e. none at all.
-    // n0's own guidance is blunt that a relay has finite bandwidth and finite
-    // connection slots, and the exposure is larger than it looks: browser/WASM
-    // iroh clients are relay-ONLY by compile-time construction (the IP transport
-    // is `#[cfg(not(wasm_browser))]`), so any browser-side traffic lands here
-    // rather than going direct.
-    //
-    // Sized as a per-client BACKSTOP, not a working limit: 16 MiB/s is far above
-    // what a relayed control-plane peer or tunnel actually pulls, so legitimate
-    // fleet traffic never touches it, while one abusive client can no longer
-    // saturate a node's relay. `HIVE_RELAY_CLIENT_BPS=0` disables it and restores
-    // the previous unlimited behaviour.
-    //
-    // Deliberately NOT setting `accept_conn_limit`/`accept_conn_burst`: iroh-relay
-    // 1.0.2 documents both as "Not currently implemented, setting this has no
-    // effect". Setting them would look like a connection cap while enforcing
-    // nothing — worse than leaving them alone, because a future reader would
-    // believe the cap exists.
-    let relay_bps = env_u64("HIVE_RELAY_CLIENT_BPS", 16 * 1024 * 1024);
+    let relay_bps = env_u64("HIVE_RELAY_CLIENT_BPS", RELAY_CLIENT_BYTES_PER_SECOND);
     if let Some(bps) = std::num::NonZeroU32::new(relay_bps.min(u32::MAX as u64) as u32) {
         let mut rl = iroh_relay::server::ClientRateLimit::new(bps);
-        // Burst allowance so a legitimate short spike (a deploy artifact moving
-        // over a relayed trunk) is not clipped by the steady-state rate.
-        rl.max_burst_bytes = std::num::NonZeroU32::new(bps.get().saturating_mul(2));
+        rl.max_burst_bytes =
+            std::num::NonZeroU32::new(bps.get().saturating_mul(RELAY_CLIENT_BURST_FACTOR));
         relay_cfg.limits.client_rx = Some(rl);
         tracing::info!(
             bytes_per_second = bps.get(),
@@ -1129,12 +959,6 @@ async fn async_main() -> anyhow::Result<()> {
             None
         }
     };
-    // Advertise our OWN relay only when we're actually listening AND have a
-    // routable public address to put in the URL — a NAT'd node can't usefully
-    // advertise a relay peers can't reach (same rule `public_ip`/`public_url`
-    // already follow). Kept alive for the whole process (`relay_server` isn't
-    // dropped until `main` returns, which — barring a fatal listener error below
-    // — is never, so the server outlives the boot function).
     let own_relay_url: Option<String> = relay_server
         .as_ref()
         .and(public_ip.as_ref())
@@ -1152,32 +976,11 @@ async fn async_main() -> anyhow::Result<()> {
         public_ip6,
         peer_id: iroh_ep.as_ref().map(|e| e.id().to_string()),
         iroh_addr: iroh_ep.as_ref().and_then(hive_p2p::addr_json),
-        // Not ready yet — GuardianDB's own iroh client hasn't bound at this
-        // point in boot. Filled in by the gossip loop via
-        // registry.set_self_guardian_addr() once guardian::my_iroh_addr()
-        // resolves (best-effort, usually within the first couple of rounds).
         guardian_iroh_addr: None,
-        // Not set here either — mirrors `guardian_iroh_addr`: populated right
-        // after `registry` exists, via `registry.set_self_relay_url(..)` below,
-        // so `relay_url`'s own doc comment stays the single source of truth for
-        // when/why it's `None` (still filled in this same boot, just after the
-        // registry the setter needs is constructed).
         relay_url: None,
-        // Nameserver INTENT: only a REAL public `:53` bind counts. A
-        // loopback/dev bind (the default 127.0.0.1:5354) is not reachable by
-        // any resolver, so advertising it would put a black hole in the
-        // delegated zone's NS set. This is a necessary condition, never a
-        // sufficient one — it says nothing about whether the internet can
-        // reach the listener. Peers prove that separately and gossip the
-        // result (`dns_attest`, `dns_probe::spawn_ns_prober`), and the DNS
-        // reconciler publishes an NS only for a node that is currently proven.
         dns_ns: std::env::var("HIVE_DNS_ADDR")
             .ok()
             .filter(|addr| dns_bind_reaches_internet(addr)),
-        // API-zone capability: this binary's Seer answers `api.{platform}`
-        // (see dnsserver::api_zone), so a public-`:53` node may appear in that
-        // zone's NS set. Older binaries never set this, which is what gates the
-        // api delegation until enough of the fleet can actually answer it.
         dns_api: {
             let ns_ok = std::env::var("HIVE_DNS_ADDR")
                 .ok()
@@ -1188,16 +991,8 @@ async fn async_main() -> anyhow::Result<()> {
                     .map(|v| !v.trim().is_empty())
                     .unwrap_or(false)
         },
-        // Filled in by `dns_probe::spawn_ns_prober` from this node's own
-        // off-host probes of its peers, refreshed every round (same post-boot
-        // fill-in pattern as `relay_url`/`guardian_iroh_addr`).
         dns_attest: Vec::new(),
-        // A MEASUREMENT, not intent: `false` until the dashboard probe loop
-        // (spawned below, post-registry) sees the local upstream answer within
-        // budget. Same fill-in pattern as `dns_attest`.
         dashboard: false,
-        // Boot value; the gossip loop refreshes this every round from the
-        // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,
         last_seen_ms: now_ms(),
         is_self: true,
@@ -1210,15 +1005,8 @@ async fn async_main() -> anyhow::Result<()> {
         cpu_cores: cap.0,
         mem_total_mb: cap.1,
         disk_total_gb: cap.2,
-        // Seeded here so the very first gossip round already carries a real
-        // figure; `spawn_disk_refresh` keeps it current from then on. Without a
-        // boot seed a node advertises 0 ("unknown") for its first interval,
-        // which placement must not mistake for "full".
         disk_free_gb: crate::resources::disk_free_gb(),
         gpu_free_mb: crate::resources::measured_gpu_free_mb(),
-        // Seeded from the boot audit that already ran above, so the very first
-        // gossip round already carries the verdict; `spawn_disk_refresh` slides
-        // the 24h window from then on.
         started_ms: crate::restart_audit::started_ms(),
         oom_restarts_24h: crate::restart_audit::oom_restarts_24h(),
         unclean_restarts_24h: crate::restart_audit::unclean_restarts_24h(),
@@ -1228,26 +1016,9 @@ async fn async_main() -> anyhow::Result<()> {
         wasm_runtime: wasm_rt,
         bun_runtime: bun_rt,
         runtime_artifact_protocol,
-        // Seeded from the same boot observation as `wasm_rt`/`bun_rt`, so the
-        // first gossip round already carries a real verdict; `spawn_disk_refresh`
-        // re-probes it on its tick. `None` on a microVM backend: those builds
-        // run inside the builder image, not against this host's PATH.
         build_toolchains: build_toolchains.clone(),
-        // Advertised ONLY from the boot-time LIVE probe above: the executor is
-        // re-hashed, re-verified and actually exercised (runsc + quota + nested
-        // Buildah) before this is ever `Some`, so a node with no working
-        // executor still advertises `None` and stays out of repository-build
-        // placement. That is the condition the former `None` literal was
-        // waiting on, and it is met: every git build surface routes repository
-        // commands through `build_executor` (`require_build_session` at each
-        // command chokepoint in git.rs).
         build_isolation_protocol,
-        // Published after CloudState::new proves the transfer receiver actually
-        // initialized (its worker, durable store and recovery all succeeded) —
-        // never asserted from this literal.
         artifact_transfer_protocol: None,
-        // Published after the sidecar proves itself — `musql::spawn` sets it,
-        // never this literal (see the wasm/bun capability rule).
         musql_engine: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
@@ -1283,12 +1054,6 @@ async fn async_main() -> anyhow::Result<()> {
              Runtime::Bun deployments will not be placed here (see the active-backend capability probe)"
         );
     }
-    // Build toolchains: a MISSING package manager is not a refusal, it is a
-    // SUBSTITUTION (npm ships with node, so a `bun install` degrades to `npm
-    // install` with a loud log). This line exists so the fleet's real spread is
-    // visible in the journal — measured when the probe was added: bun present
-    // on fc-phoenix, absent on fc-virginia and 170.106.158.151, with the build
-    // pipeline dispatching `bun install` to all three.
     match build_toolchains.as_ref() {
         None => tracing::info!(
             backend = %backend_name,
@@ -1302,24 +1067,11 @@ async fn async_main() -> anyhow::Result<()> {
         ),
     }
     let registry = NodeRegistry::new(me);
-    // The musql sidecar, if this node opted in (HIVE_SQLITE_ENGINE=musql).
-    // Started before any request can reach the SQLite lane and advertised from
-    // the PROBE (not from the flag), so a node that merely set the env var but
-    // has no usable musqld never claims the capability and is never handed a
-    // musql database. Everything else about this node is unaffected: the
-    // default engine is rusqlite, so a roll of this binary changes nothing.
     if crate::musql::spawn() {
         registry.set_self_musql_engine(crate::musql::probe());
     }
-    // Populate this node's own relay_url now that `registry` exists (mirrors
-    // `set_self_guardian_addr`'s post-boot fill-in pattern) — it rides along in
-    // the very next `/v1/nodes/announce` gossip broadcast, no new RPC surface.
     registry.set_self_relay_url(own_relay_url.clone());
 
-    // Report any at-rest secret this node can no longer open. A key change
-    // orphans previously-sealed values silently (decrypt hands back the raw
-    // ciphertext rather than failing), so without this the breakage is
-    // invisible until an app misbehaves for unrelated-looking reasons.
     crate::secrets::audit_at_rest();
 
     let cloud = CloudState::new(
@@ -1340,42 +1092,20 @@ async fn async_main() -> anyhow::Result<()> {
         sandbox_firecracker,
         sandbox_backend,
     );
-    // Fill the embedded relay's deferred AccessControl cell now that
-    // CloudState finally exists (it was constructed and wired into the relay
-    // config well before this point — see the relay-spawn block above).
-    // `Weak` deliberately: the AccessControl impl must never be the thing
-    // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
-    // Same deferred-fill shape: Fluid was constructed before CloudState (and
-    // therefore before deployment_ledger, the integrity chain's backing
-    // store) existed, so the observer is wired in here instead of at
-    // `Fluid::start`.
     cloud
         .fluid
         .set_execution_observer(crate::deployment_ledger::LedgerExecutionObserver::new(
             cloud.deployment_ledger.clone(),
         ));
-    // Advertise the sealed-artifact transfer receiver only after CloudState
-    // construction PROVED it initialized (durable store opened, worker
-    // spawned, interrupted transactions recovered). A receiver that failed
-    // closed keeps advertising `None`, so no coordinator ever selects this
-    // node as an immutable-generation transfer target.
     if cloud.runtime_artifact_transfer.enabled() {
         cloud.registry.set_self_artifact_transfer_protocol(Some(
             crate::runtime_artifact_transfer_wire::PROTOCOL_VERSION,
         ));
     }
 
-    // Tell the gateway the PUBLIC domain user deployments are reachable on, so
-    // the URLs it reports (`DeploymentInfo::alias` and friends, which the
-    // dashboard shows and the build log prints as "Aliased to …") name the host
-    // that actually serves the deployment. Without this they fall back to the
-    // local-dev `<project>.localhost`, which is what made a production deploy
-    // report "Aliased to shoomoo.localhost". Reporting only — routing keys on
-    // the host's first label and is unaffected either way.
     fluid_gateway::set_public_apps_domain(&cloud.apps_domain);
 
-    // `--acme-txt-selftest` seed (see the arg's doc comment).
     if let Some((fqdn, value)) = args
         .acme_txt_selftest
         .as_deref()
@@ -1385,36 +1115,10 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!(%fqdn, "ACME DNS-01 selftest TXT seeded into the challenge store");
     }
 
-    // Restore persisted platform state from disk (deployments, settings, WAF…).
     persist::restore(&cloud, persist::load());
-    // Start the coalescing background persister: after this, persist() marks dirty
-    // + wakes the writer instead of fsync-ing the whole state on the request thread.
     persist::spawn_persister(cloud.clone());
     deployment_ledger::spawn_outbox(cloud.clone());
-    // Metrics hour/day rollups (metrics.rs's RollupSnapshot, the only durable slice
-    // of MetricsStore) are the sole exception to "persist() runs after every
-    // mutation": state.rs's record() — called on every single HTTP request — never
-    // calls persist(), so a tenant with real traffic but no OTHER admin mutation
-    // (deploy/db-create/team-edit etc.) since the last persist can lose its entire
-    // Weekly/Monthly usage history on an UNCLEAN shutdown (crash, OOM-kill, `kill
-    // -9` — the graceful SIGTERM flush below covers a clean `systemctl restart`,
-    // but not those). persist() is cheap to call even under heavy traffic (it only
-    // marks a dirty generation + wakes the coalescing background writer, which
-    // folds every mutation since its last drain into ONE capture+write) — a
-    // periodic safety-net call closes the gap, matching spawn_guardian_snapshot_
-    // loop's identical "periodic flush independent of mutation timing" fix for the
-    // same underlying bug class.
     spawn_metrics_persist_loop(cloud.clone());
-    // Graceful-shutdown flush: on SIGTERM/SIGINT (e.g. `systemctl restart`) drain
-    // the public listener's in-flight connections (bounded), THEN write the
-    // latest state synchronously so a restart loses nothing from the coalescing
-    // window. Previously this exited immediately on signal, severing every
-    // in-flight request AND every gateway tunnel proxying to a placed app's cell
-    // the instant SIGTERM arrived — the literal mechanism behind "a hive-node
-    // restart breaks placed apps' cell tunnels". Bounded by
-    // HIVE_SHUTDOWN_GRACE_SECS (default 15s) so a stuck connection cannot hang a
-    // restart forever; systemd's own TimeoutStopSec is the final backstop if this
-    // grace window is somehow exceeded.
     let controlled_restart = ControlledRestart::new();
     {
         let flush_cloud = cloud.clone();
@@ -1455,26 +1159,11 @@ async fn async_main() -> anyhow::Result<()> {
                 ),
                 None => tracing::info!("shutdown signal received; beginning graceful shutdown"),
             }
-            // HARD DEADLINE on the whole graceful sequence. Several steps below
-            // await work that is not individually bounded (the runtime-artifact
-            // transfer drain, the platform-state flush, guardian shutdown), and a
-            // wedge in any of them leaves the process alive but dark — witnessed
-            // live on fc-sanjose (2026-08-26): memwatch requested a MemoryPressure
-            // restart at rss 12GB, "beginning graceful shutdown" logged, and the
-            // process then sat frozen for 5+ minutes serving nothing while the
-            // fleet treated the dark leader as current. The watchdog turns any
-            // wedged step into the bounded restart the caller asked for; the exit
-            // code matches what the normal tail would have used.
-            //
-            // It runs on a plain OS thread, NOT a tokio timer: a wedge that
-            // parks the worker owning tokio's IO/timer driver stops every timer
-            // on the runtime, this one included (measured: 34 of 56 stops on
-            // 90 s nodes ended in SIGKILL with every timer dead), and a std
-            // thread sleeping on the OS clock exits regardless of the runtime's
-            // state. The 75 s default must stay below systemd's TimeoutStopSec
-            // (90 s in hive-node.service) so the exit is ours, never SIGKILL's.
             {
-                let deadline = Duration::from_secs(env_u64("HIVE_SHUTDOWN_DEADLINE_SECS", 75));
+                let deadline = Duration::from_secs(env_u64(
+                    "HIVE_SHUTDOWN_DEADLINE_SECS",
+                    SHUTDOWN_DEADLINE_DEFAULT_SECS,
+                ));
                 let code = if requested_reason.is_some() { 17 } else { 0 };
                 let spawned = std::thread::Builder::new()
                     .name("hive-shutdown-deadline".into())
@@ -1498,12 +1187,6 @@ async fn async_main() -> anyhow::Result<()> {
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
                 tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
                 handle.graceful_shutdown(Some(grace));
-                // graceful_shutdown stops new connections and gives existing ones
-                // the grace window; wait for them here since exit() below would
-                // otherwise kill them the instant this task returns — but only
-                // while any remain. An unconditional sleep charged every stop the
-                // full 15 s on an idle listener (measured: the 78 s graceful
-                // path spent 15 s here with zero connections open).
                 let drain_started = std::time::Instant::now();
                 loop {
                     let open = handle.connection_count();
@@ -1533,35 +1216,8 @@ async fn async_main() -> anyhow::Result<()> {
                     None
                 }
             };
-            // Stamp the run marker as a GRACEFUL exit. Without this every
-            // deploy restart and every `systemctl restart` would be classified
-            // `unclean_exit` on the way back up, and a signal that fires on
-            // ordinary operations is a signal nobody reads — which is how the
-            // real OOM kills stayed invisible in the first place.
             restart_audit::mark_clean_exit(&flush_node_name);
-            // Same reason, different file: the geo cache's saver is debounced,
-            // so a clean restart would otherwise drop whatever was learned
-            // inside the last window and de-tailor those prefixes on the way
-            // back up. Cheap (one small sidecar) and best-effort.
             flush_cloud.dns_geo.flush_blocking();
-            // Tell every peer we are going away, instead of letting them find out.
-            //
-            // Without this, `exit(0)` below tears the process down with no QUIC
-            // CONNECTION_CLOSE on the wire, so each peer keeps a trunk it believes
-            // is live until its own idle timeout expires — and on restart this node
-            // usually comes back with different socket addrs, so those trunks are
-            // not merely idle but WRONG. That is the already-documented "after a
-            // peer restarts with new socket addrs, the stale QUIC trunk lingers
-            // until idle-timeout (~tens of seconds)" behaviour in gossip.rs: a
-            // symptom that was recorded without its cause. `close()` collapses that
-            // window to one round trip. iroh's own guidance is explicit that
-            // `Endpoint::close()` must be awaited to completion rather than left to
-            // process teardown; it is bounded here so a wedged relay can never turn
-            // a clean restart into a hung one.
-            // Drain the exact final admitted Guardian generation and durably shut
-            // the backend down (Docs/Router/Store) before the endpoint closes and
-            // the process exits — an acknowledged write must not merely reach the
-            // watch channel and then be abandoned mid-flight by process::exit.
             if let Err(error) = crate::guardian::shutdown(final_guardian_generation).await {
                 tracing::error!(%error, "Guardian shutdown did not complete cleanly; exiting anyway");
             }
@@ -3923,8 +3579,14 @@ fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Periodic safety-net flush for metrics hour/day rollups — see the call site's
-/// comment in `main()` for the full bug this closes.
+/// Periodic safety-net `persist()` for the metrics hour/day rollups (`metrics.rs`'s
+/// `RollupSnapshot`, the only durable slice of `MetricsStore`): `state.rs`'s `record()` runs on
+/// every HTTP request and never persists, so a tenant with real traffic but no OTHER admin mutation
+/// since the last persist could lose its whole Weekly/Monthly usage history on an UNCLEAN shutdown
+/// (crash, OOM kill, `kill -9`); the graceful SIGTERM flush covers only clean restarts. `persist()`
+/// just marks a dirty generation and wakes the coalescing writer, so calling it on a timer
+/// (`HIVE_METRICS_PERSIST_SECS`, 120) is cheap, like `spawn_guardian_snapshot_loop`'s periodic
+/// flush.
 fn spawn_metrics_persist_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_METRICS_PERSIST_SECS", 120));
     tokio::spawn(async move {
