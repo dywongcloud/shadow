@@ -1,11 +1,7 @@
-//! JWT signing + verification for the admin/control API.
-//!
-//! * Service tokens are HS256-signed with `HIVE_JWT_SECRET`.
-//! * Tenancy: the `tenant` claim (Clerk org id when Clerk is enabled, else a
-//!   default) scopes a token to a team/account.
-//! * **Dev-open default:** if `HIVE_JWT_SECRET` is unset, verification is skipped
-//!   so local development (and the dashboard with no auth wired) keeps working.
-//!   Set the secret to enforce signed requests.
+//! JWT signing and verification for the admin/control API. Service tokens are HS256-signed with
+//! `HIVE_JWT_SECRET`; the `tenant` claim (Clerk org id when Clerk is enabled, else a default)
+//! scopes a token to a team. Dev-open default: with `HIVE_JWT_SECRET` unset verification is
+//! skipped, and setting it enforces signed requests.
 
 use axum::{
     extract::Request,
@@ -16,15 +12,10 @@ use axum::{
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-/// TTL (seconds) for a `mesh-internal` delegation token minted to authenticate one node-to-node
-/// forwarded call (`gossip::team_claims`'s `?tok=`, `fetch_from_host`/`proxy_get_json`'s
-/// `Authorization: Bearer`). It must clear the mesh's own dial budget with real headroom:
-/// `fetch_from_host` gives `gossip::request_to` up to 20 s because `PeerPool::acquire` can fall
-/// back to a fresh-discovery dial when its cached hint is stale, and a token minted just before
-/// that fallback, plus receiver-side queuing under load, must not land on the verifying node
-/// already expired (jsonwebtoken's `ExpiredSignature`, logged as 'mesh delegation token present but
-/// INVALID'). 90 s clears the 20 s budget with a wide margin without meaningfully widening the
-/// replay window of a single-purpose, mesh-peer-trust-gated token.
+/// TTL (seconds) of a `mesh-internal` delegation token for one node-to-node forwarded call. It must
+/// clear the mesh dial budget with headroom (`fetch_from_host` lets `gossip::request_to` run up to
+/// 20 s, and a stale-hint fallback dial plus receiver queuing must not land an already-expired
+/// token) without widening the replay window of a single-purpose token.
 pub const MESH_DELEGATION_TOKEN_TTL_SECS: i64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,11 +31,9 @@ pub struct Claims {
     pub exp: usize,
     pub iat: usize,
     /// Whether the subject is a genuine PLATFORM operator (an email in `HIVE_OWNER_EMAIL` or
-    /// `HIVE_ADMIN_EMAILS`), independent of `role`. `role: "owner"` only ever means "owner of
-    /// `tenant`": every user is the owner of their own personal namespace, so it must never be
-    /// treated as platform-wide authority. `require_operator()` gates on THIS field, not `role`.
-    /// `#[serde(default)]` so any already-issued/short-lived legacy token without this field
-    /// deserializes to `false` (fail closed), never `true`.
+    /// `HIVE_ADMIN_EMAILS`), independent of `role`: `role: "owner"` only means owner of `tenant`
+    /// (every user owns their personal namespace). `require_operator()` gates on THIS field; legacy
+    /// tokens without it deserialize to `false` (fail closed).
     #[serde(default)]
     pub platform_admin: bool,
 }
@@ -73,10 +62,9 @@ pub fn enforced() -> bool {
     secret().is_some()
 }
 
-/// Issue a signed token for a subject/tenant valid for `ttl_secs`. `platform_admin`
-/// must be independently derived by the caller (matching the backend's own
-/// `owner_email` against the verified account email) — never trust a
-/// client-supplied boolean for this field.
+/// Issue a signed token valid for `ttl_secs`. `platform_admin` must be derived independently by the
+/// caller (the backend's `owner_email` against the verified account email), never from a
+/// client-supplied boolean.
 pub fn issue(
     sub: &str,
     tenant: &str,
@@ -131,10 +119,9 @@ pub fn verify_with_secret(token: &str, key: &str) -> anyhow::Result<Claims> {
     Ok(data.claims)
 }
 
-/// Extract a platform JWT from a request: `Authorization: Bearer <jwt>` first,
-/// else the `hive_jwt` cookie. The cookie lets the self-hosted dashboard carry
-/// the token as an httpOnly cookie over the same-origin `/cloud` rewrite (no
-/// token in browser JS, no CORS), while Bearer still works for API/SDK clients.
+/// Extract a platform JWT: `Authorization: Bearer` first, else the `hive_jwt` cookie, which lets
+/// the self-hosted dashboard carry the token httpOnly over the same-origin `/cloud` rewrite (no
+/// token in browser JS, no CORS).
 pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(bearer) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -157,9 +144,9 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 /// Resolve a bearer that is a dashboard-issued API key (`hive_…`, see `apikeys.rs`) into
-/// synthesized tenant-scoped [`Claims`]. API keys are the documented CLI/SDK credential, so they
-/// must clear the same mutation gates a platform JWT does. `platform_admin` is always false: a key
-/// scopes to its team, never to platform-operator authority.
+/// synthesized tenant-scoped [`Claims`], so the CLI/SDK credential clears the same mutation gates
+/// as a platform JWT. `platform_admin` is always false: a key scopes to its team, never to operator
+/// authority.
 pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claims> {
     if !token.starts_with("hive_") {
         return None;
@@ -176,53 +163,29 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
     })
 }
 
-/// Auth middleware. When a JWT secret is configured, a mutation (POST/PUT/DELETE/PATCH) needs a
-/// valid bearer token and reads always pass; with no secret nothing is enforced (dev mode) and the
-/// middleware only binds claims.
+/// Auth middleware. With a JWT secret configured a mutation (POST/PUT/DELETE/PATCH) needs a valid
+/// bearer and reads always pass; without one nothing is enforced (dev mode) and the middleware only
+/// binds claims.
 ///
-/// Tenancy: whenever a valid platform JWT, or a valid dashboard API key, is presented (read OR
-/// write), the verified [`Claims`] are inserted into the request's extensions so downstream
-/// handlers can resolve the tenant from the cryptographically-bound `tenant` claim, never from a
-/// client-supplied `x-hive-team` header, which is spoofable. Extensions are in-process only and
-/// cannot be set by the client. A JWT wins over an API key (tenant-scoped claims, never
-/// `platform_admin`). API-key claims are bound even in dev (no `HIVE_JWT_SECRET`): key verification
-/// is a self-contained hash lookup, and an identity endpoint must not report a valid key as
-/// unauthenticated just because JWTs are not enforced; only the JWT half depends on the secret.
+/// Whenever a valid platform JWT or dashboard API key is presented (read or write) its verified
+/// [`Claims`] go into the request extensions (in-process only, never client-settable), so handlers
+/// resolve the tenant from the cryptographically-bound `tenant` claim, never from the spoofable
+/// `x-hive-team` header. A JWT wins over an API key (tenant-scoped, never `platform_admin`); key
+/// claims bind even in dev, since key verification is a self-contained hash lookup.
 ///
-/// Routes that carry their OWN credential skip the mutation gate (`open`), and each fails closed in
-/// its own handler:
-///
-/// * `/healthz` and `/v1/token` (the token mint);
-/// * `/v1/git/webhook` and `/v1/billing/webhook`: GitHub and Stripe cannot present a platform JWT,
-///   so each handler verifies its own HMAC signature (`GITHUB_WEBHOOK_SECRET` /
-///   `STRIPE_WEBHOOK_SECRET`);
-/// * `/v1/zkauth/register`, `/v1/zkauth/preview-proof` and `/v1/zkauth/project-team`: called
-///   server-to-server by the dashboard's preview-unlock route with ONLY a shared `x-hive-internal`
-///   secret (`zkauth::internal_ok`), never a platform JWT, since the caller is authenticating a
-///   browser tab that has no session on this node at all;
-/// * `/v1/browser/admissions` (this exact collection POST): `admit()` fails closed through
-///   `fresh_user_claims`, so a missing or expired browser session gets the same structured
-///   `{error:{code,retryable}}` contract as every other admission denial; the item DELETE/accept
-///   routes stay behind this gate;
-/// * `/v1/sqlite/`: libsql/Hrana pipeline POSTs carry the DATABASE's own bearer, which the Hrana
-///   handler (`hrana.rs`) checks through `db_rest::credential_matches`. This is the posture of the
-///   `<slug>.{db_domain}` REST surface, which is served off the edge pipeline and never reaches
-///   this middleware;
-/// * `/v1/browser-db/`: the project's own `browser_db_rest` bearer, checked through
-///   `browser_db_rest::credential_scope` (the `/v1/sqlite/` posture);
-/// * `/v1/drive/webdav/`: WebDAV clients speak only HTTP Basic/Digest, never a bearer JWT, so
-///   `drive_webdav.rs` verifies the HTTP Basic credential itself
-///   (`drive_api::verify_webdav_credentials`) and answers 401 before any filesystem call reaches
-///   `dav_server`.
+/// Routes carrying their OWN credential skip the mutation gate (`open`) and each fails closed in
+/// its own handler: `/healthz`; `/v1/token` (the mint); the GitHub and Stripe webhooks (their own
+/// HMAC signature); `/v1/zkauth/{register,preview-proof,project-team}` (the dashboard's
+/// server-to-server `x-hive-internal` secret, `zkauth::internal_ok`); `/v1/browser/admissions`
+/// (`admit()` through `fresh_user_claims`; the item routes stay gated); `/v1/sqlite/` (the
+/// database's own bearer, checked in `hrana.rs`); `/v1/browser-db/` (the project's
+/// `browser_db_rest` bearer); `/v1/drive/webdav/` (HTTP Basic, verified by `drive_webdav.rs` before
+/// any filesystem call).
 ///
 /// A GET/HEAD is never rejected for missing auth, but an unauthenticated one on a non-exempt route
-/// resolves to `admin::ANON_TENANT` (`resolve_tenant`'s fail-closed scope: a namespace that owns
-/// nothing). That is a real 200 with a wrongly-scoped empty body, indistinguishable from 'you
-/// really have zero X' and never the 401/403 that `ui/lib/api.ts`'s `fetchWithTimeout` treats as
-/// 'the session is gone: re-mint and retry'. Such a response is therefore stamped `x-hive-anon: 1`,
-/// which the client treats like a 401/403, so a session cookie that expired mid-session (or a mint
-/// race on a fresh load) cannot leave a permanently empty list with no error, while the read path
-/// stays reachable.
+/// resolves to `admin::ANON_TENANT` (a namespace that owns nothing) and is stamped `x-hive-anon:
+/// 1`, which `ui/lib/api.ts` treats like a 401/403: a real 200 with an empty body would otherwise
+/// read as "you have zero X" after the session expired.
 pub async fn require_auth(
     axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::CloudState>>,
     mut req: Request,
