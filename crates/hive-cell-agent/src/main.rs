@@ -1,7 +1,7 @@
-//! The cell daemon inside the microVM guest: listens on vsock, runs builds ([`AgentRequest::Run`]),
-//! function launches and exec/pty sessions, streaming [`AgentEvent`]s back. Runs as the guest's
-//! `init` (PID 1) or as an ordinary process; Linux-only at runtime (`main` is a stub elsewhere so
-//! the workspace builds on macOS).
+//! The cell daemon inside the microVM guest: listens on vsock, runs builds
+//! ([`hive_core::AgentRequest::Run`]), function launches and exec/pty sessions, streaming
+//! [`hive_core::AgentEvent`]s back. Runs as the guest's `init` (PID 1) or as an ordinary process;
+//! Linux-only at runtime (`main` is a stub elsewhere so the workspace builds on macOS).
 
 fn protocol_probe_requested() -> bool {
     let Some(arg) = std::env::args_os().nth(1) else {

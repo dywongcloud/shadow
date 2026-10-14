@@ -1,8 +1,9 @@
 //! Instance-side tunnel: demux requests, proxy to the local function over HTTP concurrently, push
 //! in-band metrics, nack when at capacity. Three serving modes, chosen per function:
 //! [`TunnelServer::serve`] (HTTP-framed, multiplexed), [`TunnelServer::serve_raw`] (a bidirectional
-//! byte splice for non-HTTP protocols) and [`TunnelServer::serve_maybe_raw`] (`serve`, except the one
-//! connection whose first byte is [`RAW_UPGRADE_MAGIC`] gets `serve_raw` — the WebSocket-upgrade escape).
+//! byte splice for non-HTTP protocols) and [`TunnelServer::serve_maybe_raw`] (`serve`, except the
+//! one connection whose first byte is [`TunnelServer::RAW_UPGRADE_MAGIC`] gets `serve_raw`: the
+//! WebSocket-upgrade escape).
 
 use crate::codec::{read_frame, Frame, FrameKind};
 use crate::{Metrics, ReqMeta, RespMeta};
@@ -273,8 +274,8 @@ impl TunnelServer {
     pub const RAW_UPGRADE_MAGIC: u8 = 0xFE;
 
     /// Peek-and-dispatch entry for an HTTP-protocol listener: the one connection whose first byte is
-    /// [`RAW_UPGRADE_MAGIC`] (consumed) gets a byte splice, every other gets [`serve`](Self::serve)
-    /// unchanged.
+    /// [`RAW_UPGRADE_MAGIC`](Self::RAW_UPGRADE_MAGIC) (consumed) gets a byte splice, every other
+    /// gets [`serve`](Self::serve) unchanged.
     pub async fn serve_maybe_raw(stream: TcpStream, local_addr: String, max_concurrency: u32) {
         let mut peek = [0u8; 1];
         let is_raw =

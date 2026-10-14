@@ -1,7 +1,8 @@
 //! Framework-Defined Infrastructure: turn a source repository into the Build Output API v3
 //! contract (static assets + serverless/edge functions + routing). Native frameworks emit
-//! `.vercel/output` themselves ([`parse_build_output`]); adapted ones (Vite, CRA, Astro, static,
-//! a Node server) have their native output [`synthesize`]d into one.
+//! `.vercel/output` themselves ([`parse_build_output`]); for adapted ones (Vite, CRA, Astro,
+//! static, a Node server) [`plan_build`] names the build commands and output directory, and the
+//! caller wraps the built output into a manifest.
 
 pub mod build_output;
 pub mod deployment_snapshot;
@@ -244,7 +245,7 @@ pub fn analyze(repo: &Path) -> Analysis {
 }
 
 /// A repo resolved to a [`BuildOutput`]: an existing `.vercel/output` parsed directly, else the
-/// [`BuildPlan`] the caller runs before calling [`synthesize`] on its output directory.
+/// [`BuildPlan`] the caller runs before it synthesizes an output from the plan's output directory.
 pub enum Resolution {
     /// Build Output already present — provision straight from it.
     Ready(BuildOutput),
@@ -326,10 +327,8 @@ pub fn resolve(repo: &Path) -> anyhow::Result<Resolution> {
     }
 }
 
-/// Synthesize a Build Output config for a framework whose native output is a static directory
-/// (Vite/CRA/Astro/static) or a single Node server — the minimal adapter into the standard
-/// contract; `static_dir` is the framework's output directory and SPA frameworks get a catch-all
-/// rewrite to `index.html`.
+/// The minimal Build Output route table for a `primitive`: the `filesystem` handle, then a catch-all
+/// to `/index.html` (`Static`, so SPAs resolve) or `/index` (`Serverless`/`Hybrid`).
 pub fn synthesize_config(primitive: Primitive) -> BuildOutputConfig {
     let mut cfg = BuildOutputConfig::default();
     match primitive {

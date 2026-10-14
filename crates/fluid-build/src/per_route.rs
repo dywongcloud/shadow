@@ -45,7 +45,7 @@ impl RouteKind {
         }
     }
 
-    /// The runtime-facing class name; the string is the contract with [`fluid_core::RouteClass`]
+    /// The runtime-facing class name; the string is the contract with `fluid_core::RouteClass`
     /// since `fluid-build` does not depend on `fluid-core`.
     pub fn class_name(self) -> &'static str {
         match self {

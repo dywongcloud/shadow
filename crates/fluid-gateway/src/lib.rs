@@ -4784,10 +4784,11 @@ async fn proxy_function(
     resp
 }
 
-/// Classify a `Fluid::lease` error into a stable public [`FailureClass`]: a tenant quota is a 429,
-/// a broken deployment circuits, a NODE missing artifacts/hypervisor/locks names itself, only
-/// genuine saturation is a 503. The `else` arm is a CATCH-ALL published as "out of capacity", so
-/// a new backend failure mode belongs in its own class with its own `hive_core::fault` marker.
+/// Classify a `Fluid::lease` error into a stable public [`fluid_core::FailureClass`]: a tenant
+/// quota is a 429, a broken deployment circuits, a NODE missing artifacts/hypervisor/locks names
+/// itself, only genuine saturation is a 503. The `else` arm is a CATCH-ALL published as "out of
+/// capacity", so a new backend failure mode belongs in its own class with its own
+/// `hive_core::fault` marker.
 fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
     if es.contains("TenantQuota") {
         fluid_core::FailureClass::TenantThrottled
