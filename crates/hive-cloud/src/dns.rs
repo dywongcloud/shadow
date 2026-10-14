@@ -93,6 +93,11 @@ pub struct DomainStore {
     map: RwLock<HashMap<String, DomainRecord>>,
 }
 
+/// The nameserver pair an earlier `default_domain` seeded into every record and the dashboard
+/// showed as the domain's nameservers: invented, never measured. [`DomainStore::load`] empties a
+/// record that carries only these.
+const INVENTED_NAMESERVERS: [&str; 2] = ["ns1.openedge-dns.com", "ns2.openedge-dns.com"];
+
 /// The honest SSL block of a record with no installed bundle. A record never claims a certificate
 /// at creation: the dashboard would show "Managed SSL active" for a domain with no bundle on any
 /// edge, and the HTTP-01-only custom path can issue only apex+`www` SANs.
@@ -124,7 +129,7 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
         cdn_active: true,
         created_ms: now,
         expires_ms: 0,
-        nameservers: vec!["ns1.openedge-dns.com".into(), "ns2.openedge-dns.com".into()],
+        nameservers: Vec::new(),
         verify: None,
         ssl: pending_ssl(),
         records: vec![DnsRecord {
@@ -319,6 +324,16 @@ impl DomainStore {
             d.renewal_price.clear();
             d.auto_renew = false;
             d.expires_ms = 0;
+            // Likewise the nameserver pair `default_domain` once seeded: no such zone is delegated or
+            // measured, so a record carrying ONLY those names is emptied. A tenant's own nameservers
+            // (`set_nameservers`), or any list with one of them in it, are kept as set.
+            if !d.nameservers.is_empty()
+                && d.nameservers.iter().all(|ns| {
+                    INVENTED_NAMESERVERS.contains(&ns.trim().to_ascii_lowercase().as_str())
+                })
+            {
+                d.nameservers.clear();
+            }
             let domain = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
             let www = format!("www.{domain}");
             let attached = d
