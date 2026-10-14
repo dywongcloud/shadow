@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-14 — a build that is not live production reads as preview, so the edge preview gate protects superseded production URLs and a protected body is never cached (daa7493, e6da54f, ebcb99fcdb)
+
+A deployment record wrote `target` from the caller's production argument while `production` ANDed `publish_routes` and
+`state == Ready`, and `promote_exact` demotes every other deployment of a project to `production: false` without touching
+`target`, so a demoted previous production build (or a staged duplicate) sat as `production: false, target: "production"`
+indefinitely. The edge preview gate classifies by `target`, so every such record was served to anonymous callers: measured
+2026-10-13 on all five live nodes, 40 of 86 records each (`ughjh-58997df.shadw.app` answered 200 with no credentials while an
+ordinary preview answered 401). `fluid-gateway` now derives `target` from the same conjunction as `production` when it writes a
+record and makes `production` authoritative on read in `view_of`, so records already registered are corrected without a rebuild
+and a promoted deployment whose staged target is `preview` still reads as production; the relocation reaper
+(`remove_project_superseded`) applies the same rule (promoted OR built for production). The edge asks how a host is protected
+once per request (`protection_for_host`) and shares the answer between the gate and the CDN cache, whose key is host + path and
+carries no auth dimension: a protected body is never stored, a refusal invalidates any entry cached before protection applied,
+refusals carry `cache-control: no-store`, and `hive-edge` gains the key-scoped `CdnCache::invalidate`. What an operator must
+know: after the roll a superseded production deployment's id and commit URLs ask for a login like any preview, and the
+dashboard and `GET /v1/deployments` report it as `preview` (the environment badge follows `target`); the live production
+deployment and its domains are unchanged. `cargo test --workspace --locked` caught one stale assertion: the gateway test that
+asserted the old reading (`target_environment_is_immutable_across_promotion`) was the workspace's only failing test, because
+`cargo test --no-run` and the hive-cloud unit tests never executed it; it is now `superseded_production_build_reads_as_preview`.
+
 ## 2026-10-14 — a deployment's integrity chain is served only to the team that owns the deployment: one predicate gates every read keyed by a deployment id (fa7fe5bf57)
 
 `GET /v1/deployments/:id/integrity` admitted a caller whose tenant slug equalled the project's NAME
