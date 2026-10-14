@@ -30,9 +30,10 @@
 //! A TUN link cannot carry loopback and litebox's guest address was compiled in, so every runner
 //! owns a TUN device with its own `/30` ([`LiteboxNet`]): the runner is told the pair through
 //! `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` (`networking.patch`) and the function tunnel dials the
-//! guest address directly, with no NAT or namespace. A wildcard bind is reachable as is;
-//! `litebox-bind-shim.js` (preloaded through `NODE_OPTIONS=--require`, Node's `net.Server` only)
-//! rewrites an explicit loopback bind to the guest address.
+//! guest address directly, with no inbound NAT or namespace (guest egress is `ensure_guest_nat`'s).
+//! A wildcard bind is reachable as is; `litebox-bind-shim.js` (preloaded through
+//! `NODE_OPTIONS=--require`, Node's `net.Server` only) rewrites an explicit loopback bind to the
+//! guest address.
 //!
 //! ## Security posture
 //!
@@ -106,9 +107,10 @@ impl Default for LiteboxConfig {
     }
 }
 
-/// One runner's TUN link: a device plus its own `/30` out of `10.88.0.0/16`. The host routes to the
-/// guest end directly (no NAT or namespace); the runner learns the pair from
-/// `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP`, which `networking.patch` adds.
+/// One runner's TUN link: a device plus its own `/30` out of `10.88.0.0/16`. The host reaches the
+/// guest end directly (no inbound NAT or namespace; guest egress is `ensure_guest_nat`'s); the
+/// runner learns the pair from `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP`, which `networking.patch`
+/// adds.
 #[derive(Clone)]
 struct LiteboxNet {
     tun_dev: String,
