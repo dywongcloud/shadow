@@ -1938,11 +1938,23 @@ fn pct(s: &str) -> String {
         .collect()
 }
 
+/// Whether verified `claims` may open a preview private to `team` (the project's stored owning
+/// team): the caller's tenant IS that team, or the caller is a platform operator. `role == "owner"`
+/// proves ownership of the caller's OWN tenant only (every user owns their personal namespace), so a
+/// role alone must never open another team's deployment. A project whose tag is lost resolves to the
+/// fail-closed `UNTAGGED_TENANT` (`record_tenant`), which no tenant claim equals.
+fn claims_open_preview(claims: &crate::auth::Claims, team: &str) -> bool {
+    claims.platform_admin || crate::admin::norm(&claims.tenant) == crate::admin::record_tenant(team)
+}
+
+/// A verified platform JWT, as a Bearer or as the `hive_access` cookie, that opens a preview private
+/// to `team` ([`claims_open_preview`]). An unenforced dev node has no identities to match, so any
+/// non-empty `hive_access` cookie opens it there.
 fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
     if let Some(auth) = header(headers, "authorization") {
         if let Some(tok) = auth.strip_prefix("Bearer ") {
             if let Ok(claims) = crate::auth::verify(tok) {
-                if claims.tenant == team || claims.role == "owner" {
+                if claims_open_preview(&claims, team) {
                     return true;
                 }
             }
@@ -1954,7 +1966,7 @@ fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
             if let Some(val) = kv.strip_prefix("hive_access=") {
                 if crate::auth::enforced() {
                     if let Ok(claims) = crate::auth::verify(val) {
-                        return claims.tenant == team || claims.role == "owner";
+                        return claims_open_preview(&claims, team);
                     }
                 } else {
                     return !val.is_empty();
