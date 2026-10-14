@@ -2804,14 +2804,33 @@ async fn serve(router: axum::Router, addr: SocketAddr, label: &str) -> anyhow::R
 
 /// Invoke a deployment route on this node's own public gateway (used by cron &
 /// workflows). `deployment` is the Host subdomain (project or deployment id).
+///
+/// `path` is TENANT input (a cron job's path, a workflow step's path) joined onto the node's own
+/// trusted `public_base`. A raw `format!("{base}{path}")` is vulnerable to the userinfo/authority
+/// class of bug a URL parser later reinterprets: `path` beginning `@host:port/...` turns `base`
+/// into userinfo and `host:port` into the REAL destination (confirmed live: a workflow step path
+/// made the node GET an internal listener and returned its body in the run output), and one
+/// beginning `//host/...` is a valid "network-path reference" that replaces the authority outright
+/// under ordinary URL-relative-resolution rules. `Url::join` prevents the first (a plain relative
+/// path's `@`/`#`/`:` are not re-parsed as authority syntax), and the explicit same-origin check
+/// below closes the second.
 async fn invoke(
     cloud: &Arc<CloudState>,
     deployment: &str,
     path: &str,
 ) -> anyhow::Result<(u16, String)> {
-    let url = format!("{}{}", cloud.public_base, path);
-    let resp = cloud
-        .http
+    let base = reqwest::Url::parse(&cloud.public_base)
+        .map_err(|e| anyhow::anyhow!("invalid public_base: {e}"))?;
+    let url = base
+        .join(path)
+        .map_err(|e| anyhow::anyhow!("invalid step/cron path: {e}"))?;
+    anyhow::ensure!(
+        url.scheme() == base.scheme()
+            && url.host_str() == base.host_str()
+            && url.port_or_known_default() == base.port_or_known_default(),
+        "step/cron path must stay on this node's own gateway"
+    );
+    let resp = hive_outbound::same_origin_client()
         .get(url)
         .header("host", format!("{deployment}.localhost"))
         .send()
