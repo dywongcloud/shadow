@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-10-13 — at-rest key resolution fails closed instead of silently regenerating or running memory-only
+
+`secrets::load_or_create_key` ignored a malformed `HIVE_SECRET_KEY` with a WARN and fell back to
+the node's own `secret.key` file (the fleet silently stops sharing one key), regenerated an
+existing `secret.key` that was not 64 hex (orphaning everything already sealed under it), and left
+a memory-only key in place when the write failed (everything sealed that boot becomes unreadable
+on restart, with no error anywhere). `integrity_signer::open_or_create` had the matching bug: any
+read error on `integrity_signing.key` (EACCES, non-UTF-8, a directory), not just genuine absence,
+was treated as "no key yet" and silently overwritten, replacing the node's established
+chain-signing identity. Both now fail closed: `load_or_create_key` returns a specific `Err` for
+each unsafe branch and its caller exits the process rather than hand out a key nobody agreed on;
+`open_or_create` creates a fresh key only on `NotFound`, and every other read error is a loud
+`anyhow` error that leaves the file untouched. The dev flow (no env, no file) is unchanged.
+Witnessed on throwaway per-case nodes (`scratch2/work/secfix-keys.sh`): before, all 5 unsafe
+branches fired silently; after, all 5 refuse to boot or return a loud error naming the exact file
+and reason, while the dev flow, a valid `HIVE_SECRET_KEY` and a missing `integrity_signing.key`
+are unchanged (3/3). Operator note: a node with an already-wrong `HIVE_SECRET_KEY` or an
+already-damaged key file now refuses to start instead of silently running on the wrong key. Not
+rolled.
+
 ## 2026-10-13 — an HLS key a server labels as a playlist reaches the player
 
 `/api/tv/hls` chose its playlist lane from the URL (`.m3u8`) or a content type containing
