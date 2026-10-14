@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-10-13 — a queue consumer's script_name can no longer redirect delivery to another tenant's app or an arbitrary host
+
+An independent adversarial review found a live bypass of the same-session queue-consumer fix
+(`3ed2e2adea`): `consumer_target_owned` checked the first dot-label of `script_name` as a project
+name, but the real delivery URL was built by `format!("https://{sub}.{apps_domain}")` with `sub`
+unescaped. `script_name:"x@victim-app"` has no dot, so the check saw one opaque unowned label and
+let it through (the optimistic pass for an unrecognized name), while the raw string concatenation
+turned the embedded `@` into userinfo and "victim-app" into the real destination host — the node
+dialed tenant B's app. `script_name:"localhost:PORT#"` similarly let a literal `:` change the port
+and `#` swallow the rest as a fragment, dialing an arbitrary host:port. `valid_script_label` now
+whitelists `[a-z0-9-]` for the label, refusing anything else outright; `consumer_target_owned`
+requires positive evidence (a settings-row or deployment-record match) instead of an optimistic
+pass for an unrecognized name; `state.rs`'s `deploy_url` is hardened at the shared primitive
+(`host_scoped_https_url`: builds the host through `Url::set_host`, which runs the WHATWG host
+parser and rejects `@`/`:`/`#`/`/`, instead of string interpolation) so every other caller gets
+this for free; delivery goes over the no-redirect internal client; the batch signature now covers
+`timestamp.nonce.body` so a captured batch cannot be replayed. Witnessed on a throwaway
+auth-enforced node (`scratch2/work/secrev/t_queue.sh`): before, both attacks registered (200) and
+opened real connections to the victim's app / an arbitrary host; after, both are refused at
+registration (403, zero connections) while the legitimate same-tenant consumer is unaffected.
+Operator note: a consumer whose `script_name` is not a clean label, or does not resolve to a
+project the queue's tenant owns, now registers 400/403 instead of 200; a consumer handler verifying
+`x-hive-signature` must now read the new `x-hive-timestamp`/`x-hive-nonce` headers and HMAC
+`timestamp.nonce.body` (a wire-format change to a feature added this session, not yet rolled). Not
+rolled.
+
 ## 2026-10-13 — `/api/tv/hls` decodes a gzip body an origin sends despite `accept-encoding: identity`, and a key is decided by its URI role
 
 The route asks for `accept-encoding: identity`, but an origin that ignores it (nginx
