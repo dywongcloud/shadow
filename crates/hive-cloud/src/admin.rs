@@ -206,7 +206,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/domains/:domain/nameservers",
             put(domain_set_nameservers),
         )
-        .route("/v1/domains/:domain/auto-renew", put(domain_set_auto_renew))
         .route("/v1/domains/:domain/ssl/renew", post(domain_renew_ssl))
         .route("/v1/teams", get(teams_list).post(team_create))
         .route("/v1/teams/:slug", get(team_get).delete(team_delete))
@@ -2395,24 +2394,6 @@ async fn domain_set_nameservers(
     c.domains.set_nameservers(&domain, r.nameservers);
     c.audit
         .record(&t, "user", "update", "nameservers", &domain, "");
-    crate::persist::persist(&c);
-    Ok(Json(json!(c.domains.get(&domain))))
-}
-
-#[derive(Deserialize)]
-struct AutoRenewReq {
-    on: bool,
-}
-
-async fn domain_set_auto_renew(
-    State(c): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    claims: Option<axum::Extension<crate::auth::Claims>>,
-    Path(domain): Path<String>,
-    Json(r): Json<AutoRenewReq>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    c.domains.set_auto_renew(&domain, r.on);
     crate::persist::persist(&c);
     Ok(Json(json!(c.domains.get(&domain))))
 }

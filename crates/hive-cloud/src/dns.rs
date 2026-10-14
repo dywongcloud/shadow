@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-const YEAR_MS: u64 = 365 * 24 * 60 * 60 * 1000;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DnsRecord {
     pub id: String,
@@ -44,6 +42,13 @@ pub struct SslCert {
     pub provider: String,
 }
 
+/// One domain the platform serves DNS for. It is NOT a registrar: the registration facts
+/// (`registrar`, `renewal_price`, `auto_renew`, `expires_ms`) are never measured, so they are
+/// always empty, `false` and `0` (unknown), and no client may show them. The keys stay on the wire
+/// only because a node on an earlier build deserializes `state.json` and replicated snapshots
+/// with them REQUIRED, and a failed parse there resets that node's whole platform state: emptying
+/// a key is safe across a roll or rollback, removing it is not. [`DomainStore::load`] scrubs
+/// records written when `default_domain` still invented them.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DomainRecord {
     pub domain: String,
@@ -113,12 +118,12 @@ fn default_domain(domain: &str, tenant: &str) -> DomainRecord {
     DomainRecord {
         domain: domain.to_string(),
         tenant: tenant.to_string(),
-        registrar: "OpenEdge".into(),
-        renewal_price: "$13 per year".into(),
-        auto_renew: true,
+        registrar: String::new(),
+        renewal_price: String::new(),
+        auto_renew: false,
         cdn_active: true,
         created_ms: now,
-        expires_ms: now + YEAR_MS,
+        expires_ms: 0,
         nameservers: vec!["ns1.openedge-dns.com".into(), "ns2.openedge-dns.com".into()],
         verify: None,
         ssl: pending_ssl(),
@@ -241,15 +246,6 @@ impl DomainStore {
         true
     }
 
-    pub fn set_auto_renew(&self, domain: &str, on: bool) -> bool {
-        let mut m = self.map.write();
-        let Some(d) = m.get_mut(domain) else {
-            return false;
-        };
-        d.auto_renew = on;
-        true
-    }
-
     /// Records the REAL installed bundle on the domain's ssl block: the only writer allowed to
     /// claim an issued cert (the creation default and [`Self::renew_ssl`] leave it pending). Called
     /// from acme's custom-domain issuance/adoption with the bundle's actual SANs and expiry.
@@ -316,6 +312,13 @@ impl DomainStore {
     /// by `custom_cert_pass`, not this node's current SNI cache.
     pub fn load(&self, mut list: Vec<DomainRecord>) {
         for d in &mut list {
+            // Records written (here or by a peer on an earlier build) when `default_domain` still
+            // seeded "OpenEdge", "$13 per year", auto_renew=true and a one-year expiry carry values
+            // nobody measured: scrubbed on every load, boot and snapshot adoption alike.
+            d.registrar.clear();
+            d.renewal_price.clear();
+            d.auto_renew = false;
+            d.expires_ms = 0;
             let domain = d.domain.trim().trim_end_matches('.').to_ascii_lowercase();
             let www = format!("www.{domain}");
             let attached = d
@@ -734,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn nameservers_autorenew_and_ssl_renew() {
+    fn nameservers_and_ssl_renew() {
         let s = DomainStore::new();
         s.ensure("acme.com", "t");
         assert!(s.set_nameservers(
@@ -745,8 +748,6 @@ mod tests {
             s.get("acme.com").unwrap().nameservers,
             vec!["ns1.shadw.cloud", "ns2.shadw.cloud"]
         );
-        assert!(s.set_auto_renew("acme.com", false));
-        assert!(!s.get("acme.com").unwrap().auto_renew);
         // The ssl block starts honest-pending (no fabricated cert) and only
         // set_ssl_issued — driven by a REAL installed bundle — may claim
         // issued state; renew_ssl reads, never fabricates.
