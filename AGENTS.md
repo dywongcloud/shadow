@@ -14,9 +14,11 @@ load-bearing, delete the memories it absorbs. Nested files load where you work: 
 - A stray local branch `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work with
   `refs/remotes/origin/main..HEAD`; `git_reword` rewrites every later SHA, so never during a roll.
 - **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries); verify with
-  `cargo test --workspace` plus live execution. Fix a failure CLASS once at the shared primitive, never per call site.
-  `cargo check` skips `cfg(target_os = "linux")` code AND test targets: run `cargo test --workspace --no-run`. A
-  dependency change ships its `Cargo.lock` diff in the same pass (`--locked`).
+  `cargo test --workspace --locked` (CI's hard gate, with `scripts/cli-acceptance.sh`: on macOS give it temp dirs under
+  `/private/tmp`) plus live execution. Fix a failure CLASS once at the shared primitive, never per call site. `cargo
+  check` skips `cfg(target_os = "linux")` code AND test targets: `cargo test --workspace --no-run` compiles them but
+  runs nothing, so a behaviour change also needs the run. A dependency change ships its `Cargo.lock` diff in the same
+  pass (`--locked`).
 - A roll or deploy is a production change: the operator's word first, then `ansible/AGENTS.md` (the dashboard:
   `ui/AGENTS.md`); prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`.
 
