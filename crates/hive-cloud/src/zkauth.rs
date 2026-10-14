@@ -377,8 +377,11 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 
 /// Handles `GET /_shadw/zk?p=<proof>&m=<message>&t=<team>&next=<path>` on a preview host: verifies
 /// the anonymous proof, sets a short-lived access cookie, then redirects to `next` (default `/`),
-/// completing the one-and-done unlock. `next` is forced to a same-site path (it must start with a
-/// single `/`) to prevent open redirects.
+/// completing the one-and-done unlock. This node decides two things, never the visitor: `t` must be
+/// the ring that may unlock THIS project ([`unlock_team`]), so a proof minted over any other team's
+/// roster is refused even though it verifies; and `next` must be a same-origin path
+/// ([`crate::auth::same_origin_path`]), so the redirect cannot leave the preview host. A refusal
+/// is one opaque 401, never saying which check failed.
 pub fn bootstrap(
     cloud: &std::sync::Arc<crate::state::CloudState>,
     host: &str,
@@ -387,22 +390,71 @@ pub fn bootstrap(
     let Some(project) = cloud.gw.project_for_host(host) else {
         return (StatusCode::NOT_FOUND, "unknown deployment").into_response();
     };
-    let team = query_param(query, "t").unwrap_or_else(|| "personal".into());
+    let team = query_param(query, "t")
+        .map(|t| urldecode(&t))
+        .unwrap_or_else(|| LEGACY_PERSONAL.into());
     let proof = query_param(query, "p").unwrap_or_default();
     let message = query_param(query, "m").unwrap_or_default();
     let next = query_param(query, "next")
         .map(|n| urldecode(&n))
-        .filter(|n| n.starts_with('/') && !n.starts_with("//"))
+        .map(|n| crate::auth::same_origin_path(&n, "/").to_string())
         .unwrap_or_else(|| "/".into());
-    if verify_access(&team, &project, &proof, &message) {
-        Response::builder()
-            .status(StatusCode::FOUND)
-            .header(header::LOCATION, next)
-            .header(header::SET_COOKIE, issue_cookie(&project))
-            .body(Body::empty())
-            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    if team != unlock_team(&local_owning_team(cloud, &project))
+        || !verify_access(&team, &project, &proof, &message)
+    {
+        return (StatusCode::UNAUTHORIZED, "invalid membership proof").into_response();
+    }
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::LOCATION, next)
+        .header(header::SET_COOKIE, issue_cookie(&project))
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// The platform owner's legacy namespace, the ring that unlocks a project nobody owns.
+const LEGACY_PERSONAL: &str = "personal";
+
+/// The team whose ring may unlock a preview, given its owning team: that team, or the legacy
+/// `personal` ring for an UNOWNED project (`UNTAGGED_TENANT`). The dashboard's `/api/preview-unlock`
+/// makes the same mapping and enrolls only the platform owner there, so an unowned project is never
+/// unlocked by a tenant's ring.
+fn unlock_team(owner: &str) -> &str {
+    if owner == crate::admin::UNTAGGED_TENANT {
+        LEGACY_PERSONAL
     } else {
-        (StatusCode::UNAUTHORIZED, "invalid membership proof").into_response()
+        owner
+    }
+}
+
+/// The owning team of `project` from this node's own state: the settings row, else the newest
+/// deployment record that carries a tenant (local or peer; project names compare
+/// case-insensitively, mirroring `admin::project_owned_by`, because records legitimately carry
+/// case-variant project references). `UNTAGGED_TENANT` when nothing names one. Cheap and
+/// synchronous on purpose: the unauthenticated unlock path must not wait on the relational mirror.
+fn local_owning_team(cloud: &Arc<crate::state::CloudState>, project: &str) -> String {
+    let team = crate::admin::record_tenant(&cloud.projects.team_of(project)).to_string();
+    if team != crate::admin::UNTAGGED_TENANT {
+        return team;
+    }
+    let mut best: Option<(u64, String)> = None;
+    for r in cloud.gw.deployment_records() {
+        if r.project.eq_ignore_ascii_case(project) && !r.tenant.trim().is_empty() {
+            if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+                best = Some((r.created_at_ms, r.tenant.clone()));
+            }
+        }
+    }
+    for d in cloud.peer_deployments.read().values().flatten() {
+        if d.project.eq_ignore_ascii_case(project) && !d.tenant.trim().is_empty() {
+            if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
+                best = Some((d.created_at_ms, d.tenant.clone()));
+            }
+        }
+    }
+    match best {
+        Some((_, t)) => crate::admin::record_tenant(&t).to_string(),
+        None => team,
     }
 }
 
@@ -568,10 +620,9 @@ struct ProjectTeamQuery {
 /// the edge redirect carried. The refreshed relational mirror is authoritative: `team_for_project`
 /// only returns a value after a successful Guardian index refresh, and a present fresh row wins
 /// even when this node's ProjectStore carries a stale non-empty team. A missing row or an
-/// unavailable refresh deliberately enters the documented lower-authority fallback: local settings,
-/// then the newest deployment record (local or peer; project names compare case-insensitively,
-/// mirroring `admin::project_owned_by`, because records legitimately carry case-variant project
-/// references).
+/// unavailable refresh deliberately enters the documented lower-authority fallback,
+/// [`local_owning_team`]: local settings, then the newest deployment record. That fallback is also
+/// what [`bootstrap`] binds the proof's ring to on the serving node.
 async fn project_team(
     State(cloud): State<Arc<crate::state::CloudState>>,
     headers: HeaderMap,
@@ -602,28 +653,7 @@ async fn project_team(
         ),
     }
 
-    let mut team = crate::admin::record_tenant(&cloud.projects.team_of(&project)).to_string();
-    if team == crate::admin::UNTAGGED_TENANT {
-        let mut best: Option<(u64, String)> = None;
-        for r in cloud.gw.deployment_records() {
-            if r.project.eq_ignore_ascii_case(&project) && !r.tenant.trim().is_empty() {
-                if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
-                    best = Some((r.created_at_ms, r.tenant.clone()));
-                }
-            }
-        }
-        for d in cloud.peer_deployments.read().values().flatten() {
-            if d.project.eq_ignore_ascii_case(&project) && !d.tenant.trim().is_empty() {
-                if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
-                    best = Some((d.created_at_ms, d.tenant.clone()));
-                }
-            }
-        }
-        if let Some((_, t)) = best {
-            team = crate::admin::record_tenant(&t).to_string();
-        }
-    }
-    Ok(Json(json!({ "team": team })))
+    Ok(Json(json!({ "team": local_owning_team(&cloud, &project) })))
 }
 
 /// Mints a preview proof for the unlock flow. The dashboard reaches the fleet through a round-robin

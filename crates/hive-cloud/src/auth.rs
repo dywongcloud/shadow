@@ -54,6 +54,24 @@ pub fn is_mesh_internal(claims: &Claims) -> bool {
     claims.sub == MESH_INTERNAL_SUB && claims.role == MESH_SERVICE_ROLE
 }
 
+/// `raw` when it is a path on THIS origin, otherwise `fallback`: the only way a caller-supplied
+/// return path may become a `Location` (the unlock and SSO flows redirect back to one).
+///
+/// A same-origin path is one leading `/` followed by neither `/` nor `\`, with no control character
+/// anywhere. A `starts_with("//")` check is not enough: the WHATWG URL parser strips ASCII tab and
+/// newline from ANY position and reads `\` as `/`, so `/\evil.example` and `/<TAB>/evil.example`
+/// both resolve to `https://evil.example/`. Twin of `ui/lib/same-origin-path.ts`
+/// (`sameOriginPath`): change them together.
+pub fn same_origin_path<'a>(raw: &'a str, fallback: &'a str) -> &'a str {
+    let mut chars = raw.chars();
+    let path_absolute = chars.next() == Some('/') && !matches!(chars.next(), Some('/' | '\\'));
+    if path_absolute && !raw.chars().any(char::is_control) {
+        raw
+    } else {
+        fallback
+    }
+}
+
 fn secret() -> Option<String> {
     std::env::var("HIVE_JWT_SECRET")
         .ok()
