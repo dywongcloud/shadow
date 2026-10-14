@@ -17,8 +17,10 @@ Witnessed on throwaway per-case nodes (`scratch2/work/secfix-keys.sh`): before, 
 branches fired silently; after, all 5 refuse to boot or return a loud error naming the exact file
 and reason, while the dev flow, a valid `HIVE_SECRET_KEY` and a missing `integrity_signing.key`
 are unchanged (3/3). Operator note: a node with an already-wrong `HIVE_SECRET_KEY` or an
-already-damaged key file now refuses to start instead of silently running on the wrong key. Not
-rolled.
+already-damaged key file now refuses to start instead of silently running on the wrong key, which
+is a roll hazard for a node already in that state — run `scripts/audit-secret-keys.sh` against the
+fleet before rolling (read-only; flags exactly this, host by host, before any node restarts on the
+new fail-closed behavior). Not rolled.
 
 ## 2026-10-13 — an HLS key a server labels as a playlist reaches the player
 
