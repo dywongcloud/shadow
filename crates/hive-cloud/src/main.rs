@@ -3593,6 +3593,26 @@ const MAX_GOSSIP_TARGETS_PER_ROUND: usize = 64;
 /// the backoff for a target nobody has heard from. `answers` holds each target's newest ANSWERED
 /// sync with the round it was dispatched in, standing in while the next sync is in flight (a later
 /// result replaces an earlier one, a failed one drops the stand-in).
+///
+/// Merge: routes live in a PERSISTENT per-node set (`peer_routes_by_node`). A reached peer's full
+/// snapshot REPLACES its node's set, an unchanged report only refreshes the transport fields and
+/// liveness, and a node's routes drop solely when nothing about it has been seen within
+/// `ROUTE_TTL_MS` (treating every reached answer as authoritative let an empty `unchanged` answer
+/// wipe every route the node had published, and the deployment 404'd until the next full snapshot).
+/// Route generations are forgotten for nodes that aged out entirely, so a returning node is
+/// re-fetched in full instead of resumed from a stale generation, and `peer_routes` (host -> every
+/// peer that serves it) is derived from the set each round. Fleet deployments are TTL-merged the
+/// same way (`merge_deployments_ttl`: one missed fetch must not wipe a peer's projects from the
+/// dashboard), the git-webhook index follows them ([`index_fleet_git_repos`]), and the replicated
+/// zkauth rosters are rebuilt from scratch each cycle, so peer revocations converge, and swapped
+/// whole.
+///
+/// Roster: the `peer_iroh` map IS the mesh roster, key-addressed by endpoint id. It is capped at
+/// `ROSTER_CAP`, saved to disk every round so a restart bootstraps iroh gossip from disk without
+/// any tunnel, and replicated through GuardianDB so a node whose local file is lost can re-adopt
+/// it, written only when its content hash changed (`replicated_roster_hash`). Each round also
+/// refreshes this node's own addresses ([`refresh_self_iroh_addrs`]) and seeds GuardianDB's client
+/// with the peers' ([`seed_guardian_peers`]).
 fn spawn_gossip_loop(
     cloud: Arc<CloudState>,
     peers: Vec<String>,
@@ -3761,17 +3781,6 @@ fn spawn_gossip_loop(
                     holders.entry(k.clone()).or_default().push(nid.clone());
                 }
             }
-            // Route table: apply each reached peer's answer to the PERSISTENT
-            // per-node set, then derive the host -> routes view.
-            //
-            // This replaces "rebuild the whole table from this round's answers,
-            // then TTL-carry-forward anything from a node we did not reach".
-            // That shape is wrong once a peer may answer "unchanged": a reached
-            // node was treated as authoritative, so an empty answer wiped every
-            // route it had ever published and the deployment 404'd until the
-            // next full snapshot. Now a full snapshot REPLACES a node's set and
-            // an unchanged report only refreshes it; a node's routes are dropped
-            // solely when nothing about it has been seen within ROUTE_TTL_MS.
             {
                 let mut by_node = cloud.peer_routes_by_node.write();
                 let mut gens = cloud.route_gens.write();
@@ -3804,18 +3813,12 @@ fn spawn_gossip_loop(
                     set.retain(|_, r| now.saturating_sub(r.last_seen_ms) < crate::state::ROUTE_TTL_MS);
                     !set.is_empty()
                 });
-                // Forget generations for nodes that aged out entirely, so a
-                // returning node is re-fetched in full rather than resumed from
-                // a stale generation.
                 gens.retain(|n, _| by_node.contains_key(n));
             }
-            // Replicated zkauth rosters are rebuilt from scratch each cycle (so peer
-            // revocations converge) and swapped whole.
             #[cfg(feature = "zkauth")]
             crate::zkauth::set_peer_exports(
                 contributions.iter().filter_map(|pr| pr.zk_roster.as_ref()),
             );
-            // Derived view: host -> every peer that serves it.
             let merged = {
                 let by_node = cloud.peer_routes_by_node.read();
                 let mut m: std::collections::HashMap<String, Vec<crate::state::PeerRoute>> =
@@ -3828,59 +3831,19 @@ fn spawn_gossip_loop(
                 m
             };
             *cloud.peer_routes.write() = merged;
-            // TTL-merge fleet deployments too (same rationale as routes): a single missed
-            // gossip fetch to a peer must NOT wipe its projects from the dashboard's
-            // workflows/runs/deployments views. Carry forward an alive-but-unreached
-            // node's deployments; drop only nodes that have aged out of the registry.
             let merged_deps = {
                 let prev = cloud.peer_deployments.read().clone();
                 crate::state::merge_deployments_ttl(&prev, fleet, &alive)
             };
-            // Keep the git-webhook reverse index (`gitops::GitRepoIndex`, see
-            // `admin::git_webhook`) in sync with freshly-gossiped fleet
-            // deployments: a project first deployed via a DIFFERENT node than the
-            // one that later receives a GitHub webhook delivery (the
-            // `webhook.<platform_domain>` DNS root round-robins across every
-            // gateway node) would otherwise sit unindexed on this node until its
-            // own next deploy. Bounded to the projects visible in THIS round's
-            // peer data (not a project rescan), and skips any project this node
-            // already has a LOCAL real-git record for — matching
-            // `admin::git_for_project_fleet`'s local-wins precedence exactly.
-            {
-                let mut newest_by_project: HashMap<&str, &fluid_core::DeploymentInfo> =
-                    HashMap::new();
-                for d in merged_deps.values().flatten() {
-                    if !d.git.as_ref().is_some_and(|g| g.is_real_git()) {
-                        continue;
-                    }
-                    newest_by_project
-                        .entry(d.project.as_str())
-                        .and_modify(|cur| {
-                            if d.created_at_ms > cur.created_at_ms {
-                                *cur = d
-                            }
-                        })
-                        .or_insert(d);
-                }
-                for (project, d) in newest_by_project {
-                    if cloud.gw.git_for_project(project).is_some() {
-                        continue; // local record wins, unconditionally
-                    }
-                    if let Some(g) = &d.git {
-                        cloud.git_index.set_project_repo(project, &g.repo_url);
-                    }
-                }
-            }
+            index_fleet_git_repos(&cloud, &merged_deps);
             *cloud.peer_deployments.write() = merged_deps;
             *cloud.container_holders.write() = holders;
-            // Roster hygiene: bound unbounded growth over a long uptime. Keep every
-            // entry the registry still vouches for (its own 30s staleness already
-            // prunes dead nodes) PLUS the static config-derived targets (CLI peers /
-            // bootstrap seeds — these must survive even while their node is briefly
-            // down, unlike a transitively-learned entry); drop everything else once
-            // the map exceeds the cap, oldest-looking (registry-unknown) first. A
-            // dead/unreachable roster entry can never wedge the loop regardless (H4
-            // per-phase iroh timeouts bound every individual dial).
+            /// Bound on the `peer_iroh` roster over a long uptime: past it, every entry the
+            /// registry still vouches for (its own 30 s staleness already prunes dead nodes) and
+            /// the static config-derived targets (CLI peers and bootstrap seeds, which must survive
+            /// even while their node is briefly down, unlike a transitively learned entry) are kept
+            /// and everything else is dropped. A dead or unreachable roster entry can never wedge
+            /// the loop regardless: the per-phase iroh timeouts bound every individual dial.
             const ROSTER_CAP: usize = 256;
             {
                 let mut pi = cloud.peer_iroh.write();
@@ -3899,17 +3862,11 @@ fn spawn_gossip_loop(
                     pi.retain(|k, (nid, _)| keep.contains(k) || keep.contains(nid));
                 }
             }
-            // Persist the gossip-transport map so the next restart bootstraps iroh
-            // gossip from disk (no SSH tunnel needed for rendezvous). This map IS
-            // the mesh roster: key-addressed (endpoint ids), never IPs.
             let roster_json = {
                 let pi = cloud.peer_iroh.read();
                 crate::persist::save_peer_iroh(&pi);
                 serde_json::to_vec(&*pi).unwrap_or_default()
             };
-            // Replicate the roster through GuardianDB (iroh-docs) so a node whose
-            // local file is lost can re-adopt it from the replicated store. Only
-            // written when the content actually changes (rosters are stable).
             let h = {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3920,72 +3877,94 @@ fn spawn_gossip_loop(
                 replicated_roster_hash = h;
                 tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
             }
-            // Refresh THIS node's own MESH iroh_addr (re-serialize `ep.addr()`
-            // every round, same pattern as guardian_iroh_addr/relay_url below).
-            // `iroh_addr` was previously captured EXACTLY ONCE, at the instant
-            // `bind_full` returned — before the endpoint has had any time to
-            // register with its relay or learn hole-punch candidates, so it
-            // shipped private-addrs-only in the gossip round every OTHER node
-            // uses to dial this one. Root-caused live: fc-sanjose-gpu-2's `iroh_addr`
-            // still read `{"id":...,"addrs":[{"Ip":"10.0.2.2:48670"}]}` (no
-            // relay, no public IP) an hour after boot with its security group
-            // open the whole time, while its SEPARATE `guardian_iroh_addr` (which
-            // DOES refresh every round, see below) correctly carried the relay
-            // hint and the real public IP — proving the gap was staleness, not
-            // reachability. This is exactly the class of bug
-            // `dnsserver-nearest-by-geo`'s sibling row (`geo-refresh-not-only-at-
-            // boot`) fixed for lat/lon; same shape here for the mesh address.
-            if let Some(addr) = cloud.iroh.read().as_ref().and_then(hive_p2p::addr_json) {
-                cloud.registry.set_self_iroh_addr(addr);
-            }
-            // Publish THIS node's own GuardianDB-specific address (a SEPARATE
-            // iroh identity from the mesh's iroh_addr above — GuardianDB runs
-            // its own independent client) once it's ready, so peers can gossip
-            // it and seed it correctly. `None` until GuardianDB's client has
-            // bound; self-heals within a few rounds after boot, never blocks.
-            let cloud_for_self_addr = cloud.clone();
-            tokio::spawn(async move {
-                if let Some(addr) = crate::guardian::my_iroh_addr().await {
-                    cloud_for_self_addr
-                        .registry
-                        .set_self_guardian_addr(Some(addr));
-                }
-            });
-            // Seed GuardianDB's OWN iroh client with every currently-known
-            // peer's GuardianDB-specific address (re-asserted every round,
-            // same rationale as the bootstrap-seed re-assertion above) — NOT
-            // the mesh iroh_addr above, which belongs to a DIFFERENT identity
-            // (see guardian::seed_peer's doc comment: feeding the wrong one
-            // in previously caused a live retry-storm, reverted). Best-effort,
-            // spawned so a slow/failed seed round never blocks the gossip
-            // loop's own cadence. Persisted (mirroring peer_iroh.json) so a
-            // restart's boot-time seed has real data once the mesh has had at
-            // least one round to gossip these addresses around.
-            let guardian_peer_map: std::collections::HashMap<String, String> = cloud
-                .registry
-                .nodes()
-                .into_iter()
-                .filter(|n| !n.is_self)
-                .filter_map(|n| n.guardian_iroh_addr.clone().map(|a| (n.id.clone(), a)))
-                .collect();
-            if !guardian_peer_map.is_empty() {
-                crate::persist::save_peer_guardian_addr(&guardian_peer_map);
-                let guardian_addrs: Vec<String> = guardian_peer_map.into_values().collect();
-                tokio::spawn(
-                    async move { crate::guardian::seed_known_peers(&guardian_addrs).await },
-                );
-            }
+            refresh_self_iroh_addrs(&cloud);
+            seed_guardian_peers(&cloud);
             tokio::time::sleep(crate::gossip_round::ROUND_SLEEP).await;
         }
     });
 }
 
-/// Newest gossiped `last_seen_ms` the registry holds for a gossip target
-/// (0 = unknown), resolved through the target's transport mapping, the
-/// endpoint id a key-addressed target IS, and `known` — the node id the target
-/// answered as on its last sync, which is all a `--peer` URL target has left
-/// once a failed fetch evicted its mapping. Stale records count: the question
-/// is "has anyone heard it recently", for the dead-target backoff.
+/// Keeps the git-webhook reverse index (`gitops::GitRepoIndex`, see `admin::git_webhook`) in sync
+/// with freshly gossiped fleet deployments: a project first deployed via a DIFFERENT node than the
+/// one that later receives a GitHub webhook delivery (the `webhook.<platform_domain>` DNS root
+/// round-robins across every gateway node) would otherwise sit unindexed on this node until its own
+/// next deploy. It is bounded to the projects visible in THIS round's peer data (not a project
+/// rescan) and skips any project this node already has a LOCAL real-git record for, matching
+/// `admin::git_for_project_fleet`'s local-wins precedence exactly.
+fn index_fleet_git_repos(
+    cloud: &CloudState,
+    fleet_deployments: &std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>,
+) {
+    use std::collections::HashMap;
+    let mut newest_by_project: HashMap<&str, &fluid_core::DeploymentInfo> = HashMap::new();
+    for d in fleet_deployments.values().flatten() {
+        if !d.git.as_ref().is_some_and(|g| g.is_real_git()) {
+            continue;
+        }
+        newest_by_project
+            .entry(d.project.as_str())
+            .and_modify(|cur| {
+                if d.created_at_ms > cur.created_at_ms {
+                    *cur = d
+                }
+            })
+            .or_insert(d);
+    }
+    for (project, d) in newest_by_project {
+        if cloud.gw.git_for_project(project).is_some() {
+            continue;
+        }
+        if let Some(g) = &d.git {
+            cloud.git_index.set_project_repo(project, &g.repo_url);
+        }
+    }
+}
+
+/// Re-serializes this node's own MESH `iroh_addr` every gossip round: a one-time capture when
+/// `bind_full` returned predates the endpoint's relay registration and hole-punch candidates, so it
+/// shipped private addresses only in the very round every other node uses to dial this one. It then
+/// publishes this node's GuardianDB-specific address, a SEPARATE iroh identity from the mesh's (see
+/// `guardian::my_iroh_addr`: `None` until that client has bound, so it self-heals within a few
+/// rounds after boot and never blocks).
+fn refresh_self_iroh_addrs(cloud: &Arc<CloudState>) {
+    if let Some(addr) = cloud.iroh.read().as_ref().and_then(hive_p2p::addr_json) {
+        cloud.registry.set_self_iroh_addr(addr);
+    }
+    let cloud_for_self_addr = cloud.clone();
+    tokio::spawn(async move {
+        if let Some(addr) = crate::guardian::my_iroh_addr().await {
+            cloud_for_self_addr
+                .registry
+                .set_self_guardian_addr(Some(addr));
+        }
+    });
+}
+
+/// Seeds GuardianDB's own iroh client with every known peer's GuardianDB-specific address
+/// (`guardian::seed_known_peers`, never the mesh `iroh_addr`, which belongs to a DIFFERENT
+/// identity) and persists them, mirroring `peer_iroh.json`, so a restart's boot-time seed has real
+/// data once the mesh has had one round to gossip them. The seed is spawned so a slow or failed one
+/// never blocks the gossip loop's cadence.
+fn seed_guardian_peers(cloud: &CloudState) {
+    let guardian_peer_map: std::collections::HashMap<String, String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self)
+        .filter_map(|n| n.guardian_iroh_addr.clone().map(|a| (n.id.clone(), a)))
+        .collect();
+    if !guardian_peer_map.is_empty() {
+        crate::persist::save_peer_guardian_addr(&guardian_peer_map);
+        let guardian_addrs: Vec<String> = guardian_peer_map.into_values().collect();
+        tokio::spawn(async move { crate::guardian::seed_known_peers(&guardian_addrs).await });
+    }
+}
+
+/// Newest gossiped `last_seen_ms` the registry holds for a gossip target (0 = unknown), resolved
+/// through the target's transport mapping, the endpoint id a key-addressed target IS, and `known`
+/// (the node id the target answered as on its last sync, which is all a `--peer` URL target has
+/// left once a failed fetch evicted its mapping). Stale records count: the question is "has anyone
+/// heard it recently", for the dead-target backoff.
 fn gossip_target_heard_ms(cloud: &CloudState, target: &str, known: Option<&str>) -> u64 {
     let mapped = cloud.peer_iroh.read().get(target).map(|(id, _)| id.clone());
     let key = target.strip_prefix("seed:").unwrap_or(target);
@@ -4027,43 +4006,35 @@ fn health_decision(prev_misses: u32, ok: bool, threshold: u32) -> (u32, Option<b
     }
 }
 
-/// Eager full-mesh trunking (proactive). Keeps a live iroh QUIC trunk to EVERY
-/// healthy peer — not just the ones this node directly gossips — so a cross-node
-/// request reuses a warm trunk instead of paying a cold dial/holepunch on the
-/// critical path (the dial cost moves here, off-request). Runs a hair under the 15s
-/// QUIC keepalive so an established trunk never lapses between passes; a missing or
-/// dead one (peer just restarted) is re-dialed within a tick. Warms in PARALLEL so
-/// one slow holepunch can't serialize the rest, and `warm`'s connect is H4-bounded
-/// so a dead peer can't wedge the loop. Config: `HIVE_TRUNK_WARM_INTERVAL` (s, def 10).
+/// Eager full-mesh trunking (proactive): keeps a live iroh QUIC trunk to EVERY healthy peer with a
+/// known iroh address, not just the ones this node directly gossips, so a cross-node request reuses
+/// a warm trunk instead of paying a cold dial/holepunch on the critical path (the dial cost moves
+/// here, off-request). It runs under the 15 s QUIC keepalive so an established trunk never lapses
+/// between passes, and a missing or dead one (peer just restarted) is re-dialed within a tick. It
+/// warms in PARALLEL, so one slow holepunch cannot serialize the rest, and `warm`'s connect is
+/// bounded, so a dead peer cannot wedge the loop. The pause between passes is dithered by +-20% per
+/// tick and phased per node (`meshwatch::node_stagger_ms`): after a fleet roll every node's warmer
+/// would otherwise fire in lockstep and many nodes would holepunch the same restarted peer at the
+/// same instant (a reconnect thundering herd), and wall time alone is SHARED entropy, so two nodes
+/// computing in the same millisecond would draw the identical jitter; the dither breaks the
+/// synchronization without changing the average cadence. Peers are labelled by endpoint id where
+/// one is known (the pool keys trunks by the id in the address either way), so the warmer's logs
+/// and alias map speak the identifier the control plane uses. `HIVE_TRUNK_WARM_INTERVAL` (s,
+/// default 10).
 fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_TRUNK_WARM_INTERVAL", 10));
     tracing::info!(?interval, "eager mesh trunk warmer");
     tokio::spawn(async move {
         loop {
-            // ±20% dither per tick (now-derived): after a fleet roll every
-            // node's warmer otherwise fires in lockstep, and 14 nodes
-            // holepunching the same restarted peer in the same instant is a
-            // reconnect thundering herd — the tau-style jitter breaks the
-            // synchronization without changing the average cadence.
             let base = interval.as_millis() as u64;
             let dither = base / 5;
-            // Mix per-node identity into the phase: wall time alone is SHARED
-            // entropy — two nodes computing in the same millisecond draw the
-            // identical "jitter" and stay in lockstep.
             let phase = crate::meshwatch::node_stagger_ms(&cloud.node_name);
             let jittered = base - dither + ((hive_core::now_ms() + phase) % (2 * dither + 1));
             tokio::time::sleep(Duration::from_millis(jittered)).await;
             let pool = match cloud.mesh.read().clone() {
                 Some(p) => p,
-                None => continue, // iroh transport not bound yet
+                None => continue,
             };
-            // Every healthy peer with a known iroh address → ensure a live trunk.
-            // Label peers by their ENDPOINT ID where one is known, falling back to
-            // the name. The pool keys trunks canonically by the id parsed out of
-            // the address, so this no longer decides WHICH trunk gets warmed — but
-            // it keeps the warmer's logs and the alias map speaking the same
-            // identifier the control plane uses, rather than the name-only view
-            // that previously left the control-plane trunk permanently cold.
             let peers: Vec<(String, String)> = cloud
                 .registry
                 .nodes()
@@ -4094,20 +4065,18 @@ fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
     });
 }
 
-/// Live relay-set refresh loop (dynamic-hive-relay-urls-list): keeps the bound
-/// `iroh` endpoint's relay map in sync with the DESIRED set —
-/// `[this node's own relay_url] + [every healthy peer's relay_url, from the live
-/// gossip-replicated NodeRegistry] + [the central relay.shadw.cloud backstop] +
-/// [HIVE_RELAY_URLS manual overrides — merged in, not replaced]` — via
-/// `Endpoint::insert_relay`/`remove_relay` (a genuine LIVE update on the
-/// already-bound endpoint; see `RelaySet`). Replaces the OLD bind-time-only
-/// `relay_map_from_env` as the ongoing source of truth for the mesh's relay set
-/// (that function still seeds/merges at bind time — kept, not removed).
-/// Config: `HIVE_RELAY_SYNC_INTERVAL` (s, default 30).
+/// Live relay-set refresh loop: keeps the bound `iroh` endpoint's relay map in sync with the
+/// DESIRED set, namely this node's own `relay_url`, every healthy peer's `relay_url` (from the live
+/// gossip-replicated `NodeRegistry`), the central `hive_edge::CENTRAL_RELAY_URL` backstop (always
+/// included, so a node with no peer or own relay known yet still has a working relay path) and the
+/// `HIVE_RELAY_URLS` manual overrides (read once at boot, the same source `relay_map_from_env`
+/// reads at bind time, and merged into every refresh, not replaced), through
+/// `Endpoint::insert_relay`/`remove_relay`, a genuine LIVE update of the already-bound endpoint
+/// (see `RelaySet`). It is the ongoing source of truth for the mesh's relay set;
+/// `relay_map_from_env` still seeds/merges at bind time. A pass is skipped while the iroh transport
+/// is not bound. `HIVE_RELAY_SYNC_INTERVAL` (s, default 30).
 fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_RELAY_SYNC_INTERVAL", 30));
-    // Manual overrides, read once at boot (same source `relay_map_from_env`
-    // reads at bind time) — merged into every refresh, not just the seed.
     let manual: Vec<String> = std::env::var("HIVE_RELAY_URLS")
         .ok()
         .map(|s| {
@@ -4128,7 +4097,7 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
             tick.tick().await;
             let set = match cloud.relay_set.read().clone() {
                 Some(s) => s,
-                None => continue, // iroh transport not bound (or not yet) — nothing to sync
+                None => continue,
             };
             let me = cloud.registry.me();
             let mut desired: Vec<String> = Vec::new();
@@ -4144,8 +4113,6 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
                 }
             }
             desired.extend(manual.iter().cloned());
-            // Central backstop: always included, so a node with no peer/own relay
-            // known yet still has a working relay path.
             desired.push(hive_edge::CENTRAL_RELAY_URL.to_string());
             desired.sort();
             desired.dedup();
@@ -4156,23 +4123,15 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// GuardianDB anti-entropy loop (implement-anti-entropy-loop): each tick, picks
-/// ONE peer from the live, healthy `NodeRegistry` and asks it for its
-/// per-namespace GuardianDB HEAD map (`GET /v1/guardian/heads` —
-/// design-head-cid-exchange-rpc, key+content-hash+timestamp only, never value
-/// bytes), diffs it against this node's own local heads
-/// (`guardian::namespace_heads`), and for every namespace with a REAL
-/// divergence triggers a targeted `Doc::start_sync` reconciliation against
-/// exactly that peer (implement-reconciliation-trigger — never a
-/// full-database refresh). This is the Dynamo-style read-repair loop for the
-/// iroh-docs-backed replicated store: the periodic mechanism that catches
-/// entries a peer never picked up via the opportunistic live-sync path (e.g.
-/// this node was offline/partitioned when the peer wrote, or automatic
-/// DocTicket exchange never happened between this pair). Peer selection uses
-/// `now_ms()` modulo the healthy-peer count — good enough churn for eventual
-/// full-mesh coverage without a new RNG dependency; this is convergence
-/// machinery, not a security-sensitive selection. Config:
-/// `HIVE_ANTI_ENTROPY_INTERVAL_SECS` (s, default 60).
+/// GuardianDB anti-entropy loop, the Dynamo-style read repair for the iroh-docs-backed replicated
+/// store: each tick ([`anti_entropy_round`]) picks ONE peer from the `NodeRegistry`, asks it for
+/// its per-namespace GuardianDB HEAD map (`GET /v1/guardian/heads`: key, content hash and timestamp
+/// only, never value bytes), diffs it against this node's own heads (`guardian::namespace_heads`)
+/// and, for every namespace with a REAL divergence, triggers a targeted `Doc::start_sync` against
+/// exactly that peer, never a full-database refresh. It is the periodic mechanism that catches
+/// entries a peer never picked up through the opportunistic live-sync path (this node was offline
+/// or partitioned when the peer wrote, or the automatic DocTicket exchange never happened between
+/// the pair). `HIVE_ANTI_ENTROPY_INTERVAL_SECS` (default 60).
 fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_ANTI_ENTROPY_INTERVAL_SECS", 60));
     tracing::info!(
@@ -4192,16 +4151,28 @@ fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// One anti-entropy round — see `spawn_anti_entropy_loop`. Split out so the
-/// loop body itself stays a plain tick-and-call, matching this file's other
-/// periodic loops (`spawn_trunk_warmer`, `spawn_relay_sync_loop`).
+/// One anti-entropy round (see [`spawn_anti_entropy_loop`]), split out so the loop body stays a
+/// plain tick-and-call like the other periodic loops.
+///
+/// The peer rotates by a monotonic round counter, NEVER `now_ms() % len`: the loop ticks on a fixed
+/// interval, so a clock-derived index advances by `interval mod len` each round, which is ZERO for
+/// fleet sizes such as 12, 15 or 16 at a 60 s interval and pinned every round on the SAME peer, so
+/// one unreachable candidate could consume the single per-round slot forever while every other peer
+/// went un-reconciled; a counter cannot alias with the tick period. Candidates are deliberately NOT
+/// health-filtered: a peer this node currently calls unhealthy is the one whose state is most
+/// likely to have diverged, and filtering it out starved exactly the peers that needed reconciling
+/// (a dead peer just costs one failed RPC per round, a live-but-unprobeable one gets its state
+/// back).
+///
+/// Two kinds of divergence are counted per namespace: entry-level (a key's hash disagrees) and
+/// CONTENT-level (the hashes agree, but one side cannot read the bytes: a doc entry replicates
+/// independently of its blob, and iroh-docs stops retrying for good once the supplying peer
+/// departs). The content gap is invisible to the entry comparison and is the divergence this fleet
+/// actually suffers from, so counting it is what stops "heads already match" being reported over a
+/// node that holds only hashes; a `content_local` of `None` is UNKNOWN (pre-upgrade peer), never
+/// counted as missing, and a gap is worth reporting only when the PEER claims to hold what we lack,
+/// since only that a reconcile can close.
 async fn anti_entropy_round(cloud: &Arc<CloudState>) {
-    // Deliberately NOT health-filtered. A peer this node currently calls
-    // unhealthy is precisely the one whose state is most likely to have
-    // diverged, and filtering it out starved exactly the peers that needed
-    // reconciling — the convergence machinery avoided its own repair targets.
-    // A dead peer just costs one failed RPC per round; a live-but-unprobeable
-    // one gets its state back.
     let candidates: Vec<NodeInfo> = cloud
         .registry
         .nodes()
@@ -4209,15 +4180,8 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
         .filter(|n| !n.is_self && n.peer_id.is_some() && n.iroh_addr.is_some())
         .collect();
     if candidates.is_empty() {
-        return; // no reachable peer this round — nothing to compare against
+        return;
     }
-    // Rotate with a monotonic counter, NEVER `now_ms() % len`. The loop ticks on
-    // a fixed 60s interval, so a clock-derived index advances by exactly
-    // `60000 mod len` each round — which is ZERO for len 12, 15 or 16, the exact
-    // band this ~17-node fleet sits in. That pinned every round on the SAME peer
-    // indefinitely: one unreachable candidate could consume the single per-round
-    // slot forever while every other peer went un-reconciled. A counter cannot
-    // alias with the tick period.
     static ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let idx = ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % candidates.len();
     let peer = &candidates[idx];
@@ -4262,30 +4226,19 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
                     .collect()
             })
             .unwrap_or_default();
-        // Entries whose (key -> hash) disagree: classic entry-level divergence.
         let diverged = remote_heads
             .iter()
             .filter(|h| local_by_key.get(h.key.as_str()) != Some(&h.hash.as_str()))
             .count();
-        // CONTENT-level divergence: the hashes agree, but one of us cannot
-        // actually read the bytes. This is invisible to the entry comparison
-        // above, and it is the divergence this fleet actually suffers from —
-        // a doc entry replicates independently of its blob, and iroh-docs stops
-        // retrying for good once the supplying peer departs. Counting it is what
-        // stops "heads already match" from being reported over a node that holds
-        // nothing but hashes.
         let local_missing: std::collections::HashSet<&str> = local
             .get(ns)
             .map(|v| {
                 v.iter()
-                    // `None` = UNKNOWN (pre-upgrade peer), never counted as missing.
                     .filter(|h| h.content_local == Some(false))
                     .map(|h| h.hash.as_str())
                     .collect()
             })
             .unwrap_or_default();
-        // Only worth reporting when the PEER claims to hold what we lack — that
-        // is a gap a reconcile can actually close.
         let recoverable = remote_heads
             .iter()
             .filter(|h| h.content_local == Some(true) && local_missing.contains(h.hash.as_str()))
@@ -4329,29 +4282,29 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
     }
 }
 
-/// Apply replicated project DELETION tombstones to this node's own deployment
-/// records.
+/// Applies replicated project DELETION tombstones to this node's own deployment records. A
+/// tombstone already replicates (`ProjectStore::snapshot_synced`) and removes the SETTINGS row on
+/// every peer that receives it, but nothing applied it to the DEPLOYMENT records, a separate store:
+/// a peer that was unreachable when the delete cascaded (or was down and came back) kept its
+/// deployment rows, kept serving them and kept gossiping them into `peer_deployments`, which the
+/// dashboard's fleet view reads, so the project reappeared fully alive and deleting it again hit
+/// the same unreachable peer. No retry of the cascade at delete time can close that (the peer is by
+/// definition not listening then), so the tombstone is the durable, idempotent instruction,
+/// re-applied every tick by whoever holds it (the same shape as `tenancy_reconcile`: repair-only,
+/// never creative).
 ///
-/// A project tombstone already replicates (`ProjectStore::snapshot_synced`) and
-/// already removes the SETTINGS row on every peer that receives it — but nothing
-/// ever applied it to the DEPLOYMENT records, which are a separate store. So a
-/// peer that was unreachable when the delete cascaded (or that was down and came
-/// back) kept its deployment rows, kept serving them, and kept gossiping them
-/// into `peer_deployments` — which is what the dashboard's fleet view reads. The
-/// project reappeared, fully alive, and deleting it again hit the same
-/// unreachable peer. That is the "deleting a project does nothing" report, and
-/// no amount of retrying the cascade at delete time can close it: the peer is by
-/// definition not listening then.
-///
-/// Making the tombstone the durable, idempotent instruction — re-applied on
-/// every tick by whoever holds it — is what converges the fleet without an
-/// operator. Same shape as `tenancy_reconcile`: repair-only, never creative.
-///
-/// A project RE-CREATED after its deletion must survive, so the tombstone is
-/// only honoured while nothing newer than it exists: a settings row written
-/// after the tombstone, or ANY deployment created after it, cancels the pass for
-/// that project entirely (never a partial reap, which would delete a live
-/// deployment's siblings).
+/// A project RE-CREATED after its deletion must survive, so the tombstone is honoured only while
+/// nothing newer exists: a settings row written after the tombstone, or ANY deployment created
+/// after it, cancels the pass for that project entirely (never a partial reap, which would delete a
+/// live deployment's siblings). With no local deployment it still re-applies the delete, driving
+/// the generation-conditional relational delete every tick so a stale offline node's late boot
+/// backfill cannot resurrect `project_teams`, and releases the project's durable PUBLIC PORT claim:
+/// that release otherwise runs only in `purge_project_resources` on a node that tore a deployment
+/// down, so a node that merely ALLOCATED the port (the allocator is fleet-coordinated) would keep
+/// the claim in raw_ports.json forever, and a quarantined port is never re-granted, slowly losing
+/// public ports to projects that no longer exist. With local deployments left, a newer one is a
+/// causal recreation: the generation-aware `delete_project_local` removes only old-incarnation
+/// records and preserves the recreated row and resources.
 fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_DELETION_RECONCILE_SECS", 60));
     crate::supervise::spawn_supervised("deletion-reconcile", move || {
@@ -4382,22 +4335,7 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
                         if settings_recreated || peer_recreated {
                             continue;
                         }
-                        // Re-apply even with no local deployments: this drives
-                        // the generation-conditional relational delete every
-                        // tick, so a stale offline node's late boot backfill
-                        // cannot resurrect project_teams indefinitely.
                         cloud.projects.apply_delete(&project, tomb_ms);
-                        // No deployment records left, but a node can still hold
-                        // the project's durable PUBLIC PORT claim: the release
-                        // runs inside `purge_project_resources`, which only runs
-                        // on a node that actually tore a deployment down. A node
-                        // that merely ALLOCATED the port (the allocator is
-                        // fleet-coordinated) keeps the claim in raw_ports.json
-                        // forever, and a quarantined port is never re-granted —
-                        // so the fleet slowly loses public ports to projects that
-                        // no longer exist. Witnessed: 9000/9001 still claimed for
-                        // a project deleted fleet-wide. The tombstone is the
-                        // authority here too.
                         let retired = crate::raw_ports::release_raw_ports(&project);
                         if !retired.is_empty() {
                             tracing::warn!(
@@ -4410,9 +4348,6 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
                         }
                         continue;
                     }
-                    // A newer local deployment is a causal recreation. The
-                    // generation-aware helper removes only old-incarnation
-                    // records and preserves the recreated row/resources.
                     let team = crate::admin::norm(&cloud.projects.team_of(&project)).to_string();
                     let outcome =
                         crate::admin::delete_project_local(&cloud, &project, &team, tomb_ms).await;
@@ -4430,24 +4365,22 @@ fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
     });
 }
 
+/// Runs `store_sync::reconcile_on_promotion` once per OWNERSHIP term, polled every
+/// `HIVE_PROMOTION_RECONCILE_POLL_MS` (default 2000). It is the preamble to taking writes, so it
+/// keys on the same authority `admin_ingress` serves mutations on (`is_control_plane_leader`:
+/// authoritative owner and not isolated), never on `leadership::may_act`, whose tenure and quorum
+/// terms would delay it past the first accepted write and flip on every quorum blip. It fires on
+/// the first tick that authority holds, then again only after ownership ended or the authority
+/// lapsed for `leadership::TERM_LAPSE` or longer (long enough for another node to have become the
+/// owner and taken writes). A shorter isolation blip on a steady owner is not a promotion, and
+/// re-running the reconcile then could adopt followers' stale wholesale copies over writes accepted
+/// since.
 fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_millis(env_u64("HIVE_PROMOTION_RECONCILE_POLL_MS", 2000));
     crate::supervise::spawn_supervised("promotion-reconcile", move || {
         let cloud = cloud.clone();
         async move {
             let mut tick = tokio::time::interval(interval);
-            // Once per OWNERSHIP term. This is the preamble to taking writes,
-            // so it keys on the same authority `admin_ingress` serves
-            // mutations on (`is_control_plane_leader`: authoritative owner and
-            // not isolated) — never on `leadership::may_act`, whose tenure and
-            // quorum terms would delay it past the first accepted write and
-            // flip on every quorum blip. It fires on the first tick that
-            // authority holds, then again only after ownership ended or the
-            // authority lapsed for `leadership::TERM_LAPSE` or longer (long
-            // enough for another node to have become the owner and taken
-            // writes). A shorter isolation blip on a steady owner is not a
-            // promotion, and re-running the reconcile then could adopt
-            // followers' stale wholesale copies over writes accepted since.
             let mut reconciled_this_term = false;
             let mut lapse_since: Option<std::time::Instant> = None;
             loop {
@@ -4483,228 +4416,325 @@ fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Relational mirror loop — keeps the admin "view as PostgreSQL" browser's
-/// project_teams / teams / team_members / deployments tables (and a FULL
-/// billing_accounts backfill) populated from live store snapshots.
-/// `upsert_billing` only fires for tenants with active usage THIS tick, so an
-/// account that exists but isn't currently metered would otherwise never
-/// appear in the mirror (the live-witnessed missing-billing-accounts gap:
-/// simpfi/thoth-division had project_teams rows but no billing_accounts row).
+/// Relational mirror loop: keeps the admin "view as PostgreSQL" browser's project_teams / teams /
+/// team_members / deployments tables (and a FULL billing_accounts backfill) populated from live
+/// store snapshots (`upsert_billing` fires only for tenants with active usage THIS tick, so an
+/// account that exists but is not currently metered would otherwise never appear). It is a
+/// WRITE-ONLY projection (the follower pull of the stores themselves is `store_follower`, its own
+/// loops, never waiting on a SQL await here) and best-effort throughout, since these tables feed
+/// only fleet visibility and read-only admin views.
 ///
-/// Write discipline, per section:
-/// - project/team backfill: `leadership::may_act(RelationalLeaderWrites)`
-///   only; billing backfill: `leadership::may_act(BillingMeter)` — the SAME
-///   gate as the metering loop, so both billing writers always sit on the
-///   same node (on a chain-less mesh that includes the
-///   `HIVE_BILLING_COORDINATOR_NODE` pin).
-/// - deployments: EVERY node syncs only its OWN `gw.list()` rows (single
-///   writer per row by construction — see `relational::sync_deployments`).
+/// Write discipline: the project/team backfill runs only under
+/// `leadership::may_act(RelationalLeaderWrites)` and the billing backfill under
+/// `leadership::may_act(BillingMeter)`, the SAME gate as the metering loop, so both billing writers
+/// always sit on the same node (on a chain-less mesh that includes the
+/// `HIVE_BILLING_COORDINATOR_NODE` pin); deployments differ: EVERY node syncs only its OWN
+/// `gw.list()` rows (single writer per row by construction, see `relational::sync_deployments`).
 ///
-/// A WRITE-ONLY projection: the follower pull of the stores themselves is
-/// `store_follower` (its own loops, never waiting on a SQL await here).
-///
-/// A content hash per ordinary section skips ticks with no change. Project rows
-/// are deliberately re-asserted every ten leader ticks: that bounded write is
-/// the repair path for a stale offline node's late LWW backfill. Best-effort
-/// throughout: these tables feed only fleet visibility/read-only admin views.
-/// Config: `HIVE_RELATIONAL_MIRROR_SECS` (s, def 60).
+/// A content hash per ordinary section skips ticks with no change. Billing is hashed per tenant
+/// over the whole (account, ledger, invoices, checkouts) tuple, so a checkout or ledger entry
+/// landing with no account-field change still flips it and only tenants whose own rows changed are
+/// re-upserted (the hash map is replaced wholesale each pass, so a tenant that disappeared stops
+/// being tracked). Project rows are deliberately re-asserted every ten leader ticks. The loop runs
+/// on the BULKHEAD runtime, its supervisor included (see `bulkhead`): the guardian SQL engine
+/// reloads a whole table per statement, and the billing section on the serving runtime's workers
+/// once froze the leader. `HIVE_RELATIONAL_MIRROR_SECS` (s, default 60).
 fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_RELATIONAL_MIRROR_SECS", 60));
     tracing::info!(
         ?interval,
         "relational mirror loop (projects/teams/members/deployments + billing backfill → SQL view)"
     );
-    // On the BULKHEAD runtime (see `bulkhead`): this loop's billing section
-    // ran the guardian SQL engine for minutes at 94 % CPU on the serving
-    // runtime's workers and froze the leader (2026-10-01). Supervision is
-    // kept by running the supervisor itself on the bulkhead.
     crate::bulkhead::spawn(async move {
-    crate::supervise::spawn_supervised("relational-mirror", move || {
-        let cloud = cloud.clone();
-        async move {
-            let hash_of = |s: &str| {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                s.hash(&mut h);
-                h.finish()
-            };
-            let mut tick = tokio::time::interval(interval);
-            let (mut teams_hash, mut deps_hash) = (0u64, 0u64);
-            // Ledger high-water marks: the ledger is append-only per tenant,
-            // so after the first full mirror only entries newer than the
-            // last mirrored `ts_ms` are sent each tick (the engine's cost is
-            // rows SENT x rows STORED, so sending the whole ledger every tick
-            // was the quadratic hog). A full re-send every
-            // `LEDGER_FULL_RESEND_ROUNDS` ticks is the convergence safety net
-            // for anything a prune or a leader change left behind.
-            const LEDGER_FULL_RESEND_ROUNDS: u32 = 60;
-            let mut ledger_marks: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            let mut ledger_round: u32 = 0;
-            // Re-assert authoritative project rows every ten leader ticks. A
-            // stale node can boot and backfill an old ProjectStore snapshot
-            // after the real deletion/recreation write; version-conditional SQL
-            // rejects it when visible, and this bounded re-assertion repairs the
-            // distributed LWW race if the stale replica had not received the
-            // newer row yet. Start at 9 so a newly elected leader runs it now.
-            let mut project_reconcile_round = 9u8;
-            // Per-tenant billing hashes: only tenants whose own rows changed are
-            // re-upserted (an aggregate hash re-wrote all of them for one
-            // tenant's change).
-            let mut billing_hashes: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            loop {
-                tick.tick().await;
-                crate::supervise::beat("relational-mirror");
-                // Deployments: every node, own rows only.
-                let deps = cloud.gw.list();
-                if let Ok(json) = serde_json::to_string(&deps) {
-                    let h = hash_of(&json);
-                    if h != deps_hash {
-                        relational::sync_deployments(&cloud.node_name, &deps).await;
-                        deps_hash = h;
-                    }
-                }
-                if leadership::may_act(&cloud, leadership::Job::RelationalLeaderWrites) {
-                    project_reconcile_round = (project_reconcile_round + 1) % 10;
-                    if project_reconcile_round == 0 {
-                        let projects: Vec<(String, String, String, u64)> = cloud
-                            .projects
-                            .snapshot()
-                            .into_iter()
-                            .map(|(project, s)| (project, s.team, s.build.root_dir, s.updated_ms))
-                            .collect();
-                        relational::backfill_projects(projects).await;
-                    }
-                    let teams = cloud.teams.list_authoritative();
-                    if let Ok(json) = serde_json::to_string(&teams) {
+        crate::supervise::spawn_supervised("relational-mirror", move || {
+            let cloud = cloud.clone();
+            async move {
+                let hash_of = |s: &str| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    s.hash(&mut h);
+                    h.finish()
+                };
+                let mut tick = tokio::time::interval(interval);
+                let (mut teams_hash, mut deps_hash) = (0u64, 0u64);
+                /// The ledger is append-only per tenant, so after the first full mirror only entries
+                /// newer than the last mirrored `ts_ms` are sent each tick (the engine's cost is rows
+                /// SENT x rows STORED, so sending the whole ledger every tick was the quadratic hog;
+                /// `>=` is on purpose, entries sharing the mark's millisecond are re-sent and converge
+                /// through ON CONFLICT). A mark advances to the newest entry of a snapshot taken BEFORE
+                /// the write, so nothing that arrived meanwhile is skipped: it is newer than the mark
+                /// and goes out next tick. A full re-send every this many ticks is the convergence
+                /// safety net for anything a prune or a leader change left behind.
+                const LEDGER_FULL_RESEND_ROUNDS: u32 = 60;
+                let mut ledger_marks: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                let mut ledger_round: u32 = 0;
+                /// Authoritative project rows are re-asserted every this many leader ticks: a stale
+                /// node can boot and backfill an old ProjectStore snapshot after the real
+                /// deletion/recreation write; version-conditional SQL rejects it when visible, and this
+                /// bounded re-assertion repairs the distributed LWW race if the stale replica had not
+                /// received the newer row yet. The round counter starts one short, so a newly elected
+                /// leader runs it at once.
+                const PROJECT_REASSERT_TICKS: u8 = 10;
+                let mut project_reconcile_round = PROJECT_REASSERT_TICKS - 1;
+                let mut billing_hashes: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
+                loop {
+                    tick.tick().await;
+                    crate::supervise::beat("relational-mirror");
+                    let deps = cloud.gw.list();
+                    if let Ok(json) = serde_json::to_string(&deps) {
                         let h = hash_of(&json);
-                        if h != teams_hash {
-                            relational::sync_teams(&teams).await;
-                            teams_hash = h;
+                        if h != deps_hash {
+                            relational::sync_deployments(&cloud.node_name, &deps).await;
+                            deps_hash = h;
                         }
                     }
-                }
-                // Same writer as the billing meter itself (one gate, one
-                // designation): the relational billing projection is written
-                // only where metering runs.
-                let billing_authority = leadership::may_act(&cloud, leadership::Job::BillingMeter);
-                if billing_authority {
-                    let (accounts, _) = cloud.billing.snapshot();
-                    // Per-tenant (ledger, invoices, checkouts) fetched ONCE up
-                    // front and reused for both the dirty-check hash below and
-                    // (if dirty) the actual upsert loop.
-                    //
-                    // DIRTY-CHECK MUST COVER MORE THAN JUST ACCOUNTS: previously
-                    // `h` hashed `accounts` alone, so a checkout/ledger-entry/
-                    // invoice landing with no accompanying account-field change
-                    // never flipped `billing_hash` and the whole billing mirror
-                    // section stayed gated shut — live-witnessed: a checkout
-                    // opened against an otherwise-unchanged account stayed absent
-                    // from `billing_checkouts` for multiple ticks, only appearing
-                    // once an unrelated account field happened to change on the
-                    // same tick. Hashing the full per-tenant (account, ledger,
-                    // invoices, checkouts) tuple set closes that gap: ANY
-                    // billing-related change on ANY tenant flips the hash and
-                    // triggers a re-sync on the next tick.
-                    ledger_round = (ledger_round + 1) % LEDGER_FULL_RESEND_ROUNDS;
-                    let full_resend = ledger_round == 0;
-                    let per_tenant: Vec<_> = accounts
-                        .iter()
-                        .map(|acc| {
-                            // Newest first (`BillingStore::ledger`); keep only
-                            // what is newer than the mark unless this is the
-                            // periodic full re-send. `>=` on purpose: entries
-                            // sharing the mark's millisecond are re-sent and
-                            // converge through ON CONFLICT.
-                            let mark = ledger_marks.get(&acc.tenant).copied().unwrap_or(0);
-                            let mut ledger = cloud.billing.ledger(&acc.tenant);
-                            if !full_resend && mark > 0 {
-                                ledger.retain(|e| e.ts_ms >= mark);
+                    if leadership::may_act(&cloud, leadership::Job::RelationalLeaderWrites) {
+                        project_reconcile_round =
+                            (project_reconcile_round + 1) % PROJECT_REASSERT_TICKS;
+                        if project_reconcile_round == 0 {
+                            let projects: Vec<(String, String, String, u64)> = cloud
+                                .projects
+                                .snapshot()
+                                .into_iter()
+                                .map(|(project, s)| {
+                                    (project, s.team, s.build.root_dir, s.updated_ms)
+                                })
+                                .collect();
+                            relational::backfill_projects(projects).await;
+                        }
+                        let teams = cloud.teams.list_authoritative();
+                        if let Ok(json) = serde_json::to_string(&teams) {
+                            let h = hash_of(&json);
+                            if h != teams_hash {
+                                relational::sync_teams(&teams).await;
+                                teams_hash = h;
                             }
-                            let invoices = cloud.billing.finalized_invoices(&acc.tenant);
-                            let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
-                            (acc, ledger, invoices, checkouts)
-                        })
-                        .collect();
-                    // PER-TENANT dirty-check. This used to serialize the whole
-                    // fleet's billing dataset to one JSON string and hash that,
-                    // which meant (a) an unconditional full clone + serialize of
-                    // every tenant's entire unbounded ledger on EVERY tick even
-                    // when nothing changed, and (b) any single tenant's change
-                    // flipping the aggregate hash and re-upserting EVERY tenant.
-                    // Hashing each tenant's own tuple independently keeps the
-                    // exact same "any billing-related change triggers a re-sync"
-                    // guarantee while writing only the tenants that actually
-                    // moved, and drops the whole-dataset JSON round trip.
-                    let mut dirty: Vec<relational::BillingRows<'_>> = Vec::new();
-                    let mut next_hashes: std::collections::HashMap<String, u64> =
-                        std::collections::HashMap::with_capacity(per_tenant.len());
-                    for (acc, ledger, invoices, checkouts) in &per_tenant {
-                        let Ok(json) = serde_json::to_string(&(acc, ledger, invoices, checkouts))
-                        else {
-                            continue;
-                        };
-                        let h = hash_of(&json);
-                        next_hashes.insert(acc.tenant.clone(), h);
-                        if billing_hashes.get(&acc.tenant) != Some(&h) {
-                            dirty.push((
-                                *acc,
-                                ledger.as_slice(),
-                                invoices.as_slice(),
-                                checkouts.as_slice(),
-                            ));
                         }
                     }
-                    if !dirty.is_empty() {
-                        // ONE session (one full index refresh) for the whole
-                        // batch instead of one per tenant — see
-                        // `relational::upsert_billing_many`. Per-tenant
-                        // transactions are unchanged.
-                        let started = std::time::Instant::now();
-                        let rows: usize = dirty.iter().map(|(_, l, _, _)| l.len()).sum();
-                        relational::upsert_billing_many(&dirty).await;
-                        let elapsed_ms = started.elapsed().as_millis() as u64;
-                        if elapsed_ms > 5_000 {
-                            tracing::warn!(
-                                tenants = dirty.len(),
-                                ledger_rows = rows,
-                                elapsed_ms,
-                                full_resend,
-                                "relational: billing mirror pass was slow -- on the bulkhead runtime, so serving is unaffected, but the row volume per tick should be bounded"
-                            );
-                        } else {
-                            tracing::debug!(tenants = dirty.len(), ledger_rows = rows, elapsed_ms, full_resend, "relational: billing mirror pass");
+                    let billing_authority =
+                        leadership::may_act(&cloud, leadership::Job::BillingMeter);
+                    if billing_authority {
+                        let (accounts, _) = cloud.billing.snapshot();
+                        ledger_round = (ledger_round + 1) % LEDGER_FULL_RESEND_ROUNDS;
+                        let full_resend = ledger_round == 0;
+                        let per_tenant: Vec<_> = accounts
+                            .iter()
+                            .map(|acc| {
+                                let mark = ledger_marks.get(&acc.tenant).copied().unwrap_or(0);
+                                let mut ledger = cloud.billing.ledger(&acc.tenant);
+                                if !full_resend && mark > 0 {
+                                    ledger.retain(|e| e.ts_ms >= mark);
+                                }
+                                let invoices = cloud.billing.finalized_invoices(&acc.tenant);
+                                let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
+                                (acc, ledger, invoices, checkouts)
+                            })
+                            .collect();
+                        let mut dirty: Vec<relational::BillingRows<'_>> = Vec::new();
+                        let mut next_hashes: std::collections::HashMap<String, u64> =
+                            std::collections::HashMap::with_capacity(per_tenant.len());
+                        for (acc, ledger, invoices, checkouts) in &per_tenant {
+                            let Ok(json) =
+                                serde_json::to_string(&(acc, ledger, invoices, checkouts))
+                            else {
+                                continue;
+                            };
+                            let h = hash_of(&json);
+                            next_hashes.insert(acc.tenant.clone(), h);
+                            if billing_hashes.get(&acc.tenant) != Some(&h) {
+                                dirty.push((
+                                    *acc,
+                                    ledger.as_slice(),
+                                    invoices.as_slice(),
+                                    checkouts.as_slice(),
+                                ));
+                            }
                         }
-                    }
-                    // Advance every tenant's mark to the newest entry it has
-                    // (the snapshot was taken before the write, so nothing
-                    // that arrived meanwhile is skipped: it is newer than the
-                    // mark and goes out next tick).
-                    for (acc, ledger, _, _) in &per_tenant {
-                        if let Some(newest) = ledger.iter().map(|e| e.ts_ms).max() {
-                            let m = ledger_marks.entry(acc.tenant.clone()).or_insert(0);
-                            *m = (*m).max(newest);
+                        if !dirty.is_empty() {
+                            let started = std::time::Instant::now();
+                            let rows: usize = dirty.iter().map(|(_, l, _, _)| l.len()).sum();
+                            relational::upsert_billing_many(&dirty).await;
+                            let elapsed_ms = started.elapsed().as_millis() as u64;
+                            if elapsed_ms > 5_000 {
+                                tracing::warn!(
+                                    tenants = dirty.len(),
+                                    ledger_rows = rows,
+                                    elapsed_ms,
+                                    full_resend,
+                                    "relational: billing mirror pass was slow -- on the bulkhead runtime, so serving is unaffected, but the row volume per tick should be bounded"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    tenants = dirty.len(),
+                                    ledger_rows = rows,
+                                    elapsed_ms,
+                                    full_resend,
+                                    "relational: billing mirror pass"
+                                );
+                            }
                         }
+                        for (acc, ledger, _, _) in &per_tenant {
+                            if let Some(newest) = ledger.iter().map(|e| e.ts_ms).max() {
+                                let m = ledger_marks.entry(acc.tenant.clone()).or_insert(0);
+                                *m = (*m).max(newest);
+                            }
+                        }
+                        ledger_marks.retain(|t, _| accounts.iter().any(|a| &a.tenant == t));
+                        billing_hashes = next_hashes;
                     }
-                    ledger_marks.retain(|t, _| accounts.iter().any(|a| &a.tenant == t));
-                    // Replace wholesale so a tenant that disappeared from the
-                    // snapshot stops being tracked (no unbounded growth).
-                    billing_hashes = next_hashes;
                 }
             }
-        }
-    });
+        });
     });
 }
 
-/// Billing meter loop — the metering→billing pipeline. On a fixed interval it pulls
-/// the fleet-wide per-function usage stats (local + every peer over the mesh),
-/// aggregates them per tenant, and feeds the cumulative totals to the billing store,
-/// which charges only the DELTA since the last reading (delta·rate-card → ledger →
-/// invoice). Idempotent-ish: counter resets (pool recycle / node restart) are handled
-/// by the store's meter. Runs mock or real — Stripe only affects top-up checkout, not
-/// metering. Config: `HIVE_BILLING_METER_INTERVAL` (s, def 60).
+/// Prunes ledger entries covered by a durable, grace-elapsed checkpoint, from both the relational
+/// mirror and the in-memory ledger (never the account itself: `remove_account` is untouched,
+/// pruning and account deletion are orthogonal). A checkpoint is a tamper-evident hash chain
+/// computed once at period close in `BillingStore::account()`'s rollover branch (see
+/// `billing::LedgerCheckpoint`). The gates, in order: the checkpoint's grace period
+/// (`HIVE_LEDGER_PRUNE_GRACE_MS`, default 7 days) has elapsed; the DURABILITY gate, the relational
+/// mirror holds exactly the checkpoint's `entry_count` rows for the range, else the tenant is
+/// skipped and retried next tick (the in-memory copy is never pruned ahead of the mirror); the
+/// BLAST-RADIUS guard, the commitment is recomputed fresh from the CURRENT in-memory rows for that
+/// exact range and a mismatch refuses loudly instead of deleting data that no longer matches what
+/// was proven. The relational prune always runs before the in-memory prune, so a crash between the
+/// two retries cleanly next tick (the DELETE and the retain are both idempotent on an already-empty
+/// range).
+///
+/// It runs on every metering tick, before the usage-stats early return, so a tenant that stops
+/// generating usage still gets pruned. The in-memory `pruned=true` flag a pruned tenant now carries
+/// must be mirrored even on a quiet tick, so its account/invoice/checkout rows are re-upserted
+/// here; its ledger rows were just DELETEd in SQL and the surviving entries are already mirrored
+/// (and re-asserted by the mirror loop's periodic full pass), so re-sending the whole remaining
+/// ledger would cost one full table reload per row.
+async fn prune_checkpointed_ledgers(cloud: &CloudState) {
+    let mut pruned_tenants: Vec<String> = Vec::new();
+    for acc in cloud.billing.all_accounts() {
+        let tenant = acc.tenant.as_str();
+        let invs = cloud.billing.finalized_invoices(tenant);
+        for inv in &invs {
+            let Some(cp) = inv.ledger_checkpoint.as_ref() else {
+                continue;
+            };
+            if cp.pruned {
+                continue;
+            }
+            let grace = env_u64("HIVE_LEDGER_PRUNE_GRACE_MS", 7 * 24 * 60 * 60 * 1000);
+            if now_ms().saturating_sub(inv.created_ms) < grace {
+                continue;
+            }
+            let mirrored = match relational::count_billing_ledger_rows(
+                tenant,
+                cp.period_start_ms,
+                cp.period_end_ms,
+            )
+            .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational count failed, retrying next tick");
+                    continue;
+                }
+            };
+            if mirrored != cp.entry_count {
+                tracing::debug!(
+                    tenant,
+                    mirrored,
+                    expected = cp.entry_count,
+                    "ledger checkpoint prune: relational mirror not yet caught up, retrying next tick"
+                );
+                continue;
+            }
+            let fresh = cloud.billing.compute_ledger_checkpoint(
+                tenant,
+                cp.period_start_ms,
+                cp.period_end_ms,
+            );
+            if fresh.commitment != cp.commitment || fresh.entry_count != cp.entry_count {
+                tracing::warn!(
+                    tenant,
+                    expected_commitment = %cp.commitment,
+                    fresh_commitment = %fresh.commitment,
+                    expected_entry_count = cp.entry_count,
+                    fresh_entry_count = fresh.entry_count,
+                    "ledger checkpoint prune REFUSED: commitment mismatch (data changed since checkpoint was proven)"
+                );
+                continue;
+            }
+            if let Err(e) =
+                relational::prune_billing_ledger(tenant, cp.period_start_ms, cp.period_end_ms).await
+            {
+                tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
+                continue;
+            }
+            let removed =
+                cloud
+                    .billing
+                    .prune_ledger_range(tenant, cp.period_start_ms, cp.period_end_ms);
+            cloud
+                .billing
+                .mark_checkpoint_pruned(tenant, cp.period_start_ms);
+            tracing::info!(
+                tenant,
+                removed,
+                period_start_ms = cp.period_start_ms,
+                period_end_ms = cp.period_end_ms,
+                commitment = %cp.commitment,
+                "ledger checkpoint: raw entries pruned, commitment + invoice retained"
+            );
+            if !pruned_tenants.iter().any(|t| t == tenant) {
+                pruned_tenants.push(tenant.to_string());
+            }
+        }
+    }
+    if !pruned_tenants.is_empty() {
+        let owned: Vec<_> = pruned_tenants
+            .iter()
+            .map(|tenant| {
+                (
+                    cloud.billing.account(tenant),
+                    Vec::<billing::LedgerEntry>::new(),
+                    cloud.billing.finalized_invoices(tenant),
+                    cloud.billing.checkouts_for_tenant(tenant),
+                )
+            })
+            .collect();
+        let batch: Vec<relational::BillingRows<'_>> = owned
+            .iter()
+            .map(|(a, l, i, c)| (a, l.as_slice(), i.as_slice(), c.as_slice()))
+            .collect();
+        relational::upsert_billing_many(&batch).await;
+    }
+}
+
+/// Billing meter loop, the metering-to-billing pipeline. On a fixed interval it pulls the
+/// fleet-wide per-function usage stats (local plus every peer over the mesh), aggregates them per
+/// tenant and feeds the cumulative totals to the billing store, which charges only the DELTA since
+/// the last reading (delta times rate card, into the ledger, into the invoice); counter resets
+/// (pool recycle, node restart) are handled by the store's meter. It meters only where
+/// `leadership::may_act(BillingMeter)` holds (the strict chain owner, or the election or the
+/// `HIVE_BILLING_COORDINATOR_NODE` pin only on a chain-less mesh; not isolated; 120 s of continuous
+/// ownership; a direct voter majority): charging twice is worse than charging a tick late, and a
+/// missed tick is caught up by the next delta.
+///
+/// [`prune_checkpointed_ledgers`] runs first on every metered tick, before the early return for a
+/// fleet with no usage stats. Browser requests are counted SEPARATELY from `requests` and never
+/// folded in (no per-invocation charge for owner-served browser traffic, see
+/// `RateCard::browser_per_million_cents`), and GPU is metered by instance wall time (`fluid_ms`),
+/// not just active CPU, because it is held for the instance's entire life. Metering is strictly per
+/// tenant; the whole tick's tenants are then mirrored into the fleet-replicated relational layer
+/// (see `relational.rs`'s module doc) in ONE batch (per-tenant mirroring re-read the ENTIRE
+/// relational index before every write), ONLY from this node, the elected billing authority, so
+/// every other node's local replica converges to the same account state within seconds instead of
+/// staying empty or stale; the mirror is best-effort, and the HTTP proxy-to-leader read stays
+/// correct whatever its freshness. Only the ledger entries THIS tick's metering appended go out:
+/// the whole ledger once went out every tick and the engine reloads the table once per row (the
+/// quadratic hog behind the leader freezes); older rows are already mirrored and the mirror loop's
+/// periodic full pass is the convergence net. Runs mock or real (Stripe only affects top-up
+/// checkout, not metering). `HIVE_BILLING_METER_INTERVAL` (s, default 60).
 fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_BILLING_METER_INTERVAL", 60));
     tracing::info!(
@@ -4715,165 +4745,14 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
         let mut tick = tokio::time::interval(interval);
         loop {
             tick.tick().await;
-            // Who meters this tick: the shared leader-only job gate. Owner (the
-            // strict chain owner; the election or the
-            // `HIVE_BILLING_COORDINATOR_NODE` pin only on a chain-less mesh),
-            // not isolated, 120 s of continuous ownership (replacing the old
-            // per-loop 2-tick window) and a direct voter majority — charging
-            // twice is worse than charging a tick late, and a missed tick is
-            // caught up by the next delta.
-            // Transitions are logged by the gate itself.
             if !leadership::may_act(&cloud, leadership::Job::BillingMeter) {
                 continue;
             }
-            // Ephemeral ledger checkpoint pruning — SAME `may_act(BillingMeter)`
-            // gate above, no separate election mechanism. Runs every tick
-            // regardless of fleet-wide usage activity: a tenant with a
-            // finalized, durable, grace-period-elapsed checkpoint is prune-
-            // eligible even in a tick with zero function stats (this must
-            // NOT be gated behind the `stats.is_empty()` early-return below,
-            // which only concerns metering — a tenant that stops generating
-            // usage must still get pruned). A checkpoint is a tamper-evident
-            // SHA-256 hash chain (NOT a zk-SNARK/STARK: the verifier is this
-            // platform's own process, never an external party, so there is
-            // nothing for real ZK cryptography to buy here — see
-            // billing::LedgerCheckpoint's doc comment), computed once at
-            // period-close in `BillingStore::account()`'s rollover branch.
-            // Once a checkpoint is durable and its grace period has elapsed,
-            // the raw entries it covers become eligible for pruning from
-            // both the relational mirror and the in-memory ledger — never
-            // the account itself (billing.rs's `remove_account` stays
-            // untouched; pruning and account deletion are orthogonal by
-            // construction).
-            // Tenants that had at least one checkpoint pruned this tick — the
-            // in-memory `pruned=true` flag they now carry must be mirrored
-            // even on a quiet tick (zero fleet-wide usage), since the normal
-            // per-tenant mirror write below only runs for tenants present in
-            // `stats`/`metered`, and this whole block deliberately runs
-            // BEFORE that early-return so a usage-quiet tenant still prunes.
-            let mut pruned_tenants: Vec<String> = Vec::new();
-            for acc in cloud.billing.all_accounts() {
-                let tenant = acc.tenant.as_str();
-                let invs = cloud.billing.finalized_invoices(tenant);
-                for inv in &invs {
-                    let Some(cp) = inv.ledger_checkpoint.as_ref() else {
-                        continue;
-                    };
-                    if cp.pruned {
-                        continue;
-                    }
-                    let grace = env_u64("HIVE_LEDGER_PRUNE_GRACE_MS", 7 * 24 * 60 * 60 * 1000);
-                    if now_ms().saturating_sub(inv.created_ms) < grace {
-                        continue;
-                    }
-                    // Durability gate: never prune the in-memory copy ahead of
-                    // the relational mirror having actually caught up — skip
-                    // and retry next tick if it hasn't.
-                    let mirrored = match relational::count_billing_ledger_rows(
-                        tenant,
-                        cp.period_start_ms,
-                        cp.period_end_ms,
-                    )
-                    .await
-                    {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational count failed, retrying next tick");
-                            continue;
-                        }
-                    };
-                    if mirrored != cp.entry_count {
-                        tracing::debug!(
-                            tenant,
-                            mirrored,
-                            expected = cp.entry_count,
-                            "ledger checkpoint prune: relational mirror not yet caught up, retrying next tick"
-                        );
-                        continue;
-                    }
-                    // Blast-radius guard: recompute the commitment fresh from
-                    // the CURRENT in-memory rows for this exact range; refuse
-                    // loudly rather than deleting data that no longer matches
-                    // what was proven.
-                    let fresh = cloud.billing.compute_ledger_checkpoint(
-                        tenant,
-                        cp.period_start_ms,
-                        cp.period_end_ms,
-                    );
-                    if fresh.commitment != cp.commitment || fresh.entry_count != cp.entry_count {
-                        tracing::warn!(
-                            tenant,
-                            expected_commitment = %cp.commitment,
-                            fresh_commitment = %fresh.commitment,
-                            expected_entry_count = cp.entry_count,
-                            fresh_entry_count = fresh.entry_count,
-                            "ledger checkpoint prune REFUSED: commitment mismatch (data changed since checkpoint was proven)"
-                        );
-                        continue;
-                    }
-                    // Relational prune before in-memory prune, always — a
-                    // crash between the two just retries cleanly next tick
-                    // (both DELETE and retain are idempotent on an
-                    // already-empty range).
-                    if let Err(e) = relational::prune_billing_ledger(
-                        tenant,
-                        cp.period_start_ms,
-                        cp.period_end_ms,
-                    )
-                    .await
-                    {
-                        tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
-                        continue;
-                    }
-                    let removed = cloud.billing.prune_ledger_range(
-                        tenant,
-                        cp.period_start_ms,
-                        cp.period_end_ms,
-                    );
-                    cloud
-                        .billing
-                        .mark_checkpoint_pruned(tenant, cp.period_start_ms);
-                    tracing::info!(
-                        tenant,
-                        removed,
-                        period_start_ms = cp.period_start_ms,
-                        period_end_ms = cp.period_end_ms,
-                        commitment = %cp.commitment,
-                        "ledger checkpoint: raw entries pruned, commitment + invoice retained"
-                    );
-                    if !pruned_tenants.iter().any(|t| t == tenant) {
-                        pruned_tenants.push(tenant.to_string());
-                    }
-                }
-            }
-            if !pruned_tenants.is_empty() {
-                // Account/invoice/checkout rows only: the pruned ledger rows
-                // were just DELETEd in SQL and the surviving entries are
-                // already mirrored (and re-asserted by the mirror loop's
-                // periodic full pass). Re-sending a tenant's whole remaining
-                // ledger here cost one full table reload per row.
-                let owned: Vec<_> = pruned_tenants
-                    .iter()
-                    .map(|tenant| {
-                        (
-                            cloud.billing.account(tenant),
-                            Vec::<billing::LedgerEntry>::new(),
-                            cloud.billing.finalized_invoices(tenant),
-                            cloud.billing.checkouts_for_tenant(tenant),
-                        )
-                    })
-                    .collect();
-                let batch: Vec<relational::BillingRows<'_>> = owned
-                    .iter()
-                    .map(|(a, l, i, c)| (a, l.as_slice(), i.as_slice(), c.as_slice()))
-                    .collect();
-                relational::upsert_billing_many(&batch).await;
-            }
+            prune_checkpointed_ledgers(&cloud).await;
             let stats = admin::fleet_function_stats(&cloud).await;
             if stats.is_empty() {
                 continue;
             }
-            // Aggregate cumulative usage per tenant across the whole fleet.
             let mut totals: std::collections::HashMap<String, billing::UsageTotals> =
                 std::collections::HashMap::new();
             for s in &stats {
@@ -4883,47 +4762,18 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                     .mem_gb_hr_milli
                     .saturating_add((s.memory_gb_hrs * 1000.0) as u64);
                 t.requests = t.requests.saturating_add(s.requests);
-                // Counted SEPARATELY from `t.requests`, never folded in: the
-                // bn-impl-billing-metering design decision is NO per-invocation
-                // charge for owner-served browser traffic (Cloudflare/Salad
-                // precedent -- bill only platform-consumed resources). This
-                // counter exists so quota/UI have real numbers ahead of any
-                // future distinct rate; RateCard.browser_per_million_cents is
-                // 0.0 today, not omitted, so pricing it later needs no schema
-                // migration.
                 t.browser_requests = t.browser_requests.saturating_add(s.browser_requests);
                 if s.gpu {
-                    // GPU is held for the instance's entire life — meter its
-                    // wall-time (fluid_ms), not just active CPU.
                     t.gpu_ms = t.gpu_ms.saturating_add(s.fluid_ms);
                 }
             }
             let mut charged_any = 0u64;
-            // Meter first, then mirror the whole tick's tenants in ONE batch.
-            // Mirroring inside this loop called `relational::upsert_billing`
-            // per tenant, and each of those re-read the ENTIRE relational
-            // index before writing (see `upsert_billing_many`). Metering
-            // itself is unchanged and still strictly per tenant.
             let tick_started_ms = now_ms();
             let mut metered: Vec<String> = Vec::new();
             for (tenant, tot) in totals {
                 charged_any += cloud.billing.meter_usage(&tenant, tot);
                 metered.push(tenant);
             }
-            // Mirror into the fleet-replicated relational layer (see
-            // relational.rs's module doc) right after metering — ONLY this
-            // node (the elected billing authority) ever writes it, so
-            // every OTHER node's local replica converges to this SAME
-            // account state within seconds instead of staying empty/stale
-            // (the confirmed 5-way billing-divergence bug). Best-effort:
-            // the existing HTTP proxy-to-leader read remains correct and
-            // available regardless of this mirror's freshness.
-            // Only the ledger entries THIS tick's metering appended: the
-            // whole ledger (17k rows for the owner tenant) went out here every
-            // 60 s, and the engine reloads the table once per row -- the
-            // quadratic hog behind the 2026-10-01 leader freezes. Older rows
-            // are already mirrored; the mirror loop's periodic full pass is
-            // the convergence net.
             let owned: Vec<_> = metered
                 .iter()
                 .map(|tenant| {
@@ -4949,27 +4799,14 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Active full-mesh health probing (the fast path for down-detection). Every node
-/// directly probes every OTHER public node in PARALLEL on a short interval, so health
-/// — up AND down — is owned by a direct probe (sub-`interval` flips) instead of
-/// transitive gossip + the ~30s staleness drain. Scope = public-IP nodes only: NAT'd
-/// nodes are reachable solely via relay, are already excluded from client DNS (the
-/// `public_ip` gate in `lb_records`), and stay on the staleness model so relay-probe
-/// jitter can't churn their health or spam logs. `nodes()`'s 30s staleness drop stays
-/// the backstop for a peer that's both unprobeable and gone. Config:
-/// `HIVE_HEALTH_INTERVAL` (s, def 5), `HIVE_HEALTH_TIMEOUT` (s, def 2),
-/// `HIVE_HEALTH_FAIL_THRESHOLD` (consecutive misses, def 2).
-/// Loud, cheap, self-observed early warning for the fc-sanjose-2 shape: a
-/// process climbing toward its cgroup memory ceiling while every EXTERNAL
-/// signal (systemd is-active, /healthz 200, even :443 customer traffic) stays
-/// green. Distinct from `spawn_health_loop` (which is PEER-observed reachability,
-/// the right check for routing decisions) — this is a SELF-check for exactly
-/// the failure class no peer probe can see, because the process is still
-/// answering everything a probe would ask, right up until it isn't.
-/// `HIVE_MEMORY_ALARM_PCT` (default 80.0): once RSS crosses this fraction of
-/// the cgroup limit, warn on every tick until it drops back below — noisy on
-/// purpose, since the incident this guards against was invisible for however
-/// long the climb took.
+/// Loud, cheap, self-observed early warning for a process climbing toward its cgroup memory ceiling
+/// while every EXTERNAL signal (systemd is-active, /healthz 200, even :443 customer traffic) stays
+/// green (the fc-sanjose-2 shape). It is a SELF-check for exactly the failure class no peer probe
+/// can see, distinct from [`spawn_health_loop`] (PEER-observed reachability, the right check for
+/// routing decisions), because the process keeps answering everything a probe would ask right up
+/// until it does not. `HIVE_MEMORY_ALARM_PCT` (default 80.0): once RSS crosses that fraction of the
+/// cgroup limit it warns on every tick until it drops back below, noisy on purpose, since the
+/// incident this guards against was invisible for however long the climb took.
 fn spawn_memory_pressure_alarm() {
     let alarm_pct = std::env::var("HIVE_MEMORY_ALARM_PCT")
         .ok()
@@ -5005,6 +4842,41 @@ struct ProbeOutcome {
     rtt: Option<u64>,
 }
 
+/// Active full-mesh health probing, the fast path for down-detection. Every node directly probes
+/// every OTHER public-IP node with a resolvable iroh address in PARALLEL on a short interval, so
+/// health, up AND down, is owned by a direct probe (sub-`interval` flips) instead of transitive
+/// gossip plus the ~30 s staleness drain. Public-IP nodes only: NAT'd nodes are reachable solely
+/// via relay, are already excluded from client DNS (the `public_ip` gate in `lb_records`), and stay
+/// on the staleness model so relay-probe jitter cannot churn their health or spam logs; `nodes()`'s
+/// 30 s staleness drop stays the backstop for a peer that is both unprobeable and gone. A round is
+/// skipped while no mesh transport is bound (a peer is never false-flagged) and when there is
+/// nothing to probe and no probe still running.
+///
+/// Each probe runs in its own task and a round waits for them only until `health::probe_deadline()`
+/// (`bounded_round`): under `join_all` one failing peer's probe (two samples at the dial-fallback
+/// ceiling) held every round, so every other peer's verdict, the restore hysteresis and the miss
+/// counters all ran at ~33 s instead of the interval. A probe still running at the deadline stays
+/// in flight (never probed twice at once) and its verdict lands in whichever round receives it.
+/// Each result retains the immutable endpoint id and liveness timestamp captured with the attempted
+/// address, and the miss counters of identities no longer probed are forgotten, never one whose
+/// probe is still running.
+///
+/// The budget is per target. The fast `timeout` is the right steady-state check (is the warm trunk
+/// still alive) but is shorter than the connect budget alone, so a target needing a fresh dial
+/// would be cancelled before it could finish connecting, and `probe`'s trunk eviction (meant to let
+/// the next dial resolve the peer's CURRENT addr via discovery) could never deliver that: a peer
+/// whose cached address went stale (restart with new socket addrs, NAT rebind) stayed unhealthy
+/// PERMANENTLY, and unhealthy nodes drop out of client DNS and placement, silently shrinking the
+/// fleet. Once a target is already failing (misses at or past the threshold) it gets the full
+/// `dial_fallback_ceiling()` so discovery has a real chance to recover it. Each probe takes TWO
+/// samples and passes on EITHER (a multi-ping liveness check): a single lost datagram train on a
+/// lossy cross-continent path used to count as a full round miss, and at threshold 2 two unlucky
+/// rounds withdrew a healthy peer. The samples run sequentially so the second only spends budget
+/// when the first genuinely failed (which also gives `probe`'s trunk eviction from the first
+/// failure a fresh-dial chance within the same round).
+///
+/// Config: `HIVE_HEALTH_INTERVAL` (s, default 5), `HIVE_HEALTH_TIMEOUT` (s, default 2),
+/// `HIVE_HEALTH_FAIL_THRESHOLD` (consecutive misses, default 2).
 fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = crate::health::probe_interval();
     let timeout = crate::health::probe_timeout();
@@ -5019,23 +4891,12 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
     );
     tokio::spawn(async move {
         let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        // Each probe runs in its own task and a round waits for them only until
-        // `health::probe_deadline()` (`bounded_round`). Under `join_all` one
-        // failing peer's probe — two samples at the dial-fallback ceiling, ~28 s —
-        // held every round, so every other peer's verdict, the restore hysteresis
-        // and the misses counters all ran at ~33 s instead of the interval. A probe
-        // still running at the deadline stays in flight (never probed twice at
-        // once) and its verdict lands in whichever round receives it.
         let mut fanout = crate::bounded_round::BoundedRound::<ProbeOutcome>::new();
         loop {
             tokio::time::sleep(interval).await;
-            // No mesh transport bound yet → skip the round (never false-flag a peer).
             if cloud.mesh.read().is_none() {
                 continue;
             }
-            // Probe set: every OTHER node with a public IP + a resolvable iroh address.
-            // Each result retains the immutable endpoint id and liveness timestamp
-            // captured with the attempted address.
             let targets: Vec<(String, String, String, u64)> = cloud
                 .registry
                 .nodes()
@@ -5050,25 +4911,11 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                     ))
                 })
                 .collect();
-            // Nothing to probe and no probe still running (a landed straggler keeps
-            // its flag until drained): skip the round, as before.
             if targets.is_empty() && fanout.in_flight_keys().is_empty() {
                 continue;
             }
             let round_deadline = tokio::time::Instant::now() + deadline;
             let mut landed = fanout.begin();
-            // Budget is per-target, not fleet-wide. The fast `timeout` (2s) is the
-            // right STEADY-STATE check — "is the warm trunk still alive" — but it is
-            // shorter than `connect_budget` alone, so a target needing a fresh dial
-            // gets cancelled before it can even finish connecting, and `probe`'s own
-            // trunk eviction (whose stated purpose is "let the next dial resolve the
-            // peer's CURRENT addr via discovery") could never actually deliver that:
-            // every subsequent attempt was cancelled at the same 2s. A peer whose
-            // cached address went stale (restart with new socket addrs, NAT rebind)
-            // therefore stayed unhealthy PERMANENTLY — and unhealthy nodes are
-            // dropped from client DNS and placement, so this silently shrank the
-            // fleet. Once a target is already failing, give it the full
-            // dial_fallback_ceiling so discovery gets a genuine chance to recover it.
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (name, endpoint_id, addr, observed_last_seen_ms) in targets {
                 live.insert(endpoint_id.clone());
@@ -5081,14 +4928,6 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 let cloud = cloud.clone();
                 let key = endpoint_id.clone();
                 fanout.spawn(&key, async move {
-                    // TWO samples per round, pass on EITHER (tau's multi-ping
-                    // liveness): a single lost datagram train on a lossy
-                    // cross-continent path counted as a full round miss, and
-                    // at threshold=2 two unlucky rounds withdrew a healthy
-                    // peer. The samples run sequentially so the second only
-                    // spends budget when the first genuinely failed (which
-                    // also gives `probe`'s trunk-eviction from the first
-                    // failure a fresh-dial chance within the same round).
                     let first = gossip::probe(&cloud, &endpoint_id, &addr, budget).await;
                     let rtt = match first {
                         Some(ms) => Some(ms),
@@ -5112,7 +4951,7 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                     rtt,
                 } = outcome;
                 if name.is_empty() {
-                    continue; // the probe task died: no verdict
+                    continue;
                 }
                 let prev = *misses.get(&endpoint_id).unwrap_or(&0);
                 let (next, write) = health_decision(prev, rtt.is_some(), threshold);
@@ -5154,8 +4993,6 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                      this node's mesh transport is failing against live peers"
                 );
             }
-            // Forget miss-counters for endpoint identities no longer in the probe set
-            // (never one whose probe is still running).
             misses.retain(|endpoint_id, _| {
                 live.contains(endpoint_id) || fanout.in_flight(endpoint_id)
             });
