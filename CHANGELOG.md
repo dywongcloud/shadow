@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-10-14 — a Clerk org's team is created at Hobby, so its record and its billing account agree and no org reaches Pro for free (d57615ef87)
+
+`identity_sync` mirrors a Clerk org into the teams store with `create_with_slug(slug, name, "pro", ..)`,
+outside the plan-authority primitive: the team record read Pro while the org's billing account (Hobby until a
+checkout or an operator grant) read Hobby, the two halves `apply_plan_everywhere` exists to keep in step, and
+every org reached Pro-gated features (deployment protection, failover, longer runtimes) with no payment. It is
+now created at Hobby, the plan `team_create` gives a non-operator: a tier is raised only through
+`apply_plan_everywhere` (a paid checkout or an operator), and the billing account of a new tenant is Hobby, so
+both halves agree without a second write. Witnessed on a real enforced node (`scratch2/work/secfix3-small.sh`,
+the dashboard's server-side identity sync with `x-hive-internal`): before, the new org's team record read pro,
+its billing account hobby, and the org owner's PUT of deployment protection (a Pro/Enterprise feature) answered
+200 with no checkout; after, both read hobby and the same PUT answers 403, while an operator grant (both halves)
+still opens the feature (200) and an operator still creates a Pro team directly (200). Operator note: org teams
+created by `identity_sync` before this change keep the plan they were stored with (pro) while their billing
+account reads hobby; list them with `GET /v1/teams` and lower or grant them deliberately. Not rolled.
+
 ## 2026-10-14 — the deployment-password unlock cookie is a server-sealed expiring token, Secure outside plain-http loopback (229e0df6d9)
 
 `EnterpriseStore::seal_password_cookie` returned the STORED password hash as the `hive_pw` cookie value and
