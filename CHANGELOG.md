@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-10-13 — the logs page resets its page with the filter, not a render later
+
+`project-logs-client.tsx` reset the page to 0 in an effect keyed on every filter, which is
+the one error `eslint` still reported for the dashboard and also a real defect: the render
+that changed a filter still carried the old page, so the fetch effect asked the node for
+the new filter at the old offset first and for page 0 one render after. The reset is now
+derived while rendering (the filter signature is kept in state and compared, the officially
+recommended replacement for an effect that only resets state), so there is one correct
+request per change and `npx eslint .` is clean. Witnessed in headless Chrome on the logs
+page of a throwaway node (page size 100, paged to the second page, then the timeline
+switched to one hour): the change triggered a request at `offset=100` and then one with no
+offset before, only the offset-less one after; `npx eslint .` exits 0. Not rolled.
+
+## 2026-10-13 — node-to-node RPC routes and the legacy sandbox no longer accept any tenant token
+
+The class scan over every non-GET route behind `auth::require_auth` (which only proves "some
+valid token") found four mutation handlers that took no claims at all. `POST /v1/nodes/announce`
+let any tenant write a registry entry for any node name (public address, health, peer id, the
+fencing epoch): witnessed on a throwaway auth-enforced node, one forged `evil-node` announce
+from a tenant token put it in the operator's registry and the node's next mutation (a second
+tenant's env write) answered 503, because the forged owner became the control-plane leader this
+node forwards its mutating API to. `PUT /v1/push/sms-relay` and `PUT /v1/push/sms-direct-mx`
+ran the platform's Textbelt egress and a direct-MX blast for any tenant (the relays exist for the
+mesh: their only callers are the gossip arms and `put_to_host`). All three now sit behind
+`admin::require_mesh_rpc` (a platform operator, the `x-hive-internal` secret, or a `mesh-internal`
+delegation, which is what `gossip::fetch`'s HTTP fallback sends), announce through
+`node_announce_public` so the gossip arm keeps calling the unguarded inner behind the transport's
+signer and trust gate. `POST /v1/sandbox` (the dashboard's single-use "Terminal" cell) is a real
+tenant feature, so it stays open to signed-in tenants but is bound to one: the image name
+selects a rootfs and the data drive named like it on the node (a tenant could name another
+tenant's deployment image), so naming an image other than `default` is now operator-only (403),
+`timeout_secs` is clamped to 5..=120 s (`u64::MAX` panicked the handler on the overflowing
+multiply; it is a normal run now), a tenant holds at most 2 cells per node (a Drop-released
+slot; the third answers 429), and every run is audit-recorded under the tenant. Witnessed before
+and after on throwaway nodes: sms-relay and sms-direct-mx answered 200 to a tenant token before
+and answer 403 after, while a mesh-internal delegation and the operator still reach them; the
+sandbox accepted `image=dpl-another-tenants-deployment` (200), ran three concurrent cells
+(200/200/200) and dropped the connection on `timeout_secs=18446744073709551615` before, and
+answers 403, 200/200/429 and 200 after, the plain dashboard run unchanged (200, exit 0, logs
+returned). Operator note: nothing to migrate; automation that selected a custom sandbox image
+with a tenant token must use an operator credential, and a node's own announce and relay
+traffic over iroh is untouched. Not rolled.
+
 ## 2026-10-13 — the operator pages stop polling in a background tab
 
 `useOpsPoll` (`lib/api.ts`, behind every `/admin` page) was a hand copy of `usePoll` minus

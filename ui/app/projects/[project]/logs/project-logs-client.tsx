@@ -83,6 +83,12 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
   }
 
   const levelKey = levels.slice().sort().join(",");
+  const filterKey = JSON.stringify([range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, q, pageSize]);
+  const [pagedFilterKey, setPagedFilterKey] = useState(filterKey);
+  if (pagedFilterKey !== filterKey) {
+    setPagedFilterKey(filterKey);
+    setPage(0);
+  }
   const offset = page * pageSize;
   const maxOffset = Math.max(0, LOGS_LIMIT_MAX - pageSize);
   const nextOffset = (page + 1) * pageSize;
@@ -125,10 +131,6 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
     const id = setInterval(load, pollMs);
     return () => clearInterval(id);
   }, [load, live, pollMs]);
-
-  useEffect(() => {
-    setPage(0);
-  }, [range, levelKey, fStatus, fMethod, fHost, fRoute, fCache, fEnv, fResource, q, pageSize]);
 
   const counts = useMemo(() => {
     const c: Record<string, number> = { info: 0, warning: 0, error: 0, fatal: 0 };
