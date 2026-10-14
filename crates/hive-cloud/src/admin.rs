@@ -7870,13 +7870,11 @@ async fn admin_content_hash(
     ))
 }
 
-/// THIS node's supervised background loops: restart counts + heartbeat age.
-/// Operator-only, and deliberately NODE-LOCAL (no leader proxy): each node
-/// reports its OWN loops — a dead reconciler on node X is only visible by
-/// asking X, so the round-robin read split is the semantics here, not a bug.
-/// Answers "is the world reconciler / lock sweep / anti-entropy loop actually
-/// alive on this node?" — the question that previously required inferring from
-/// which log lines had STOPPED appearing.
+/// THIS node's supervised background loops (restart counts, heartbeat age). Operator-only and
+/// deliberately NODE-LOCAL, with no leader proxy: a dead reconciler on node X is only visible by
+/// asking X, so the round-robin read split is the semantics here, not a bug. Answers "is the world
+/// reconciler / lock sweep / anti-entropy loop alive on this node?" without inferring it from log
+/// lines that stopped appearing.
 async fn tasks_health(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -7886,6 +7884,14 @@ async fn tasks_health(
     ))
 }
 
+/// Platform overview: operators get the platform-wide counters and control-plane state; every other
+/// signed-in user gets the topology shape only (a tenant's own usage is the tenant-scoped
+/// `/v1/metrics`). `control_plane.degraded` means peers are configured but nothing synced within
+/// the TTL (the data plane keeps serving local known-good state; this only makes the staleness
+/// observable), and `mesh` is the membership health distinct from it: a node launched with no
+/// `--peer` args has zero configured peers, so `degraded` is always false for it even when it is
+/// fully isolated (see `MeshHealth`). `peer_trust` reports whether P2P admission is enforced
+/// (`HIVE_PEER_TRUST`) and how many peers are trusted.
 async fn overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -7893,9 +7899,6 @@ async fn overview(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     if !operator_allowed(cl, crate::auth::enforced()) {
-        // Tenant-safe subset: topology shape only. Platform-wide counters
-        // (requests/WAF/deployments/concurrency) stay operator-only; tenant
-        // usage lives at the tenant-scoped /v1/metrics instead.
         return Ok(Json(json!({
             "node": c.node_name,
             "region": c.region,
@@ -7930,20 +7933,11 @@ async fn overview(
         "cron_jobs": c.cron.list().len(),
         "workflows": c.workflows.defs().len(),
         "control_plane": {
-            // #25: gossip freshness. degraded=true means peers are configured but
-            // we haven't synced within the TTL — data plane still serves local
-            // known-good state; this just makes the staleness observable.
             "last_gossip_ms": c.last_gossip_ms(),
             "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
-            // Membership health, distinct from the staleness check above: a node
-            // launched with no --peer args has zero configured peers, so
-            // `degraded` above is unconditionally false for it even when it's
-            // fully isolated from the fleet (see MeshHealth's doc).
             "mesh": c.mesh_health(),
         },
         "peer_trust": {
-            // #20: P2P admission control. enforced=true rejects iroh peers whose
-            // cryptographic identity isn't in `trusted` (env + gossip roster).
             "enforced": std::env::var("HIVE_PEER_TRUST").map(|v| v == "1" || v == "true").unwrap_or(false),
             "trusted_peers": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0),
         },
@@ -8000,6 +7994,9 @@ fn non_operator_node_view(n: &hive_edge::region::NodeInfo, connectivity: &'stati
     })
 }
 
+/// `/v1/nodes`: operators (and the mesh-internal gossip path, whose peer sync needs
+/// `iroh_addr`/`peer_id`) get the full node records plus `connectivity`; every other signed-in user
+/// gets [`non_operator_node_view`].
 pub(crate) async fn nodes(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8007,8 +8004,6 @@ pub(crate) async fn nodes(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     let list = c.registry.nodes();
-    // Operators (and the mesh-internal gossip path) get the full record —
-    // peer sync depends on iroh_addr/peer_id being present.
     if operator_allowed(cl, crate::auth::enforced()) {
         let full: Vec<Value> = list
             .iter()
@@ -8031,27 +8026,22 @@ async fn cluster_status(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Leader/term/member NAMES are the coordination view the network page shows
-    // every signed-in user; nothing mesh-internal is exposed here.
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
     let members: Vec<String> = c.registry.nodes().into_iter().map(|n| n.id).collect();
     Ok(Json(json!(c.cluster.status(members))))
 }
 
-/// Anycast routing table: every node with latency/health, and the node this edge
-/// would route a request to (lowest-latency healthy, region-preferred). Operators (and dev mode)
-/// get the full node records; every other reader gets [`non_operator_node_view`] plus
-/// `latency_ms` (latency is not addressing), so this route never hands out what `/v1/nodes`
-/// withholds.
+/// Anycast routing table: every node with latency and health, the node this edge would route a
+/// request to (lowest-latency healthy, region-preferred), and `serving`: per node, how many
+/// deployment hosts it actually serves (this node's local ones plus peers' via `peer_routes`;
+/// absent = standby), independent of the single anycast pick. Operators (and dev mode) get the full
+/// node records; every other reader gets [`non_operator_node_view`] plus `latency_ms` (latency is
+/// not addressing), so this route never hands out what `/v1/nodes` withholds.
 async fn anycast_table(
     State(c): State<Arc<CloudState>>,
     claims: Option<&crate::auth::Claims>,
 ) -> Json<Value> {
     let selected = c.registry.anycast(Some(&c.region));
-    // REAL placement: which nodes actually HOST deployments — this node's local
-    // deployments plus peers' deployments learned via gossip (`peer_routes`). A
-    // node is "serving" if it hosts >= 1 deployment, independent of the single
-    // anycast pick. This is what the Network page reads to mark serving vs standby.
     use std::collections::{HashMap, HashSet};
     let mut serving: HashMap<String, HashSet<String>> = HashMap::new();
     let self_subs: HashSet<String> =
@@ -8092,7 +8082,6 @@ async fn anycast_table(
         "region": c.region,
         "selected": selected.as_ref().map(|n| n.name.clone()),
         "table": table,
-        // node name -> count of deployments it actually hosts (0/absent = standby).
         "serving": serving_counts,
     }))
 }
@@ -8119,11 +8108,6 @@ async fn ratelimit_put(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<RateLimitBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // This mutates the NODE's single shared DDoS rate limiter — every other
-    // tenant hosted on this node relies on it. Unlike a per-tenant setting,
-    // any authenticated caller (of any role) could previously disable it
-    // fleet-wide, matching the operator-only gate already used for WAF/bot
-    // policy.
     require_operator(claims.as_ref().map(|e| &e.0))?;
     c.ratelimit.set(b.enabled, b.limit, b.window_ms);
     Ok(Json(json!(c.ratelimit.stats())))
@@ -8137,14 +8121,16 @@ async fn regions(
     Ok(Json(json!(c.registry.regions())))
 }
 
-/// TENANT-SCOPED function stats (Usage page's cost breakdown, the Functions
-/// list page, service-graph/deployment-canvas overlays). Previously gated
-/// behind `require_operator` — a hard 401/403 for every non-owner user, so
-/// all four dashboard consumers silently showed zero invocations/CPU/memory
-/// (and, on the Usage page, near-zero computed dollar charges) for the
-/// overwhelming majority of real users. No admin-only page ever depended on
-/// this endpoint's previous all-tenants shape — fixed the same way
-/// `databases_list` already scopes `/v1/databases`.
+/// TENANT-SCOPED function stats (Usage page cost breakdown, Functions list, service-graph and
+/// deployment-canvas overlays), scoped like `databases_list`. A verified `service` delegation
+/// asking for its own `local=true` slice is the billing meter's unfiltered aggregation path
+/// (`fleet_function_stats`); every other caller sees only its tenant's rows. A top-level read also
+/// fans out to every healthy peer's `?local=true` (functions run wherever placement put them; the
+/// guard stops the recursion) and then RE-SCOPES the merged rows to the caller, because a peer
+/// answers `?local=true` UNFILTERED on purpose: without it one tenant's page would list every other
+/// tenant's functions, and an anonymous read would match the peer slice. The result is cached per
+/// tenant for `POLLED_RESPONSE_CACHE_TTL` (never the inner hop), since the dashboard polls every
+/// 3-5 s from several components and tabs.
 pub async fn functions(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -8152,13 +8138,6 @@ pub async fn functions(
     axum::extract::Query(q): axum::extract::Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // `fleet_function_stats` (the billing meter) reads this endpoint on every
-    // peer over a signed node-to-node delegation with an EMPTY tenant, which
-    // `resolve_tenant` maps to "personal" — so the meter was only ever counting
-    // each peer's personal-tenant functions and silently UNDER-COUNTING org
-    // compute. A verified `service` delegation asking for its own local slice is
-    // the internal aggregation path, so it gets the unfiltered view; everything
-    // else stays tenant-scoped exactly as before.
     let internal = claims
         .as_ref()
         .map(|e| e.0.role == "service")
@@ -8170,15 +8149,6 @@ pub async fn functions(
         .filter(|f| (internal && q.local == Some(true)) || norm(&f.tenant) == t)
         .map(|f| json!(f))
         .collect();
-    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
-    // few seconds — the same belt `metrics_get` already wears. The dashboard
-    // polls this endpoint every 3-5s from several co-mounted components and
-    // from every open tab, and the client-side `PATH_TTL` de-dupes only within
-    // ONE tab, so without this each poll paid a full cross-node fan-out:
-    // measured 8.0028s per call on fc-sanjose and a hit at the full per-peer
-    // budget on fc-virginia / fc-virginia-3 on every second poll. Keyed by
-    // tenant (never across tenants) and only for the top-level call, so the
-    // billing meter's own `local=true` slice is never served from here.
     let is_top_level = q.local != Some(true);
     let cache_key = format!("functions:{t}:{}", internal);
     if is_top_level {
@@ -8186,12 +8156,6 @@ pub async fn functions(
             return Json(v);
         }
     }
-    // `c.fluid` is THIS node's in-process runtime, but functions run wherever
-    // the placement scheduler put them — so the dashboard, polling through the
-    // round-robin, kept landing on a node hosting none of the tenant's
-    // functions and rendering an empty Functions page and zero usage. The
-    // `local=true` guard is required: `fleet_function_stats` also reads this
-    // endpoint on every peer, and without it the fan-out would recurse.
     if is_top_level {
         let peers = all_healthy_peers(&c);
         for v in fan_out_peers_polled(&c, &peers, &t, "/v1/functions?local=true").await {
@@ -8207,14 +8171,6 @@ pub async fn functions(
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("")
             ))
         });
-        // A peer answers `?local=true` UNFILTERED on purpose (the billing
-        // meter's aggregation path must see every tenant), so its rows carry
-        // whatever tenants that peer hosts. Re-scope them to the caller before
-        // they leave a tenant-scoped request -- otherwise one tenant's
-        // dashboard page lists every other tenant's functions, and an
-        // unauthenticated read (`t == ANON_TENANT`) matched the peer slice
-        // only because the local filter never ran on it. Internal (`service`)
-        // callers keep the unfiltered aggregate.
         if !internal {
             list.retain(|v| norm(v.get("tenant").and_then(|x| x.as_str()).unwrap_or("")) == t);
         }
@@ -8235,9 +8191,15 @@ async fn tunnels(
     Ok(Json(json!(c.gw.tunnel_stats().await)))
 }
 
-/// Relay cost accounting (#23): relay-vs-direct connection + byte breakdown for
-/// this node's mesh trunks. `relayed_*` bytes transit a relay server (a real cost
-/// + a holepunch-failure signal). Empty when P2P (iroh) isn't enabled on the node.
+/// Relay cost accounting: relay-vs-direct connection and byte breakdown for this node's mesh trunks
+/// (`relayed_*` bytes transit a relay server: a real cost and a holepunch-failure signal), plus
+/// per-trunk QUIC path state (rtt, cwnd, loss, mtu, selected relay-vs-direct: read it DURING a bulk
+/// pull, it is the only surface that separates a relayed path, a loss-collapsed window and an
+/// app-limited sender), iroh timeout counters, DNS-reconciler and TLS state, and gossip-verify and
+/// post-quantum key-exchange counters. `pq_kex` counts REAL negotiated handshakes
+/// (`hive_p2p::record_kex_telemetry`), not a config flag; `classical_fallback` includes every peer
+/// that cannot speak X25519MLKEM768, notably the wasm32 browser client, a permanent boundary rather
+/// than a bug. Empty when P2P (iroh) is not enabled.
 async fn relay_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8264,10 +8226,6 @@ async fn relay_stats(
                 "direct_bytes_tx": s.direct_bytes_tx,
                 "direct_bytes_rx": s.direct_bytes_rx,
                 "relayed_bytes_pct": relayed_pct,
-                // Per-trunk QUIC transport state, per path (rtt, cwnd, loss, mtu,
-                // selected relay-vs-direct). Read this DURING a bulk pull: it is the
-                // only surface that separates a relayed path, a loss-collapsed
-                // congestion window, and an app-limited sender.
                 "trunks": s.trunks.iter().map(|t| json!({
                     "endpoint_id": t.endpoint_id,
                     "incarnation": t.incarnation,
@@ -8298,13 +8256,11 @@ async fn relay_stats(
                         "lost_plpmtud_probes": p.lost_plpmtud_probes,
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
-                // Per-peer, per-phase iroh timeout counters (#H4) — p2p_timeout{phase,node_id}.
                 "timeouts": s.timeouts.iter().map(|t| json!({
                     "node_id": t.node_id,
                     "phase": t.phase,
                     "count": t.count,
                 })).collect::<Vec<_>>(),
-                // Vercel DNS reconciler (ngrok retirement) — leader-elected publish loop.
                 "dns_reconciler": {
                     "passes": crate::vercel_dns::STATS.passes.load(std::sync::atomic::Ordering::Relaxed),
                     "creates": crate::vercel_dns::STATS.creates.load(std::sync::atomic::Ordering::Relaxed),
@@ -8312,16 +8268,10 @@ async fn relay_stats(
                     "api_errors": crate::vercel_dns::STATS.api_errors.load(std::sync::atomic::Ordering::Relaxed),
                     "empty_set_blocks": crate::vercel_dns::STATS.empty_set_blocks.load(std::sync::atomic::Ordering::Relaxed),
                     "per_name_holds": crate::vercel_dns::STATS.per_name_holds.load(std::sync::atomic::Ordering::Relaxed),
-                    // Host labels currently pinned straight to their owning node
-                    // (deployment affinity) rather than falling through to the
-                    // all-nodes wildcard — 0 means every request is still a coin
-                    // flip across the fleet.
                     "affinity_records": crate::vercel_dns::STATS.affinity_records.load(std::sync::atomic::Ordering::Relaxed),
                     "last_pass_ms": crate::vercel_dns::STATS.last_pass_ms.load(std::sync::atomic::Ordering::Relaxed),
                 },
-                // ACME/TLS state: which zones have an installed certificate.
                 "tls_zones": crate::acme::installed_zones(),
-                // Web3 gossip signature verification (staged log→enforce rollout).
                 "gossip_verify": {
                     "mode": format!("{:?}", hive_p2p::verify_mode()).to_lowercase(),
                     "sign_outbound": hive_p2p::gossip_sign_enabled(),
@@ -8332,16 +8282,6 @@ async fn relay_stats(
                     "signer_mismatch": hive_p2p::verify_stats().4,
                     "rejected": hive_p2p::verify_stats().5,
                 },
-                // Post-quantum key exchange: REAL negotiated-handshake counts
-                // (`hive_p2p::record_kex_telemetry`, read off each connection's
-                // actual `HandshakeData` once, not derived from any config flag
-                // -- see docs/pqc-migration-scope.md). `hybrid_pq` is a
-                // key-exchange property only; transport IDENTITY stays
-                // classical Ed25519 regardless (no ML-DSA enrollment exists in
-                // this codebase yet). `classical_fallback` includes every peer
-                // that cannot yet speak X25519MLKEM768 -- an unrolled binary,
-                // or the wasm32 hive-browser client (aws-lc-rs has no
-                // realistic wasm32 target, a permanent boundary, not a bug).
                 "pq_kex": {
                     "hybrid_pq": hive_p2p::pq_kex_stats().0,
                     "classical_fallback": hive_p2p::pq_kex_stats().1,
@@ -8353,11 +8293,9 @@ async fn relay_stats(
     })
 }
 
-/// Serverless GPU pool snapshot (operator-only, same guard as `/v1/tunnels` /
-/// `/v1/relay`): every healthy `gpu_count > 0` node grouped into a named pool
-/// by region, with live aggregate + per-node free VRAM. See `gpu_pool`'s
-/// module doc for the allocate/release discipline and the fan-out rationale
-/// (per AGENTS.md's round-robin doc — live instance counts are node-local).
+/// Serverless GPU pool snapshot (operator-only): every healthy `gpu_count > 0` node grouped into a
+/// named pool by region, with live aggregate and per-node free VRAM; see `gpu_pool`'s module doc
+/// for the allocate/release discipline and the fan-out rationale.
 async fn gpu_pools(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8367,11 +8305,9 @@ async fn gpu_pools(
     Ok(Json(json!(regions)))
 }
 
-/// Managed-inference endpoint listing (operator): every project with an
-/// inference spec, its deterministic coordinator/port/URL, plus THIS node's
-/// own live server statuses (authoritative only for endpoints coordinated
-/// here — the listing names the coordinator so an operator knows where the
-/// authoritative status lives).
+/// Managed-inference endpoint listing (operator): every project with an inference spec, its
+/// deterministic coordinator/port/URL, and THIS node's live server statuses, authoritative only for
+/// endpoints coordinated here (the listing names the coordinator).
 async fn inference_endpoints(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8406,22 +8342,13 @@ async fn inference_endpoints(
     })))
 }
 
-/// Live memory accounting (operator). The measurement that was MISSING during
-/// the 2026-08 fc-hongkong OOM hunt: the heap profile said live sampled heap was
-/// ~80 MB while RSS was ~1.09 GB, and there was no way to read jemalloc's own
-/// `stats.allocated/active/resident/retained` to tell a leak from dirty-page
-/// fragmentation — `stats_print:true` only writes at exit, and the process is
-/// SIGKILLed, so the atexit hook never runs.
-///
-/// Unlike `/v1/debug/heap` this is CHEAP (no sampling, no dump) and safe to
-/// poll, so it is also the right thing for a monitor to scrape. It reports, on
-/// one document: the OS view (RSS, thread count), the allocator view, and every
-/// tenant-driven growth bound this node enforces as a live gauge — a bound
-/// nobody can read is indistinguishable from no bound at all.
-///
-/// NODE-LOCAL, like `/v1/dns/stats`: `/proc/self` and this process's own
-/// allocator. Through the dashboard's `/ops/*` proxy you are reading the
-/// LEADER's memory, not the page-serving node's.
+/// Live memory accounting (operator): the OS view (RSS, thread count), jemalloc's own
+/// `stats.allocated/active/resident/retained` (which tell a leak from dirty-page fragmentation;
+/// `stats_print` only writes at exit and a SIGKILLed process never reaches it) and every
+/// tenant-driven growth bound this node enforces as a live gauge. Unlike `/v1/debug/heap` it is
+/// CHEAP (no sampling, no dump), so it is safe to poll and to scrape. NODE-LOCAL, like
+/// `/v1/dns/stats`: through the dashboard's `/ops/*` proxy you read the LEADER's memory, not the
+/// page-serving node's.
 async fn memory_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8435,25 +8362,14 @@ async fn memory_stats(
     Ok(Json(v))
 }
 
-/// Restart audit (operator): did this node die, when, and why.
-///
-/// The question that had no answer. A cgroup OOM kill is SIGKILL — the dying
-/// process cannot log it — and systemd has the node back in under a second, so
-/// the platform's own view showed only "a node that is up". A node cycling
-/// every 2-3h was investigated for a whole session as "random unhealthy nodes",
-/// because every symptom (probe failures, dropped trunks, placement gaps) was
-/// visible and the cause was not.
-///
-/// Returns this boot's verdict with the EVIDENCE it was reached from (kernel
-/// line, cgroup counter, boot id, last-heartbeat RSS against the memory
-/// ceiling), the bounded restart history with each previous process's uptime —
-/// the list that makes a 2-3h cycle self-evident rather than an inference —
-/// and the live 24h counters.
-///
-/// NODE-LOCAL, like `/v1/dns/stats`: the marker file, the history file and
-/// `/proc` all belong to the node answering. Through the dashboard's `/ops/*`
-/// proxy you are reading the LEADER's restarts; the fleet view is the gossiped
-/// `NodeInfo::started_ms` / `oom_restarts_24h` / `last_oom_ms` on `/v1/nodes`.
+/// Restart audit (operator): did this node die, when and why. Returns this boot's verdict with the
+/// EVIDENCE it was reached from (kernel line, cgroup counter, boot id, last-heartbeat RSS against
+/// the memory ceiling), the bounded restart history with each previous process's uptime, and the
+/// live 24h counters. A cgroup OOM kill is SIGKILL, so the dying process cannot log it: this audit,
+/// and the gossiped `NodeInfo::started_ms` / `oom_restarts_24h` / `last_oom_ms` on `/v1/nodes` (the
+/// fleet view), are the only record. NODE-LOCAL: the marker file, the history file and `/proc`
+/// belong to the answering node, so through the dashboard's `/ops/*` proxy you read the LEADER's
+/// restarts.
 async fn node_restarts(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8462,16 +8378,11 @@ async fn node_restarts(
     Ok(Json(crate::restart_audit::snapshot(&c.node_name)))
 }
 
-/// Health-demotion guard (operator): how often THIS observer withdrew a peer
-/// from DNS/placement, how often it declined to because the peer was still
-/// gossiping, and which peers are currently in a local routing penalty.
-///
-/// `refused_gossip_alive` is the number to read during an incident: a large
-/// value means this node's transports are failing against peers that are
-/// demonstrably alive, i.e. the fault is local — and before the guard existed
-/// every one of those would have been a fleet-visible withdrawal (see
-/// health.rs). NODE-LOCAL, like `/v1/dns/stats`: a health verdict is
-/// per-observer, so this is deliberately one observer's counters.
+/// Health-demotion guard (operator): how often THIS observer withdrew a peer from DNS/placement,
+/// how often it declined because the peer was still gossiping, and which peers are in a local
+/// routing penalty. `refused_gossip_alive` is the number to read during an incident: a large value
+/// means this node's transports fail against peers that are demonstrably alive, i.e. the fault is
+/// local. NODE-LOCAL by design, since a health verdict is per-observer.
 async fn mesh_health_guard(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8485,26 +8396,13 @@ async fn mesh_health_guard(
     Ok(Json(v))
 }
 
-/// Live heap profile (operator). Answers "which allocation site is growing?"
-/// on a node that is ALREADY misbehaving, which is the question nothing on the
-/// fleet could answer during the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon
-/// before the kernel killed it, never root-caused).
-///
-/// `GET /v1/debug/heap` returns a jemalloc heap profile in jeprof's native
-/// format — analyze with the `jeprof` that ships alongside jemalloc, e.g.
-/// `jeprof --show_bytes --pdf /path/to/hive-cloud heap.prof`, or diff two with
-/// `jeprof --base=first.prof <binary> second.prof`. Sampling is OFF at boot
-/// (`prof_active:false` in main.rs's malloc_conf) so there is no steady-state
-/// cost; this handler turns it on for the process on first call and leaves it
-/// on, since a leak hunt needs the allocations that happen AFTER activation.
-///
-/// Intended use is a diff, not a single dump: call once to start sampling,
-/// wait while RSS climbs, call again, and compare the two profiles — the growth
-/// is what identifies the leak, whereas one snapshot mostly shows normal
-/// steady-state usage. `?deactivate=1` turns sampling back off.
-///
-/// Linux-only: the fleet is Linux and jemalloc profiling is unavailable on
-/// macOS, where this returns 501 rather than failing the build.
+/// Live heap profile (operator): `GET /v1/debug/heap` returns a jemalloc heap profile in jeprof's
+/// native format (`jeprof --show_bytes --pdf <binary> heap.prof`, or
+/// `jeprof --base=first.prof <binary> second.prof` for a diff). Sampling is OFF at boot
+/// (`prof_active:false` in main.rs's `malloc_conf`); the first call turns it on for the process and
+/// leaves it on, because a leak hunt needs the allocations AFTER activation, so the intended use is
+/// a diff of two dumps taken while RSS climbs; `?deactivate=1` turns it back off. Linux-only:
+/// elsewhere jemalloc profiling is unavailable and this returns 501 instead of failing the build.
 #[cfg(target_os = "linux")]
 async fn heap_profile(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -8514,10 +8412,6 @@ async fn heap_profile(
     require_operator(claims.as_ref().map(|e| &e.0))?;
 
     let want_off = q.get("deactivate").is_some_and(|v| v == "1" || v == "true");
-    // `prof.active` is a bool mallctl; `prof.dump` takes a NUL-terminated path.
-    // Both are only present when the binary was built against a jemalloc with
-    // profiling enabled (see main.rs's malloc_conf) -- on a build without it,
-    // these return ENOENT, which is reported rather than silently ignored.
     let set_active = |on: bool| -> Result<(), String> {
         unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", on) }.map_err(|e| e.to_string())
     };
@@ -8548,9 +8442,6 @@ async fn heap_profile(
         );
     }
 
-    // Dump to a unique path so concurrent operator calls can't clobber each
-    // other, then read it back and delete it -- the profile is returned in the
-    // response body, never left on disk.
     let path = format!("/tmp/hive-heap-{}-{}.prof", std::process::id(), now_ms());
     let mut c_path = path.clone().into_bytes();
     c_path.push(0);
@@ -8599,12 +8490,10 @@ async fn heap_profile(
     ))
 }
 
-/// Host listener audit (operator). NODE-LOCAL, exactly like `/v1/dns/stats`:
-/// the report describes the node that answers, so through the dashboard's
-/// `/ops/*` proxy you are reading the LEADER's host, not the page-serving
-/// node's — the fleet view is `scripts/audit-public-listeners.sh`. `last` is
-/// `null` until the first pass (~30 s after boot); `supported: false` means
-/// the host has no `/proc/net/tcp` (macOS), which is "not audited", never
+/// Host listener audit (operator), NODE-LOCAL: it describes the answering node, so through the
+/// dashboard's `/ops/*` proxy you read the LEADER's host (the fleet view is
+/// `scripts/audit-public-listeners.sh`). `last` is `null` until the first pass (~30 s after boot);
+/// `supported: false` means the host has no `/proc/net/tcp` (macOS), which is "not audited", never
 /// "clean". See `listener_audit`.
 async fn host_listeners(
     State(c): State<Arc<CloudState>>,
@@ -8619,12 +8508,15 @@ async fn host_listeners(
     })))
 }
 
-/// Geo-DNS observability (operator): live Seer query counters, the
-/// tailored-vs-generic split that actually tells you whether proximity routing
-/// is working, the local geo table's identity and hit rate (plus the optional
-/// remote fallback's memo state and its on-disk persistence counters), the
-/// delegation record count the DNS reconciler published, and the per-node
-/// histogram of which address each answer handed out first.
+/// Geo-DNS observability (operator): live Seer query counters, the tailored-vs-generic split that
+/// tells whether proximity routing works, the local geo table's identity and hit rate
+/// (`table_source: "none"` means it failed validation and every answer is generic, the one state
+/// worth alerting on) plus the optional remote fallback's memo state and persistence counters, the
+/// delegation record count the reconciler published, the per-node proof verdicts and the histogram
+/// of which address each answer handed out first. `validation` is derived from verdicts computed
+/// FRESH in this response, never from the reconciler-written counters, which lag on non-leaders and
+/// right after a restart and contradicted the per-node verdicts; those stay exported as
+/// `reconciler_last_pass_*`.
 async fn dns_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8657,36 +8549,20 @@ async fn dns_stats(
             "tailored": s.tailored.load(Ordering::Relaxed),
             "generic": s.generic.load(Ordering::Relaxed),
             "with_ecs": s.with_ecs.load(Ordering::Relaxed),
-            // The local prefix table: which copy is loaded and how big it is.
-            // `source: "none"` means it failed validation and every answer here
-            // is generic — the one state worth alerting on.
             "table_source": table_source,
             "table_rows_v4": table_v4,
             "table_rows_v6": table_v6,
             "local_hits": geo.local_hits,
             "local_misses": geo.local_misses,
-            // The optional remote fallback. Disabled unless an operator set
-            // HIVE_DNS_GEO_ENDPOINT, in which case these count its memo.
             "remote_enabled": geo.remote_enabled,
             "remote_known": geo.remote_known,
             "remote_pending": geo.remote_pending,
             "remote_unlocatable": geo.remote_unlocatable,
-            // Durability of the remote memo: how many prefixes came back off
-            // disk at boot (0 after a first-ever boot OR a wiped/corrupt file —
-            // the signal that this node is re-warming from scratch) and how
-            // many debounced saves have run since.
             "cache_loaded_at_boot": loaded_at_boot,
             "cache_writes": cache_writes,
             "cache_file": crate::dns_geo::cache_path().display().to_string(),
         },
         "delegation_records": crate::vercel_dns::STATS.geo_delegation_records.load(Ordering::Relaxed),
-        // Prove-before-advertise, made visible. `nameservers` is the SAME
-        // verdict the DNS reconciler publishes from (`validate_nameservers`
-        // over the same gossiped registry) — an operator asking "why is this
-        // node not in the NS set?" gets the actual reason, plus who attested
-        // it and from which regions, rather than having to infer it. `probes`
-        // is this node's OWN raw evidence, which is what makes a disagreement
-        // between vantages diagnosable instead of mysterious.
         "nameservers": verdicts
             .iter()
             .map(|v| json!({
@@ -8716,15 +8592,6 @@ async fn dns_stats(
             "checked_ms": p.checked_ms,
         })).collect::<Vec<_>>(),
         "validation": {
-            // Derived from the verdicts computed FRESH in this response, never
-            // the reconciler-written counters: those are stamped only inside
-            // the DNS reconcile loop, so on a non-leader node (or on the
-            // leader between passes / right after a restart) they lag and
-            // CONTRADICT the per-node verdicts in the same payload —
-            // live-witnessed as `proven: 0` above eight `validated: true`
-            // rows. The counters stay exported below as the reconciler's own
-            // last-pass view (`reconciler_last_pass_*`), clearly named so a
-            // stale number can no longer masquerade as live truth.
             "proven": verdicts.iter().filter(|v| v.validated).count(),
             "unproven": verdicts.iter().filter(|v| v.declared && !v.validated).count(),
             "reconciler_last_pass_proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
@@ -8732,9 +8599,6 @@ async fn dns_stats(
             "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
             "api_delegation_holds": crate::vercel_dns::STATS.api_delegation_holds.load(Ordering::Relaxed),
             "create_circuit_skips": crate::vercel_dns::STATS.create_circuit_skips.load(Ordering::Relaxed),
-            // Never-dark cutover telemetry: cutovers completed, rollbacks
-            // (a climbing rollback count = a delegation RETRYING, never
-            // stranding), and ACME orphan challenges swept.
             "delegation_cutovers": crate::vercel_dns::STATS.delegation_cutovers.load(Ordering::Relaxed),
             "delegation_cutover_rollbacks": crate::vercel_dns::STATS.delegation_cutover_rollbacks.load(Ordering::Relaxed),
             "acme_orphans_swept": crate::vercel_dns::STATS.acme_orphans_swept.load(Ordering::Relaxed),
@@ -8745,24 +8609,16 @@ async fn dns_stats(
     })))
 }
 
-/// Mesh address-lookup observability (operator): which address SOURCES this
-/// node actually registered, and what the public mainline-DHT provider has
-/// done since boot.
-///
-/// This exists because "the DHT is enabled" is a config claim while "41
-/// resolves, 12 hits, 3 publishes requested" is evidence — without it the
-/// mechanism is unfalsifiable in production. It is also the fastest way to see
-/// the condition that motivated the DHT in the first place: a node whose
-/// `seed_providers`, `pkarr_providers` and `n0_enabled` are all zero/false has
-/// NO address source at all, so `PeerPool::dial_fresh` has nothing to consult
-/// and burns its budget for nothing.
-///
-/// **Node-local by construction, like `/v1/dns/stats`.** Every field is read
-/// from this process's own counters; there is no fleet-wide answer and none is
-/// implied. Note the consequence for the dashboard: `/ops/*` forwards to the
-/// control-plane LEADER, so a browser reading this through the dashboard sees
-/// the leader's numbers, not those of the node serving the page. Query a
-/// specific node's admin port directly to ask about that node.
+/// Mesh address-lookup observability (operator): which address SOURCES this node registered and
+/// what the public mainline-DHT provider has done since boot, so "the DHT is enabled" is evidence
+/// (resolves, hits, publishes requested) rather than a config claim. A node whose `seed_providers`,
+/// `pkarr_providers` and `n0_enabled` are all zero/false has NO address source, so
+/// `PeerPool::dial_fresh` burns its budget for nothing. `publishes_requested` is requested, not
+/// succeeded (`AddressLookup::publish` is fire-and-forget), and a `discovery_budget_ms` at or below
+/// ~4 s means the DHT provider is registered but cancelled before it can answer (measured resolve
+/// 2.0-4.6 s on a cold routing table). NODE-LOCAL by construction, like `/v1/dns/stats`: through
+/// the dashboard's `/ops/*` proxy you read the LEADER's numbers, so query a specific node's admin
+/// port to ask about that node.
 async fn mesh_discovery(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8772,37 +8628,21 @@ async fn mesh_discovery(
     let sources = usize::from(s.n0_enabled) + s.seed_providers + s.pkarr_providers;
     Ok(Json(json!({
         "node": c.node_name,
-        // This node's own 64-hex id: the argument another host passes to
-        // `--dht-probe` to prove it can find THIS node from cold.
         "endpoint_id": c.iroh.read().as_ref().map(|e| e.id().to_string()),
-        // The pre-DHT sources, so "this node had nowhere to look" is a reading
-        // rather than an inference.
         "sources": {
             "bootstrap_seeds": s.seed_providers,
             "pkarr_relays": s.pkarr_providers,
             "n0_public": s.n0_enabled,
             "mainline_dht": s.dht_registered,
-            // Sources OTHER than the DHT. 0 is the state that made a wiped
-            // node permanently dark on 12 of 14 fleet hosts.
             "non_dht_total": sources,
         },
         "dht": {
             "registered": s.dht_registered,
-            // Populated only while NOT registered — names the exact reason
-            // (disabled by env, bootstrap unresolvable, socket conflict), so a
-            // silently-inert feature is impossible to mistake for a live one.
             "skip_reason": s.dht_skip_reason,
             "bootstrap_nodes": s.dht_bootstrap_nodes,
-            // 0 = the crate default (try 6881, fall back to an ephemeral port).
             "port": s.dht_port,
             "publish": s.dht_publish,
-            // false ⇒ only this node's relay URL is on the public DHT; true ⇒
-            // its globally-routable direct address is too (never its RFC1918
-            // ones — see hive_p2p::dht's publish filter).
             "publish_direct": s.dht_publish_direct,
-            // "requested", not "succeeded": AddressLookup::publish is
-            // fire-and-forget by contract, so a success count here would be a
-            // claim with no witness.
             "publishes_requested": s.publishes_requested,
             "last_publish_request_ms": s.last_publish_request_ms,
             "resolves": s.resolves,
@@ -8810,33 +8650,24 @@ async fn mesh_discovery(
             "resolve_misses": s.resolve_misses,
             "resolve_errors": s.resolve_errors,
         },
-        // The budget dial_fresh gives the whole address-lookup set. Measured
-        // steady-state DHT resolve is 2.0-4.6s on top of a cold-routing-table
-        // warm-up, so a value at or below ~4s means the DHT provider is
-        // registered but is being cancelled before it can answer.
         "discovery_budget_ms": hive_p2p::dial_discovery_budget().as_millis() as u64,
         "dial_fallback_ceiling_ms": hive_p2p::dial_fallback_ceiling().as_millis() as u64,
     })))
 }
 
-/// `/v1/logs` query. EVERY field is bounded at parse time (see [`logs`]): an
-/// unbounded window, list or limit on a fan-out endpoint is a
-/// denial-of-service vector, and a filter that is accepted but silently ignored
-/// is the exact bug this endpoint is being fixed for — so a malformed term is a
-/// 400, never a no-op.
-///
-/// Every parameter here must be reconstructed in BOTH
-/// [`crate::gossip::logs_query`] (the mesh dispatch arm) and in the fan-out
-/// query string built in [`logs`]; a parameter added in only one place works on
-/// the owner node and silently returns unfiltered/empty data on every peer.
+/// `/v1/logs` query. EVERY field is bounded at parse time (see [`logs`]), because an unbounded
+/// window, list or limit on a fan-out endpoint is a denial-of-service vector, and a malformed term
+/// is a 400, never a silently ignored filter. Every parameter must be reconstructed in BOTH
+/// [`crate::gossip::logs_query`] (the mesh dispatch arm) and the fan-out query string built by
+/// [`logs_fanout_qs`]: one added in only one place works on the owner node and silently returns
+/// unfiltered or empty data on every peer.
 #[derive(Deserialize)]
 pub(crate) struct LogsQ {
     pub(crate) limit: Option<usize>,
     /// Filter events to a project (matches the deployment host subdomain).
     pub(crate) project: Option<String>,
-    /// Filter events to ONE deployment: events tagged with this deployment id
-    /// at record time, plus untagged events on that deployment's own alias
-    /// hosts. Composes with `project` (the deployment-detail view sends both).
+    /// Filter events to ONE deployment: events tagged with this deployment id at record time plus
+    /// untagged events on its own alias hosts; composes with `project`.
     #[serde(default)]
     pub(crate) deployment: Option<String>,
     /// Free-text search across path/host/detail.
@@ -8845,9 +8676,9 @@ pub(crate) struct LogsQ {
     /// local events (no fan-out) — prevents proxy recursion.
     #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
-    /// Named window: `30m` | `1h` | `24h` | `7d` | `30d`. Resolved to absolute
-    /// bounds server-side; never forwarded as a string (a peer resolving it
-    /// against its own clock would widen or shrink the window).
+    /// Named window: `30m` | `1h` | `24h` | `7d` | `30d`, resolved to absolute bounds server-side
+    /// and never forwarded as a string (a peer resolving it against its own clock would widen or
+    /// shrink the window).
     #[serde(default)]
     pub(crate) range: Option<String>,
     /// Absolute inclusive lower bound (ms epoch).
@@ -8896,13 +8727,17 @@ pub(crate) const LOGS_LIMIT_MAX: usize = 1000;
 pub(crate) const LOGS_OFFSET_MAX: usize = 100_000;
 /// Retention ceiling: no plan reaches further back than this.
 pub(crate) const LOGS_MAX_AGE_MS: u64 = 30 * crate::event_log::DAY_MS;
-/// Slack applied to the age comparison. The coordinator resolves `range=7d`
-/// into an absolute `since_ms` on ITS clock and every peer then re-checks that
-/// bound against its own, so a peer whose clock is milliseconds ahead sees the
-/// window as a hair older than the plan allows and refuses a range the
-/// coordinator just accepted — the whole fleet-wide read fails on clock skew,
-/// not on policy. 5 minutes is slack against a 7/30-day window, not a loophole.
+/// Slack on the age comparison: the coordinator resolves `range=7d` into an absolute `since_ms` on
+/// ITS clock and every peer re-checks it against its own, so without slack a peer whose clock is
+/// milliseconds ahead refuses a window the coordinator accepted and the whole fleet-wide read fails
+/// on clock skew. 5 minutes is slack against a 7/30-day window, not a loophole.
 pub(crate) const LOGS_AGE_TOLERANCE_MS: u64 = 5 * 60_000;
+
+/// One extra row per node beyond `limit + offset`: fetching exactly `limit + offset` makes `total`
+/// land on `limit` whenever more rows exist, so `has_more` would be false on page 1 of every result
+/// set and the UI's "Next" could never advance. Peer plus local fetch stays under
+/// `LOGS_LIMIT_MAX + 1`, so it does not widen the fan-out bound.
+const LOGS_PROBE_ROWS: usize = 1;
 
 /// Named window -> span in ms. `None` = unknown range (caller turns that into a
 /// 400 rather than silently ignoring it).
@@ -8961,6 +8796,23 @@ fn logs_hdr(h: &mut HeaderMap, k: &'static str, v: impl std::fmt::Display) {
     }
 }
 
+/// Event log read (`/v1/logs`): every input is bounded first and a malformed filter is a 400, never
+/// ignored. The window resolves to absolute bounds (`range` or `since_ms`/`until_ms`) and is gated
+/// on the OWNING TENANT's plan SERVER-SIDE (history older than the hobby window of 7 days is
+/// Pro/Enterprise, up to the 30-day retention ceiling): a request past it is REFUSED with a typed
+/// error, never silently truncated, with no operator carve-out because platform admins read as
+/// `enterprise` through the billing floor (the team row wins over billing, as in `team_plan`).
+/// Scoping runs INSIDE the scan: only events of projects this team owns, UNATTRIBUTED events (empty
+/// project: apex bot probes, unresolved hosts, control-plane noise) are operator-only in the
+/// unfiltered view because they leak cross-tenant request metadata, and a project view matches the
+/// EXACT project tag or untagged events on one of that project's real deployment hostnames, never a
+/// substring of host/detail (pre-tag deployment events match on the host's first label only, since
+/// project and branch aliases move on promote). Requests are recorded on the node that SERVES them,
+/// so a top-level read merges the relevant peers' events (`local=true` against recursion; a project
+/// filter targets its host node(s), otherwise every peer hosting one of this tenant's projects,
+/// addressed by NODE through `fetch_from_host` because FC nodes have no HTTP admin URL), surfaces a
+/// peer's error envelope (plan gate, bad filter) instead of merging it as an empty array, and sorts
+/// newest-first with a deterministic tie-break so paging does not reshuffle.
 pub(crate) async fn logs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -8970,7 +8822,6 @@ pub(crate) async fn logs(
     use crate::event_log::{parse_list, DeployFacts, EventFilter, StatusPred};
 
     let now = hive_core::now_ms();
-    // --- bound every input first -------------------------------------------
     let limit = q
         .limit
         .unwrap_or(LOGS_LIMIT_DEFAULT)
@@ -8984,7 +8835,6 @@ pub(crate) async fn logs(
     let is_operator = operator_allowed(cl, crate::auth::enforced());
     let t = tenant(&c, &headers, cl);
 
-    // --- resolve the window -------------------------------------------------
     let mut since_ms = q.since_ms.unwrap_or(0);
     let mut until_ms = q.until_ms.unwrap_or(u64::MAX);
     let range_name = q
@@ -9028,11 +8878,6 @@ pub(crate) async fn logs(
         ));
     }
 
-    // --- SERVER-SIDE plan gate ---------------------------------------------
-    // Ranges older than 7 days are a Pro/Enterprise capability. This is
-    // enforced on the plan HERE, not in the client: a client-only gate is
-    // trivially bypassed with curl. A request past the plan's window is
-    // REFUSED with a typed error, never silently truncated to look empty.
     if since_ms > 0 {
         let age_ms = now.saturating_sub(since_ms);
         let span_ms = until_ms.min(now).saturating_sub(since_ms);
@@ -9052,22 +8897,12 @@ pub(crate) async fn logs(
         }
         let plan = match q.project.as_deref().filter(|p| !p.is_empty()) {
             Some(p) => team_plan(&c, p),
-            // Same precedence as `team_plan`: the TEAM row first, billing as the
-            // fallback for a personal namespace that has no team row. Reading
-            // billing alone made the two shapes disagree for the SAME tenant —
-            // a project-scoped read honoured a pro team row while an unscoped
-            // read (billing row never written) fell back to hobby and refused
-            // the identical window. `apply_plan_everywhere` writes both halves,
-            // so a real plan change keeps them in agreement either way.
             None => c
                 .teams
                 .get(&t)
                 .map(|x| x.plan)
                 .unwrap_or_else(|| c.billing.account(&t).plan),
         };
-        // No operator carve-out: platform admins read as `enterprise` through
-        // the billing floor (`team_plan`/`account()`), so this gate stays a
-        // single question — what does the OWNING TENANT's plan allow?
         let max_age = crate::billing::plan_max_log_age_ms(&plan);
         if age_ms > max_age + LOGS_AGE_TOLERANCE_MS || span_ms > max_age + LOGS_AGE_TOLERANCE_MS {
             return Err((
@@ -9090,7 +8925,6 @@ pub(crate) async fn logs(
         }
     }
 
-    // --- parse + validate the field filters --------------------------------
     logs_validate_terms(
         q.level.as_deref(),
         "level",
@@ -9145,14 +8979,6 @@ pub(crate) async fn logs(
                 }
             });
 
-    // --- tenant + project + deployment scoping, applied INSIDE the scan ----
-    // Tenant scope: only events for projects owned by this team. UNATTRIBUTED
-    // events (empty project: platform-apex bot probes, unresolved hosts,
-    // control-plane noise) are OPERATOR-ONLY in the unfiltered view — they are
-    // nobody's tenant traffic, and showing them to every signed-in team both
-    // leaks cross-tenant request metadata (hosts/paths) and buries the team's
-    // own logs in scanner noise. A project-scoped view below still re-admits
-    // the project's OWN untagged host traffic via the alias-host branch.
     let scope_project = q
         .project
         .as_deref()
@@ -9163,12 +8989,6 @@ pub(crate) async fn logs(
         .as_deref()
         .filter(|d| !d.is_empty())
         .map(|d| d.to_lowercase());
-    // EXACT project scoping, tenant-checked. The old filter also kept any event
-    // whose `host`/`detail` merely CONTAINED the project name as a substring —
-    // so `/projects/ctest/logs` leaked in every other project's events that
-    // happened to mention "ctest" anywhere. Scope instead to: events tagged with
-    // this exact project, OR untagged/infra events whose `host` is one of THIS
-    // project's real deployment hostnames (exact label or a subdomain of it).
     let project_hosts: Vec<(String, String)> = match scope_project.as_deref() {
         Some(pl) => {
             c.gw.list()
@@ -9188,9 +9008,6 @@ pub(crate) async fn logs(
         }
         None => Vec::new(),
     };
-    // `project_owned_by` walks the deployment table + peer deployments, so it
-    // must not run once per scanned JSONL line (a 30-day window can examine
-    // hundreds of thousands). Distinct projects are few — memoize per project.
     let owned_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
         Default::default();
     let scope: std::sync::Arc<dyn Fn(&crate::state::Event) -> bool + Send + Sync> = {
@@ -9225,7 +9042,7 @@ pub(crate) async fn logs(
             if let Some(pl) = scope_project.as_ref() {
                 if e.project.to_lowercase() != *pl {
                     if !e.project.is_empty() {
-                        return false; // tagged for a DIFFERENT project — never leak it.
+                        return false;
                     }
                     let h = e.host.to_lowercase();
                     if !hosts.iter().any(|(ph, phd)| {
@@ -9240,10 +9057,6 @@ pub(crate) async fn logs(
                     if !e.deployment.is_empty() {
                         return false;
                     }
-                    // Pre-tag events: the id_alias URL is unambiguous over time
-                    // (project/branch aliases move between deployments on
-                    // promote), so the host's FIRST LABEL is the only trusted
-                    // fallback.
                     let h = e.host.to_lowercase();
                     let label = h
                         .split(':')
@@ -9262,13 +9075,7 @@ pub(crate) async fn logs(
         })
     };
 
-    // `+1` is a PROBE row: fetching exactly `limit + offset` makes `total` land
-    // on `limit` whenever more rows exist, so `has_more` (`total > offset+limit`)
-    // is false on page 1 of every result set and the UI's "Next" can never
-    // advance. One extra row per node is what makes pagination discoverable.
-    // Peer + local fetch stays under `LOGS_LIMIT_MAX + 1`, so this does not
-    // widen the fan-out bound.
-    let fetch = limit + offset + 1;
+    let fetch = limit + offset + LOGS_PROBE_ROWS;
     let filter = EventFilter {
         since_ms,
         until_ms,
@@ -9286,8 +9093,6 @@ pub(crate) async fn logs(
     };
     let facts = DeployFacts::build(&c.gw.list());
 
-    // The durable scan reads day-files: heavy, synchronous I/O, so it never
-    // runs on a serving tokio worker (same rule as `relational::exec`).
     let evs = match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| c.query_events(&filter, &facts))
@@ -9309,28 +9114,14 @@ pub(crate) async fn logs(
         })
         .collect();
 
-    // Fleet aggregation: requests are recorded on the node that SERVES them, so a
-    // project placed on a peer logs there, not here. Merge in the relevant peers'
-    // events (scoped to the same project/search, `local=true` to avoid recursion),
-    // then sort newest-first and truncate.
     if !q.local.unwrap_or(false) {
         let qs = logs_fanout_qs(&q, fetch, since_ms, until_ms);
-        // A project filter targets just its host node(s); otherwise pull from every
-        // peer hosting one of this tenant's projects. Address by NODE (not HTTP admin
-        // URL) and go through `fetch_from_host`, which falls back to the iroh mesh —
-        // FC nodes have no HTTP admin URL, so an admin-URL-only path returns nothing.
-        // (The old `git_for_project` gate skipped the proxy entirely for git-sourced
-        // projects, but the placement scheduler still hosts those on peers → the
-        // coordinator logged nothing for them. This is the "empty project logs" bug.)
         let nodes: Vec<String> = match q.project.as_deref() {
             Some(p) if !p.is_empty() => host_nodes_for_project(&c, p),
             _ => peer_nodes_for_tenant(&c, &t),
         };
         for node in nodes {
             if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/logs?{qs}"), &t).await {
-                // A peer that refused (plan gate / bad filter) answers with an
-                // error envelope — surface it instead of merging an empty array
-                // and looking like "no logs".
                 if v.get("error").is_some() {
                     let st = v
                         .get("error")
@@ -9345,8 +9136,6 @@ pub(crate) async fn logs(
                 }
             }
         }
-        // Stable newest-first, then a deterministic tie-break so paging with
-        // equal timestamps does not reshuffle between pages.
         out.sort_by(|a, b| {
             let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
             ts(b)
@@ -9399,12 +9188,11 @@ pub(crate) async fn logs(
     Ok((hdrs, Json(json!(out))))
 }
 
-/// The query string the coordinator sends to each peer. EVERY filter above must
-/// appear here or it works on the owner node and silently returns unfiltered
-/// data everywhere else — which is the bug class being fixed. `range=` is
-/// deliberately NOT forwarded (it is resolved to absolute bounds first, so a
-/// peer cannot widen the window by re-resolving it against its own clock), and
-/// `offset=` is not forwarded either (paging happens once, after the merge).
+/// The query string the coordinator sends to each peer. EVERY filter of [`LogsQ`] must appear here
+/// or it works on the owner node and silently returns unfiltered data everywhere else. `range=` is
+/// deliberately NOT forwarded (it is resolved to absolute bounds first, so a peer cannot widen the
+/// window by re-resolving it against its own clock) and neither is `offset=` (paging happens once,
+/// after the merge).
 fn logs_fanout_qs(q: &LogsQ, fetch: usize, since_ms: u64, until_ms: u64) -> String {
     let mut s = format!("limit={fetch}&local=true");
     if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
@@ -9439,8 +9227,6 @@ fn logs_fanout_qs(q: &LogsQ, fetch: usize, since_ms: u64, until_ms: u64) -> Stri
     s
 }
 
-// ---- WAF ----
-
 async fn waf_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9456,7 +9242,6 @@ async fn waf_add_rule(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(rule): Json<WafRule>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // WAF rules are GLOBAL edge infrastructure — operator-only when auth is on.
     require_operator(claims.as_ref().map(|e| &e.0))?;
     c.waf.add_rule(rule);
     crate::persist::persist(&c);
@@ -9490,8 +9275,6 @@ async fn waf_managed(
     Ok(Json(json!({ "managed": c.waf.managed_enabled() })))
 }
 
-// ---- Bot management ----
-
 async fn bot_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9510,8 +9293,6 @@ async fn bot_put(
     Ok(Json(json!(*c.bot_policy.read())))
 }
 
-// ---- CDN ----
-
 async fn cdn_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9522,8 +9303,6 @@ async fn cdn_get(
         json!({ "hits": hits, "misses": misses, "stale": stale, "entries": entries, "hit_ratio": ratio }),
     ))
 }
-
-// ---- Runtime Cache (Vercel-style regional data cache) ----
 
 #[derive(Deserialize)]
 struct RcKey {
@@ -9662,8 +9441,6 @@ async fn cdn_purge(
     Ok(Json(json!({ "purged": true })))
 }
 
-// ---- Concurrency scaling ----
-
 async fn concurrency_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9671,8 +9448,6 @@ async fn concurrency_get(
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
     Ok(Json(json!(c.limiter.stats())))
 }
-
-// ---- Routing layer ----
 
 async fn routing_get(
     State(c): State<Arc<CloudState>>,
@@ -9745,8 +9520,13 @@ async fn del_rewrite(
     Ok(Json(json!({ "rewrites": c.router.rewrites() })))
 }
 
-// ---- Cron ----
-
+/// Tenant-scoped cron list: this team's jobs (legacy jobs with no recorded tenant are attributed to
+/// their target project's owning team), deduped by id, plus every healthy peer's local list
+/// (`?local=true` against recursion). Cron is NODE-LOCAL (a `vercel.json` cron is registered on the
+/// node that BUILT the deployment, a manual job on the control-plane leader, and neither
+/// replicates), so one node alone shows only its slice; this is a READ merge, never store
+/// replication plus leader-only execution, so each node keeps firing exactly its own jobs and
+/// nothing double-fires or drops a follower-hosted deployment's cron.
 pub(crate) async fn cron_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -9754,13 +9534,6 @@ pub(crate) async fn cron_list(
     Query(q): Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Tenant-scoped: only this team's jobs. Legacy jobs (no tenant recorded) are
-    // attributed by their target project's owning team.
-    // Dedup by id here too (`seen`): defends the merged view against a store
-    // that still holds pre-fix duplicate jobs (same id) until every node has
-    // restarted onto the deduping restore path — without it a node's own
-    // duplicates would show while a peer fanning them in would collapse them,
-    // leaving counts that never converge across the fleet.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut jobs: Vec<CronJob> = c
         .cron
@@ -9776,17 +9549,7 @@ pub(crate) async fn cron_list(
         })
         .filter(|j| seen.insert(j.id.clone()))
         .collect();
-    // FLEET FAN-OUT (read-only): cron jobs are node-local — a `vercel.json` cron
-    // is registered on the node that BUILT the deployment (git.rs), and a manual
-    // job on the control-plane leader; neither replicates. So a dashboard read
-    // that lands on any single node shows only that node's slice. Merge every
-    // healthy peer's local list (dedup by job id) so the operator sees the whole
-    // fleet's schedule. Deliberately a READ merge, NOT store replication +
-    // leader-only execution: each node keeps firing exactly its own jobs, so
-    // this can never double-fire or drop a follower-hosted deployment's cron.
-    // `?local=true` (the internal fan-out marker) short-circuits the recursion.
     if !q.local.unwrap_or(false) {
-        // `seen` already holds this node's own (deduped) job ids from above.
         for v in fan_out_peers_polled(&c, &all_healthy_peers(&c), &t, "/v1/cron?local=true").await {
             if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
                 for j in peer_jobs {
@@ -9806,8 +9569,6 @@ async fn cron_add(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut job): Json<CronJob>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Stamp the caller's tenant (never trust a tenant in the body) and require
-    // the target project to belong to them.
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &job.deployment)?;
     job.tenant = t;
     match c.cron.add(job) {
@@ -9857,11 +9618,9 @@ fn cron_job_owner(c: &Arc<CloudState>, job: &CronJob) -> String {
     }
 }
 
-/// Manually trigger a cron job right now (the dashboard's "Run" button) — the
-/// SAME invocation path the scheduler's own tick loop uses
-/// (`spawn_cron_loop`/`invoke`), so a manual run behaves identically to a
-/// real firing, but stamped as a manual run in the recorded event and without
-/// touching the job's own `next_run_ms` (its schedule is unaffected).
+/// Manually triggers a cron job now (the dashboard's "Run" button) through the SAME invocation path
+/// as the scheduler's tick loop (`spawn_cron_loop`/`invoke`), recorded as a manual run and leaving
+/// the job's own `next_run_ms` untouched.
 async fn cron_run(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -9905,8 +9664,6 @@ async fn project_cron_enabled_put(
     Path(project): Path<String>,
     Json(b): Json<CronToggle>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
     require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_cron_enabled(&project, b.enabled);
     crate::persist::persist(&c);
@@ -9918,14 +9675,9 @@ struct CronToggle {
     enabled: bool,
 }
 
-// ---- Workflows ----
-
-/// Lenient `Option<bool>` query-param deserializer: axum's default (via
-/// `serde_urlencoded`) only accepts the literal strings `"true"`/`"false"`
-/// and 400s on anything else, but callers (the dashboard, `?summary=1`) send
-/// `"1"`/`"0"` — the same convention `gossip.rs`'s internal `wf_query`/
-/// `logs_query` already special-case (`v == "true" || v == "1"`) for the
-/// mesh-RPC path. This brings the public HTTP path up to that convention.
+/// Lenient `Option<bool>` query-param deserializer: axum's default accepts only `"true"`/`"false"`
+/// and 400s on anything else, but callers (the dashboard, `?summary=1`) send `"1"`/`"0"`, the
+/// convention `gossip.rs`'s `wf_query`/`logs_query` already special-case on the mesh-RPC path.
 fn de_lenient_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -9963,12 +9715,10 @@ pub(crate) struct WfQuery {
     /// Scope a run-scoped read (e.g. `/v1/workflows/hooks`) to a single run.
     #[serde(default, rename = "runId")]
     pub(crate) run_id: Option<String>,
-    /// Internal: skip the per-project WORLD reads (`worlds=0`). Set by the
-    /// fleet-aggregation fan-out only. A world is read over the project's own
-    /// REST URL, which answers from ANY node — so the aggregating node reads
-    /// every tenant-owned project's world itself and each peer hop would
-    /// otherwise re-read the same worlds, once per peer, just to have its rows
-    /// thrown away as duplicates.
+    /// Internal: skip the per-project WORLD reads (`worlds=0`), set by the fleet-aggregation
+    /// fan-out only. A world is read over the project's own REST URL, which answers from ANY node,
+    /// so the aggregating node reads every tenant-owned project's world itself and each peer hop
+    /// would otherwise re-read the same worlds just to have its rows discarded as duplicates.
     #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) worlds: Option<bool>,
 }
@@ -10062,10 +9812,10 @@ async fn wf_run_wakeup(
     .await
 }
 
-/// Shared dispatch for the four run operations. Resolves the project (given or
-/// auto-scanned), checks tenant ownership, then runs the op on the project's
-/// HOST node (env decrypts locally): local when we host it, else forwarded over
-/// the iroh mesh with `local=1` so the host runs it without re-forwarding.
+/// Shared dispatch for the four run operations: resolves the project (given or auto-scanned),
+/// checks tenant ownership, then runs the op on the project's HOST node (env decrypts locally): in
+/// place when this node hosts it, else forwarded over the iroh mesh with `local=1` so the host runs
+/// it without re-forwarding.
 pub(crate) async fn wf_run_op_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -10078,11 +9828,9 @@ pub(crate) async fn wf_run_op_dispatch(
     let is_forwarded = body.local.unwrap_or(false);
     let cancel_reason = body.cancel_reason.clone();
 
-    // 1) Resolve the project that holds this run.
     let project = if let Some(p) = body.project.clone() {
         p
     } else {
-        // Auto-scan: which of this tenant's world-backed projects has the run?
         let locals: Vec<String> = {
             let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
             for d in c.gw.list() {
@@ -10106,7 +9854,6 @@ pub(crate) async fn wf_run_op_dispatch(
             }
         }
         if found.is_empty() && !is_forwarded {
-            // Not on this node — fan the op out to peers hosting this tenant's projects.
             let peers = peer_nodes_for_tenant(c, &team);
             let body_json = json!({ "cancelReason": cancel_reason, "local": true });
             for node in peers {
@@ -10135,11 +9882,9 @@ pub(crate) async fn wf_run_op_dispatch(
     if project.is_empty() {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 2) Ownership.
     if !wf_in_team(c, &project, &team) {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 3) If this project isn't hosted locally, forward to its host node.
     if c.gw.git_for_project(&project).is_none() && !is_forwarded {
         if let Some(node) = host_node_for_project(c, &project) {
             let body_json =
@@ -10171,17 +9916,18 @@ pub(crate) async fn wf_run_op_dispatch(
             ));
         }
     }
-    // 4) Run it locally against the project's world.
     match crate::world::run_op(c, &project, id, op, cancel_reason.as_deref()).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
-/// POST a JSON body to a host node by NAME: HTTP admin POST if we know its URL,
-/// else the iroh mesh (`GOSSIP_POST` — same body/path dispatch). The
-/// body-carrying, POST-verb counterpart of `post_to_host`/`put_to_host`, used
-/// to forward run operations to a project's hosting node.
+/// POSTs a JSON body to a host node by NAME: the HTTP admin when its URL is known, else the iroh
+/// mesh (`GOSSIP_POST`); the body-carrying counterpart of `post_to_host`/`put_to_host`, used to
+/// forward run operations to a project's host. A configured `HIVE_INTERNAL_TOKEN` rides along as
+/// `x-hive-internal`, so handlers gated by `require_operator_or_internal` (run events and
+/// attributes) still pass on this forwarded hop, which never carries the caller's Authorization
+/// header (an inert extra header for every other route).
 pub(crate) async fn post_body_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -10195,11 +9941,6 @@ pub(crate) async fn post_body_to_host(
             .http
             .post(format!("{admin}{path}"))
             .header("x-hive-team", team);
-        // Carry the internal node-to-node trust token, when configured, so a
-        // handler gated by `require_operator_or_internal` (run events/
-        // attributes) still passes on this forwarded hop, which never carries
-        // the caller's Authorization header. Inert extra header for every
-        // other forwarded route, which doesn't check it.
         if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
             if !t.trim().is_empty() {
                 req = req.header("x-hive-internal", t);
@@ -10245,12 +9986,9 @@ pub(crate) async fn post_body_to_host(
     None
 }
 
-/// Body for the operator-only generic run-event append, matching the real
-/// `@workflow/world` spec's `events.create(runId, data, params)` shape:
-/// `eventType` = the event name (required — this is what makes the endpoint
-/// GENERIC, unlike the three hardcoded call sites in [`crate::world::run_op`]),
-/// `eventData` = its payload (spec's `data`), `correlationId` = spec's
-/// `params.correlationId`.
+/// Body for the operator-only generic run-event append, matching the `@workflow/world` spec's
+/// `events.create(runId, data, params)`: `eventType` (required, which makes the endpoint GENERIC),
+/// `eventData` (the spec's `data`) and `correlationId` (`params.correlationId`).
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunEventBody {
     /// Which project's world holds the run (lets the op skip the auto-scan).
@@ -10268,10 +10006,9 @@ pub(crate) struct RunEventBody {
     pub(crate) local: Option<bool>,
 }
 
-/// Body for the operator-only run-attributes merge, matching the real spec's
-/// `experimentalSetAttributes(runId, changes, options)`: `attributes` = the
-/// spec's `changes`, merged (top-level keys, overwriting) into the run's
-/// stored `attributes` object.
+/// Body for the operator-only run-attributes merge, matching the spec's
+/// `experimentalSetAttributes(runId, changes, options)`: `attributes` is the spec's `changes`,
+/// merged (top-level keys, overwriting) into the run's stored `attributes`.
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunAttributesBody {
     #[serde(default)]
@@ -10317,13 +10054,11 @@ async fn wf_run_set_attributes(
     .await
 }
 
-/// Shared dispatch for the operator-only "append arbitrary event to a run"
-/// op. Mirrors [`wf_run_op_dispatch`]'s project-resolution + host-forward
-/// shape exactly (this is the same node-local world data cancel/replay/
-/// wakeup mutate — see AGENTS.md's round-robin-reads-vs-leader-forwarded-
-/// writes section), but gated by [`require_operator_or_internal`] instead of
-/// tenant ownership alone: this is a manual incident-recovery primitive for
-/// platform operators, not a tenant self-service action like the 3-dots menu.
+/// Shared dispatch for the operator-only "append arbitrary event to a run" op: the same project
+/// resolution and host forwarding as [`wf_run_op_dispatch`] (the data is the node-local world that
+/// cancel/replay/wakeup mutate), but gated by [`require_operator_or_internal`] rather than tenant
+/// ownership, because it is a manual incident-recovery primitive for platform operators, not tenant
+/// self-service.
 pub(crate) async fn wf_run_event_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -10342,8 +10077,6 @@ pub(crate) async fn wf_run_event_dispatch(
     let team = tenant(c, headers, claims);
     let is_forwarded = body.local.unwrap_or(false);
 
-    // 1) Resolve the project that holds this run — identical shape to
-    // `wf_run_op_dispatch`'s auto-scan/fan-out.
     let project = if let Some(p) = body.project.clone() {
         p
     } else {
@@ -10398,11 +10131,9 @@ pub(crate) async fn wf_run_event_dispatch(
     if project.is_empty() {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 2) Ownership.
     if !wf_in_team(c, &project, &team) {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 3) If this project isn't hosted locally, forward to its host node.
     if c.gw.git_for_project(&project).is_none() && !is_forwarded {
         if let Some(node) = host_node_for_project(c, &project) {
             let body_json = json!({ "project": project, "eventType": event_type, "eventData": event_data, "correlationId": correlation_id, "local": true });
@@ -10433,7 +10164,6 @@ pub(crate) async fn wf_run_event_dispatch(
             ));
         }
     }
-    // 4) Run it locally against the project's world.
     match crate::world::append_run_event(
         c,
         &project,
@@ -10449,9 +10179,8 @@ pub(crate) async fn wf_run_event_dispatch(
     }
 }
 
-/// Shared dispatch for the operator-only "merge run attributes" op — same
-/// shape as [`wf_run_event_dispatch`] (and [`wf_run_op_dispatch`]), routed to
-/// [`crate::world::merge_run_attributes`] instead.
+/// Shared dispatch for the operator-only "merge run attributes" op, shaped like
+/// [`wf_run_event_dispatch`] and routed to [`crate::world::merge_run_attributes`].
 pub(crate) async fn wf_run_attributes_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -10568,6 +10297,10 @@ pub(crate) async fn wf_run_attributes_dispatch(
     }
 }
 
+/// Workflow definitions for the caller's team. Workflows are ingested on the node that HOSTS a
+/// deployment: a project placed on a peer is proxied to its host node, and the global view (no
+/// project filter) merges in the workflows registered on every peer hosting one of this tenant's
+/// projects.
 pub(crate) async fn wf_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10575,8 +10308,6 @@ pub(crate) async fn wf_list(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Workflows are ingested on the node that HOSTS a deployment. If this project
-    // was placed on a peer, proxy to that node so its workflows show up.
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
             if let Some(node) = host_node_for_project(&c, project) {
@@ -10601,9 +10332,6 @@ pub(crate) async fn wf_list(
         .filter(|d| q.project.as_deref().map(|p| p == d.project).unwrap_or(true))
         .map(|d| json!(d))
         .collect();
-    // Global view (no project filter): merge in workflows registered on peer nodes
-    // that host this tenant's projects — they're ingested on the HOST, so the
-    // coordinator otherwise shows none for scheduler-placed projects.
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = defs
             .iter()
@@ -10646,7 +10374,6 @@ async fn wf_define(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(def): Json<WorkflowDef>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // The workflow's project must belong to the caller's team.
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &def.project)?;
     c.workflows.define(def);
     let defs: Vec<WorkflowDef> = c
@@ -10665,6 +10392,16 @@ fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
     LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
 }
 
+/// Workflow runs for the caller's team, the most expensive read on the dashboard (fleet fan-out
+/// plus per-project world reads), cached for 2 s per team/project/summary. The inner `local=true`
+/// hop runs inline, uncached and uncoalesced (its caller carries the budget); a top-level call
+/// aggregates on a DETACHED task coalesced per cache key: the dashboard's world proxy aborts a
+/// request at 20 s and axum then drops the handler future, so caches written only at handler
+/// completion starved `resp_cache` AND the last-known-good belt forever (every poll re-ran the slow
+/// path and aborted identically). Detaching means the computation always finishes and fills the
+/// caches, and coalescing means five aborted-and-retried polls spawn ONE aggregation. The in-flight
+/// map entry MUST clear even if the collector panics, or a dead sender sends every later poll down
+/// the uncached inline path forever.
 pub(crate) async fn wf_runs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10672,11 +10409,6 @@ pub(crate) async fn wf_runs(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Cache this endpoint's result for a couple seconds — it's "the most
-    // expensive read on the dashboard" per the comments below (fleet fan-out
-    // PLUS per-project Upstash world reads on every call), so collapsing
-    // concurrent/rapid requests from multiple tabs/team members matters more
-    // here than almost anywhere else. Never cache the inner `local=true` hop.
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
         "wf_runs:{team}:{}:{}",
@@ -10689,21 +10421,8 @@ pub(crate) async fn wf_runs(
         }
     }
     if !is_top_level {
-        // Inner `local=true` hop: run inline, never cached, never coalesced —
-        // its caller (a peer's own aggregation) carries the budget.
         return Json(wf_runs_collect(c, team, q).await);
     }
-    // Top-level: the aggregation runs on a DETACHED task, coalesced per cache
-    // key. Two reasons, both live-witnessed as "Error loading runs" on the
-    // dashboard: (1) the dashboard's own world proxy aborts this request at
-    // 20s, and axum then DROPS this handler future mid-await — with the
-    // caches written only at handler completion, an aborted poll starved
-    // `resp_cache` AND the last-known-good belt forever, so EVERY subsequent
-    // poll re-ran the full slow path and aborted identically (steady-state
-    // failure, not a transient). Detaching means the computation always
-    // finishes and always writes the caches — one slow poll instead of an
-    // endless series. (2) Coalescing means five aborted-and-retried polls
-    // spawn ONE aggregation, not five (the dc8286f amplification rule).
     type WfShared = tokio::sync::watch::Receiver<Option<Value>>;
     fn wf_inflight() -> &'static parking_lot::Mutex<std::collections::HashMap<String, WfShared>> {
         static M: std::sync::OnceLock<
@@ -10720,10 +10439,6 @@ pub(crate) async fn wf_runs(
                 m.insert(cache_key.clone(), rx.clone());
                 let (c2, team2, q2, key2) = (c.clone(), team.clone(), q.clone(), cache_key.clone());
                 tokio::spawn(async move {
-                    // The map entry MUST clear even if the collector panics:
-                    // a leaked entry's dead sender makes every later poll fall
-                    // through to the uncached inline path forever — the exact
-                    // steady-state starvation this task exists to prevent.
                     struct ClearOnDrop(String);
                     impl Drop for ClearOnDrop {
                         fn drop(&mut self) {
