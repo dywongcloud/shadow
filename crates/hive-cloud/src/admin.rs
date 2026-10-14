@@ -2967,6 +2967,7 @@ pub(crate) async fn build_cancel(
     c.record(ev);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &t,
         &b.project,
         "deployment.canceled",
         json!({ "id": id, "project": b.project }),
@@ -4146,6 +4147,7 @@ pub(crate) async fn dep_promote(
         c.record(ev);
         crate::webhooks::dispatch(
             &c.webhooks,
+            &t0,
             &info.project,
             "deployment.promoted",
             json!({ "id": id, "project": info.project, "url": c.deploy_url(&info.alias) }),
@@ -5206,6 +5208,7 @@ async fn project_delete(
     if outcome.logical_deleted && !outcome.recreated {
         crate::webhooks::dispatch(
             &c.webhooks,
+            &t,
             &project,
             "project.removed",
             json!({
@@ -5754,6 +5757,7 @@ async fn project_rename(
     let rename_ms = outcome.rename_ms;
     crate::webhooks::dispatch(
         &c.webhooks,
+        &t,
         &new,
         "project.renamed",
         json!({
@@ -5949,7 +5953,7 @@ async fn rename_project_owned(
     let moved_service_graphs = c.svcgraph.rename_project(project, new);
     let moved_metric_buckets = c.metrics.rename_project(project, new);
     let moved_sandboxes = c.sandboxes.rename_project(project, new);
-    let moved_webhooks = c.webhooks.rename_project(project, new);
+    let moved_webhooks = c.webhooks.rename_project(norm(team), project, new);
     c.git_index.rename_project(project, new);
     {
         let mut seen = c.git_poll_seen.write();
@@ -11888,9 +11892,8 @@ async fn webhooks_all(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let list: Vec<_> = c
         .webhooks
-        .snapshot()
+        .list(crate::webhooks::Scope::Team(&t), None)
         .into_iter()
-        .filter(|w| norm(&w.team) == t)
         .map(|w| w.decrypted())
         .collect();
     Json(json!(list))
@@ -11911,13 +11914,25 @@ async fn webhook_create_team(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateTeamWebhook>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if t == ANON_TENANT {
+        return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
+    }
     let targets: Vec<String> = if b.projects.is_empty() || b.projects.iter().any(|p| p == "*") {
         vec!["*".into()]
     } else {
         b.projects.clone()
     };
+    if let Some(foreign) = targets
+        .iter()
+        .find(|p| p.as_str() != "*" && !project_owned_by(&c, p, &t))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("project {foreign:?} belongs to a different team"),
+        ));
+    }
     let mut created = Vec::new();
     for p in targets {
         created.push(c.webhooks.add(crate::webhooks::Webhook {
@@ -11933,7 +11948,7 @@ async fn webhook_create_team(
     }
     crate::persist::persist(&c);
     let created: Vec<_> = created.into_iter().map(|w| w.decrypted()).collect();
-    Json(json!(created))
+    Ok(Json(json!(created)))
 }
 
 async fn webhooks_for_project(
@@ -11948,7 +11963,7 @@ async fn webhooks_for_project(
     }
     let list: Vec<_> = c
         .webhooks
-        .list(Some(&project))
+        .list(crate::webhooks::Scope::Team(&t), Some(&project))
         .into_iter()
         .map(|w| w.decrypted())
         .collect();
@@ -11994,12 +12009,11 @@ async fn webhook_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some(w) = c.webhooks.snapshot().into_iter().find(|w| w.id == id) {
-        if norm(&w.team) != t {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    if c.webhooks.remove(crate::webhooks::Scope::Team(&t), &id)
+        == crate::webhooks::Removal::NotYours
+    {
+        return Err(StatusCode::NOT_FOUND);
     }
-    c.webhooks.remove(&id);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
@@ -12507,6 +12521,7 @@ fn database_ready_callback(
             crate::persist::persist(&cloud);
             crate::webhooks::dispatch(
                 &cloud.webhooks,
+                &database.team,
                 &project,
                 "database.ready",
                 json!({
@@ -12719,6 +12734,7 @@ async fn database_create(
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &db.team,
         &db.project,
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
@@ -12803,6 +12819,7 @@ pub(crate) async fn database_provision_local(
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &db.team,
         &db.project,
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
@@ -14151,7 +14168,7 @@ async fn admin_overview(
         "err30": err30,
         "incidents_open": c.incidents.open_count(),
         "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
-        "webhooks": c.webhooks.list(None).len(),
+        "webhooks": c.webhooks.list(crate::webhooks::Scope::Operator, None).len(),
         "resources": {
             "cpu_cores": nodes.iter().map(|n| n.cpu_cores as u64).sum::<u64>(),
             "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
@@ -14349,9 +14366,8 @@ async fn incident_open(
     }
     let inc = c.incidents.open_new(req);
     crate::persist::persist(&c);
-    crate::webhooks::dispatch(
+    crate::webhooks::dispatch_platform(
         &c.webhooks,
-        "*",
         "incident.opened",
         json!({ "id": inc.id, "title": inc.title, "severity": inc.severity }),
     );
@@ -14383,9 +14399,8 @@ async fn incident_update(
         .ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
     if resolved {
-        crate::webhooks::dispatch(
+        crate::webhooks::dispatch_platform(
             &c.webhooks,
-            "*",
             "incident.resolved",
             json!({ "id": inc.id, "title": inc.title }),
         );
@@ -14418,9 +14433,8 @@ async fn incident_delete(
         .remove(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
-    crate::webhooks::dispatch(
+    crate::webhooks::dispatch_platform(
         &c.webhooks,
-        "*",
         "incident.deleted",
         json!({ "id": inc.id, "title": inc.title }),
     );
@@ -16368,7 +16382,7 @@ async fn data_delete(
             true
         }
         "webhooks" => {
-            c.webhooks.remove(&id);
+            c.webhooks.remove(crate::webhooks::Scope::Operator, &id);
             true
         }
         _ => {

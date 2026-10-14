@@ -1227,8 +1227,10 @@ pub async fn start_build(
         lines: Vec::new(),
     });
     crate::persist::persist(&cloud);
+    let wh_team = cloud.projects.team_of(&project);
     crate::webhooks::dispatch(
         &cloud.webhooks,
+        &wh_team,
         &project,
         "deployment.created",
         serde_json::json!({ "id": id, "project": project, "repo": req.repo_url, "state": "building" }),
@@ -1272,6 +1274,7 @@ pub async fn start_build(
                 crate::persist::persist(&cloud);
                 crate::webhooks::dispatch(
                     &cloud.webhooks,
+                    &wh_team,
                     &wh_project,
                     "deployment.error",
                     serde_json::json!({ "id": bid, "project": wh_project, "error": e.to_string() }),

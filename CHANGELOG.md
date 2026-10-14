@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-13 — webhooks are scoped to their team: no cross-tenant read, registration or event delivery
+
+`WebhookStore` filtered nothing by owner. `GET /v1/projects/:project/webhooks` (ownership
+checked on the project only) returned every team's team-wide `"*"` hooks with the signing
+secrets decrypted, so tenant A could read tenant B's hook URL and secret from its own project
+and forge signed deliveries; `POST /v1/webhooks` accepted any `projects` entry, or none,
+without `project_owned_by`; and `dispatch` selected hooks by project name only, so a
+team-wide hook registered by A received every project's events, B's included, and B's
+received A's. The store primitive now takes the owner on every operation: `list(Scope,
+project)`, `remove(Scope, id)`, `rename_project(team, from, to)`, and `dispatch(store, team,
+project, ...)` / `dispatch_durable(..., Audience, ...)` select by (team, project), so a `"*"`
+hook means every project of THIS team. The operator surfaces pass `Scope::Operator`
+explicitly, and operator-declared incidents use `dispatch_platform`, which still reaches every
+team's `"*"` hooks. `webhook_create_team` refuses an anonymous caller and an explicit
+`projects` entry the caller's team does not own (403), and the deployment lifecycle outbox
+resolves its team from the deployment record. Migration: webhook rows persisted before tenant
+ownership have no `team`; they used to normalize to the shared "personal" tenant (listed to
+every personal user and fired for every team's events). They now stay on disk, inert (never
+listed, never delivered), with one WARN at the first load that counts them: nothing is dropped
+and nothing is exposed, and an operator re-creates them under their team. Witnessed on a
+throwaway auth-enforced node with a plain HTTP receiver: before, tenant `ta`'s project list
+returned `tb`'s team-wide hook URL and secret, `ta`'s team-wide hook received `tb`'s
+`database.created` event and `tb`'s received `ta`'s, a hook on `tb`'s project was accepted
+(200) and fired, and two injected team-less rows were listed to the `personal` tenant, shown in
+`ta`'s project list and fired for `tb`'s event; after, all seven are refused (empty list, no
+delivery, 403, the rows inert and still in `state.json`), while each team's own hooks still
+list, sign and deliver and a cross-team delete is still 404. Operator note: re-create any
+legacy team-less webhooks (the WARN gives the count); the API is unchanged for owners. Not
+rolled.
+
 ## 2026-10-13 — a queue consumer can only target the queue's own tenant's app, and its batches are signed
 
 A push consumer's `script_name` was accepted unchecked (`queues_api.rs` `consumer_create`) and

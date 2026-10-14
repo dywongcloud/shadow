@@ -544,12 +544,28 @@ pub fn spawn_outbox(cloud: Arc<crate::state::CloudState>) {
     });
 }
 
+/// The team an outbox entry's webhooks belong to: the tenant tag of the deployment it is about
+/// (this node accepted it, so its record is local), else the project's owner. A blank answer
+/// reaches no hook, which acknowledges the entry as having no subscribers.
+fn outbox_team(cloud: &Arc<crate::state::CloudState>, entry: &LifecycleOutboxEntry) -> String {
+    cloud
+        .gw
+        .deployment_records()
+        .into_iter()
+        .find(|record| record.id == entry.deployment_id)
+        .map(|record| record.tenant)
+        .filter(|tenant| !tenant.trim().is_empty())
+        .unwrap_or_else(|| cloud.projects.team_of(&entry.project))
+}
+
 pub async fn drain_outbox_once(cloud: &Arc<crate::state::CloudState>) {
     for entry in cloud.deployment_ledger.pending_outbox() {
+        let team = outbox_team(cloud, &entry);
         let delivered = crate::webhooks::dispatch_durable(
             &cloud.webhooks,
             &entry.id,
             entry.created_ms,
+            crate::webhooks::Audience::Team(&team),
             &entry.project,
             &entry.event,
             entry.payload,
