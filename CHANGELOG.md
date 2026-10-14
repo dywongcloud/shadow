@@ -1,5 +1,122 @@
 # Changelog
 
+## 2026-10-14 — the token mint is limited per user with a peer-wide backstop, and only guesses at the internal token spend the strict per-peer budget (0f4187d92b)
+
+Every session of the fleet reaches `POST /v1/token` through ONE dashboard server, so the single per-peer budget (20 per minute)
+was shared by every user: about 300 org sessions (each re-mints every 15 minutes) saturated it, and a stream of bad guesses from
+the dashboard's own peer address spent the same budget, so legitimate mints were refused too. `mint_token` now checks the
+internal token first. A request that fails `mint_allowed` is a guess and alone spends the strict per-peer budget (20 per minute,
+unchanged; `tls_bundle_mesh` still counts every request against it). A legitimate mint spends a per-USER budget (the request's
+`sub`, `HIVE_MINT_USER_PER_MIN`, default 30: a runaway-client bound, a session mints about every 15 minutes) and a peer-wide
+backstop for all users together (`HIVE_MINT_BACKSTOP_PER_MIN`, default 600, the order of the admin router's own per-peer
+budget). The UI's re-mint cadence is a separate change and is not touched. Witnessed on a real enforced node
+(`scratch2/work/secfix6-mint.sh`, a fresh node per case): before, 3 defects (40 different users in a minute: 20 refused 429; 25
+bad guesses and then a legitimate mint: 429; the backstop knob ignored, the peer capped at 20); after, 0 (40 users 40 minted,
+one user 30 minted and 10 refused, the legitimate mint after 25 guesses 200 with the guesses still throttled, the backstop
+capping exactly at its knob). Not rolled.
+
+## 2026-10-14 — a browser-originated identity sync records nothing: the dashboard server is the only writer of the identity mirror (9f283c557f)
+
+`26674b3fa7` kept a browser sync from writing an EMAIL, but `identity_sync` still recorded the rest of the body the caller
+wrote: any signed-in caller (a viewer even, `/v1/identity/sync` is a viewer route) could POST a sync for ANY user id with the
+name and image it liked, and the row took the CALLER's tenant (the reviewer's victim renamed `defaced`), could create a mirror
+row for itself and rewrote the name and image of its own org. `identity_sync` now writes the mirror (`upsert_org`, the roster
+mirror, `upsert_user`, `persist`) only for the dashboard SERVER's sync (`mint_allowed`: `x-hive-internal` on an enforced node,
+always true on an unenforced dev node, which has no tenant boundary to protect). A browser-originated sync still answers 200
+`{ok, tenant, is_owner}`, which is all the client reads; the server syncs the verified profile, tenant and org at every mint, so
+nothing the browser sync recorded is lost. Witnessed on a real enforced node (`scratch2/work/secfix6-identity.sh`): before, 6
+defects (a viewer's browser sync renamed the victim, replaced its image, moved its row to the viewer's tenant, renamed the
+viewer's org `PWNED ORG`, replaced the org's image and created a mirror row for itself); after, 0, the server's sync still
+recording name, image, email, org and roster and a dev node still recording (10 PASS); the reviewer's `t_transfer` chain agrees.
+Not rolled.
+
+## 2026-10-14 — a write nobody listed needs admin, and billing, DNS, the destructive database operations and the edge security rules are admin rows (3e737fa9c6)
+
+The matrix defaulted a write no row names to MEMBER, so a member and the default CI key could charge the team (`POST
+/v1/billing/charge`), edit DNS records and nameservers, delete or rotate a database, rewrite the WAF, rate-limit and bot rules
+and the repository link, and a route added without a row opened itself to a member. `roles::floor` now answers ADMIN for a write
+no row names, every route a member may call is NAMED in `RULES` (deploy and build, env, attaching and verifying domains, project
+settings, snapshots, database create and connect, sandboxes, cron, queues, storage, workflows, microfrontend groups, drive,
+routing, cache, secure links, incidents, the caller's own API key and team), and the new admin rows are billing checkout, confirm
+and charge; DNS records, import, nameservers and certificate renewal; database delete and credential rotation; WAF, rate limits,
+bot rules and SMS delivery providers; `PUT` and `DELETE /v1/gitops`. 37 routes change from member to admin (the operator-only
+`/v1/admin/*` and the fleet-only mesh and internal routes among them, which no member could use before either). UI-visible:
+`ui/lib/team-role.ts` (the client mirror of the table) must offer the new admin controls to an admin only. Witnessed on a real
+enforced node (`scratch2/work/secfix6-matrix2.sh`): 19 named gap routes plus a sweep of every mutation route of the router x 7
+principals (4 role JWTs, 3 key roles) = 1274 requests against an independent encoding of the intended floors; before 112
+defects, after 0, with the day-to-day member flows and the default CI key's deploy, env, domain, queue, storage, database and
+cron calls still passing and a dev node unchanged; the role-matrix (65) and CLI (8) witnesses still pass. Not rolled.
+
+## 2026-10-14 — a transfer is a move: the project row is the owner of record, a claim never takes a project, and the deployments follow the row (e3effdb137)
+
+`PUT /v1/projects/:p/team` (`413287e85e`) left the project's deployments tagged with the old team, and the old team kept the
+project through them (`project_owned_by` was deployment-aware): it listed the deployments, read their resources and builds,
+promoted and deleted them, aimed a queue consumer at the app, and its next env write TOOK THE PROJECT BACK, because the settings
+write claimed the row with an unconditional `set_team` (after which it could delete it). `ProjectStore::claim_team` is now a
+compare-and-set: an untagged row is claimed, the owner's own claim is a no-op, a row another team holds is refused
+(`require_project_claiming_row` uses it). `admin::row_holder` is the owner of record, the team a row names when its tag is real,
+and `admin::deployment_tenant` resolves a deployment's tenant through it: when a holder exists it ALONE decides, in
+`project_owned_by` and in every gate that read a deployment's tag (the deployment list, resources, promote and delete, build read
+and cancel, the queue-consumer target, the project list); the project delete and rename front doors refuse a foreign holder at
+once (404, where a foreign delete used to cascade to the fleet and answer 502, after ~20 s on a fresh node). A transfer re-tags
+the deployments of the node that serves it (`Gateway::retag_project`, with the function pools' tenant, `Fluid::set_tenant`), and
+every other host converges from the row in `tenancy_reconcile` (`HIVE_DEPLOYMENT_RETAG_SECS`, default 15;
+`HIVE_DEPLOYMENT_RETAG=0` disables), so a transfer made before this build completes itself on the first pass after the roll: the
+old team stops listing those projects (the WARN `tenancy reconcile: re-tagged deployments to their project's team` names each).
+Witnessed on real enforced nodes: a node that has not converged (`HIVE_DEPLOYMENT_RETAG=0` and the operator's row-only route,
+`scratch2/work/secfix6-stale.sh`), before 17 defects (the old team listed the deployments and the project, read resources and a
+real git build and its log, cancelled the build, promoted and deleted a deployment, aimed a queue consumer at the app, read the
+settings, wrote env and took the project back, while the new team saw none of its own deployments and was locked out after the
+take-back), after 0 with the new team served throughout; the transfer itself (`secfix6-move.sh`) before 9 defects, after 0,
+including the convergence of a row-only change; the reviewer's `t_transfer`: the old team's env put 200 and a later delete 200,
+now 403 and 404. Not changed, and open: a domain, database, webhook or integration the old team created is not moved by a
+transfer; the browser lane (admission, artifact delivery, browser DB grants) still decides from deployment tags and follows them
+within the re-tag interval; the mesh arms for delete, rename, reap and domain activation keep their own evidence (their engines
+refuse a foreign row) and the delete arm reports acceptance for a delete its engine refused (a separate row). Not rolled.
+
+## 2026-10-14 — a roster removal authorises every row it deletes, so a ghost row ahead of the Owner cannot carry the Owner away (8c1cf77c34)
+
+`remove_checked` ruled on the FIRST row that matched an email and then deleted EVERY row that matched. With a legacy ghost row
+ahead of the real Owner (an older build stored `" own@vt.test"`), an admin's `DELETE` of `"  own@vt.test"` (two spaces, which
+matches neither row exactly) was judged on the ghost's role (member), answered 200 and removed both rows: the Owner was gone and
+the last-owner rule never ran; the operator got the same through two Owner rows of one person. `check_roster_removal` is the
+removal's twin of `check_roster_change` and takes the role of EVERY row the removal will delete: `AboveActor` when any of them
+outranks the actor, `LastOwner` when the rows removed include every Owner the team has; `remove_checked` collects the targets,
+authorises them together and only then drops them. The exact-string rule that keeps a ghost removable on its own is unchanged.
+Witnessed with legacy rosters written into `state.json` (`scratch2/work/secfix6-ghost.sh`): before, 4 defects (the admin's padded
+delete removed the Owner with 200; the operator's left the team ownerless); after, 0 (403 for the admin, 409 for the operator,
+both Owners kept; removing a ghost by its exact string, a ghost and its member together and an owner removing an admin still
+200; 5 PASS); the reviewer's `t_roster4` agrees. Not rolled.
+
+## 2026-10-14 — a service role string opens nothing: the workflow queue token may only enqueue, fleet identities pass by subject and role, and every other service claim is no principal (31e80ccff2)
+
+The role matrix (`d79bc7c1f0`) passed any claim whose role string was `service` through every row, and `git.rs` puts exactly such a
+token in a tenant's project env: a workflow build issued `world-queue-client` (the team's tenant, 365 days) as `HIVE_QUEUE_TOKEN`,
+which a member triggers with a one-line `vercel.json` in a zip upload. The real token, read from the node's data dir, answered 200
+on SIEM, IP blocks, SCIM mint, webhook create, integration credentials, env put and delete on another project, project delete,
+API-key revoke and deploy, opened protected previews (the preview gate trusts any verified tenant claim) and outlived the
+member's removal; any forged `service` claim did the same. The fix is at the primitives. `auth::verify` accepts a service claim
+only for a FLEET identity (`is_fleet_service`: `mesh-internal`, or the `mesh-node:<coordinator>` transfer token, subject AND
+role) at the one decode every generic verification site shares, so the queue token and every other service claim stop being a
+principal there. The queue client has its own verifier (`verify_queue_client`: subject AND role, never an operator, `iat` no older
+than `HIVE_QUEUE_TOKEN_MAX_AGE_SECS`, default 30 days) and `auth::principal` is the one resolution `require_auth` and the regional
+ingress share. `roles::gate` passes a fleet token, confines the queue client to `POST /v1/wqueue/enqueue` and `GET
+/v1/wqueue/stats` and refuses any other service claim. A workflow build issues a 30-day token (not 365) and puts the PLAINTEXT
+pair in the function env (it used to copy the sealed `enc:v1:` form of the project row, which is no bearer), and
+`world_queue::rotate_queue_tokens` (every node at boot+90 s, then every `HIVE_QUEUE_TOKEN_ROTATE_SECS`, 6 h) re-issues the token
+in the function env of each local deployment whose token is past half its age, expired, issued with a lifetime beyond the cap or
+still sealed, through `Gateway::update_manifest` (future launches; a running instance keeps its token until it recycles); a
+tenant's own `HIVE_QUEUE_TOKEN` is never touched. Migration for the tokens already in deployments' env: nothing to do for an app
+whose instances recycle within 30 days of the roll (each local deployment gets a 30-day token about 90 s after its node boots
+with this build); an instance that lives longer keeps its old token until it restarts, and the age cap counts from the token's
+own `iat`, so a 365-day token issued N days before the roll stops working 30 days after ITS issue unless the instance was
+recycled first or `HIVE_QUEUE_TOKEN_MAX_AGE_SECS` is raised; a project row's stale sealed copy is harmless (403 everywhere but
+enqueue) and a rebuild replaces it. Witnessed on a real enforced node (`scratch2/work/secfix6-service.sh`): before, 34 defects
+(the real member-triggered token 200 on eleven admin and member routes and an open protected preview; a 365-day token, an unknown
+service subject and a forged `platform_admin` queue claim the same); after, 0, enqueue and the counters still 200, `mesh-internal`
+and the `mesh-node` token still pass the gate, rotation replaces a 365-day token and a sealed copy with working 30-day tokens and
+leaves a young token and a tenant's own alone (15 PASS); the reviewer's `t_queuetoken2` and `t_svc` agree. Not rolled.
+
 ## 2026-10-14 — the session cookie is re-minted from its own lifetime, once per browser, and an authorization 403 never re-mints (cf7298c6d5)
 
 Org tokens live 900 s (`9e464c496d`) but the dashboard re-minted on a fixed 50-minute timer, so the `hive_jwt` cookie lapsed
