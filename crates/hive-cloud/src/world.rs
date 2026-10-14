@@ -46,7 +46,29 @@ use serde_json::{json, Value};
 
 use crate::state::CloudState;
 
+/// The exact shape `databases.rs::provision_redis` writes on a node with no db host: plain http to
+/// this host's own loopback address, no userinfo, path or query.
+fn is_platform_loopback_shim(raw: &str) -> bool {
+    reqwest::Url::parse(raw).is_ok_and(|u| {
+        u.scheme() == "http"
+            && u.host_str() == Some("127.0.0.1")
+            && u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/"
+            && u.query().is_none()
+    })
+}
+
 /// Resolved world connection for a project: (rest_url, token, key_prefix).
+///
+/// The URL comes from the project's env, which a TENANT writes, so a loopback one is trusted ONLY
+/// when it is exactly the REST URL recorded on the project's own managed Redis database that this
+/// node hosts (`DatabaseStore::local_redis_rest_url`): the env may name the platform's sidecar, it
+/// can never introduce a loopback destination (confirmed live: a tenant-set
+/// `WORKFLOW_REDIS_REST_URL=http://127.0.0.1:<port>` made the control plane POST, with the tenant's
+/// bearer, to any listener on this host — admin ports, other tenants' sidecars). Any other loopback
+/// URL is no world at all, and every non-loopback URL still goes through the full `hive_outbound`
+/// guard in [`resolve_world_endpoint`]. Everything `cmd`/`pipeline` dial came through here.
 fn world_config(cloud: &Arc<CloudState>, project: &str) -> Option<(String, String, String)> {
     let env = cloud.projects.env_map(project);
     let get = |k: &str| {
@@ -57,7 +79,17 @@ fn world_config(cloud: &Arc<CloudState>, project: &str) -> Option<(String, Strin
     let url = get("WORKFLOW_REDIS_REST_URL").or_else(|| get("UPSTASH_REDIS_REST_URL"))?;
     let token = get("WORKFLOW_REDIS_REST_TOKEN").or_else(|| get("UPSTASH_REDIS_REST_TOKEN"))?;
     let prefix = get("WORKFLOW_REDIS_KEY_PREFIX").unwrap_or_else(|| "owf".to_string());
-    Some((url.trim_end_matches('/').to_string(), token, prefix))
+    let url = url.trim_end_matches('/').to_string();
+    if is_platform_loopback_shim(&url) {
+        let team = cloud.projects.team_of(project);
+        let owned = cloud
+            .databases
+            .local_redis_rest_url(project, &team, &cloud.node_name);
+        if owned.as_deref() != Some(url.as_str()) {
+            return None;
+        }
+    }
+    Some((url, token, prefix))
 }
 
 /// True if this project has a (readable) WDK world configured.
@@ -68,24 +100,21 @@ pub fn has_world(cloud: &Arc<CloudState>, project: &str) -> bool {
 /// The most the node reads from one world REST reply.
 const WORLD_REPLY_MAX_BYTES: usize = 32 * 1024 * 1024;
 
-/// Resolves a world Redis-REST URL to (parsed URL, client). Two shapes reach here: the platform's
-/// OWN locally-provisioned managed-redis sidecar (`databases.rs::provision_redis`, which always
-/// writes exactly `http://127.0.0.1:<port>`, no path or query) and a tenant's BYO URL
+/// Resolves a world Redis-REST URL to (parsed URL, client). Two shapes reach here, both already
+/// vetted by [`world_config`]: the platform's OWN locally-provisioned managed-redis sidecar
+/// (`databases.rs::provision_redis`, exactly `http://127.0.0.1:<port>`, and only ever the one
+/// recorded on the project's own database), dialed over the no-redirect internal client — it is
+/// this host's own loopback, so the full tenant-URL guard (https + public-address-only) would
+/// regress a node whose managed redis has no public/https front door — and a tenant's BYO URL
 /// (`WORKFLOW_REDIS_REST_URL`, or a tenant-set `UPSTASH_REDIS_REST_URL` naming their own external
-/// account). The platform's own shim is recognized by that EXACT shape and dialed over the
-/// no-redirect internal client — it is this host's own loopback, never attacker-reachable from
-/// outside — so routing it through the full tenant-URL guard (https + public-address-only) does not
-/// regress a node whose managed redis has no public/https front door. Anything else goes through
-/// the full `hive_outbound` guard.
+/// account), which goes through the full `hive_outbound` guard. The shape test here is defense in
+/// depth, never the authorization: it is not safe to call with a URL that did not come through
+/// `world_config`.
 fn resolve_world_endpoint(raw: &str) -> Option<(reqwest::Url, reqwest::Client)> {
-    if let Ok(u) = reqwest::Url::parse(raw) {
-        let is_platform_loopback_shim = u.scheme() == "http"
-            && u.host_str() == Some("127.0.0.1")
-            && u.path() == "/"
-            && u.query().is_none();
-        if is_platform_loopback_shim {
-            return Some((u, hive_outbound::internal_client()));
-        }
+    if is_platform_loopback_shim(raw) {
+        return reqwest::Url::parse(raw)
+            .ok()
+            .map(|u| (u, hive_outbound::internal_client()));
     }
     hive_outbound::validate_url(raw)
         .ok()
