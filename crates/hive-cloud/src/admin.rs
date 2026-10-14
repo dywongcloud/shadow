@@ -15442,7 +15442,13 @@ async fn identity_sync(
                     .map(|o| o.name.trim())
                     .filter(|s| !s.is_empty())
                     .unwrap_or(slug.as_str());
-                let _ = c.teams.create_with_slug(slug, name, "pro", &c.owner_email);
+                // Hobby, the plan `team_create` gives a non-operator: a tier is RAISED only through
+                // `apply_plan_everywhere` (a paid checkout or an operator), and the billing account
+                // of a new tenant is Hobby, so both halves agree. Created at "pro" the record read
+                // Pro while billing read Hobby, and every org reached Pro-gated features free.
+                let _ = c
+                    .teams
+                    .create_with_slug(slug, name, "hobby", &c.owner_email);
             }
             let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
                 crate::teams::Role::Admin
