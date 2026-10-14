@@ -14,14 +14,15 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
   `sdallocx`/`mallocx` is a 96-byte stub `libjemalloc.a` from a killed build (`--clean-jemalloc`). `GROUPS`
   is a special shell array: the script uses `TARGET_GROUPS`.
 - A roll: `ansible-playbook ansible/playbooks/parallel-deploy.yml --tags backend` (the unit is
-  `hive-node.service`, never `hive-cloud`). It verifies CONTENT (this run's artifact sha against the on-disk
-  binary and `/proc/<MainPID>/exe`, unit start after the run began on each host's own clock), refuses a run
-  that changed no host's binary unless `allow_noop_deploy=true`, restarts the backend serial 1 and the UI
-  serial 3, and re-kicks the first three restarted nodes (their trunks formed against a fleet that then
-  bounced). `rsync -a` preserves mtimes, so the fan-out build host touches `crates/**/*.rs` when a sync
-  changed anything (cargo fingerprints would skip the rebuild); `vendor/` rides every roll (never edit it
-  between a roll's sync and its build); the cr-sqlite extension (`/var/lib/hive/crsqlite.so`, per glibc
-  group) is built and installed on EVERY run.
+  `hive-node.service`, never `hive-cloud`), once the read-only `scripts/audit-secret-keys.sh` passes (a node
+  with a set-but-EMPTY or malformed `HIVE_SECRET_KEY` will not boot). It verifies CONTENT (this run's
+  artifact sha against the on-disk binary and `/proc/<MainPID>/exe`, unit start after the run began on each
+  host's own clock), refuses a run that changed no host's binary unless `allow_noop_deploy=true`, restarts
+  the backend serial 1 and the UI serial 3, and re-kicks the first three restarted nodes (their trunks
+  formed against a fleet that then bounced). `rsync -a` preserves mtimes, so the fan-out build host touches
+  `crates/**/*.rs` when a sync changed anything (cargo fingerprints would skip the rebuild); `vendor/` rides
+  every roll (never edit it between a roll's sync and its build); the cr-sqlite extension
+  (`/var/lib/hive/crsqlite.so`, per glibc group) is built and installed on EVERY run.
 - `scripts/deploy-ui-fleet.sh`: ONE build, many nodes (Next/Turbopack builds are not deterministic: per-node
   builds behind one round-robin hostname 404 each other's chunks): the elected build host (the control-plane
   leader) builds once and every other host gets the identical artifact (`--exclude=.gm`). It awk-matches
@@ -39,9 +40,9 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
   skip it unless `INCLUDE_RETIRED=1`, fail2ban excludes it (a provider re-issues a released IP to a
   stranger). The sections `[glibc239]`/`[glibc238]`/`[browser_nodes]`/`[litebox]` still NAME the five
   deleted hosts (bkk hk va2 sp fr) with no definition line; `[glibc238]` has no live member; every live host
-  is glibc 2.39 (`scripts/audit-runtime-versions.sh`). `hive_geo="lat,lon,city,country"` pins the UI city.
-  `litebox_verified=true` stays on every host that has run verified Litebox: an unlimited `--tags litebox`
-  run otherwise removes its drop-in and restarts it into MockBackend.
+  is glibc 2.39 (`scripts/audit-runtime-versions.sh`). `litebox_verified=true` stays on every host that has
+  run verified Litebox: an unlimited `--tags litebox` run otherwise removes its drop-in and restarts it into
+  MockBackend.
 - `ansible.cfg`: `forks = 20` (the default 5 silently batches every play without `serial:`;
   `serial:`/`throttle:` are the real bounds); `vault_password_file = .vault_pass` is mandatory: a missing
   gitignored `ansible/.vault_pass` aborts EVERY ansible command, `--syntax-check` included.
@@ -55,10 +56,11 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
 ## Credentials and templates
 
 - `roles/hive_ui/templates/env.local.j2` OVERWRITES the node's whole `.env.local`, so the Clerk, Composio
-  and GitHub App blocks are each guarded `| default('') | length > 0`, never `is defined` (an EMPTY vault
-  key renders a bare falsy `KEY=`: next-server 500s, working keys wiped). `hive_owner_email` decides
-  `isOwner` in `ui/app/api/token/route.ts` and the backend's `admin_emails`, so a hand-added address
-  survives only until the next `--tags ui` run.
+  and GitHub App blocks are each guarded `| default('', true) | string | length > 0` (undefined, null, empty
+  and numeric values all survive; `default('') | length` aborts the render on a YAML null or integer), never
+  `is defined` (an EMPTY vault key renders a bare falsy `KEY=`: next-server 500s, working keys wiped).
+  `hive_owner_email` decides `isOwner` in `ui/app/api/token/route.ts` and the backend's `admin_emails`, so a
+  hand-added address survives only until the next `--tags ui` run.
 - `GITHUB_APP_PRIVATE_KEY` is DOUBLE-QUOTED in `.env.local` (systemd's `EnvironmentFile=` eats the backslash
   of an unquoted `\n`) and a single-quoted scalar with LITERAL `\n` escapes in the node env; load keys only
   through `scripts/set-github-app-key.sh`. The App pair reaches hive-node as
@@ -82,8 +84,8 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
   `hive_p2p_discovery_ms` is 8000 (the code default 4000 ships the DHT inert); `hive_dht_port` stays empty.
   Relay URLs (`hive_relay_urls`, the browser node's relays) are the https `:3343` hostnames (wildcard cert
   `*.relay.shadw.app`: an IP-literal URL fails verification).
-- fail2ban installs from the upstream tarball (TencentOS 4 has no package and no usable EPEL), bans via
-  `nftables-multiport`/`-allports`, and `ignoreip` is every non-retired host's addresses plus
+- fail2ban installs from the upstream tarball (TencentOS 4 has no package), bans via
+  `nftables-multiport`/`-allports`, and `ignoreip` is every non-retired host plus
   `hive_fail2ban_ignoreip_extra`.
 - A guardian-filled node (`GUARDIAN_GC_SECS=0` disables blob GC and the store grows without bound): stop
   hive-node, remove `iroh_store`, `iroh_docs` AND `keystore` together under the guardian `iroh/` dir (a kept
@@ -109,12 +111,10 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
 - Litebox role: patches apply in order `networking.patch`, `fork-inplace.patch`, `tcp-keepalive.patch` and
   fail loudly when a pin bump stops one applying; the `git` task carries
   `refspec: +<litebox_commit>:refs/remotes/origin/pinned` (upstream's history was rewritten twice and left
-  the pin dangling: only a full 40-hex sha fetches it). Before re-pinning (see
-  `roles/litebox/files/PATCHES.md`): the repo's `created_at`/`fork`/`archived`, the new commit author's
-  account and org membership, that the tree is the same project, that `networking.patch` still passes
-  `git apply --check` (the strongest check), and that the earlier docs' own claims (the `fork()` fix is
-  present) still hold. Staging the runner never restarts hive-node (it reads the path at startup, only with
-  `HIVE_LITEBOX_VERIFIED=1`).
+  the pin dangling: only a full 40-hex sha fetches it). Before re-pinning run the six-step legitimacy check
+  in `roles/litebox/files/PATCHES.md` (the strongest step: `networking.patch` still passes
+  `git apply --check`), then `hive-cloud --litebox-probe`. Staging the runner never restarts hive-node (it
+  reads the path at startup, only with `HIVE_LITEBOX_VERIFIED=1`).
 - BuildExecutor roles: the probe mirrors a real build (hive-build-init needs no_new_privs CLEAR, so never
   `--security-opt=no-new-privileges`; exactly the eleven `BUILDER_CAPABILITIES`). The nft policy loads
   BEFORE the Netavark network and is re-applied every run; `policy_id` is `sha256-<hex>`, never
