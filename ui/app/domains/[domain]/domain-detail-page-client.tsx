@@ -522,54 +522,68 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
   );
 }
 
+/** The platform's own nameservers, as the nodes measured them (`/v1/domains-nameserver-roster`): shown only once the set is proven ready. */
+function PlatformNameservers({ roster }: { roster: NsRoster | null }) {
+  const ns = roster?.nameservers ?? [];
+  const ready = roster?.delegation_ready === true && ns.length > 0;
+  return (
+    <Card className="p-0">
+      {ready ? (
+        ns.map((n) => (
+          <div key={n} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{n}</div>
+        ))
+      ) : (
+        <div className="px-4 py-3 text-sm text-secondary">Not yet ready — the platform nameserver set is still converging.</div>
+      )}
+    </Card>
+  );
+}
+
+/** Nameservers shown only from what the platform measured (its roster) or the tenant typed (the domain's custom list): there is no invented default to restore. */
 function Nameservers({ domain, nameservers, attached, onChange }: { domain: string; nameservers: string[]; attached: boolean; onChange: () => void }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(nameservers.join("\n"));
   const [roster, setRoster] = useState<NsRoster | null>(null);
   useEffect(() => {
-    if (attached) fetchNsRoster().then(setRoster).catch(() => setRoster(null));
-  }, [attached]);
-  async function save() {
-    const ns = text.split("\n").map((s) => s.trim()).filter(Boolean);
+    fetchNsRoster().then(setRoster).catch(() => setRoster(null));
+  }, []);
+  async function write(ns: string[]) {
     await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
     setEditing(false); onChange();
   }
+  const delegateDesc = "Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone.";
   if (attached) {
-    const ns = roster?.nameservers ?? [];
-    const ready = roster?.delegation_ready === true && ns.length > 0;
     return (
-      <Section
-        title="Nameservers"
-        desc="Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone."
-      >
-        <Card className="p-0">
-          {ready ? (
-            ns.map((n) => (
-              <div key={n} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{n}</div>
-            ))
-          ) : (
-            <div className="px-4 py-3 text-sm text-secondary">Not yet ready — the platform nameserver set is still converging.</div>
-          )}
-        </Card>
+      <Section title="Nameservers" desc={delegateDesc}>
+        <PlatformNameservers roster={roster} />
       </Section>
     );
   }
   return (
-    <Section
-      title="Nameservers"
-      desc="By default, OpenEdge propagates its nameservers for your domains. You can view them or add custom ones here."
-      action={editing ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><Button onClick={save}>Save</Button></div> : <div className="flex gap-2"><Button variant="outline" onClick={() => apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ["ns1.openedge-dns.com", "ns2.openedge-dns.com"] }).then(onChange)}>Restore Original</Button><Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }}>Edit</Button></div>}
-    >
-      <Card className="p-0">
-        {editing ? (
-          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={Math.max(2, nameservers.length)} className="w-full resize-none rounded-xl bg-card px-4 py-3 font-mono text-sm focus:outline-none" />
-        ) : (
-          nameservers.map((ns) => (
-            <div key={ns} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{ns}</div>
-          ))
-        )}
-      </Card>
-    </Section>
+    <>
+      <Section title="Nameservers" desc={delegateDesc}>
+        <PlatformNameservers roster={roster} />
+      </Section>
+      <Section
+        title="Custom nameservers"
+        desc="Nameservers you have recorded for this domain. None are recorded until you add them."
+        action={editing
+          ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><Button onClick={() => write(text.split("\n").map((s) => s.trim()).filter(Boolean))}>Save</Button></div>
+          : <div className="flex gap-2">{nameservers.length > 0 && <Button variant="outline" onClick={() => write([])}>Clear</Button>}<Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }}>Edit</Button></div>}
+      >
+        <Card className="p-0">
+          {editing ? (
+            <textarea value={text} onChange={(e) => setText(e.target.value)} rows={Math.max(2, nameservers.length)} className="w-full resize-none rounded-xl bg-card px-4 py-3 font-mono text-sm focus:outline-none" />
+          ) : nameservers.length > 0 ? (
+            nameservers.map((ns) => (
+              <div key={ns} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{ns}</div>
+            ))
+          ) : (
+            <div className="px-4 py-3 text-sm text-secondary">No custom nameservers recorded.</div>
+          )}
+        </Card>
+      </Section>
+    </>
   );
 }
 
