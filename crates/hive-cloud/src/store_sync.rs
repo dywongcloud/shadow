@@ -1,56 +1,41 @@
-//! Generic leader→follower store replication.
+//! Generic leader-to-follower store replication.
 //!
-//! A whole CLASS of `CloudState` stores are node-local: their mutations
-//! (POST/PUT/DELETE) forward to the control-plane leader via `admin_ingress`,
-//! but their GET handlers serve the LOCAL store — so under multi-A DNS a
-//! dashboard read lands on a random node that never saw the leader's writes and
-//! returns empty/stale data. This was live-witnessed twice (the teams store,
-//! then the admin incidents page showing nothing / "create doesn't work") and a
-//! fleet audit found ~10 more stores with the identical shape.
+//! A whole CLASS of `CloudState` stores are node-local: their mutations (POST/PUT/DELETE) forward
+//! to the control-plane leader via `admin_ingress`, but their GET handlers serve the LOCAL store,
+//! so under multi-A DNS a dashboard read lands on a random node that never saw the leader's writes
+//! and returns empty or stale data. This module is ONE mechanism for all of them: a [`REGISTRY`] of
+//! [`SyncedStore`] entries, each a `(name, snapshot, adopt)` triple. The gossip layer exposes every
+//! entry at `GET /v1/store-snapshot/<name>` (see `gossip::dispatch`), and the follower pull
+//! (`crate::store_follower`) iterates the registry every tick, pulls each store's snapshot from the
+//! leader through [`fetch_snapshot`] (the one size-aware transfer policy) and adopts it when it
+//! differs.
 //!
-//! Rather than hand-write a bespoke gossip arm + follower-adoption block per
-//! store, this module is ONE mechanism: a [`REGISTRY`] of [`SyncedStore`]
-//! entries, each a `(name, snapshot, adopt)` triple. The gossip layer exposes
-//! every entry at `GET /v1/store-snapshot/<name>` (see `gossip::dispatch`), and
-//! the follower pull (`crate::store_follower`) iterates the registry every
-//! tick, pulls each store's snapshot from the leader through [`fetch_snapshot`]
-//! (the one size-aware transfer policy), and adopts it when it differs.
+//! Contract: `snapshot` must produce DETERMINISTIC bytes for equal state (maps serialized via
+//! sorted `BTreeMap`/pre-sorted `Vec`), because the follower's change-gate is a raw byte comparison
+//! of the leader's bytes against its own `snapshot` bytes (no `PartialEq` on the payload types
+//! needed). `adopt` returns `Some(count)` when it actually loaded new state (for the log line) and
+//! `None` when it declined (empty or unparsable: never wipe a follower on a momentarily unreachable
+//! or booting leader).
 //!
-//! Contract: `snapshot` must produce DETERMINISTIC bytes for equal state (maps
-//! serialized via sorted `BTreeMap`/pre-sorted `Vec`), because the follower's
-//! change-gate is a raw byte comparison of the leader's bytes against the
-//! follower's own `snapshot` bytes — no `PartialEq` on the payload types
-//! needed. `adopt` returns `Some(count)` when it actually loaded new state
-//! (for the log line), `None` when it declined (empty/unparsable — never wipe a
-//! follower on a momentarily-unreachable or booting leader).
-//!
-//! Scope: only stores whose full contents are safe to replicate wholesale under
-//! the single-writer model. Node-affinity stores (securelinks — the tunnel runs
-//! on the provisioning node), append-only logs (audit — needs merge-on-read),
-//! and edge-enforcement config (waf/router/cron/bot — need an enforcement
-//! overlay so every node ENFORCES, not just displays) are deliberately excluded
-//! and handled separately. Secret-bearing members (apikeys hashes, database
-//! credentials, enterprise SAML/SCIM secrets) ride the peer-trust-enforced,
-//! signed gossip mesh — the same transport TLS bundles, billing, and zkauth
+//! Scope: only stores whose full contents are safe to replicate wholesale under the single-writer
+//! model are members (the registry's own doc lists the exceptions and why each store is in).
+//! Secret-bearing members (apikeys hashes, database credentials, enterprise SAML/SCIM secrets) ride
+//! the peer-trust-enforced, signed gossip mesh, the same transport TLS bundles, billing and zkauth
 //! rosters already replicate over.
 
 use crate::state::CloudState;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Wire path prefix every registry store is served under (`gossip::dispatch`
-/// matches it, [`fetch_snapshot`] builds it).
-///
-/// Also the ONE gossip path whose bulk responses must NOT be deprioritized on
-/// the serving trunk: `hive_p2p::serve_tunnels_full` takes it as
-/// `bulk_exempt`. A snapshot is multi-MB by design (billing 6.3 MB, incidents
-/// 10.5 MB) and the follower is BLOCKED on it, so queueing it below every
-/// default-priority stream — probes, tunnels, the follower's own batch —
-/// starves it indefinitely: measured live, billing ran out its whole 240 s
-/// budget at <26 KB/s while a 223,637-byte snapshot one step under
-/// `hive_p2p`'s bulk threshold finished in 2.8 s on the same trunk at the same
-/// instant. Deprioritizing it was never the protection it looked like; every
-/// other bulk reply (browser artifacts, TLS bundles, drive files) still is.
+/// Wire path prefix every registry store is served under (`gossip::dispatch` matches it,
+/// [`fetch_snapshot`] builds it). It is also the ONE gossip path whose bulk responses must NOT be
+/// deprioritized on the serving trunk (`hive_p2p::serve_tunnels_full` takes it as `bulk_exempt`): a
+/// snapshot is multi-MB by design (billing 6.3 MB, incidents 10.5 MB) and the follower is BLOCKED
+/// on it, so queueing it below every default-priority stream (probes, tunnels, the follower's own
+/// batch) starves it indefinitely: measured live, billing ran out its whole 240 s budget at under
+/// 26 KB/s while a 223,637-byte snapshot one step under `hive_p2p`'s bulk threshold finished in 2.8
+/// s on the same trunk at the same instant. Every other bulk reply (browser artifacts, TLS bundles,
+/// drive files) is still deprioritized.
 pub const SNAPSHOT_PATH_PREFIX: &str = "/v1/store-snapshot/";
 
 /// One replicated store: its wire name plus serialize/adopt function pointers.
@@ -76,23 +61,17 @@ fn enc<T: serde::Serialize>(v: &T) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-/// Deterministic-order serialization for a Vec whose store is HASHMAP-backed
-/// (`snapshot()` collects `.values()` in nondeterministic hash order, which
-/// differs process-to-process). Without this the follower's byte-compare
-/// change-gate never matches the leader's differently-ordered bytes and it
-/// re-adopts the identical data every tick (wasteful load + a misleading
-/// "adopted" log line every 60s) — live-witnessed for databases/domains/gitops.
-/// Sorting by each element's own canonical JSON makes both sides produce
-/// identical bytes for identical state, without needing to know the element's
-/// key field. Display order is unaffected: every read handler is team-scoped
-/// and the dashboard sorts client-side.
+/// Deterministic-order serialization for a Vec whose store is HASHMAP-backed (`snapshot()` collects
+/// `.values()` in nondeterministic hash order, which differs process to process): without it the
+/// follower's byte-compare change-gate never matches the leader's differently ordered bytes and it
+/// re-adopts identical data every tick (wasteful load plus a misleading "adopted" log line every 60
+/// s). Each element is canonicalized through `serde_json::Value` FIRST (this crate builds
+/// serde_json WITHOUT `preserve_order`, so `Value::Object` is BTreeMap-backed and re-serializes
+/// with SORTED keys, which makes a nested map such as `Database.connection: HashMap` deterministic
+/// too) and the elements are then sorted by their canonical string, so both sides produce identical
+/// bytes for identical state without needing to know the element's key field. Display order is
+/// unaffected: every read handler is team-scoped and the dashboard sorts client-side.
 fn enc_sorted<T: serde::Serialize>(v: Vec<T>) -> Vec<u8> {
-    // Canonicalize via serde_json::Value FIRST: this crate builds serde_json
-    // WITHOUT the `preserve_order` feature, so `Value::Object` is BTreeMap-
-    // backed and re-serializes with SORTED keys — which is what makes a nested
-    // map deterministic too (e.g. `Database.connection: HashMap`, whose own key
-    // order is otherwise process-random and would defeat element sorting). Then
-    // sort the elements by their now-canonical string.
     let mut rows: Vec<String> = v
         .iter()
         .map(|e| {
@@ -107,30 +86,62 @@ fn enc_sorted<T: serde::Serialize>(v: Vec<T>) -> Vec<u8> {
     joined.into_bytes()
 }
 
+/// The replicated stores. `snapshot` is deterministic: [`enc`] for stores already ordered by
+/// construction (sorted Vecs, BTreeMaps, the audit buffer's insertion order, which is identical
+/// once a follower adopts the leader's), [`enc_sorted`] for HashMap-backed ones. `adopt` DECLINES
+/// (`None`) an empty or unparsable payload: a leader that has not loaded yet is indistinguishable
+/// from one that genuinely has nothing, and adopting it would wipe the follower (a leader with zero
+/// billing accounts would erase every tenant's tier and balance fleet-wide). Entries with no
+/// natural count (`enterprise`, `bot_policy`, `ratelimit`) report 1 to signal that a load happened;
+/// the follower loop's outer byte-compare guarantees that only fires on a real change.
+///
+/// Exceptions: `browser_admissions` and `browser_presence` treat an empty active set as
+/// authoritative (tombstones plus a monotonic version prove a revocation, or "zero satellites now",
+/// not a boot-time read failure; adoption also reconciles Gateway and BrowserPool). `teams`,
+/// `projects`, `production_deployments`, `databases` and `queues` MERGE row by row with tombstones
+/// instead of replacing, and carry deletions explicitly: `databases` once adopted the leader's list
+/// wholesale (guarded only against an empty payload), which made "the leader has not got this
+/// record yet" and "this record was deleted" the same event, so a leader OOM-killed before its
+/// debounced save restarted without a record and every follower erased its own copy; wholesale
+/// replacement of `projects` is how one node's row loss became "the project vanished from the
+/// account fleet-wide within 60 s". A legacy bare payload from a pre-upgrade node is still
+/// accepted, tombstone-less, and a pre-upgrade node receiving the new envelope fails to parse and
+/// keeps its own state, the safe direction: a replicated store must not be able to destroy data by
+/// omission. `queues` replicates queue/consumer METADATA only (messages never ride this: node-local
+/// plus GuardianDB-mirrored).
+///
+/// Why each is a member: `billing` is replicated so the two halves of a tenant's tier (`teams.plan`
+/// and `billing.plan`) converge by the same leader-pull mechanism instead of relying on a read-path
+/// patch (`proxy_billing_read` falls back to the node's own stale row on failure, and every
+/// INTERNAL consumer, `can_deploy`, quota checks and metering, reads the local row
+/// unconditionally). `projects` is replicated because a control-plane failover to a peer that never
+/// built a project locally would serve that project's settings/env/domains as empty defaults until
+/// it happened to receive a write for it. `waf`, `router`, `bot_policy` and `ratelimit` replicate
+/// edge-enforcement config, so EVERY node enforces identically instead of a follower applying only
+/// its own locally authored rules (`PUT /v1/ratelimit` once configured only the leader's in-process
+/// atomics while the Network page read `enabled: false` from everyone else: a security control that
+/// reports as configured but is not); `ratelimit` syncs only the CONFIG (see [`RateLimitConfig`]).
+/// Cron is deliberately NOT a member: its config replication is coupled to gating execution to a
+/// single node, tracked separately. `acme_challenges` carries the DNS-01 TXT for Seer-answered
+/// (self-delegated) zones, because Let's Encrypt resolves the zone through ANY advertised
+/// nameserver node, so replication is what lets every follower's Seer answer; post-issuance cleanup
+/// empties the leader's map, which adoption declines, and a follower's stale copy stops answering
+/// through the store's own lookup TTL (see `AcmeChallengeStore::lookup`). `acme_http01` does the
+/// same for custom tenant domains, since a validation fetch can land on ANY node.
 pub static REGISTRY: &[SyncedStore] = &[
     SyncedStore {
         name: "browser_admissions",
-        // Unlike durable business stores, an empty active set is authoritative:
-        // tombstones + the monotonic version prove it is a revocation, not a
-        // boot-time read failure. Adoption also reconciles Gateway and BrowserPool.
         snapshot: crate::browser_admission::snapshot_bytes,
         adopt: crate::browser_admission::adopt_snapshot,
     },
     SyncedStore {
         name: "browser_presence",
-        // Same authoritative-empty shape as browser_admissions, for the same
-        // reason: a leader whose last browser peer just disconnected must be
-        // able to replicate "zero satellites now", not be mistaken for a
-        // follower that hasn't synced yet.
         snapshot: crate::browser_presence::snapshot_bytes,
         adopt: crate::browser_presence::adopt_snapshot,
     },
     SyncedStore {
         name: "teams",
         snapshot: |c| enc(&c.teams.snapshot_synced()),
-        // Merge the versioned aggregate and permanent tombstones. A legacy bare
-        // map is accepted without tombstones; a pre-upgrade peer safely declines
-        // the new envelope rather than replacing its state by omission.
         adopt: |c, b| {
             let synced: crate::teams::SyncedTeams =
                 serde_json::from_slice(b).ok().or_else(|| {
@@ -149,20 +160,6 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "billing",
-        // The OTHER half of a tenant's tier. `teams` has been replicated here
-        // for a long time while `billing` was not, and that asymmetry is exactly
-        // how ONE logical fact ended up with two per-node values: measured live
-        // 2026-08-03, `teams.plan` was unanimously `enterprise` across all 8
-        // nodes while `billing.plan` read `hobby` on 7 and `enterprise` on 1 (a
-        // 13-day-stale holdout) for the SAME tenant — and the leader held the
-        // wrong half, so the owner account was quota-locked out of deploying.
-        //
-        // Reads were patched over at runtime by `proxy_billing_read` forwarding
-        // to the billing authority, but that proxy falls back to the node's own
-        // stale row on failure, and every INTERNAL consumer (`can_deploy`, quota
-        // checks, metering) reads the local row unconditionally with no proxy at
-        // all. Replicating it converges the halves by the same leader-pull
-        // mechanism `teams` already uses instead of relying on a read-path patch.
         snapshot: |c| {
             let (accounts, ledger) = c.billing.snapshot();
             let by_tenant: std::collections::BTreeMap<String, crate::billing::BillingAccount> =
@@ -177,10 +174,6 @@ pub static REGISTRY: &[SyncedStore] = &[
                 std::collections::BTreeMap<String, crate::billing::BillingAccount>,
                 Vec<crate::billing::LedgerEntry>,
             ) = serde_json::from_slice(b).ok()?;
-            // Authoritative-empty is NOT meaningful here: a leader with zero
-            // billing accounts is indistinguishable from one that has not
-            // loaded yet, and adopting that would wipe every tenant's tier and
-            // balance fleet-wide. Decline, exactly as `teams` does.
             if by_tenant.is_empty() {
                 return None;
             }
@@ -191,20 +184,7 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "projects",
-        // HashMap<String, ProjectSettings> → sorted BTreeMap for deterministic
-        // bytes, same shape as `teams`. Confirmed-real gap: `ProjectStore` is
-        // node-local like every other store this registry fixes, but was
-        // excluded from the first pass — a control-plane failover to a peer
-        // that never locally built a given project serves that project's
-        // settings/env/domains as empty defaults until it happens to receive a
-        // write for it.
         snapshot: |c| enc(&c.projects.snapshot_synced()),
-        // MERGE with tombstones, never replace — the `databases` fix applied to
-        // the store whose wholesale replacement is how a single node's row loss
-        // became "the project vanished from the account fleet-wide within 60s".
-        // Legacy payloads (a bare map, from a pre-upgrade node) are accepted
-        // tombstone-less; a pre-upgrade node receiving THIS shape fails to
-        // parse and keeps its own state — the safe direction, as with databases.
         adopt: |c, b| {
             let synced: crate::project_settings::SyncedProjects =
                 serde_json::from_slice(b).ok().or_else(|| {
@@ -231,12 +211,6 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "production_deployments",
-        // Same MERGE-not-replace shape as `projects`: tombstoned deletions,
-        // newest-`updated_ms`-per-row wins. Genuinely-empty is normal (no
-        // production deployments yet on a fresh fleet), never distinguished
-        // from "not synced yet" — the row-level merge already tolerates a
-        // legitimately-partial local set, unlike the wholesale-replace stores
-        // above that must decline an empty payload outright.
         snapshot: |c| enc(&c.production_deployments.snapshot_synced()),
         adopt: |c, b| {
             let synced: crate::production_deployments::SyncedProductionDeployments =
@@ -262,13 +236,9 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "push",
-        // PushState's Vecs are kept sorted by the store's own mutators and the
-        // watermark map is a BTreeMap, so `enc` alone is already deterministic.
         snapshot: |c| enc(&c.push.snapshot()),
         adopt: |c, b| {
             let v: crate::push::PushState = serde_json::from_slice(b).ok()?;
-            // Decline an entirely-empty leader payload (fresh leader before its
-            // own first persist load) — never wipe a follower's adopted copy.
             if v.subs.is_empty() && v.sms.is_empty() && v.vapid.public_b64.is_empty() {
                 return None;
             }
@@ -306,23 +276,6 @@ pub static REGISTRY: &[SyncedStore] = &[
     SyncedStore {
         name: "databases",
         snapshot: |c| enc(&c.databases.snapshot_synced()),
-        // MERGE, never replace — and carry deletions explicitly.
-        //
-        // This adopted the leader's list wholesale, guarded only against a fully
-        // EMPTY payload, which makes "the leader has not got this record yet" and
-        // "this record was deleted" the same event. Witnessed end to end: a managed
-        // SQLite database created through the leader (HTTP 200, reached `ready`)
-        // existed on 6 of 11 nodes and then vanished from ALL of them — the leader
-        // was OOM-killed before its debounced save ran (SIGKILL bypasses
-        // `flush_blocking`), restarted without the record, and every follower
-        // adopted that and erased its own copy. A replicated store must not be able
-        // to destroy data by omission.
-        //
-        // Legacy payloads (a bare array, from a node still running the previous
-        // binary) are still accepted so a mixed fleet keeps converging; they simply
-        // carry no tombstones. A pre-upgrade node receiving the NEW object shape
-        // fails to parse and declines to adopt, which leaves its own state intact —
-        // the safe direction.
         adopt: |c, b| {
             let synced: crate::databases::SyncedDatabases =
                 serde_json::from_slice(b).ok().or_else(|| {
@@ -343,11 +296,6 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
-        // Queue/consumer METADATA only — messages never ride this (node-local
-        // + GuardianDB-mirrored, see queues.rs's module doc). Same
-        // empty-payload guard as `databases`: a fully-empty snapshot means
-        // "the leader hasn't published anything yet", never "delete
-        // everything" — tombstones carry deletions explicitly.
         name: "queues",
         snapshot: |c| enc(&c.queues.snapshot_synced()),
         adopt: |c, b| {
@@ -420,10 +368,6 @@ pub static REGISTRY: &[SyncedStore] = &[
         snapshot: |c| enc(&c.notifications.snapshot()),
         adopt: |c, b| {
             let s: crate::notifications::NotificationState = serde_json::from_slice(b).ok()?;
-            // read/archived state can legitimately be empty on the leader (no
-            // one has read anything yet); the follower loop's outer byte-compare
-            // already skips a no-change tick, so only decline the truly-empty
-            // payload to avoid a churny load-of-nothing.
             if s.archived.is_empty() && s.read.is_empty() {
                 return None;
             }
@@ -451,9 +395,6 @@ pub static REGISTRY: &[SyncedStore] = &[
         adopt: |c, b| {
             let s: crate::enterprise::EnterpriseSnapshot = serde_json::from_slice(b).ok()?;
             c.enterprise.load(s);
-            // Enterprise config has no single "count"; report 1 to signal a load
-            // happened (the outer byte-compare guarantees this only fires on a
-            // real change).
             Some(1)
         },
     },
@@ -472,9 +413,6 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "audit",
-        // Insertion order (oldest→newest) is deterministic and identical once a
-        // follower adopts the leader's buffer, so `enc` (not `enc_sorted`) is
-        // right — and preserves chronological order for the operator view.
         snapshot: |c| enc(&c.audit.snapshot()),
         adopt: |c, b| {
             let v: Vec<crate::audit::AuditEntry> = serde_json::from_slice(b).ok()?;
@@ -486,12 +424,6 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(n)
         },
     },
-    // Edge-enforcement config: replicating the leader's WAF rules / redirects /
-    // rewrites / bot policy makes EVERY node enforce identically, not just
-    // display the same thing — a follower node serving edge traffic otherwise
-    // applies only its own locally-authored rules. (cron is deliberately NOT
-    // here: its config-replication is coupled to gating execution to a single
-    // node, tracked separately.)
     SyncedStore {
         name: "waf",
         snapshot: |c| {
@@ -533,16 +465,6 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(1)
         },
     },
-    // L7 rate limiting was the one edge control NOT replicated here, which made
-    // it worse than merely mis-displayed: `PUT /v1/ratelimit` is a mutation, so
-    // it configured the leader's in-process atomics only — the limit was
-    // ENFORCED on the leader alone while the Network page, polling back through
-    // the round-robin, read `enabled: false` from everyone else. A security
-    // control that reports as configured but isn't.
-    //
-    // Only the CONFIG is synced. `tracked_ips`/`blocked_total` are per-node
-    // counters; including them would make every node's snapshot differ on every
-    // request and defeat the content-compare that gates a replication write.
     SyncedStore {
         name: "ratelimit",
         snapshot: |c| {
@@ -559,16 +481,8 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(1)
         },
     },
-    // ACME DNS-01 challenge TXT for Seer-answered (self-delegated) zones: the
-    // leader's acme.rs places challenges, but Let's Encrypt resolves the zone
-    // through ANY of the advertised nameserver nodes — replication is what lets
-    // every follower's Seer answer. Post-issuance cleanup empties the leader's
-    // map, which adoption declines per the registry-wide never-wipe rule; a
-    // follower's stale copy stops answering via the store's own lookup TTL
-    // instead (see `AcmeChallengeStore::lookup`).
     SyncedStore {
         name: "acme_challenges",
-        // BTreeMap-backed store → `enc` alone is already deterministic.
         snapshot: |c| enc(&c.acme_challenges.snapshot()),
         adopt: |c, b| {
             let m: std::collections::BTreeMap<String, crate::acme::AcmeChallenge> =
@@ -581,9 +495,6 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(n)
         },
     },
-    // HTTP-01 equivalents for custom tenant domains: a validation fetch can
-    // land on ANY node (that is the whole point of the challenge type), so
-    // the token → key-authorization map replicates exactly like the TXT one.
     SyncedStore {
         name: "acme_http01",
         snapshot: |c| enc(&c.acme_http01.snapshot()),
@@ -600,6 +511,9 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
 ];
 
+/// The stores [`adopt_on_promotion`] merges from any single peer: their adoption is a per-row merge
+/// with tombstones, so a partial or stale peer copy cannot erase local rows. Every other store is
+/// wholesale-replace and needs two independent peers to corroborate.
 pub static MERGE_STORES: &[&str] = &[
     "browser_admissions",
     "browser_presence",
@@ -608,8 +522,9 @@ pub static MERGE_STORES: &[&str] = &[
     "production_deployments",
 ];
 
-/// Rate-limit config wire shape — deliberately config-only (see the registry
-/// entry above for why the live counters are excluded).
+/// Rate-limit config wire shape, deliberately config-only: `tracked_ips` and `blocked_total` are
+/// per-node counters, and including them would make every node's snapshot differ on every request
+/// and defeat the content-compare that gates a replication write.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct RateLimitConfig {
     enabled: bool,
@@ -642,15 +557,6 @@ pub fn serve(cloud: &Arc<CloudState>, name: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-// ---- snapshot transfer policy ---------------------------------------------
-//
-// ONE place decides how a store snapshot crosses a trunk, for every caller
-// (the follower pull in `store_follower`, `reconcile_on_promotion`): a trunk
-// sustains ~170 KB/s (1200-byte PMTU, 64 ms RTT, measured), so a fixed 10 s
-// budget can never carry billing (6.2 MB) or incidents (10.9 MB), and a fixed
-// long budget still turns growth into a permanent failure once a store
-// outgrows it. The budget is derived from the store's size instead.
-
 /// Snapshot size at which a store is LARGE: it leaves the follower pull's
 /// concurrent batch for the serial lane and gets a size-derived budget.
 pub const LARGE_STORE_BYTES: usize = 1 << 20;
@@ -659,14 +565,12 @@ const SMALL_FETCH_SECS: u64 = 10;
 const SMALL_RESPONSE_CAP: usize = 16 << 20;
 /// Response bound for a large snapshot (the memory ceiling of one pull).
 const LARGE_RESPONSE_CAP: usize = 64 << 20;
-/// The slowest sustained rate a large budget is sized for. Lowered from
-/// 64 KiB/s because that rate made the DERIVED budget smaller than the flat
-/// floor for every store the fleet actually has (billing 6.3 MB derived
-/// 149 s, incidents 10.5 MB derived 230 s), so `derived.max(floor)` always
-/// returned the floor and a 1-12 MB store got the same 240 s whether it was
-/// 1 MB or 10 MB. A trunk carrying a snapshot beside a follower's own batch
-/// sustains 25-90 KB/s live (64 ms RTT peers), so 32 KiB/s is the rate a
-/// budget must assume for the size term to be the one that binds.
+/// The slowest sustained rate a large budget is sized for. A trunk carrying a snapshot beside a
+/// follower's own batch sustains 25-90 KB/s live (64 ms RTT peers), so 32 KiB/s is the rate a
+/// budget must assume for the size term to be the one that binds: at 64 KiB/s the DERIVED budget
+/// was smaller than the flat floor for every store the fleet has (billing 6.3 MB derived 149 s,
+/// incidents 10.5 MB derived 230 s), so `derived.max(floor)` always returned the floor and a 1-12
+/// MB store got the same 240 s whether it was 1 MB or 10 MB.
 const LARGE_MIN_RATE: usize = 32 << 10;
 
 /// The latest snapshot size of each store any peer served this process.
@@ -689,18 +593,21 @@ pub fn size_hint(store: &str, local_len: usize) -> usize {
         .max(local_len)
 }
 
-/// `(timeout_secs, response_cap)` for a fetch of `hint` bytes. Large: the
-/// time `hint` plus 25 % growth takes at [`LARGE_MIN_RATE`] plus 30 s of
-/// and never below what the response cap could carry at that rate, so a store
-/// never grows into a budget that always fails.
+/// `(timeout_secs, response_cap)` for a fetch of `hint` bytes: the ONE place that decides how a
+/// store snapshot crosses a trunk, for every caller (the follower pull in `store_follower` and
+/// `reconcile_on_promotion`). A trunk sustains ~170 KB/s (1200-byte PMTU, 64 ms RTT, measured), so
+/// a fixed 10 s budget can never carry billing (6.2 MB) or incidents (10.9 MB), and a fixed long
+/// budget still turns growth into a permanent failure once a store outgrows it: the budget is
+/// derived from the store's size instead.
 ///
-/// The floor is now only a SAFETY NET for a store whose size is still unknown
-/// (a suspect store planned at [`LARGE_STORE_BYTES`]): at [`LARGE_MIN_RATE`]
-/// the size term dominates it for every store the fleet has, so a 10.5 MB
-/// snapshot is allowed ~430 s and a 6.3 MB one ~272 s instead of both being
-/// cut off at 240 s. A flat floor that binds turns "slow" into "permanent
-/// failure" and, worse, leaves a multi-MB transfer occupying the trunk for the
-/// whole floor before it gives up.
+/// A hint at or below [`LARGE_STORE_BYTES`] gets the small budget. A large one gets the time `hint`
+/// plus 25 % growth (capped at the response cap) takes at [`LARGE_MIN_RATE`] plus 30 s, raised to
+/// the floor (`HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS`, default 240 s). The floor is only a SAFETY NET
+/// for a store whose size is still unknown (a suspect store planned at [`LARGE_STORE_BYTES`]): at
+/// [`LARGE_MIN_RATE`] the size term dominates it for every store the fleet has, so a 10.5 MB
+/// snapshot is allowed ~430 s and a 6.3 MB one ~272 s instead of both being cut off at 240 s. A
+/// flat floor that binds turns "slow" into "permanent failure" and, worse, leaves a multi-MB
+/// transfer occupying the trunk for the whole floor before it gives up.
 pub fn fetch_budget(hint: usize) -> (u64, usize) {
     if hint <= LARGE_STORE_BYTES {
         return (SMALL_FETCH_SECS, SMALL_RESPONSE_CAP);
@@ -744,6 +651,21 @@ pub async fn fetch_snapshot(
     Some(bytes)
 }
 
+/// Promotion reconciliation: when this node becomes the control-plane owner (the promotion loop in
+/// `main.rs` runs it once per ownership term) it pulls every registered store from up to 5 healthy
+/// peers and adopts what they hold, so writes the outgoing owner accepted in its trailing sync
+/// window are not lost. Five candidates, not three, because wholesale adoption requires 2
+/// INDEPENDENT peers to corroborate identical bytes (see [`adopt_on_promotion`]), and a wider
+/// candidate set keeps that quorum reachable when one or two queried peers are momentarily slow or
+/// unreachable. Each store's local snapshot is taken BEFORE its fetch window: a wholesale store
+/// whose local copy changed during the window is not adopted.
+///
+/// Small stores are fetched all at once. Large ones ([`LARGE_STORE_BYTES`]) are fetched one store
+/// at a time, from every peer at once (each peer is its own trunk) under the size-derived budget,
+/// and adopted right after their own fetch, so a long transfer never widens any other store's
+/// window. Promotion merges are authoritative mutations, so they are queued for persistence
+/// immediately: otherwise a hard crash before the periodic capture could lose a newly recovered row
+/// or tombstone and reboot into the stale local snapshot.
 pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     let mut peers: Vec<(String, String, String)> = cloud
         .registry
@@ -752,10 +674,6 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         .filter(|n| !n.is_self && n.healthy)
         .filter_map(|n| Some((n.name, n.peer_id?, n.iroh_addr?)))
         .collect();
-    // 5, not 3: the non-merge-store adoption below now requires 2 INDEPENDENT
-    // peers to corroborate identical bytes before adopting (see below) — a
-    // wider candidate set makes that quorum reachable even when one or two
-    // queried peers are momentarily slow/unreachable.
     peers.truncate(5);
     if peers.is_empty() {
         tracing::warn!(
@@ -767,8 +685,6 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     }
     let peer_names: Vec<String> = peers.iter().map(|(n, _, _)| n.clone()).collect();
 
-    // Each store's local snapshot BEFORE its fetch window: a wholesale store
-    // whose local copy changed during the window is not adopted (below).
     let before: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
     let hints: Vec<usize> = REGISTRY
         .iter()
@@ -795,11 +711,6 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     };
 
     let mut adopted: Vec<&'static str> = Vec::new();
-    // Small stores: every (store, peer) at once, as before. Large ones
-    // (`LARGE_STORE_BYTES`): one store at a time — from every peer at once,
-    // each peer being its own trunk — under the size-derived budget, and
-    // adopted right after its own fetch, so a long transfer never widens any
-    // other store's window.
     let (large, small): (Vec<usize>, Vec<usize>) =
         (0..REGISTRY.len()).partition(|&i| hints[i] > LARGE_STORE_BYTES);
     let small_results = futures::future::join_all(small.iter().map(|&i| fetch_all(i))).await;
@@ -811,9 +722,6 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         adopt_on_promotion(cloud, store_idx, &before[store_idx], &candidates, &mut adopted);
     }
     if !adopted.is_empty() {
-        // Promotion merges are authoritative mutations. Queue them immediately;
-        // otherwise a hard crash before the periodic capture can lose a newly
-        // recovered row or tombstone and reboot into the stale local snapshot.
         crate::persist::persist(cloud);
     }
     tracing::info!(
@@ -824,9 +732,29 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     );
 }
 
-/// Adopt what the peers served for one store at promotion (`candidates`:
-/// `(peer, bytes)`, empties dropped), against `before` — the local snapshot
-/// taken before the fetch window.
+/// Adopts what the peers served for one store at promotion (`candidates`: `(peer, bytes)`, empties
+/// dropped), against `before`, the local snapshot taken before the fetch window. The local snapshot
+/// is re-read right HERE, after the peer round trip, not once before it: `admin_ingress` starts
+/// serving and forwarding writes to this node the instant `is_control_plane_leader()` flips true
+/// (see `state.rs`: no caching, no coordination with this function), which typically happens well
+/// before this loop even starts, let alone finishes its network wait.
+///
+/// [`MERGE_STORES`] merge every differing peer snapshot row by row. Wholesale-replace stores
+/// (everything else: apikeys, billing, webhooks, domains, integrations, enterprise SSO secrets,
+/// identity, ...) get NO per-record provenance or signature check (the sole boundary is "must be a
+/// trusted mesh member"), so trusting whichever single arbitrary peer answers with the longest
+/// payload would let any ONE reachable trusted node, not necessarily one that was ever the
+/// control-plane leader, become the adopted source of truth for fleet-wide secrets the instant some
+/// OTHER node gets promoted (leadership flapping happens on this fleet with no node compromise
+/// involved at all). Requiring at least 2 INDEPENDENT peers to report byte-identical, larger
+/// content raises that bar to colluding two already-trusted mesh members, at no cost in the
+/// legitimate recovery case: a genuinely fresher state that reached the outgoing leader before it
+/// stepped down had already replicated to every follower through the ordinary store_sync pull loop,
+/// so more than one surviving peer holds it, and a lone responder is the anomalous case.
+///
+/// A write this node accepted DURING the fetch window is in `local` and in no peer's copy, so
+/// replacing wholesale would silently drop an already-acknowledged write: the local copy is kept,
+/// since the outgoing leader's trailing writes are the lesser loss.
 fn adopt_on_promotion(
     cloud: &Arc<CloudState>,
     store_idx: usize,
@@ -835,11 +763,6 @@ fn adopt_on_promotion(
     adopted: &mut Vec<&'static str>,
 ) {
     let store = &REGISTRY[store_idx];
-    // Freshly re-read right HERE, after the peer round trip — not once before
-    // it. `admin_ingress` starts serving/forwarding writes to this node the
-    // instant `is_control_plane_leader()` flips true (state.rs, no caching, no
-    // coordination with this function), which typically happens well before
-    // this loop even starts, let alone finishes its network wait.
     let local = (store.snapshot)(cloud);
     if MERGE_STORES.contains(&store.name) {
         for (peer_name, bytes) in candidates {
@@ -860,25 +783,6 @@ fn adopt_on_promotion(
         }
         return;
     }
-    // Wholesale-replace stores (apikeys/teams/billing/webhooks/domains/
-    // integrations/enterprise SSO secrets/identity/... — everything not
-    // in MERGE_STORES) get NO per-record provenance or signature check
-    // (this module's own doc: the sole boundary is "must be a trusted
-    // mesh member"), so trusting whichever single arbitrary peer answers
-    // fastest with the longest payload would let ANY ONE reachable
-    // trusted node — not necessarily one that was ever the control-plane
-    // leader, merely one that is alive and answers
-    // `GET /v1/store-snapshot/<name>` — become the adopted source of
-    // truth for fleet-wide secrets the instant some OTHER node gets
-    // promoted (a real, non-rare trigger: leadership flapping happens on
-    // this fleet with no node compromise involved at all). Requiring at
-    // least 2 INDEPENDENT peers to report byte-identical content raises
-    // that bar to "collude two already-trusted mesh members" while
-    // costing nothing in the legitimate recovery case: a genuinely
-    // fresher state that reached the outgoing leader before it stepped
-    // down had already replicated to every follower via the ordinary
-    // 60s store_sync pull loop, so more than one surviving peer holds it
-    // — a single lone responder is the anomalous case, not the common one.
     let mut by_bytes: HashMap<&[u8], Vec<&str>> = HashMap::new();
     for (peer_name, bytes) in candidates {
         by_bytes
@@ -893,10 +797,6 @@ fn adopt_on_promotion(
     let Some((bytes, corroborators)) = best else {
         return;
     };
-    // A write this node accepted DURING the fetch window is in `local` and in
-    // no peer's copy: replacing wholesale would silently drop an already-200'd
-    // write. Keep the local copy; the outgoing leader's trailing writes are the
-    // lesser loss (CS-4's attested digests recover them exactly).
     if local != before {
         tracing::warn!(
             store = store.name,
