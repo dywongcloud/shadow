@@ -405,17 +405,22 @@ pub fn ensure_vapid_on_leader(c: &Arc<CloudState>) {
 /// (`.push.services.mozilla.com`), Edge WNS (`.notify.windows.com`) or Safari (`.push.apple.com`).
 /// Refusing arbitrary endpoints stops our VAPID-signed, server-side POSTs from being aimed at
 /// attacker-chosen URLs (SSRF/amplification) via a forged subscription.
+///
+/// Parses with the real WHATWG URL parser (`Url`), never by hand-splitting the string: a hand
+/// parser that reads everything before the first `:` after `://` as the host is fooled by userinfo
+/// (confirmed live: `https://fcm.googleapis.com:x@127.0.0.1:PORT/ep` read "fcm.googleapis.com" as
+/// the host while the real destination — everything after the unescaped `@` — was the attacker's
+/// loopback listener). Userinfo is refused outright regardless of what host it is attached to.
 fn allowed_push_host(endpoint: &str) -> bool {
-    let Some(rest) = endpoint.strip_prefix("https://") else {
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
     };
-    let host = rest
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .split(':')
-        .next()
-        .unwrap_or("");
+    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
     const SUFFIXES: &[&str] = &[
         "fcm.googleapis.com",
         "android.googleapis.com",
@@ -604,9 +609,13 @@ pub async fn send_web_push(
     let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
     let body = encrypt_payload(&sub.p256dh, &sub.auth, &bytes)
         .ok_or("payload encryption failed (bad subscription keys?)")?;
-    let r = c
-        .http
-        .post(&sub.endpoint)
+    // Re-validated at send time (DNS can change after subscribe) through the connect-time-filtered
+    // guard, never the bare shared client: `allowed_push_host` gates the allow-listed suffix, this
+    // gates the resolved address.
+    let target = hive_outbound::validate_url(&sub.endpoint)
+        .map_err(|e| format!("endpoint no longer valid: {e}"))?;
+    let r = hive_outbound::client()
+        .post(target)
         .header("authorization", auth)
         .header("content-encoding", "aes128gcm")
         .header("content-type", "application/octet-stream")
