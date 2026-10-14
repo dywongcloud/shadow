@@ -258,13 +258,39 @@ fn model_total_timeout() -> Duration {
 }
 
 /// Longest the transfer may go without receiving a single byte (`HIVE_INFERENCE_MODEL_STALL_SECS`,
-/// default 60 s); also bounds the connect-and-headers phase.
+/// default 30 s); also bounds the connect-and-headers phase. A trickle that delivers a byte now and
+/// then never trips it: [`model_min_bytes_per_sec`] is what ends that.
 fn model_stall_timeout() -> Duration {
     Duration::from_secs(
         std::env::var("HIVE_INFERENCE_MODEL_STALL_SECS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(60),
+            .unwrap_or(30),
+    )
+}
+
+/// The slowest average a download may sustain over [`model_rate_window`]
+/// (`HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC`, default 64 KiB/s; 0 disables the floor). A slow drip
+/// (a byte every few seconds) delivers data often enough that the stall timeout never fires, and
+/// without a rate floor it would hold one of the node's few download slots for the whole total
+/// timeout (2 h). Every real model transfer runs orders of magnitude above this.
+fn model_min_bytes_per_sec() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(64 * 1024)
+}
+
+/// The window the rate floor is measured over (`HIVE_INFERENCE_MODEL_RATE_WINDOW_SECS`, default 30 s,
+/// never under 1 s): a download is ended when a whole window passes under the floor, so a trickle
+/// holds its slot for one window, not for the total timeout.
+fn model_rate_window() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_RATE_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1),
     )
 }
 
@@ -317,6 +343,55 @@ fn max_concurrent_downloads() -> usize {
 /// is simply tried again on the next reconcile tick ([`model_state`]); nothing queues.
 static DOWNLOAD_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(max_concurrent_downloads())));
+
+/// Most downloads one TENANT may have running at once (`HIVE_INFERENCE_MODEL_DOWNLOADS_PER_TENANT`,
+/// default 1, never under 1): the node's few slots are shared, and a tenant whose projects name
+/// several slow hosts must not be able to hold every one of them.
+fn max_downloads_per_tenant() -> usize {
+    std::env::var("HIVE_INFERENCE_MODEL_DOWNLOADS_PER_TENANT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// How many downloads each tenant has running; an untagged project counts under the fail-closed
+/// `UNTAGGED_TENANT`, so all of them together share one place.
+static TENANT_DOWNLOADS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One running download counted against its tenant ([`max_downloads_per_tenant`]); dropped on every
+/// exit of the download task.
+struct TenantSlot {
+    tenant: String,
+}
+
+impl TenantSlot {
+    /// Counts a download for `tenant`, or `None` when it already has its share running.
+    fn acquire(tenant: &str) -> Option<TenantSlot> {
+        let mut running = TENANT_DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = running.entry(tenant.to_string()).or_insert(0);
+        if *n >= max_downloads_per_tenant() {
+            return None;
+        }
+        *n += 1;
+        Some(TenantSlot {
+            tenant: tenant.to_string(),
+        })
+    }
+}
+
+impl Drop for TenantSlot {
+    fn drop(&mut self) {
+        let mut running = TENANT_DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = running.get_mut(&self.tenant) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                running.remove(&self.tenant);
+            }
+        }
+    }
+}
 
 /// The bytes every download in flight still EXPECTS to write (its declared length less what has
 /// landed): the disk reserve is shared by all of them, so each admission and each periodic re-check
@@ -523,6 +598,9 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     hasher.update(MODEL_BLOB_DOMAIN);
     let mut written: u64 = 0;
     let mut disk_checked_at: u64 = 0;
+    let (min_rate, rate_window) = (model_min_bytes_per_sec(), model_rate_window());
+    let mut window_started = std::time::Instant::now();
+    let mut window_bytes: u64 = 0;
     loop {
         let left = total.saturating_sub(started.elapsed());
         let next = match tokio::time::timeout(stall.min(left), resp.chunk()).await {
@@ -536,6 +614,14 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
         written += chunk.len() as u64;
         if written > max_bytes {
             return Err("model exceeds the maximum download size".to_string());
+        }
+        window_bytes += chunk.len() as u64;
+        if window_started.elapsed() >= rate_window {
+            if window_bytes < min_rate.saturating_mul(rate_window.as_secs()) {
+                return Err("model download too slow".to_string());
+            }
+            window_started = std::time::Instant::now();
+            window_bytes = 0;
         }
         if written - disk_checked_at >= 256 * 1024 * 1024 {
             disk_checked_at = written;
@@ -598,8 +684,9 @@ enum ModelState {
 /// timeouts) and the loop moves on to every other project, polling again next tick. The loop used
 /// to await the transfer inline, so one slow-drip URL stalled every tenant's endpoint on the
 /// coordinator. A failed URL is remembered for [`model_retry_cooldown_ms`] before it is retried, a URL
-/// two projects share is fetched once, and at most [`max_concurrent_downloads`] run at a time.
-async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
+/// two projects share is fetched once, at most [`max_concurrent_downloads`] run at a time and a
+/// tenant has at most [`max_downloads_per_tenant`] of them.
+async fn model_state(cloud: &Arc<CloudState>, project: &str, model: &str) -> ModelState {
     match cached_model(model).await {
         Ok(Some((path, bytes))) => return ModelState::Ready(path, bytes),
         Err(e) => return ModelState::Failed(e),
@@ -608,7 +695,7 @@ async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
     let Some(url) = model_url(model) else {
         return ModelState::Failed(format!("unresolvable model ref '{model}'"));
     };
-    let slot = {
+    let slots = {
         let mut fetches = cloud.inference.fetches.lock();
         let now = hive_core::now_ms();
         match fetches.get(&url) {
@@ -628,15 +715,21 @@ async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
         // At most `max_concurrent_downloads` run node-wide; a URL that finds no free slot is not
         // recorded and is simply tried again next tick, so nothing queues and a `Running` entry
         // always names a transfer that really started.
+        // One download per tenant at a time, then a node-wide slot: a tenant whose projects name
+        // several slow hosts holds one place, never the node's whole share.
+        let tenant = crate::admin::record_tenant(&cloud.projects.team_of(project)).to_string();
+        let Some(tenant_slot) = TenantSlot::acquire(&tenant) else {
+            return ModelState::Downloading;
+        };
         let Ok(slot) = DOWNLOAD_SLOTS.clone().try_acquire_owned() else {
             return ModelState::Downloading;
         };
         fetches.insert(url.clone(), Fetch::Running { since_ms: now });
-        slot
+        (slot, tenant_slot)
     };
     let (cloud, model) = (cloud.clone(), model.to_string());
     tokio::spawn(async move {
-        let _slot = slot;
+        let _slots = slots;
         let outcome = ensure_model(&model).await;
         let mut fetches = cloud.inference.fetches.lock();
         match outcome {
@@ -989,7 +1082,7 @@ async fn reconcile_local(
     };
 
     // Never awaits a download inline: this loop serves every project on the coordinator.
-    let (model_path, model_bytes) = match model_state(cloud, &spec.model).await {
+    let (model_path, model_bytes) = match model_state(cloud, project, &spec.model).await {
         ModelState::Ready(path, bytes) => (path, bytes),
         ModelState::Downloading => {
             set_status(cloud, "starting".into(), &[]);
