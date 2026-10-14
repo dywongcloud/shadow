@@ -4,6 +4,7 @@ import { UpstreamError, boundedBody, readBounded, safeGet, type SafeResponse } f
 const SELF_PATH = "/api/tv/hls";
 const UPSTREAM_TIMEOUT_MS = 25_000;
 const PLAYLIST_MAX_BYTES = 2 * 1024 * 1024;
+const KEY_MAX_BYTES = 4096;
 const BODY_MAX_BYTES = 64 * 1024 * 1024;
 const SINGLE_RANGE = /^bytes=\d*-\d*$/;
 const PLAYLIST_PATH = /\.m3u8?$/i;
@@ -51,14 +52,22 @@ async function respond(upstream: SafeResponse): Promise<NextResponse> {
     return reply(`upstream ${upstream.status}`, 502);
   }
   const ctype = String(upstream.headers["content-type"] ?? "").toLowerCase();
-  if (PLAYLIST_PATH.test(upstream.url.pathname) || ctype.includes("mpegurl")) {
-    const text = (await readBounded(upstream.body, PLAYLIST_MAX_BYTES)).toString("utf8");
-    if (!text.trimStart().startsWith("#EXTM3U")) return reply("upstream is not an HLS playlist", 415);
-    try {
-      return reply(rewritePlaylist(text, upstream.url), 200, { "content-type": "application/vnd.apple.mpegurl" });
-    } catch {
-      return reply("malformed upstream playlist", 502);
+  const namedPlaylist = PLAYLIST_PATH.test(upstream.url.pathname);
+  const labelledPlaylist = ctype.includes("mpegurl");
+  if (namedPlaylist || labelledPlaylist) {
+    const bytes = await readBounded(upstream.body, PLAYLIST_MAX_BYTES);
+    const text = bytes.toString("utf8");
+    if (text.trimStart().startsWith("#EXTM3U")) {
+      try {
+        return reply(rewritePlaylist(text, upstream.url), 200, { "content-type": "application/vnd.apple.mpegurl" });
+      } catch {
+        return reply("malformed upstream playlist", 502);
+      }
     }
+    if (labelledPlaylist && !namedPlaylist && bytes.length > 0 && bytes.length <= KEY_MAX_BYTES) {
+      return reply(bytes, 200, { "content-type": "application/octet-stream" });
+    }
+    return reply("upstream is not an HLS playlist", 415);
   }
   const declaredType = ctype.split(";")[0].trim() || "application/octet-stream";
   const mediaType = MISLABELLED_TS_TYPES.has(declaredType) && TS_SEGMENT_PATH.test(upstream.url.pathname) ? "video/mp2t" : declaredType;
@@ -80,7 +89,8 @@ async function respond(upstream: SafeResponse): Promise<NextResponse> {
 }
 
 /** Same-origin HLS proxy so hls.js obeys the CSP `connect-src 'self'`: playlists are rewritten to point back here and segments stream through, but only
- *  public https hosts are reachable (`safeGet`), only `range` is forwarded, and bodies are size- and content-type-bounded. */
+ *  public https hosts are reachable (`safeGet`), only `range` is forwarded, and bodies are size- and content-type-bounded. A body is a playlist only if it starts
+ *  with `#EXTM3U`: an encryption key a server labels as a playlist is served as at most `KEY_MAX_BYTES` of `application/octet-stream`. */
 export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get("url");
   if (!raw) return reply("missing url", 400);
