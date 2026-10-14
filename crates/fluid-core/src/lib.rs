@@ -251,10 +251,10 @@ pub struct RawPortBinding {
     pub label: Option<String>,
 }
 
-/// A Tencent Cloud EIP bought for a `functions[].dedicated_ipv4` opt-in. `tencent_eip_id` is the
-/// idempotency anchor (its presence in the durable claim registry stops a redeploy or crash-retry
-/// buying a second address); `owner_node` is the only node that binds it (`raw_proxy.rs`), every
-/// other node binds the wildcard for the same public port.
+/// A Tencent Cloud EIP bought for a project's dedicated-IPv4 addon and kept as
+/// `ProjectSettings::dedicated_ipv4`, whose presence is the idempotency anchor (a retried checkout
+/// returns it instead of buying a second address). `owner_node` is the node the EIP is associated
+/// to, the only node whose `dedicated_ipv4_listener` binds `address:443`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DedicatedIpv4 {
     pub address: String,
@@ -346,14 +346,16 @@ pub struct FunctionConfig {
     /// [`FunctionConfig::browser_artifact`] and surfaced through [`DeploymentInfo::browser_ineligible`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_ineligible_reason: Option<String>,
-    /// Opt-in to a dedicated public IPv4 (fluid.json `functions[].dedicatedIpv4`): deploy time buys or
-    /// re-adopts a Tencent Cloud EIP via `hive-cloud::tencent_eip`; no placement filter follows (any
+    /// Whether this function binds the project's paid dedicated public IPv4: `git.rs` sets it from
+    /// `FunctionSettings::dedicated_ipv4`, overriding whatever fluid.json declares, and the EIP
+    /// itself is bought at checkout (`hive-cloud::tencent_eip`). No placement filter follows (any
     /// node can hold an EIP).
     #[serde(default, skip_serializing_if = "is_false")]
     pub dedicated_ipv4: bool,
-    /// The allocated address, stamped onto the manifest once `tencent_eip::claim_or_allocate` succeeds
-    /// (the same stamp-before-`deploy_full` shape as [`RawPortBinding::public_port`]) and hoisted onto
-    /// [`DeploymentInfo::dedicated_ipv4`]; `None` until allocation succeeds.
+    /// The project's allocated address, stamped onto the manifest by `git.rs` from
+    /// `ProjectSettings::dedicated_ipv4` while the function's flag is on (the same
+    /// stamp-before-`deploy_full` shape as [`RawPortBinding::public_port`]) and hoisted onto
+    /// [`DeploymentInfo::dedicated_ipv4`]; `None` until purchased.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedicated_ipv4_alloc: Option<DedicatedIpv4>,
     /// Per-function CWD override relative to the runtime workdir; Build Output API v3 Node functions
