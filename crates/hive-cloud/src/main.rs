@@ -2092,18 +2092,11 @@ async fn admin_ingress(
     }
     if crate::auth::enforced() {
         let is_mutation = is_mutation_request(&req);
-        let path = req.uri().path();
-        // Keep in sync with auth::require_auth's `open` list: these paths authenticate by something
-        // other than a platform JWT (zkauth internal secret, per-database or per-project bearer,
-        // WebDAV Basic).
-        let open = path == "/healthz"
-            || path == "/v1/token"
-            || path == "/v1/git/webhook"
-            || path == "/v1/zkauth/register"
-            || path == "/v1/zkauth/preview-proof"
-            || path.starts_with("/v1/sqlite/")
-            || path.starts_with("/v1/browser-db/")
-            || path.starts_with("/v1/drive/webdav/");
+        // The routes that authenticate by something other than a platform JWT are
+        // `auth::is_open_route`'s: the node's own gate asks the same function, so the two cannot
+        // drift (this list used to lack the Stripe webhook, `/v1/browser/admissions`,
+        // `/v1/zkauth/project-team` and, later, SCIM).
+        let open = crate::auth::is_open_route(req.uri().path());
         if is_mutation && !open {
             let ok = crate::auth::extract_token(req.headers())
                 .map(|t| {

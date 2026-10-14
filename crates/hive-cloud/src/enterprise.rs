@@ -302,6 +302,21 @@ fn norm(team: &str) -> String {
     }
 }
 
+/// Whether `presented` is the SCIM bearer stored as `token_enc`: a sealed value is opened with
+/// `secrets::try_decrypt` (one no key can open never matches), a legacy plaintext value is compared
+/// as stored, and an empty stored value never matches.
+fn scim_token_matches(token_enc: &str, presented: &str) -> bool {
+    let stored = if crate::secrets::is_encrypted(token_enc) {
+        match crate::secrets::try_decrypt(token_enc) {
+            Some(plain) => plain,
+            None => return false,
+        }
+    } else {
+        token_enc.to_string()
+    };
+    !stored.is_empty() && crate::admin::ct_eq(&stored, presented)
+}
+
 impl EnterpriseStore {
     pub fn new() -> Self {
         Self::default()
@@ -455,14 +470,19 @@ impl EnterpriseStore {
             t.enabled = false;
         }
     }
-    /// Resolve the team that owns a SCIM bearer token (constant-ish lookup).
+    /// Resolve the team that owns a SCIM bearer token (constant-ish lookup). This is the ONLY
+    /// credential check of the `/v1/scim/v2/` routes, which skip the platform gate
+    /// (`auth::is_open_route`), so it fails closed: an empty presented token never matches, and a
+    /// stored value no key can open is never compared (`secrets::decrypt` hands such a ciphertext
+    /// back unchanged, which would make the leaked ciphertext itself a working bearer).
     pub fn scim_team_for_token(&self, token: &str) -> Option<String> {
+        if token.is_empty() {
+            return None;
+        }
         self.scim
             .read()
             .iter()
-            .find(|(_, t)| {
-                t.enabled && crate::admin::ct_eq(&crate::secrets::decrypt(&t.token_enc), token)
-            })
+            .find(|(_, t)| t.enabled && scim_token_matches(&t.token_enc, token))
             .map(|(team, _)| team.clone())
     }
     pub fn scim_upsert_user(

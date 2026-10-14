@@ -4,10 +4,13 @@
 //! `billing::plan_allows_*`). Secrets (SIEM/SCIM tokens, deployment passwords) are AEAD-encrypted
 //! at rest and never returned in the clear: list/get responses redact them to booleans or masks.
 //!
-//! Two endpoint families use *non-tenant* auth because an external IdP calls them: SCIM 2.0
-//! (`/v1/scim/v2/*`, bearer = the per-team SCIM token) and the SAML ACS (`/v1/saml/:team/acs`, IdP
-//! form POST). Neither is on `auth::require_auth`'s open list, so with `HIVE_JWT_SECRET` set an
-//! IdP's POST (which carries no platform JWT) is refused with 401 before it reaches the handler.
+//! Two endpoint families are called by an external IdP, not by a tenant: SCIM 2.0 (`/v1/scim/v2/*`,
+//! bearer = the per-team SCIM token) and the SAML ACS (`/v1/saml/:team/acs`, IdP form POST). SCIM is
+//! on `auth::is_open_route`'s list (the platform gate would refuse an IdP's JWT-less POST with 401)
+//! because every SCIM handler authenticates by its own bearer (`scim_auth`) and fails closed. The
+//! SAML ACS is NOT: it verifies no assertion signature, so it stays behind the platform gate AND
+//! answers only the team's own owner or admin (`saml_acs`): an anonymous caller is refused 401, a
+//! caller from another team or a plain member of this one 403.
 
 use std::sync::Arc;
 
@@ -342,19 +345,35 @@ struct AcsForm {
 /// SAML Assertion Consumer Service: the IdP POSTs the (base64) SAML response here after the user
 /// authenticates. It decodes the response, extracts the NameID (email), optionally auto-provisions
 /// the team member (`auto_provision`), then bounces to the dashboard (`HIVE_DASHBOARD_URL`, else
-/// the API base) at `RelayState`, appended as given. It establishes NO session: it federates
-/// directory membership, and the dashboard's own auth signs the user in.
+/// the API base) at `RelayState`, reduced to a same-origin path (`auth::same_origin_path`: an
+/// absolute, protocol-relative or `@host` RelayState lands on `/`, never on another host). It
+/// establishes NO session: it federates directory membership, and the dashboard's own auth signs
+/// the user in.
 ///
 /// SECURITY GAP: the assertion's XML-DSig signature is NOT verified against the IdP `x509_cert`;
 /// the handler checks only that SAML is enabled for the team and extracts the subject, so it trusts
 /// any `NameID` posted to it (with `auto_provision`, that email becomes a team Member). Signature
-/// verification is the open hardening item; this is stated here rather than pretending assertions
-/// are cryptographically verified.
+/// verification is the open hardening item, so until it exists the ACS is not a public endpoint:
+/// the platform gate refuses an anonymous POST and `require_team` lets only the team's own owner or
+/// admin (who can already add members) through, so a signed-in caller of ANOTHER team, or a plain
+/// member of this one, can no longer forge an assertion into the roster. Consequence: an IdP's
+/// browser POST (no platform JWT) cannot complete a sign-in on an enforced platform.
 async fn saml_acs(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
     Path(team): Path<String>,
     axum::extract::Form(form): axum::extract::Form<AcsForm>,
 ) -> Response {
+    if let Err((status, message)) = crate::admin::require_team(
+        &c,
+        &headers,
+        claims.as_ref().map(|e| &e.0),
+        &team,
+        &["owner", "admin"],
+    ) {
+        return (status, message).into_response();
+    }
     let cfg = c.enterprise.saml(&team);
     if !cfg.enabled {
         return (StatusCode::FORBIDDEN, "SAML not enabled for this team").into_response();
@@ -379,11 +398,7 @@ async fn saml_acs(
             .record(&team, "saml", "login", "member", &email, "SAML sign-in");
     }
     let dash = std::env::var("HIVE_DASHBOARD_URL").unwrap_or_else(|_| c.api_base());
-    let next = if form.relay_state.is_empty() {
-        "/".to_string()
-    } else {
-        form.relay_state
-    };
+    let next = crate::auth::same_origin_path(&form.relay_state, "/");
     axum::response::Redirect::temporary(&format!("{}{}", dash.trim_end_matches('/'), next))
         .into_response()
 }

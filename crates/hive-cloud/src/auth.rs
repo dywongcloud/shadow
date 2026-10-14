@@ -184,6 +184,35 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
     })
 }
 
+/// Routes that carry their OWN credential, so a mutation to them needs no platform JWT or API key
+/// and each fails closed in its own handler: `/healthz`; `/v1/token` (the mint); the GitHub and
+/// Stripe webhooks (their own HMAC signature); `/v1/zkauth/{register,preview-proof,project-team}`
+/// (the dashboard's server-to-server `x-hive-internal` secret, `zkauth::internal_ok`);
+/// `/v1/browser/admissions` (`admit()` through `fresh_user_claims`; the item routes stay gated);
+/// `/v1/sqlite/` (the database's own bearer, checked in `hrana.rs`); `/v1/browser-db/` (the
+/// project's `browser_db_rest` bearer); `/v1/drive/webdav/` (HTTP Basic, verified by
+/// `drive_webdav.rs` before any filesystem call); `/v1/scim/v2/` (the team's SCIM bearer, resolved
+/// by `enterprise_api::scim_auth`: an IdP's directory sync carries no platform JWT). The SAML ACS
+/// is deliberately NOT here: its handler verifies no signature.
+///
+/// THE one list: `require_auth` and `main::admin_ingress` (which rejects an unauthenticated
+/// mutation before forwarding it to the leader) both ask it, so they cannot disagree about which
+/// routes may skip the gate.
+pub fn is_open_route(path: &str) -> bool {
+    path == "/healthz"
+        || path == "/v1/token"
+        || path == "/v1/git/webhook"
+        || path == "/v1/billing/webhook"
+        || path == "/v1/zkauth/register"
+        || path == "/v1/zkauth/preview-proof"
+        || path == "/v1/zkauth/project-team"
+        || path == "/v1/browser/admissions"
+        || path.starts_with("/v1/sqlite/")
+        || path.starts_with("/v1/browser-db/")
+        || path.starts_with("/v1/drive/webdav/")
+        || path.starts_with("/v1/scim/v2/")
+}
+
 /// Auth middleware. With a JWT secret configured a mutation (POST/PUT/DELETE/PATCH) needs a valid
 /// bearer and reads always pass; without one nothing is enforced (dev mode) and the middleware only
 /// binds claims.
@@ -194,14 +223,8 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
 /// `x-hive-team` header. A JWT wins over an API key (tenant-scoped, never `platform_admin`); key
 /// claims bind even in dev, since key verification is a self-contained hash lookup.
 ///
-/// Routes carrying their OWN credential skip the mutation gate (`open`) and each fails closed in
-/// its own handler: `/healthz`; `/v1/token` (the mint); the GitHub and Stripe webhooks (their own
-/// HMAC signature); `/v1/zkauth/{register,preview-proof,project-team}` (the dashboard's
-/// server-to-server `x-hive-internal` secret, `zkauth::internal_ok`); `/v1/browser/admissions`
-/// (`admit()` through `fresh_user_claims`; the item routes stay gated); `/v1/sqlite/` (the
-/// database's own bearer, checked in `hrana.rs`); `/v1/browser-db/` (the project's
-/// `browser_db_rest` bearer); `/v1/drive/webdav/` (HTTP Basic, verified by `drive_webdav.rs` before
-/// any filesystem call).
+/// Routes carrying their OWN credential skip the mutation gate ([`is_open_route`]) and each fails
+/// closed in its own handler.
 ///
 /// A GET/HEAD is never rejected for missing auth, but an unauthenticated one on a non-exempt route
 /// resolves to `admin::ANON_TENANT` (a namespace that owns nothing) and is stamped `x-hive-anon:
@@ -223,18 +246,7 @@ pub async fn require_auth(
     }
     let method = req.method().clone();
     let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    let path = req.uri().path();
-    let open = path == "/healthz"
-        || path == "/v1/token"
-        || path == "/v1/git/webhook"
-        || path == "/v1/billing/webhook"
-        || path == "/v1/zkauth/register"
-        || path == "/v1/zkauth/preview-proof"
-        || path == "/v1/zkauth/project-team"
-        || path == "/v1/browser/admissions"
-        || path.starts_with("/v1/sqlite/")
-        || path.starts_with("/v1/browser-db/")
-        || path.starts_with("/v1/drive/webdav/");
+    let open = is_open_route(req.uri().path());
     if !is_mutation || open {
         let mut resp = next.run(req).await;
         if !authed && !open {
