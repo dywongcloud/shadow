@@ -334,13 +334,41 @@ fn verify_access(team: &str, project: &str, proof_hex: &str, message: &str) -> b
     verify(&ring, scope.as_bytes(), message.as_bytes(), &proof)
 }
 
-fn issue_cookie(project: &str) -> String {
+/// The `Set-Cookie` value that unlocks `project`: a sealed `project|expiry`, `HttpOnly`,
+/// `SameSite=Lax`, and `Secure` unless `secure` is false (a loopback dev host, see
+/// [`is_loopback_host`]). `None` when the value could not be sealed: `secrets::encrypt` hands its
+/// input back unsealed on a failure, and [`cookie_access`] accepts only sealed values, so an
+/// unsealed cookie would be dead on arrival.
+fn issue_cookie(project: &str, secure: bool) -> Option<String> {
     let exp = now_ms() + COOKIE_TTL_MS;
     let token = crate::secrets::encrypt(&format!("{project}|{exp}"));
-    format!(
-        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+    if !crate::secrets::is_encrypted(&token) {
+        return None;
+    }
+    let secure = if secure { " Secure;" } else { "" };
+    Some(format!(
+        "{COOKIE}={token}; Path=/; HttpOnly;{secure} SameSite=Lax; Max-Age={}",
         COOKIE_TTL_MS / 1000
-    )
+    ))
+}
+
+/// Whether `host` (a Host header value, port allowed) names this machine: `localhost`,
+/// `*.localhost` or a loopback address. The only hosts whose unlock cookie omits `Secure`: a
+/// browser on plain `http://<project>.localhost:<port>` (the local dev flow) would not keep a
+/// `Secure` cookie in every browser. Every other host, a platform preview host included, gets
+/// `Secure`. The unlock request's scheme is not visible here, so the host decides.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = match host.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name == "::1"
+        || name
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// True if the request carries a valid, unexpired access cookie for `project`.
@@ -388,7 +416,8 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 /// the ring that may unlock THIS project ([`unlock_team`]), so a proof minted over any other team's
 /// roster is refused even though it verifies; and `next` must be a same-origin path
 /// ([`crate::auth::same_origin_path`]), so the redirect cannot leave the preview host. A refusal
-/// is one opaque 401, never saying which check failed.
+/// is one opaque 401, never saying which check failed. The cookie is `HttpOnly; SameSite=Lax` and
+/// `Secure` for every host but a loopback dev one ([`is_loopback_host`]).
 pub fn bootstrap(
     cloud: &std::sync::Arc<crate::state::CloudState>,
     host: &str,
@@ -411,10 +440,17 @@ pub fn bootstrap(
     {
         return (StatusCode::UNAUTHORIZED, "invalid membership proof").into_response();
     }
+    let Some(cookie) = issue_cookie(&project, !is_loopback_host(host)) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not seal the access cookie",
+        )
+            .into_response();
+    };
     Response::builder()
         .status(StatusCode::FOUND)
         .header(header::LOCATION, next)
-        .header(header::SET_COOKIE, issue_cookie(&project))
+        .header(header::SET_COOKIE, cookie)
         .body(Body::empty())
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
