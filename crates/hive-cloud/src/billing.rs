@@ -506,6 +506,22 @@ pub enum Unconfirmed {
     Unpaid,
 }
 
+/// Largest amount, in cents, one credit, charge or checkout may carry ($10 billion). Amounts arrive
+/// as `u64` in request bodies and live as `i64`: a `u64` above `i64::MAX` cast `as i64` is NEGATIVE,
+/// so a debit of one used to CREDIT the account (`POST /v1/billing/charge`). Every entry point
+/// bounds its amount by this before it reaches a balance, and the balance updates saturate, so
+/// neither one hostile amount nor a long run of maximal ones can wrap a balance.
+pub const MAX_AMOUNT_CENTS: u64 = 1_000_000_000_000;
+
+/// Why [`BillingStore::charge`] debited nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ChargeError {
+    /// The amount is above [`MAX_AMOUNT_CENTS`].
+    OutOfRange,
+    /// Hobby (no overage) with neither allowance nor prepaid credits left for it.
+    Insufficient,
+}
+
 #[derive(Default)]
 pub struct BillingStore {
     accounts: RwLock<HashMap<String, BillingAccount>>,
@@ -943,17 +959,20 @@ impl BillingStore {
         } else {
             tenant
         };
+        // Callers bound `cents` by MAX_AMOUNT_CENTS; a bare `as i64` would turn one above i64::MAX
+        // into a DEBIT, so the conversion saturates and the sum cannot wrap either.
+        let credit = i64::try_from(cents).unwrap_or(i64::MAX);
         let bal;
         {
             let mut m = self.accounts.write();
             let acc = m
                 .entry(tenant.to_string())
                 .or_insert_with(|| BillingAccount::default_for(tenant));
-            acc.balance_cents += cents as i64;
+            acc.balance_cents = acc.balance_cents.saturating_add(credit);
             acc.updated_ms = now_ms();
             bal = acc.balance_cents;
         }
-        self.ledger_push(tenant, "credit", cents as i64, bal, note);
+        self.ledger_push(tenant, "credit", credit, bal, note);
         self.account(tenant)
     }
 
@@ -985,8 +1004,18 @@ impl BillingStore {
 
     /// Charge compute usage: consume the monthly included allowance first, then
     /// prepaid balance. On Hobby (no overage) a charge that would go negative is
-    /// rejected. Returns Ok(account) or Err(reason).
-    pub fn charge(&self, tenant: &str, cents: u64, note: &str) -> Result<BillingAccount, String> {
+    /// rejected ([`ChargeError::Insufficient`]); an amount above [`MAX_AMOUNT_CENTS`] is refused
+    /// before it touches the account ([`ChargeError::OutOfRange`]): `cents` comes straight from a
+    /// tenant's request body and, unbounded, `as i64` turned one above `i64::MAX` into a CREDIT.
+    pub fn charge(
+        &self,
+        tenant: &str,
+        cents: u64,
+        note: &str,
+    ) -> Result<BillingAccount, ChargeError> {
+        if cents > MAX_AMOUNT_CENTS {
+            return Err(ChargeError::OutOfRange);
+        }
         let tenant = if tenant.is_empty() {
             "personal"
         } else {
@@ -999,20 +1028,16 @@ impl BillingStore {
                 .entry(tenant.to_string())
                 .or_insert_with(|| BillingAccount::default_for(tenant));
             let spec = plan_spec(&acc.plan);
-            let mut remaining = cents;
             let included_left = acc.included_cents.saturating_sub(acc.used_cents);
-            let from_included = remaining.min(included_left);
-            acc.used_cents += from_included;
-            remaining -= from_included;
-            if remaining > 0 {
-                if acc.balance_cents >= remaining as i64 {
-                    acc.balance_cents -= remaining as i64;
-                } else if spec.overage {
-                    acc.balance_cents -= remaining as i64;
-                } else {
-                    return Err("Insufficient credits — upgrade to Pro or add credits.".into());
-                }
+            let from_included = cents.min(included_left);
+            let owed = (cents - from_included) as i64;
+            // Decide BEFORE touching the account: a refused charge used to leave the allowance it
+            // had already started to consume.
+            if owed > 0 && acc.balance_cents < owed && !spec.overage {
+                return Err(ChargeError::Insufficient);
             }
+            acc.used_cents += from_included;
+            acc.balance_cents = acc.balance_cents.saturating_sub(owed);
             acc.updated_ms = now_ms();
             bal_after = acc.balance_cents;
         }

@@ -15774,6 +15774,15 @@ async fn billing_checkout(
         match req.kind.as_str() {
             "credits" => {
                 let amt = req.amount_cents.unwrap_or(1000);
+                if amt == 0 || amt > crate::billing::MAX_AMOUNT_CENTS {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "a credit purchase is between 1 and {} cents",
+                            crate::billing::MAX_AMOUNT_CENTS
+                        ),
+                    ));
+                }
                 (
                     "".to_string(),
                     amt,
@@ -16219,6 +16228,10 @@ struct ChargeReq {
     note: String,
 }
 
+/// Debits the CALLER's own account by `cents` (usage the caller reports; it cannot touch another
+/// tenant's). The amount comes straight from the request body, so `BillingStore::charge` bounds it
+/// by `billing::MAX_AMOUNT_CENTS` (400 above it): a `u64` above `i64::MAX` cast `as i64` used to
+/// turn a huge debit into a CREDIT of the same size.
 async fn billing_charge(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16244,7 +16257,14 @@ async fn billing_charge(
             crate::persist::persist(&c);
             Ok(Json(json!({ "ok": true, "account": acc })))
         }
-        Err(e) => Err((StatusCode::PAYMENT_REQUIRED, e)),
+        Err(crate::billing::ChargeError::OutOfRange) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("cents must be at most {}", crate::billing::MAX_AMOUNT_CENTS),
+        )),
+        Err(crate::billing::ChargeError::Insufficient) => Err((
+            StatusCode::PAYMENT_REQUIRED,
+            "Insufficient credits — upgrade to Pro or add credits.".into(),
+        )),
     }
 }
 
@@ -16293,6 +16313,15 @@ async fn billing_grant(
     let t = req.tenant.trim();
     if t.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tenant is required".into()));
+    }
+    if req.credit_cents > crate::billing::MAX_AMOUNT_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "credit_cents must be at most {}",
+                crate::billing::MAX_AMOUNT_CENTS
+            ),
+        ));
     }
     if !req.plan.is_empty() && crate::billing::known_plan(&req.plan).is_none() {
         return Err((
