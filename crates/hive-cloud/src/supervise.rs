@@ -131,10 +131,17 @@ pub fn memory_pressure() -> MemoryPressure {
     }
 }
 
+/// First wait before a restart.
+const BACKOFF_START_SECS: u64 = 5;
+/// The longest wait before a restart, and the run length that counts as healthy.
+const BACKOFF_MAX_SECS: u64 = 300;
+
 /// Spawns `make()`'s future and keeps it alive: on panic OR return it logs, backs off (5 s doubling
-/// to 5 min: a deterministic crash must not spin hot) and re-spawns. `make` is a factory because
-/// the future is consumed per attempt. A cancelled task (the runtime shutting down) is not
-/// respawned.
+/// to 5 min: a deterministic crash must not spin hot) and re-spawns. A run that lasted longer than
+/// the longest backoff was healthy, so the crash that ended it starts a NEW incident: the backoff
+/// returns to 5 s instead of staying at 5 min for a loop that crashed once after days of running.
+/// `make` is a factory because the future is consumed per attempt. A cancelled task (the runtime
+/// shutting down) is not respawned.
 ///
 /// The body should call `beat(name)` each iteration; supervision without the heartbeat still
 /// restarts crashes but cannot tell "healthy and quiet" from "alive but wedged mid-await".
@@ -145,8 +152,9 @@ where
 {
     let e = entry(name);
     tokio::spawn(async move {
-        let mut backoff_secs = 5u64;
+        let mut backoff_secs = BACKOFF_START_SECS;
         loop {
+            let started = tokio::time::Instant::now();
             let attempt = tokio::spawn(make());
             match attempt.await {
                 Ok(()) => {
@@ -167,8 +175,11 @@ where
                 }
             }
             e.restarts.fetch_add(1, Ordering::Relaxed);
+            if started.elapsed() > std::time::Duration::from_secs(BACKOFF_MAX_SECS) {
+                backoff_secs = BACKOFF_START_SECS;
+            }
             tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-            backoff_secs = (backoff_secs * 2).min(300);
+            backoff_secs = (backoff_secs * 2).min(BACKOFF_MAX_SECS);
         }
     });
 }
