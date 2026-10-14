@@ -1,7 +1,8 @@
 //! HTTP surface for the enterprise feature suite ([`crate::enterprise`]).
 //!
-//! Every mutating endpoint is team-scoped (via [`crate::admin::tenant`]) and plan-gated (via
-//! `billing::plan_allows_*`). Secrets (SIEM/SCIM tokens, deployment passwords) are AEAD-encrypted
+//! Every mutating endpoint is team-scoped (via [`crate::admin::tenant`]), plan-gated (via
+//! `billing::plan_allows_*`) and role-gated ([`require_config_admin`]: owner and admin write, every
+//! member reads). Secrets (SIEM/SCIM tokens, deployment passwords) are AEAD-encrypted
 //! at rest and never returned in the clear: list/get responses redact them to booleans or masks.
 //!
 //! Two endpoint families are called by an external IdP, not by a tenant: SCIM 2.0 (`/v1/scim/v2/*`,
@@ -95,6 +96,29 @@ fn forbid(feature: &str) -> (StatusCode, String) {
     )
 }
 
+/// The roles that may WRITE a team's enterprise configuration (IP blocks, the SIEM sink and its
+/// test event, SAML, SCIM, deployment protection): owner and admin. Every member may READ it.
+/// Without a floor a viewer or member reconfigured the team's security: pointed the audit stream at
+/// their own SIEM endpoint, added or deleted IP blocks, switched deployment protection off, or
+/// minted the SCIM bearer (which provisions roster members and locks the IdP out). On an UNENFORCED
+/// dev node there are no verified roles and the floor steps aside (`admin::require_team_floor`),
+/// like every other role gate.
+fn require_config_admin(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: &Claims,
+    team: &str,
+) -> Result<(), (StatusCode, String)> {
+    crate::admin::require_team_floor(
+        c,
+        headers,
+        claims.as_ref().map(|e| &e.0),
+        team,
+        &["owner", "admin"],
+    )
+    .map(|_| ())
+}
+
 async fn ip_blocks_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -118,6 +142,7 @@ async fn ip_block_add(
     Json(b): Json<IpBlockReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_config_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_ip_blocking(&plan_of(&c, &t)) {
         return Err(forbid("IP blocking"));
     }
@@ -136,12 +161,13 @@ async fn ip_block_delete(
     headers: HeaderMap,
     claims: Claims,
     Path(id): Path<String>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_config_admin(&c, &headers, &claims, &t)?;
     c.enterprise.remove_ip_block(&t, &id);
     c.audit.record(&t, "user", "delete", "ip-block", &id, "");
     crate::persist::persist(&c);
-    Json(json!({ "ok": true }))
+    Ok(Json(json!({ "ok": true })))
 }
 
 /// SIEM config with the token REDACTED (only whether one is configured).
@@ -193,6 +219,7 @@ async fn siem_put(
     Json(b): Json<SiemReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_config_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_siem(&plan_of(&c, &t)) {
         return Err(forbid("SIEM log streaming"));
     }
@@ -226,6 +253,7 @@ async fn siem_test(
     claims: Claims,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_config_admin(&c, &headers, &claims, &t)?;
     if c.enterprise
         .siem(&t)
         .map(|s| !s.enabled || s.endpoint.is_empty())
@@ -290,6 +318,7 @@ async fn saml_put(
     Json(b): Json<SamlReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_config_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_saml(&plan_of(&c, &t)) {
         return Err(forbid("SAML SSO"));
     }
@@ -451,34 +480,16 @@ async fn scim_get(
     }))
 }
 
-/// The roles that may manage a team's SCIM connection: the bearer is the directory's whole
-/// authority over the roster, and (re)issuing it invalidates the IdP's current token, so a viewer or
-/// member who could mint it could both provision arbitrary members and lock the IdP out. On an
-/// unenforced dev node there are no verified roles and the floor steps aside (`require_team_floor`).
-fn require_scim_admin(
-    c: &Arc<CloudState>,
-    headers: &HeaderMap,
-    claims: &Claims,
-    team: &str,
-) -> Result<(), (StatusCode, String)> {
-    crate::admin::require_team_floor(
-        c,
-        headers,
-        claims.as_ref().map(|e| &e.0),
-        team,
-        &["owner", "admin"],
-    )
-    .map(|_| ())
-}
-
-/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE. Owner or admin only.
+/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE. Owner or admin only
+/// (the bearer is the directory's whole authority over the roster, and a re-mint invalidates the
+/// IdP's current token).
 async fn scim_enable(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    require_scim_admin(&c, &headers, &claims, &t)?;
+    require_config_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_scim(&plan_of(&c, &t)) {
         return Err(forbid("SCIM directory sync"));
     }
@@ -499,7 +510,7 @@ async fn scim_disable(
     claims: Claims,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    require_scim_admin(&c, &headers, &claims, &t)?;
+    require_config_admin(&c, &headers, &claims, &t)?;
     c.enterprise.scim_disable(&t);
     c.audit.record(&t, "user", "disable", "scim", &t, "");
     crate::persist::persist(&c);
@@ -774,6 +785,7 @@ async fn protection_put(
     Json(b): Json<ProtectionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = crate::admin::require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    require_config_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_deploy_protection(&plan_of(&c, &t)) {
         return Err((
             StatusCode::FORBIDDEN,
