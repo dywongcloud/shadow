@@ -1,21 +1,32 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { auth, clerkClient } from "@clerk/nextjs/server";
+import { sameOriginPath } from "@/lib/same-origin-path";
 
-// Trust boundary: verifies via Clerk that the signed-in user is a MEMBER of the deployment's team before enrolling them in the ZK roster and
-// minting a proof on the node (the node cannot verify Clerk, so its zkauth endpoints stay off the public proxy).
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
+const NODE_TIMEOUT_MS = 10_000;
 const PERSONAL = new Set(["personal", "__personal__", ""]);
+const LEGACY_PERSONAL_TEAM = "personal";
+const UNTAGGED_TEAM = "__untagged__";
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
+const HOSTNAME = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const RETRY_AFTER_SECS = "5";
 
-/** Whether `host` is a platform-issued deployment domain (the `.localhost` dev shapes and the NEXT_PUBLIC_DEPLOYMENT_DOMAIN apps wildcard):
- *  blocks an open redirect that would ship the minted proof to an arbitrary origin. A project's own CUSTOM domain is NOT matched, so a proof
- *  for one is refused here. */
-function isKnownDeploymentHost(host: string): boolean {
+type Access = "granted" | "denied" | "unavailable";
+type TeamResolution = { team: string } | { refusal: NextResponse };
+
+function isLocalhostHost(host: string): boolean {
   const h = host.toLowerCase();
-  if (h === "localhost" || h.endsWith(".localhost")) return true;
-  if (DEPLOY_DOMAIN && (h === DEPLOY_DOMAIN || h.endsWith(`.${DEPLOY_DOMAIN}`))) return true;
-  return false;
+  return h === "localhost" || h.endsWith(".localhost");
+}
+
+/** Whether `host` is a bare hostname the platform issues for deployments (the `.localhost` dev shapes and the NEXT_PUBLIC_DEPLOYMENT_DOMAIN apps wildcard):
+ *  blocks an open redirect that would ship the minted proof to an arbitrary origin. A project's own CUSTOM domain is NOT matched, so a proof for one is refused here. */
+function isKnownDeploymentHost(host: string): boolean {
+  if (!HOSTNAME.test(host)) return false;
+  const h = host.toLowerCase();
+  if (isLocalhostHost(h)) return true;
+  return !!DEPLOY_DOMAIN && (h === DEPLOY_DOMAIN || h.endsWith(`.${DEPLOY_DOMAIN}`));
 }
 
 /** Cause-specific copy for an unlock failure (an access-service fault is not "the deployment may still be starting"). */
@@ -24,6 +35,14 @@ function unlockError(status: number, stage: "enroll" | "mint"): string {
   if (status === 404) return "The preview access service is unavailable on this node. Please try again.";
   if (status >= 500) return "The preview access service failed while verifying your membership. Please try again.";
   return `Could not ${stage === "enroll" ? "enroll you for" : "grant"} preview access (${status}).`;
+}
+
+function retryable(error: string): NextResponse {
+  return NextResponse.json({ ok: false, error }, { status: 503, headers: { "retry-after": RETRY_AFTER_SECS } });
+}
+
+function nodeFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  return fetch(`${ADMIN}${path}`, { ...init, signal: AbortSignal.timeout(NODE_TIMEOUT_MS) });
 }
 
 /** The configured platform owner(s): HIVE_OWNER_EMAIL is a COMMA-SEPARATED list, parsed into a set exactly like `/api/token` does. */
@@ -37,43 +56,73 @@ function ownerEmails(): Set<string> {
   );
 }
 
+async function clerkUsers() {
+  return (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient).users as any;
+}
+
 /** A personal namespace belongs to exactly ONE user, so membership is checked directly rather than through Clerk orgs: `u_<clerkUid>` must match
- *  exactly, and the legacy shared `personal` belongs to the platform owner(s) by HIVE_OWNER_EMAIL (permissive when none is configured). */
-async function personalAccessOk(team: string, userId: string): Promise<boolean> {
-  if (team.startsWith("u_")) return team === `u_${userId}`;
+ *  exactly, and the legacy shared `personal` belongs to the platform owner(s) by HIVE_OWNER_EMAIL (with none configured only a non-production
+ *  deployment lets anyone in). A Clerk lookup that fails is `unavailable`, never a verdict. */
+async function personalAccess(team: string, userId: string): Promise<Access> {
+  if (team.startsWith("u_")) return team === `u_${userId}` ? "granted" : "denied";
   const owners = ownerEmails();
-  if (owners.size === 0) return true;
+  if (owners.size === 0) return process.env.NODE_ENV !== "production" ? "granted" : "denied";
   try {
-    const client = (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient) as any;
-    const u = await client.users.getUser(userId);
+    const u = await (await clerkUsers()).getUser(userId);
     const emails: string[] = (u?.emailAddresses ?? []).map((e: any) => String(e?.emailAddress || "").toLowerCase());
-    return emails.some((e) => owners.has(e));
+    return emails.some((e) => owners.has(e)) ? "granted" : "denied";
   } catch {
-    return true;
+    return "unavailable";
   }
 }
 
 /** Is `userId` a member of the Clerk org whose slug (or id) == `team`? */
-async function isOrgMember(userId: string, team: string): Promise<boolean> {
+async function orgAccess(userId: string, team: string): Promise<Access> {
   try {
-    const client = (typeof clerkClient === "function" ? await (clerkClient as any)() : clerkClient) as any;
-    const res = await client.users.getOrganizationMembershipList({ userId, limit: 200 });
+    const res = await (await clerkUsers()).getOrganizationMembershipList({ userId, limit: 200 });
     const list: any[] = res?.data ?? res ?? [];
     return list.some((m) => {
       const o = m.organization || {};
       return o.slug === team || o.id === team;
-    });
+    })
+      ? "granted"
+      : "denied";
   } catch {
-    return false;
+    return "unavailable";
   }
 }
 
+/** The node's authoritative owning team of `project` (never the `?team=` the edge redirect carried): unanswerable is a retryable refusal, empty or untagged is
+ *  the legacy `personal` namespace. */
+async function resolveProjectTeam(project: string): Promise<TeamResolution> {
+  let res: Response;
+  try {
+    res = await nodeFetch(`/v1/zkauth/project-team?project=${encodeURIComponent(project)}`, { headers: TOKEN ? { "x-hive-internal": TOKEN } : {} });
+  } catch {
+    return { refusal: retryable(unlockError(503, "enroll")) };
+  }
+  if (res.status === 403) {
+    console.error(`[preview-unlock] project-team resolution refused (403) for ${project}; check HIVE_INTERNAL_TOKEN`);
+    return { refusal: NextResponse.json({ ok: false, error: unlockError(403, "enroll") }, { status: 502 }) };
+  }
+  if (!res.ok) {
+    console.error(`[preview-unlock] project-team resolution failed ${res.status} for ${project}`);
+    const error = unlockError(res.status, "enroll");
+    return { refusal: res.status >= 500 ? retryable(error) : NextResponse.json({ ok: false, error }, { status: 502 }) };
+  }
+  const body = await res.json().catch(() => null);
+  if (!body || typeof body !== "object") return { refusal: retryable(unlockError(503, "enroll")) };
+  const resolved = String(body.team ?? "").trim();
+  return { team: resolved && resolved !== UNTAGGED_TEAM ? resolved : LEGACY_PERSONAL_TEAM };
+}
+
+/** Authorizes only from the node's project -> team answer plus the caller's Clerk identity, failing closed and retryable when either cannot be asked, then
+ *  mints the preview proof for that team. */
 export async function GET(req: NextRequest) {
   const sp = req.nextUrl.searchParams;
   const host = sp.get("host") || "";
   const project = sp.get("project") || "";
-  const paramTeam = sp.get("team") || "personal";
-  const next = sp.get("next") || "/";
+  const next = sameOriginPath(sp.get("next"), "/");
   if (!host || !project) return NextResponse.json({ ok: false, error: "missing deployment info" }, { status: 400 });
   if (!isKnownDeploymentHost(host)) {
     return NextResponse.json({ ok: false, error: "unrecognized deployment host" }, { status: 400 });
@@ -82,24 +131,14 @@ export async function GET(req: NextRequest) {
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ ok: false, signin: true, error: "sign in required" }, { status: 401 });
 
-  let team = paramTeam;
-  try {
-    const th: Record<string, string> = {};
-    if (TOKEN) th["x-hive-internal"] = TOKEN;
-    const tr = await fetch(`${ADMIN}/v1/zkauth/project-team?project=${encodeURIComponent(project)}`, { headers: th });
-    if (tr.ok) {
-      const td = await tr.json();
-      const resolved = String(td?.team || "").trim();
-      if (resolved && resolved !== "__untagged__") team = resolved;
-    } else if (tr.status === 403) {
-      console.error(`[preview-unlock] project-team resolution refused (403) for ${project}; check HIVE_INTERNAL_TOKEN`);
-      return NextResponse.json({ ok: false, error: unlockError(403, "enroll") }, { status: 502 });
-    }
-  } catch {}
+  const resolution = await resolveProjectTeam(project);
+  if ("refusal" in resolution) return resolution.refusal;
+  const { team } = resolution;
 
   const personal = PERSONAL.has(team) || team.startsWith("u_");
-  const allowed = personal ? await personalAccessOk(team, userId) : await isOrgMember(userId, team);
-  if (!allowed) {
+  const access = personal ? await personalAccess(team, userId) : await orgAccess(userId, team);
+  if (access === "unavailable") return retryable("We could not verify your membership right now. Please try again.");
+  if (access === "denied") {
     return NextResponse.json(
       {
         ok: false,
@@ -114,28 +153,20 @@ export async function GET(req: NextRequest) {
   const headers: Record<string, string> = { "content-type": "application/json", "x-hive-team": team };
   if (TOKEN) headers["x-hive-internal"] = TOKEN;
   try {
-    const reg = await fetch(`${ADMIN}/v1/zkauth/register`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ user_id: userId }),
-    });
+    const reg = await nodeFetch("/v1/zkauth/register", { method: "POST", headers, body: JSON.stringify({ user_id: userId }) });
     if (!reg.ok) {
       const detail = await reg.text().catch(() => "");
       console.error(`[preview-unlock] member ${userId} of ${team}: enrollment failed ${reg.status}: ${detail}`);
       return NextResponse.json({ ok: false, error: unlockError(reg.status, "enroll") }, { status: 502 });
     }
-    const r = await fetch(`${ADMIN}/v1/zkauth/preview-proof`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ user_id: userId, project, host }),
-    });
+    const r = await nodeFetch("/v1/zkauth/preview-proof", { method: "POST", headers, body: JSON.stringify({ user_id: userId, project, host }) });
     if (!r.ok) {
       const detail = await r.text().catch(() => "");
       console.error(`[preview-unlock] member ${userId} of ${team}: proof mint failed ${r.status}: ${detail}`);
       return NextResponse.json({ ok: false, error: unlockError(r.status, "mint") }, { status: 502 });
     }
     const d = await r.json();
-    const scheme = host.includes("localhost") ? "http" : "https";
+    const scheme = isLocalhostHost(host) ? "http" : "https";
     const url = `${scheme}://${host}/_shadw/zk?p=${encodeURIComponent(d.proof)}&m=${encodeURIComponent(d.message)}&t=${encodeURIComponent(d.team)}&next=${encodeURIComponent(next)}`;
     const proof: string = d.proof || "";
     return NextResponse.json({
@@ -146,7 +177,7 @@ export async function GET(req: NextRequest) {
       fingerprint: proof.slice(0, 16),
       nullifier: (d.message || "").toString().slice(0, 12),
     });
-  } catch (e) {
+  } catch {
     return NextResponse.json({ ok: false, error: "unlock failed" }, { status: 502 });
   }
 }

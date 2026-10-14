@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-10-13 — the preview unlock route authorizes only from the node's answer and fails closed
+
+`GET /api/preview-unlock` (the dashboard half of the protected-preview unlock: Clerk says
+the signed-in user belongs to the deployment's team, then the route enrolls them on the
+node and mints the membership proof) fell back to the client-supplied `?team=` whenever
+the node's `project-team` lookup threw, answered non-OK (other than 403), answered no
+team or `__untagged__`, or returned a body that did not parse; the membership check then
+ran against the caller's OWN org, and the node's `/_shadw/zk` verifies a proof against
+whichever team ring `t` names without tying it to the project's owner, so that proof
+unlocked any project name. The legacy `personal` check let everyone in when
+`HIVE_OWNER_EMAIL` was unset and when the Clerk lookup threw, and the proof URL used
+plain `http` for any host merely containing `localhost`. Found while reading the call
+chain: `isKnownDeploymentHost` did a suffix test on the raw string, so `host=evil.example/
+x.localhost` and `evil.example#.localhost` passed and the route minted a proof for the
+signed-in member and handed it to an arbitrary origin, and `next` reached the node
+unfiltered (which accepts `/\evil.example`). Now the team is ONLY the node's answer (an
+unanswerable lookup is a retryable 503, a non-OK one a 502, 403 keeps its 502, an empty or
+untagged answer is the legacy `personal` namespace), the personal and org checks share a
+`granted | denied | unavailable` result so a Clerk failure is a retryable 503 instead of a
+verdict, no configured owner is permissive only outside `NODE_ENV=production`, the scheme
+is `http` only for `localhost` and `*.localhost`, the host must be a bare hostname, `next`
+goes through `sameOriginPath`, and node calls have a 10 s timeout. Witnessed by running
+the real route handler against a throwaway auth-enforced node (`HIVE_INTERNAL_TOKEN` set)
+with Clerk replaced by an identity stub and a fault-injecting proxy in front of ONLY
+`project-team`: a member of `attacker-org` asking for `?team=attacker-org&project=
+victimproj` was ACCEPTED before for a 500, a 404, a dropped connection, an empty team and
+an untagged project, and that proof verified on the node's gateway for victimproj's host
+(`302` plus a `shadw_zk` cookie); after, those five are 503, 502, 503, 403 and 403 and no
+proof is minted. An owner and a real team member still unlock, development without an
+owner still lets anyone in, production without one now refuses, a throwing Clerk lookup
+is 503 (it was accepted), `evil-localhost.shadw.app` gets https (it got http) and the
+smuggled hosts are 400. Not rolled. Still open in hive-cloud: `zkauth::bootstrap` accepts
+a proof from any team ring for any project, so the dashboard route is the only place the
+project's owning team is enforced.
+
 ## 2026-10-13 — the GitHub OAuth return path can no longer leave the site
 
 The connect route (`app/api/github/connect/route.ts`), `verifyState` (`lib/github-app.ts`)
