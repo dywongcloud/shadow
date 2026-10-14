@@ -15528,6 +15528,12 @@ fn resolve_identity_sync(
 /// Members are added if absent only (`TeamStore::add_member_if_absent`, the one primitive every
 /// directory sync uses: `add_member` overwrites an existing member's role, and a manually granted
 /// Owner/Admin must never be demoted by a routine sync).
+///
+/// The mirror's EMAIL feeds authorization (`team_create` takes the new team's owner from it,
+/// `caller_administers` takes the caller's roster identity from it), so only the dashboard SERVER
+/// writes it: its sync carries `x-hive-internal` and the Clerk-verified email. A browser-originated
+/// sync (the topnav's own `/cloud/v1/identity/sync`) carries a body the caller wrote: it still
+/// records the user, and answers `is_owner`, but never sets or changes an email.
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15588,9 +15594,14 @@ async fn identity_sync(
             c.teams.add_member_if_absent(slug, email, role);
         }
     }
+    let verified_email = if mint_allowed(&headers) {
+        req.user.email.as_str()
+    } else {
+        ""
+    };
     c.identity.upsert_user(
         &req.user.id,
-        &req.user.email,
+        verified_email,
         &req.user.name,
         &req.user.image_url,
         &tenant,
