@@ -1,6 +1,6 @@
-//! The tenant's project inventory: every `ProjectSettings` row it owns, with deployment counts and
-//! the newest build outcome — a project whose first build failed has a row and no deployment, and
-//! is listed here instead of hiding behind the deployment list.
+//! The tenant's project inventory: every `ProjectSettings` row it owns with deployment counts and
+//! the newest build outcome, so a project whose first build failed (a row, no deployment) is listed
+//! too.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

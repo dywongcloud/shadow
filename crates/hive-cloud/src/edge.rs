@@ -1,7 +1,6 @@
-//! The edge request pipeline, mirroring Vercel's CDN layering:
-//! **routing (redirects/rewrites) -> firewall (WAF + bots) -> concurrency
-//! admission -> CDN cache (HIT/STALE/MISS w/ SWR) -> compute (route)**.
-//! Adds `x-hive-region` and `x-hive-cache`, and records events for the dashboard.
+//! The edge request pipeline, mirroring Vercel's CDN layering: routing -> firewall (WAF + bots) ->
+//! concurrency admission -> CDN cache (HIT/STALE/MISS with SWR) -> compute. Adds `x-hive-region`
+//! and `x-hive-cache` and records dashboard events.
 
 use std::sync::Arc;
 
@@ -66,19 +65,32 @@ pub async fn edge_pipeline(
     resp
 }
 
+/// Platform liveness on the PUBLIC listener: a probe with a Host the platform does not admit (an IP
+/// literal, a bare infrastructure name) would 404 once per probe as `host-rejected` and swamp the
+/// log, and `/healthz` is no tenant route, so it is served here. The guard is the host gate's own
+/// predicate, so an admitted Host keeps its pipeline, and nothing tenant-owned is reachable through
+/// it.
+fn is_unadmitted_host_liveness_probe(
+    cloud: &Arc<CloudState>,
+    method: &str,
+    path: &str,
+    host: &str,
+) -> bool {
+    path == "/healthz"
+        && (method == "GET" || method == "HEAD")
+        && !host.is_empty()
+        && !cloud.host_allowed(host)
+}
+
 /// The edge request pipeline. Invariants: the client IP is the real TCP peer, NEVER
-/// `x-forwarded-for` (no proxy fronts any fleet node, so XFF is attacker-controlled and would let a
-/// client spoof the rate limiter and the enterprise IP block); ACME HTTP-01 answers run before
-/// every other gate (an unattached host is exactly a domain being validated) and a miss proxies to
-/// the leader; account-level IP blocking is enforced at the ENTRY node before any mesh proxying; a
-/// container deployment is served ONLY by its placement lease owner (no split-brain), addressed
-/// from the gossip registry; a local record that cannot serve (a dead `Building...` placeholder) or
-/// is stale (a leftover preview while a peer holds the promoted production deployment) must not win
-/// the host over a healthy peer route; a request is retried on another candidate only when safe
-/// (idempotent method or idempotency key, replayable body, no response started) and a failed unsafe
-/// request is never re-executed on another peer; a renamed-away project name is RESERVED forever,
-/// so its permanent redirect is safe and consulted only on the already-failing path; Next.js RSC
-/// requests bypass the CDN cache, which keys on host+path only.
+/// `x-forwarded-for` (no proxy fronts a fleet node, so XFF is attacker-controlled); ACME HTTP-01
+/// answers run before every other gate; account-level IP blocking happens at the ENTRY node before
+/// any mesh proxying; a container deployment is served ONLY by its placement lease owner; a local
+/// record that cannot serve or is stale never wins the host over a healthy peer route; a request is
+/// retried on another candidate only when safe (idempotent method or key, replayable body, no
+/// response started); a renamed-away project name is RESERVED forever, so its permanent redirect is
+/// consulted only on the already-failing path; Next.js RSC requests bypass the CDN cache, which
+/// keys on host+path only.
 async fn edge_pipeline_inner(
     State(cloud): State<Arc<CloudState>>,
     peer: std::net::SocketAddr,
@@ -167,18 +179,16 @@ async fn edge_pipeline_inner(
         let hp = host.split(':').next().unwrap_or(&host).to_ascii_lowercase();
         if hp == cloud.db_domain || hp.ends_with(&format!(".{}", cloud.db_domain)) {
             let status_host = hp.clone();
-            /// Dedicated db-tier limiter, NOT the shared browsing-tier `cloud.ratelimit` (100/10
-            /// s): a WDK app's world-redis dispatcher polls its database every 50 ms (200 req/10
-            /// s), which exhausted the shared budget for that IP and 429ed the platform's own
-            /// workflow-world reads from the same host. Keyed per (IP, DB host), not per IP alone:
-            /// every microVM cell on a node NATs out through the node's public IP, so one chatty
-            /// app's queue drain would eat the budget of every OTHER database reached from that
-            /// node. 5000/10 s per (IP, db) rides out a journal-replay drain while shedding real
-            /// floods; the body is JSON so Upstash-compatible clients surface a clean error.
+            /// Dedicated db-tier limiter keyed per (IP, DB host), NOT the shared `cloud.ratelimit`:
+            /// every microVM cell on a node NATs out through its public IP, so a shared or per-IP
+            /// budget would let one chatty app starve the platform's own reads and every OTHER
+            /// database reached from that node.
             fn db_rest_rate_limiter() -> &'static hive_edge::RateLimiter {
+                const LIMIT_PER_WINDOW: u32 = 5000;
+                const WINDOW_MS: u64 = 10_000;
                 static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> =
                     std::sync::OnceLock::new();
-                LIMITER.get_or_init(|| hive_edge::RateLimiter::new(5000, 10_000))
+                LIMITER.get_or_init(|| hive_edge::RateLimiter::new(LIMIT_PER_WINDOW, WINDOW_MS))
             }
             let rl_key = format!("{ip}|{hp}");
             if !db_rest_rate_limiter().check(&rl_key, hive_core::now_ms()) {
@@ -300,23 +310,7 @@ async fn edge_pipeline_inner(
         return crate::zkauth::bootstrap(&cloud, &host, &query);
     }
 
-    // Platform liveness on the PUBLIC listener. A daemon or load-balancer probe reaching this port
-    // with a Host the platform does not admit — an IP literal (`127.0.0.1:8787`) or a bare
-    // infrastructure name — is exactly the request that falls into the `host-rejected` branch
-    // below, so it 404s once per probe and swamps the request log. `/healthz` is not a tenant
-    // route anywhere in the tree (the public router is a bare fallback), so no admission-rule
-    // change could ever make it answer: it has to be served here.
-    //
-    // Safe by construction, and unchanged for everything else: the guard is the host gate's own
-    // predicate, so a Host the platform DOES admit keeps its existing pipeline byte-for-byte; the
-    // body is the constant "ok"; no host-derived lookup runs, no deployment is reached, and the
-    // preview gate further down is never consulted — so nothing tenant-owned, no deployment
-    // content and no preview decision is reachable through it.
-    if path == "/healthz"
-        && (method == "GET" || method == "HEAD")
-        && !host.is_empty()
-        && !cloud.host_allowed(&host)
-    {
+    if is_unadmitted_host_liveness_probe(&cloud, &method, &path, &host) {
         let ev = cloud.event(&region, &method, &host, &path, 200, "health", &host);
         cloud.record(ev);
         return (
@@ -1226,11 +1220,9 @@ fn region_code(region: &str) -> String {
     }
 }
 
-/// The ngrok ingress region code of a `*.<code>.ngrok.pizza` host (iad/sin/sfo/lax), or None for
-/// the legacy zone, localhost or any non-region host: used to detect a region-MISMATCHED request so
-/// a browser navigation can be redirected to the app's home region (307, only when the home code
-/// differs, so it never loops). Distinct from the vanity `region_code` (`iad1`/`sfo1`, for error
-/// ids): these no-digit codes are the reserved ngrok wildcards.
+/// The ngrok ingress region code of a `*.<code>.ngrok.pizza` host (iad/sin/sfo/lax), `None` for the
+/// legacy zone, localhost or any non-region host: detects a region-MISMATCHED request so a browser
+/// navigation is redirected (307) to the app's home region. Not the vanity `region_code` (`iad1`).
 fn host_region_code(host: &str) -> Option<&'static str> {
     let h = host.split(':').next().unwrap_or(host);
     let stem = h.strip_suffix(".ngrok.pizza")?;
@@ -1315,12 +1307,10 @@ struct KnownLabel {
     detail: String,
 }
 
-/// Does ANY deployment record in the fleet (local or gossiped) claim this host label, or does a
-/// project by that name exist? `None` is a label nothing has heard of (the real
-/// DEPLOYMENT_NOT_FOUND); `Some` means the label is known but unserved here, a different problem
-/// with a different fix. Ready records are reported too: a Ready deployment we could not route to
-/// is a routing/gossip gap, and "not found" for it has misdirected debugging. The visitor-facing
-/// text never names the hosting node (internal topology); the event detail keeps it.
+/// Does ANY deployment record in the fleet (local or gossiped) or a project claim this host label?
+/// `None` is unknown (the real DEPLOYMENT_NOT_FOUND); `Some` is known but unserved here (even a
+/// Ready record we could not route to), a routing/gossip gap. The visitor-facing text never names
+/// the hosting node; the event detail keeps it.
 fn known_label_status(cloud: &Arc<CloudState>, sub: &str) -> Option<KnownLabel> {
     let label_hit = |d: &fluid_core::DeploymentInfo| {
         d.project == sub
@@ -1404,8 +1394,7 @@ fn known_label_status(cloud: &Arc<CloudState>, sub: &str) -> Option<KnownLabel> 
 }
 
 /// The honest counterpart to [`deployment_not_found`]: the platform KNOWS this project and has
-/// nothing Ready to serve, so 503 (not 404): the name is real and the condition temporary, since a
-/// fixed build makes it serve with no other action.
+/// nothing Ready to serve, so 503 rather than 404 (the name is real and the condition temporary).
 fn deployment_not_ready(region: &str, known: &KnownLabel) -> Response {
     let esc = |s: &str| {
         s.replace('&', "&amp;")
@@ -1473,11 +1462,9 @@ fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: Cache
     resp
 }
 
-/// Background stale-while-revalidate refresh: re-fetches through our own gateway and updates the
-/// cache entry. Every early-return path is a FAILED revalidation in Vercel's ISR sense (network
-/// error or timeout, or a status outside the success allowlist, which `maybe_store` classifies) and
-/// must call `note_revalidation_failed`, preserving the stale entry and engaging the 30 s retry
-/// backoff instead of letting the next request re-fire another refresh at once.
+/// Background stale-while-revalidate refresh through our own gateway. Every early return is a
+/// FAILED revalidation and must call `note_revalidation_failed`, keeping the stale entry and
+/// engaging the 30 s retry backoff instead of letting the next request re-fire a refresh.
 fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: String) {
     tokio::spawn(async move {
         let url = format!("{}{}", cloud.public_base, path_q);
@@ -1584,11 +1571,10 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Resolves the dashboard origin to bounce a protected-preview browser request to: over a PUBLIC
-/// wildcard host the unlock screen stays on the public tunnel, not `localhost:3002` (every node's
-/// `HIVE_DASHBOARD_URL` is the local-dev value); prefers `HIVE_PUBLIC_DASHBOARD_URL`, else derives
-/// it from the matched deploy suffix minus a leading `deployment.` label; a local/loopback host
-/// uses `HIVE_DASHBOARD_URL`.
+/// The dashboard origin to bounce a protected-preview browser request to: over a PUBLIC wildcard
+/// host `HIVE_PUBLIC_DASHBOARD_URL`, else the matched deploy suffix minus a leading `deployment.`
+/// label (every node's `HIVE_DASHBOARD_URL` is the local-dev value); a loopback host uses
+/// `HIVE_DASHBOARD_URL`.
 fn dashboard_origin(cloud: &Arc<CloudState>, host: &str) -> Option<String> {
     derive_dashboard(
         host,
@@ -1599,10 +1585,9 @@ fn dashboard_origin(cloud: &Arc<CloudState>, host: &str) -> Option<String> {
     )
 }
 
-/// Pure core of [`dashboard_origin`] (unit-testable without a node): a public wildcard host
-/// resolves to `public_env` if set, else the deploy suffix minus a leading `deployment.` label as
-/// `https://...` (the suffix falls back to `apps_domain`, since `HIVE_DEPLOY_SUFFIXES` defaults to
-/// `localhost` only); a local/loopback host resolves to `local_env`.
+/// Pure core of [`dashboard_origin`]: public wildcard host -> `public_env`, else the deploy suffix
+/// (falling back to `apps_domain`, since `HIVE_DEPLOY_SUFFIXES` defaults to `localhost`) minus a
+/// leading `deployment.` label as `https://...`; loopback -> `local_env`.
 fn derive_dashboard(
     host: &str,
     suffixes: &[String],
@@ -1639,10 +1624,10 @@ fn derive_dashboard(
 }
 
 /// How the deployment serving a host is protected, decided ONCE per request by
-/// `protection_for_host` and shared by the gate and the CDN cache. The cache key (`host + path`)
-/// has no auth dimension, so a protected body is never stored, a refusal evicts the key
-/// (`CdnCache::invalidate`) and answers `cache-control: no-store`, and two code paths answering "is
-/// this protected?" differently would put a protected body in a cache any caller can read.
+/// `protection_for_host` and shared by the gate and the CDN cache. The cache key has no auth
+/// dimension, so a protected body is never stored and a refusal evicts the key and answers
+/// `no-store`; two paths disagreeing on "is this protected?" would put a protected body in a cache
+/// any caller can read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Protection {
     /// Not protected — production by default, or protection explicitly off.
@@ -1660,8 +1645,8 @@ struct HostProtection {
     kind: Protection,
 }
 
-/// `Protection` of the deployment serving `host`; `None` when none resolves for that host on this
-/// node. Its environment is `DeploymentInfo::target`, which `fluid_gateway::view_of` normalizes so
+/// `Protection` of the deployment serving `host`, or `None` when none resolves here. Its
+/// environment is `DeploymentInfo::target`, which `fluid_gateway::view_of` normalizes so
 /// `production` wins over a disagreeing stored `target`; an empty target is a legacy record and
 /// falls back to the `production` flag.
 fn protection_for_host(cloud: &Arc<CloudState>, host: &str) -> Option<HostProtection> {
@@ -1693,14 +1678,11 @@ fn protection_for_host(cloud: &Arc<CloudState>, host: &str) -> Option<HostProtec
     })
 }
 
-/// Gates access to protected preview deployments: `Some(401)` when the host is a
-/// team-private preview and the request carries no valid access credential, `None`
-/// to proceed. Gated by the deployment's ACTUAL environment, never the subdomain
-/// (a production deployment is never preview-protected, via its production domain
-/// or its commit/id URLs). Enterprise protection (`password` or `standard`, scope
-/// preview|all|production) is evaluated beside the legacy per-project preview
-/// toggle; a password unlocks via the sealed `hive_pw` cookie or the GET
-/// `__shadw_pw` form.
+/// Gates access to protected preview deployments: `Some(401)` for a team-private preview whose
+/// request carries no valid access credential, `None` to proceed. Gated by the deployment's ACTUAL
+/// environment, never the subdomain; enterprise protection (`password`/`standard`, scope
+/// preview|all|production) is evaluated beside the legacy per-project toggle, and a password
+/// unlocks via the sealed `hive_pw` cookie or the GET `__shadw_pw` form.
 fn preview_gate(
     cloud: &Arc<CloudState>,
     host: &str,
@@ -1835,9 +1817,9 @@ fn query_param(query: &str, key: &str) -> Option<String> {
         .find_map(|kv| kv.strip_prefix(&prefix).map(|v| percent_decode(v)))
 }
 
-/// Vercel-style deployment-password prompt: a minimal self-contained HTML page that GET-submits
-/// `__shadw_pw` back to the same path (the gate then seals a cookie and redirects); `bad` renders
-/// the incorrect-password state.
+/// Vercel-style deployment-password prompt: a self-contained page that GET-submits `__shadw_pw`
+/// back to the same path (the gate seals a cookie and redirects); `bad` shows the
+/// incorrect-password state.
 fn password_page(project: &str, path: &str, region: &str, bad: bool) -> Response {
     let err = if bad {
         "<p style=\"color:#f87171;font-size:13px;margin:0 0 12px\">Incorrect password. Try again.</p>"
@@ -1915,9 +1897,8 @@ fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
     false
 }
 
-/// O(1) single-header read straight from the request's HeaderMap, for the always-executed EARLY
-/// lookups (before any proxy consumes `req`); aggregate consumers (WAF ctx, preview gate, forward
-/// loops) use `headers_vec`, which holds the full header list.
+/// O(1) single-header read for the EARLY lookups that run before any proxy consumes `req`;
+/// aggregate consumers use `headers_vec`.
 #[inline]
 fn hget(req: &Request, name: &str) -> Option<String> {
     req.headers()
@@ -1934,12 +1915,11 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
 }
 
 /// Per-candidate iroh cooldown (`HIVE_EDGE_IROH_COOLDOWN_MS`, default 120 s, `0` disables): a
-/// forward over a peer's iroh trunk that yields no first byte (`PostSendTimeout`, 15 s) or no
-/// connection (`DeadPeerTimeout`) was followed by a working HTTP fallback and then paid again on
-/// the NEXT request, since the peer still gossips and stays healthy. While a candidate cools its
-/// HTTP gateway goes first and iroh is the fallback; once the window expires exactly ONE request
-/// claims the probe slot (re-arming the window for everyone else) and tries iroh first again, so a
-/// recovered trunk is picked up without a pile-in.
+/// forward over a peer's iroh trunk with no first byte (`PostSendTimeout`) or no connection
+/// (`DeadPeerTimeout`) that then succeeded over HTTP would pay again on the NEXT request, since the
+/// peer still gossips healthy. While a candidate cools its HTTP gateway goes first; once the window
+/// expires exactly ONE request claims the probe slot and tries iroh first, so a recovered trunk is
+/// picked up without a pile-in.
 fn iroh_cooldown() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>
 {
     static COOLING: std::sync::OnceLock<
@@ -1995,9 +1975,8 @@ fn iroh_mark_ok(node: &str) {
         .remove(node);
 }
 
-/// A gateway URL another node can actually reach: Macs and laptop dev nodes advertise their bind
-/// address (`http://0.0.0.0:8787`, `http://127.0.0.1:...`), meaningless from here and never the
-/// first choice.
+/// A gateway URL another node can reach: Macs and laptop dev nodes advertise their bind address
+/// (`http://0.0.0.0:8787`, `http://127.0.0.1:...`), never the first choice.
 fn usable_gateway(gateway: &str) -> bool {
     let g = gateway.trim();
     !g.is_empty()
@@ -2006,10 +1985,8 @@ fn usable_gateway(gateway: &str) -> bool {
             .any(|bad| g.contains(bad))
 }
 
-/// HTTP-fallback timeout for one candidate: iroh and the HTTP fallback share ONE per-candidate
-/// deadline (`HIVE_EDGE_CANDIDATE_MS`, default 30 s) instead of stacking; the fallback gets what
-/// the iroh attempt left, floored at 1 s so a candidate that burned the budget still gets one quick
-/// HTTP shot.
+/// HTTP-fallback timeout for one candidate: iroh and the fallback share ONE per-candidate deadline
+/// (`HIVE_EDGE_CANDIDATE_MS`, default 30 s), the fallback getting what iroh left, floored at 1 s.
 fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
     let total_ms = std::env::var("HIVE_EDGE_CANDIDATE_MS")
         .ok()
@@ -2022,11 +1999,10 @@ fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
         .max(std::time::Duration::from_secs(1))
 }
 
-/// Orders mesh candidates by the deployment's configured region/failover policy: no `regions` means
-/// same-region-first anycast with latency as tiebreak; `failover: true` keeps only configured
-/// regions, primary first then latency; `failover: false` restricts to the PRIMARY region only and
-/// never crosses regions (an empty result makes the caller 503 rather than route elsewhere). Only
-/// `healthy` candidates are passed in.
+/// Orders mesh candidates by the deployment's region/failover policy: no `regions` is
+/// same-region-first anycast with latency as tiebreak, `failover: true` keeps only configured
+/// regions (primary first), `failover: false` restricts to the PRIMARY region and never crosses it
+/// (an empty result makes the caller 503). Only `healthy` candidates are passed in.
 #[allow(dead_code)]
 fn order_candidates(
     raw: Vec<crate::state::PeerRoute>,
@@ -2072,19 +2048,16 @@ fn order_candidates_with_cold(
     balance_same_region(raw, &is_cold)
 }
 
-/// Load-balances across the BEST (front) region tier so same-region peers share traffic instead of
-/// every request hitting the single lowest-latency node: rotates the equal-best-region prefix by a
-/// global round-robin counter; failover tiers keep their order. Each chosen node still runs its own
-/// in-instance-concurrent pool; this only spreads the first-tried node.
+/// Load-balances across the BEST region tier: rotates the equal-best prefix by a global round-robin
+/// counter so same-region peers share traffic; failover tiers keep their order.
 fn balance_same_region(
     mut raw: Vec<crate::state::PeerRoute>,
     is_cold: &impl Fn(&str) -> bool,
 ) -> Vec<crate::state::PeerRoute> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static RR: AtomicUsize = AtomicUsize::new(0);
-    /// Co-located peers are within this latency band of each other; a much slower same-region node
-    /// falls outside it and is NOT rotated into the front (30 ms covers intra-region jitter without
-    /// spanning regions).
+    /// Co-located peers are within this latency band of each other (30 ms covers intra-region
+    /// jitter without spanning regions); a slower same-region node is not rotated into the front.
     const BAND_MS: u64 = 30;
     if raw.len() > 1 {
         let best = raw[0].region.clone();
@@ -2109,15 +2082,12 @@ fn balance_same_region(
     raw
 }
 
-/// Cross-node WebSocket proxy for every candidate OTHER than this node: opens a RAW byte stream to
-/// the owner over its iroh trunk, replays the upgrade request (the owner's local target performs
-/// the handshake), relays the owner's response head (e.g. `101`) back, then splices raw bytes both
-/// ways with HTTP framing bypassed. `open_raw` runs BEFORE the client upgrade is consumed, so a
-/// failed candidate can be retried on the next one. The caller never dials this against
-/// `cloud.node_name` itself (the owner splices to its own gateway, re-entering this same pipeline,
-/// which would re-evaluate `is_ws_upgrade`): [`local_ws_proxy`] handles the local case. Generic raw
-/// TCP/UDP has no upgrade to replay and goes through `PeerPool::open_raw_to_port` (owner side
-/// `mesh_raw::resolver`).
+/// Cross-node WebSocket proxy for every candidate OTHER than this node: opens a RAW stream to the
+/// owner over its iroh trunk, replays the upgrade request (the owner's local target performs the
+/// handshake), relays the response head back, then splices raw bytes both ways. `open_raw` runs
+/// BEFORE the client upgrade is consumed, so a failed candidate can be retried. Never dialed
+/// against `cloud.node_name` ([`local_ws_proxy`] handles it): the owner would re-enter this
+/// pipeline.
 async fn ws_proxy(
     req: &mut Request,
     pool: &hive_p2p::PeerPool,
@@ -2166,13 +2136,11 @@ async fn ws_proxy(
     Ok(resp)
 }
 
-/// LOCAL counterpart to [`ws_proxy`] when the winning candidate for a WebSocket upgrade is THIS
-/// node: leases the target function like an ordinary request (`Gateway::lease_for_path`), opens a
-/// fresh connection to the instance's tunnel listener prefixed with
-/// [`fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC`] (switching that ONE connection to a raw
-/// splice, see `serve_maybe_raw`), replays the upgrade as `ws_proxy` does and splices, avoiding a
-/// mesh self-dial. The lease rides as the spliced task's guard, so inflight accounting covers the
-/// whole WS session.
+/// LOCAL counterpart to [`ws_proxy`] when the winning candidate is THIS node: leases the target
+/// function (`Gateway::lease_for_path`), opens a fresh connection to the instance's tunnel listener
+/// prefixed with [`fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC`] (switching that ONE connection
+/// to a raw splice), replays the upgrade and splices, avoiding a mesh self-dial. The lease rides as
+/// the spliced task's guard, so inflight accounting covers the whole session.
 async fn local_ws_proxy(
     req: &mut Request,
     cloud: &Arc<CloudState>,
@@ -2227,9 +2195,8 @@ async fn local_ws_proxy(
     Ok(resp)
 }
 
-/// Reads an HTTP/1.x response head (status line and headers up to the blank line) from a raw
-/// stream; returns the status, header pairs and any bytes already read past the head (the start of
-/// the spliced body or WS frames).
+/// Reads an HTTP/1.x response head from a raw stream; returns the status, header pairs and any
+/// bytes already read past the head (the start of the spliced body or WS frames).
 async fn read_http_head<R: tokio::io::AsyncRead + Unpin>(
     r: &mut R,
 ) -> Result<(StatusCode, Vec<(String, String)>, Vec<u8>), ()> {

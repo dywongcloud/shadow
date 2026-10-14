@@ -4,6 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 const DISCOVERY_POLICY_VERSION: u16 = 1;
+/// A checked-in deployment contract or prebuilt Build Output outranks inference from package metadata.
+const SCORE_DEPLOYMENT_CONTRACT: u8 = 4;
+const SCORE_FRAMEWORK: u8 = 3;
+const SCORE_START_OR_SERVER_ENTRY: u8 = 2;
+const SCORE_STATIC_INDEX: u8 = 1;
 
 pub(crate) struct Selection {
     pub(crate) relative: PathBuf,
@@ -34,13 +39,13 @@ struct Candidate {
     score: u8,
 }
 
+/// Infer the single deployable application of a workspace checkout; `None` when an explicit root
+/// contract exists (authoritative) or there is no workspace. Cardinality-based on purpose: exactly
+/// one deployable application may be inferred, a larger set needs an explicit Root Directory.
 pub(crate) async fn select(
     root: &Path,
     workspace: Option<&crate::workspace::Workspace>,
 ) -> anyhow::Result<Option<Selection>> {
-    // Explicit root contracts are authoritative. Without one, discovery is
-    // intentionally cardinality-based: exactly one deployable application may be
-    // inferred, while any larger set requires an explicit Root Directory.
     if has_root_contract(root).await? {
         return Ok(None);
     }
@@ -156,6 +161,9 @@ pub(crate) fn is_member(
         && workspace.members.iter().any(|member| member == relative))
 }
 
+/// Workspace dependency closure to stage with the selected application: empty without a workspace,
+/// for the app root or a nested non-member (installed independently, with its own `node_modules`),
+/// and for a package-less checked-in/prebuilt deployment contract (a complete artifact).
 pub(crate) async fn runtime_include_rel(
     root: &Path,
     selected: &Path,
@@ -171,21 +179,16 @@ pub(crate) async fn runtime_include_rel(
     let Some(workspace) = workspace else {
         return Ok(Default::default());
     };
-    if selected_relative.as_os_str().is_empty()
+    let installs_independently = selected_relative.as_os_str().is_empty()
         || !workspace
             .members
             .iter()
-            .any(|member| member == selected_relative)
-    {
-        // The app root already carries its own node_modules, while a nested
-        // non-member is installed independently in its own directory.
+            .any(|member| member == selected_relative);
+    if installs_independently {
         return Ok(Default::default());
     }
 
     let Some(selected_package) = read_package(selected, selected_relative).await? else {
-        // A checked-in/prebuilt deployment contract may be a complete artifact
-        // without package metadata. It has no declared workspace dependency
-        // closure; the selected application itself is staged separately.
         return Ok(Default::default());
     };
 
@@ -527,15 +530,13 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
         return Ok(None);
     }
     let score = if !contracts.is_empty() {
-        // A checked-in deployment contract or prebuilt Build Output is stronger
-        // than inference from package metadata.
-        4
+        SCORE_DEPLOYMENT_CONTRACT
     } else if !frameworks.is_empty() {
-        3
+        SCORE_FRAMEWORK
     } else if start || server_entry.is_some() {
-        2
+        SCORE_START_OR_SERVER_ENTRY
     } else {
-        1
+        SCORE_STATIC_INDEX
     };
     let mut evidence = contracts;
     evidence.extend(

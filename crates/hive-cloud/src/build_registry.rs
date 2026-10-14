@@ -1,11 +1,8 @@
-//! Host-lane package-registry guard: when the host user's npm registry (a
-//! provider mirror answerable only by the provider's resolvers) is dark while
-//! the public registry answers, a build runs with `npm_config_userconfig`
-//! pointing at a copy of the host npmrc whose registry is the public one.
-//! The user-config layer sits BELOW a repository's own `.npmrc`, so a tenant
-//! registry wins by npm's layering with no detection, and npm 10/11, pnpm
-//! 9-12 and yarn 1 all honour it (pnpm 11+ ignores `npm_config_registry`).
-//! History: CHANGELOG 2026-10-13.
+//! Host-lane package-registry guard: when the host user's npm registry (a provider mirror) is dark
+//! while the public registry answers, a build runs with `npm_config_userconfig` pointing at a copy
+//! of the host npmrc whose registry is the public one. That layer sits BELOW a repository's own
+//! `.npmrc`, so a tenant registry still wins; npm 10/11, pnpm 9-12 and yarn 1 honour it (pnpm 11+
+//! ignores `npm_config_registry`).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -16,9 +13,9 @@ pub const GLOBAL_NPMRC: &str = "/etc/npmrc";
 pub const FALLBACK_ENV_KEY: &str = "npm_config_userconfig";
 const FALLBACK_FILE: &str = "build-registry-fallback.npmrc";
 
-/// Exact hosts that serve a copy of the PUBLIC npm registry; a registry on
-/// any other host may be private and is never replaced (dependency confusion).
-/// `HIVE_BUILD_REGISTRY_MIRRORS` (comma-separated hosts) extends the list.
+/// Exact hosts serving a copy of the PUBLIC npm registry; a registry on any other host may be
+/// private and is never replaced (dependency confusion). `HIVE_BUILD_REGISTRY_MIRRORS` extends the
+/// list.
 const PUBLIC_MIRROR_HOSTS: [&str; 10] = [
     "mirrors.tencentyun.com",
     "mirrors.tencent.com",

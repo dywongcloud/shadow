@@ -1,51 +1,27 @@
-//! Control-plane ownership: WHO is the single writer, and the fencing that keeps
-//! it single during transitions.
+//! Control-plane ownership: WHO is the single writer, and the fencing that keeps it single. Two
+//! mechanisms, never mixed (`control_plane_owner_with_source`):
 //!
-//! Two mechanisms, never mixed (`control_plane_owner_with_source`):
+//! 1. **Owner chain** (`HIVE_CP_OWNER_CHAIN`): the STRICT owner is the first entry PRESENT in
+//! `registry.nodes()`, identified and publicly addressable; the observer's own `healthy` flag is
+//! never consulted. No qualifying entry is `None`, a HOLD, never the identity election (a chain
+//! dark to this observer is a partitioned minority's view), and the
+//! `HIVE_CP_LEADER`/`HIVE_DNS_LEADER_NODE` pins are ignored.
+//! 2. **Identity election** (`billing_leader`): only when no chain is set: the lowest healthy
+//! ed25519 `peer_id`, public nodes preferred, the legacy `HIVE_CP_LEADER` pin honored.
 //!
-//! 1. **Operator-curated owner chain** (`HIVE_CP_OWNER_CHAIN`, comma-separated
-//!    node names, e.g. `fc-sanjose,fc-phoenix,fc-virginia-3`): the STRICT owner
-//!    is the FIRST entry that is PRESENT in `registry.nodes()` (its own gossip
-//!    reached this node, directly or relayed, inside the 30 s freshness window)
-//!    + cryptographically identified + publicly addressable. The observer's own
-//!    `healthy` flag is deliberately NOT consulted: gossip presence proves the
-//!    process is alive and writing, and a transport-only fault between THIS
-//!    observer and the owner must not demote it — that per-observer demotion is
-//!    what let fc-virginia elect itself (and a fallback) 121 times a day while
-//!    fc-sanjose never stopped serving. When no entry qualifies the answer is
-//!    `None` — HOLD, never the identity election: a chain that is dark to this
-//!    observer is exactly the view a partitioned minority has, and electing from
-//!    it is the split brain. `HIVE_CP_LEADER`/`HIVE_DNS_LEADER_NODE` pins are
-//!    ignored while a chain is set.
-//! 2. **Identity election** (`billing_leader`): ONLY when no chain is
-//!    configured (single-node/dev meshes). Lowest healthy ed25519 `peer_id`
-//!    wins, publicly-addressable nodes preferred; the legacy `HIVE_CP_LEADER`
-//!    single pin is honored here.
-//!
-//! Background single-writer jobs never ask this module directly: they ask
-//! `leadership::may_act`, which layers tenure, isolation and a voter quorum on
-//! top of the owner resolved here. Request-path forwarding asks
-//! `CloudState::control_plane_leader`.
-//!
-//! The [`Cluster`] instance tracks the observed owner and a monotonic **epoch**
-//! that bumps on every ownership change (promotion/failover). The epoch is
-//! gossiped fleet-wide via `NodeInfo.cp_epoch` (max-merge on ingest) and rides
-//! every forwarded admin mutation as `x-hive-cp-epoch` — a fencing token: a node
-//! whose view of ownership is stale (its epoch is behind the receiver's) gets its
-//! forwarded writes refused instead of silently applied. This reuses the pattern
-//! `lease.rs` already proves for container leases, applied to the control plane
-//! per the architecture-audit proposal (static owner + curated backup chain +
-//! epoch fencing).
-//!
-//! Placement/replication/failover of CONTAINERS stays on the dynamic HRW+lease
-//! machinery in `lease.rs`/`schedule.rs` — dynamic election is the right tool
-//! there and only there. `elect_among` is the shared, parameterized election
-//! helper for per-candidate-set votes (used by `world_queue`'s per-tenant
-//! primary), so hand-rolled reimplementations can't drift.
+//! Background jobs ask `leadership::may_act`, request-path forwarding
+//! `CloudState::control_plane_leader`. [`Cluster`] tracks the observed owner and a monotonic
+//! **epoch** (bumped on every ownership change, gossiped as `NodeInfo.cp_epoch`, max-merged) that
+//! rides forwarded admin mutations as `x-hive-cp-epoch`: a fencing token, so a node whose epoch is
+//! behind has its forwarded writes refused. `elect_among` is the shared election for
+//! per-candidate-set votes.
 
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::sync::Arc;
+
+/// Minimum spacing between two "chain has no present entry: HOLDING" warnings.
+const HOLD_WARN_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 /// Where [`Cluster::control_plane_owner_with_source`] found its answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -67,14 +43,9 @@ impl OwnerSource {
         matches!(self, OwnerSource::Chain | OwnerSource::Election)
     }
 
-    /// Whether a follower may REPLACE a whole store with `owner`'s snapshot.
-    /// Stricter than [`Self::is_authority`]: a chain owner qualifies only when
-    /// it is the chain HEAD. A backup is the strict owner only in the views of
-    /// observers that currently miss the head, and while per-node chains
-    /// differ it may not even be the owner in its OWN view (fc-virginia's
-    /// chain omits itself, so phx/va3 resolving it would adopt a stale fork
-    /// from a node that holds, not writes). Until the signed lease attests a
-    /// failover owner's store digests, only merge stores are pulled from one.
+    /// Whether a follower may REPLACE a whole store with `owner`'s snapshot: only the chain HEAD or
+    /// the identity election, since a backup owner differs per observer and would hand out a stale
+    /// fork; failover owners are merge-only.
     pub fn may_adopt_wholesale_from(self, owner: &str, chain: &[String]) -> bool {
         match self {
             OwnerSource::Election => true,
@@ -86,9 +57,8 @@ impl OwnerSource {
 
 #[derive(Clone, Serialize)]
 pub struct ClusterStatus {
-    /// Monotonic control-plane epoch: bumps on every ownership change. (Field
-    /// keeps its legacy wire name `term` for dashboard compatibility; unlike the
-    /// old decorative term, this value now fences real writes.)
+    /// Monotonic control-plane epoch, bumped on every ownership change. Keeps its legacy wire name
+    /// `term` for dashboard compatibility.
     pub term: u64,
     /// The current control-plane owner (single write authority).
     pub leader: String,
@@ -99,9 +69,8 @@ pub struct ClusterStatus {
 
 pub struct Cluster {
     me: String,
-    /// Monotonic ownership epoch. Starts at 1; bumps whenever the OBSERVED owner
-    /// changes; max-merges with epochs gossiped by peers so the whole fleet
-    /// converges on the highest epoch any node has witnessed.
+    /// Monotonic ownership epoch: starts at 1, bumps whenever the OBSERVED owner changes, and
+    /// max-merges with gossiped epochs so the fleet converges on the highest any node witnessed.
     epoch: RwLock<u64>,
     /// The owner as last observed by this node.
     owner: RwLock<String>,
@@ -116,11 +85,8 @@ impl Cluster {
         })
     }
 
-    /// Record the currently-resolved owner. Bumps the epoch iff ownership
-    /// CHANGED since the last observation (a promotion/failover event). Returns
-    /// the current epoch. Called on every resolution (gossip-round cadence via
-    /// `CloudState::control_plane_leader`), so the epoch tracks real transitions
-    /// without any extra loop.
+    /// Record the resolved owner; bumps the epoch iff ownership CHANGED since the last observation,
+    /// and returns the current epoch.
     pub fn observe_owner(&self, owner: &str) -> u64 {
         {
             let mut cur = self.owner.write();
@@ -134,9 +100,8 @@ impl Cluster {
         *self.epoch.read()
     }
 
-    /// Max-merge a peer's gossiped epoch. Keeps every node's fencing token at
-    /// the highest value witnessed anywhere, so a write forwarded with a stale
-    /// (lower) epoch is rejectable even before the local view fully converges.
+    /// Max-merge a peer's gossiped epoch, so a write forwarded with a stale (lower) epoch is
+    /// rejectable even before the local view converges.
     pub fn adopt_epoch(&self, remote: u64) {
         if remote > *self.epoch.read() {
             *self.epoch.write() = remote;
@@ -161,10 +126,8 @@ impl Cluster {
             .unwrap_or_default()
     }
 
-    /// The STRICT chain owner: the first `chain` entry present in `nodes` (the
-    /// gossip-fresh set) with a cryptographic identity and a public address.
-    /// Presence, never the observer's `healthy` flag — see the module doc.
-    /// `None` when no entry qualifies (HOLD).
+    /// The STRICT chain owner: the first `chain` entry present in `nodes` with an identity and a
+    /// public address; `None` (HOLD) when none qualifies.
     pub fn strict_chain_owner(chain: &[String], nodes: &[hive_edge::NodeInfo]) -> Option<String> {
         chain
             .iter()
@@ -187,10 +150,9 @@ impl Cluster {
                 .is_some_and(|ip| !ip.trim().is_empty())
     }
 
-    /// Resolve the control-plane owner. With a chain configured: the strict
-    /// chain owner (`pref` ignored), else `None`. Without one: the identity
-    /// election with the legacy pin. THE owner every single-writer role sits
-    /// on — see the module doc.
+    /// Resolve the control-plane owner: the strict chain owner (or `None`) with a chain, the
+    /// identity election with the legacy pin without one. THE owner every single-writer role sits
+    /// on.
     pub fn control_plane_owner(
         chain: &[String],
         pref: Option<&str>,
@@ -201,14 +163,9 @@ impl Cluster {
             .map(|(owner, _)| owner)
     }
 
-    /// [`Self::control_plane_owner`] plus WHERE the answer came from, and — only
-    /// while a chain is set and no entry is the strict owner — a best-effort
-    /// FORWARDING target: the first chain entry present in `nodes` that is not
-    /// `me` ([`OwnerSource::Fallback`]). A fallback is never an authority: it
-    /// may receive a forwarded write (which it refuses unless it really owns),
-    /// but nothing is ever adopted wholesale from it and it never makes `me`
-    /// the owner. With no chain entry present at all the answer is `None` and
-    /// the HOLD is logged at most once per 5 minutes.
+    /// [`Self::control_plane_owner`] plus its source and, while a chain is set with no strict
+    /// owner, a FORWARDING-only target ([`OwnerSource::Fallback`]): never an authority, nothing is
+    /// adopted from it and it never makes `me` the owner.
     pub fn control_plane_owner_with_source(
         chain: &[String],
         pref: Option<&str>,
@@ -226,7 +183,7 @@ impl Cluster {
             std::sync::atomic::AtomicU64::new(0);
         let now = hive_core::now_ms();
         let last = LAST_HOLD_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(last) >= 5 * 60 * 1000 {
+        if now.saturating_sub(last) >= HOLD_WARN_INTERVAL_MS {
             LAST_HOLD_WARN_MS.store(now, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 chain = ?chain,
@@ -242,33 +199,18 @@ impl Cluster {
             .map(|entry| (entry.clone(), OwnerSource::Fallback))
     }
 
-    /// Elect the BILLING coordinator from live mesh membership — web3-style: no
-    /// hardcoded privileged node. Deterministic over every node's converged view:
-    /// among HEALTHY nodes with a cryptographic iroh identity, the lowest ed25519
-    /// `peer_id` wins (identity-ordered, not name-ordered, so the election is over
-    /// unforgeable keys). Returns the winner's node NAME. Auto-failover is free:
-    /// when the leader dies, health flips within the probe interval and every
-    /// node's next evaluation converges on the next-lowest identity.
-    ///
-    /// PUBLICLY ADDRESSABLE nodes are preferred: this election also seats the
-    /// control-plane WRITE authority, and the AdminAPI ingress forwards mutations
-    /// to the leader over HTTPS pinned to the leader's PUBLIC IP — a NAT'd node
-    /// (e.g. a dev laptop that joins the mesh with a low peer_id) winning the
-    /// election 503s every forwarded write (`/v1/token` mints included, which
-    /// blanks the whole dashboard) while looking perfectly healthy in gossip.
-    /// Only when NO public candidate exists (single-node dev, all-LAN mesh) does
-    /// the election fall back to every healthy identity, preserving dev behavior.
+    /// Elect the BILLING coordinator: among HEALTHY nodes with an iroh identity the lowest
+    /// `peer_id` wins and its NAME is returned. Public nodes are preferred, because the ingress
+    /// forwards mutations to the leader's public IP and a NAT'd winner would 503 every forwarded
+    /// write; with no public candidate every healthy identity competes.
     pub fn billing_leader(nodes: &[hive_edge::NodeInfo]) -> Option<String> {
         let pref = std::env::var("HIVE_CP_LEADER").ok();
         Self::billing_leader_with_pref(pref.as_deref(), nodes)
     }
 
-    /// `billing_leader` with an explicit operator preference (no env read) — the
-    /// deterministic core. `HIVE_CP_LEADER=<node name>` pins the coordinator to a
-    /// specific node (e.g. the one nearest the operator, since mutations serialize
-    /// through it) — honored ONLY while that node is healthy and publicly
-    /// addressable, so a dead or NAT'd pin falls back to the election instead of
-    /// wedging the control plane. Must be set consistently fleet-wide.
+    /// `billing_leader` with an explicit operator preference (no env read). `HIVE_CP_LEADER=<node>`
+    /// is honored ONLY while that node is healthy and public, so a dead or NAT'd pin falls back to
+    /// the election.
     pub fn billing_leader_with_pref(
         pref: Option<&str>,
         nodes: &[hive_edge::NodeInfo],
@@ -297,13 +239,9 @@ impl Cluster {
         elect(true).or_else(|| elect(false))
     }
 
-    /// Shared, parameterized election over an explicit CANDIDATE LIST: among the
-    /// named candidates that are healthy with a cryptographic identity, lowest
-    /// `peer_id` wins; when none has an electable identity yet (e.g. iroh not
-    /// bound), deterministic name-order fallback so a primary always exists.
-    /// This is the one implementation per-candidate-set votes (per-tenant queue
-    /// primaries, etc.) must call — the audit flagged the hand-rolled duplicate
-    /// in `world_queue.rs` as a drift risk.
+    /// Election over an explicit CANDIDATE LIST: the lowest `peer_id` among healthy identified
+    /// candidates, else the first by name, so a primary always exists. Per-candidate-set votes must
+    /// call this so copies cannot drift.
     pub fn elect_among(candidates: &[String], nodes: &[hive_edge::NodeInfo]) -> Option<String> {
         if candidates.is_empty() {
             return None;

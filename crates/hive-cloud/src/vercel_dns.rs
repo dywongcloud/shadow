@@ -1,20 +1,15 @@
-//! Vercel DNS reconciler: a leader-elected loop that syncs healthy node public IPs to Vercel DNS
-//! records (plain authoritative DNS: a REST records API, no health checks, no geo steering). Every
-//! healthy public node enters both the `api` and wildcard sets; `relay.`/`discovery.` come from env
-//! IP lists; the DB gateway zone (`*.{db_domain}`) gets the wildcard + apex on every publishable
-//! node plus one specific record per live database slug, pointing at its OWNER node (a non-owner
-//! edge pays a buffered mesh forward per request); a database whose owner left the registry or
-//! advertises no address is reported as a critical incident and never repaired.
+//! Vercel DNS reconciler: a leader-elected loop syncing healthy node public IPs to Vercel DNS
+//! (plain authoritative DNS: a records API, no health checks, no geo steering) for the `api`,
+//! wildcard and apex sets, `relay.`/`discovery.` from env IP lists, and the DB gateway zone (one
+//! record per live database slug at its OWNER node; an owner that left the registry is a critical
+//! incident, never repaired).
 //!
-//! Safety properties: delta-only writes; flap damping (a node's records leave only after K=2
-//! consecutive unhealthy passes and return only after `HEALTHY_PASSES_BEFORE_REPUBLISH` healthy
-//! ones); never publish an empty set (keep last-known-good and raise an incident); NEVER DARK (a
-//! managed name never ends a pass with neither addresses nor delegation: delegation transitions are
-//! restore-on-failure transactions with VERIFIED restores, and an account-wide create block skips
-//! every delete-before-create step); exponential backoff on 429/5xx.
-//!
-//! Regional/latency steering stays in `edge.rs` (`order_candidates`) after the client reaches any
-//! node; the self-hosted Seer (`dnsserver.rs`) serves the zones delegated to it.
+//! Safety properties: delta-only writes; flap damping (`UNHEALTHY_PASSES_BEFORE_WITHDRAW` /
+//! `HEALTHY_PASSES_BEFORE_REPUBLISH`); never publish an empty set (keep last-known-good and raise
+//! an incident); NEVER DARK (no managed name ends a pass with neither addresses nor delegation:
+//! restore-on-failure transactions, and an account-wide create block skips every
+//! delete-before-create step); exponential backoff on 429/5xx. Regional steering stays in
+//! `edge.rs`; the self-hosted Seer (`dnsserver.rs`) serves the delegated zones.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,19 +17,19 @@ use std::sync::Arc;
 
 use crate::state::CloudState;
 
+/// Fewest PROVEN nameservers a delegation may be published with.
+const MIN_PROVEN_NAMESERVERS: usize = 2;
+
 /// How many consecutive unhealthy reconcile passes before a node's records are
 /// withdrawn (flap damping).
 pub const UNHEALTHY_PASSES_BEFORE_WITHDRAW: u32 = 2;
 
-/// Consecutive HEALTHY passes a withdrawn node needs before its records are republished (re-add
-/// flap damping): paired with the withdraw threshold it collapses the create/delete treadmill a
-/// flapping node drives across every managed name (sustained 429s, even briefly deleting real
-/// address records).
+/// Consecutive HEALTHY passes before a withdrawn node's records return; with the withdraw threshold
+/// it ends a flapping node's create/delete treadmill (429s, briefly deleted address records).
 pub const HEALTHY_PASSES_BEFORE_REPUBLISH: u32 = 2;
 
-/// Minimum age before an `_acme-challenge.*` TXT unknown to the in-flight challenge store may be
-/// swept as an orphan: ACME orders complete in minutes, so 15 minutes is far outside any legitimate
-/// order while still protecting a record whose placement just raced the pass's own zone listing.
+/// Minimum age before an unknown `_acme-challenge.*` TXT may be swept as an orphan: far beyond any
+/// legitimate order, and it spares a record that just raced the pass's own zone listing.
 const ACME_ORPHAN_MIN_AGE_MS: u64 = 15 * 60 * 1000;
 
 /// A DNS record as it exists at Vercel (subset we care about).
@@ -236,9 +231,8 @@ pub struct PublishNode {
     pub name: String,
     pub ip4: Option<String>,
     pub ip6: Option<String>,
-    /// This node CLAIMS to answer authoritative DNS on a public `:53` (gossiped
-    /// `NodeInfo::dns_ns`): necessary for the geo zone's NS set, never sufficient (see
-    /// `desired_geo_delegation`).
+    /// This node CLAIMS to answer authoritative DNS on a public `:53` (`NodeInfo::dns_ns`):
+    /// necessary for the geo NS set, never sufficient (see `desired_geo_delegation`).
     pub dns_ns: bool,
     /// This node's Seer also serves the platform API zone (gossiped `NodeInfo::dns_api`): required
     /// on top of `dns_ns` for the `api` label's NS set (see `desired_api_delegation`).
@@ -249,10 +243,8 @@ pub struct PublishNode {
     /// The node's region code (`san-jose`, `bangkok`, ...) from the registry, so per-region names
     /// derive from the same health-damped set as every other record.
     pub region: String,
-    /// This node's local dashboard upstream answers within budget (gossiped `NodeInfo::dashboard`,
-    /// a live measurement): gates the apex/`www` A-set so slow-SSR nodes do not degrade first
-    /// visits; below two capable nodes the gate falls back to every publishable node (see
-    /// `desired_platform`).
+    /// This node's dashboard upstream answers within budget (`NodeInfo::dashboard`): gates the
+    /// apex/`www` A-set, falling back to every publishable node below two capable nodes.
     pub dashboard: bool,
 }
 
@@ -283,8 +275,7 @@ pub fn desired_apps(nodes: &[PublishNode]) -> Vec<DesiredRecord> {
 }
 
 /// The label the geo zone hangs off inside the apps zone, from `HIVE_DEPLOY_ZONE`
-/// (`deploy.shadw.app` inside apps zone `shadw.app` gives `deploy`); `None` when the deploy zone is
-/// unset or not a child of the apps zone (nothing to delegate).
+/// (`deploy.shadw.app` in `shadw.app` gives `deploy`); `None` when unset or not a child of it.
 pub fn geo_label(deploy_zone: &str, apps_domain: &str) -> Option<String> {
     let dz = deploy_zone.trim().trim_matches('.').to_lowercase();
     let apps = apps_domain.trim().trim_matches('.').to_lowercase();
@@ -296,21 +287,16 @@ pub fn geo_label(deploy_zone: &str, apps_domain: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Stable nameserver label `ns-<node-name>`: the record set is a pure function of the registry (an
-/// index that renumbers when a node drops out would silently repoint an existing NS at a different
-/// machine).
+/// Stable nameserver label `ns-<node-name>`: the record set is a pure function of the registry,
+/// since a renumbering index would silently repoint an NS at a different machine.
 pub fn ns_label(node_name: &str) -> String {
     format!("ns-{}", node_name.trim().to_lowercase())
 }
 
-/// Delegation records for the geo zone: NS records on `<label>` pointing at per-node nameservers
-/// inside the apps zone (always fully qualified: Vercel rejects a relative NS target), plus their
-/// glue A/AAAA. Vercel DNS has no geo/health routing, so Seer can only answer names DELEGATED to
-/// it. Eligibility is proof, not configuration: `dns_ns` is a claim, `dns_validated` means peers in
-/// at least two regions got a usable authoritative answer. Below two proven nameservers this
-/// publishes NOTHING AND MANAGES NOTHING: a deliberate HOLD that leaves an already-published
-/// delegation untouched (desiring 0 or 1 would delete every NS record and blackhole the zone); the
-/// caller logs and raises an incident.
+/// Geo-zone delegation: NS records on `<label>` at per-node nameservers in the apps zone (fully
+/// qualified: Vercel rejects relative targets) plus glue. Eligibility is proof (`dns_validated`),
+/// not the `dns_ns` claim; below `MIN_PROVEN_NAMESERVERS` it publishes AND MANAGES NOTHING, a
+/// deliberate HOLD (fewer NS would blackhole the zone) that the caller logs and raises.
 pub fn desired_geo_delegation(
     nodes: &[PublishNode],
     label: &str,
@@ -347,17 +333,14 @@ pub fn desired_geo_delegation(
             managed.push(ns);
         }
     }
-    if out.iter().filter(|r| r.rtype == "NS").count() < 2 {
+    if out.iter().filter(|r| r.rtype == "NS").count() < MIN_PROVEN_NAMESERVERS {
         return (Vec::new(), Vec::new());
     }
     (out, managed)
 }
 
-/// Two-sided damping for the api-label delegation decision, with the same constants as
-/// `publishable`: engagement waits for `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive at-floor
-/// passes (a one-pass attestation blip never starts a cutover) and disengagement for
-/// `UNHEALTHY_PASSES_BEFORE_WITHDRAW` consecutive zero-declaration passes (a one-pass registry blip
-/// never plans the NS deletes).
+/// Two-sided damping of the api-label delegation (the constants of `publishable`): a one-pass blip
+/// never starts a cutover or plans NS deletes.
 #[derive(Default)]
 pub struct DelegationDamping {
     /// Consecutive passes with >=2 PROVEN api-capable nameservers.
@@ -373,24 +356,20 @@ pub enum ApiDelegation {
     /// Publish this NS set on `api` (>=2 proven api-capable nameservers,
     /// stable for `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive passes).
     Delegate(Vec<DesiredRecord>),
-    /// Change NOTHING on the `api` name this pass: a delegation is (or may be) published but the
-    /// capable set is below the floor, so the reconciler neither manages the name nor desires its
-    /// flat set (child address records would veto a later NS re-creation). Loud: the caller logs
-    /// and raises an incident.
+    /// Change NOTHING on `api` this pass: a delegation is (or may be) published but the capable set
+    /// is below the floor, so the name is neither managed nor given its flat set (child address
+    /// records would veto a later NS re-creation). The caller raises an incident.
     Hold,
     /// No delegation to protect: manage `api` and desire the flat A set (the pre-cutover behaviour,
     /// which also drives a TRUE disengagement's NS deletes through phase 0).
     Flat,
 }
 
-/// NS-only delegation of the `api` label in the PLATFORM zone to the fleet's own geo/health-aware
-/// nameservers, instead of the flat A set `desired_platform` publishes. Unlike the geo path it
-/// emits NO glue (the `ns-<node>.{apps}` targets already live in the apps zone) and also requires
-/// the gossiped `dns_api` capability (an older binary would NXDOMAIN `api.{platform}`). Eligibility
-/// is PROOF (`dns_validated`), and below the floor it HOLDS rather than disengages. `declared`
-/// comes from the UNDAMPED registry view (any node with `dns_ns && dns_api`); `delegated_now` is
-/// whether the platform zone published NS on `api` at the last successful reconcile (`None` =
-/// unobserved, which holds: a fresh leader never plans NS deletes on its first pass).
+/// NS-only delegation of the `api` label in the PLATFORM zone to the fleet's nameservers instead of
+/// the flat A set: no glue, and it also needs the gossiped `dns_api` capability. Eligibility is
+/// proof; below the floor it HOLDS. `declared` is the UNDAMPED registry view; `delegated_now` is
+/// whether NS was published at the last reconcile (`None` = unobserved, which holds: a fresh leader
+/// never plans NS deletes on its first pass).
 pub fn desired_api_delegation(
     nodes: &[PublishNode],
     apps_domain: &str,
@@ -419,7 +398,7 @@ pub fn desired_api_delegation(
             ApiDelegation::Flat
         }
     };
-    if out.len() >= 2 {
+    if out.len() >= MIN_PROVEN_NAMESERVERS {
         damping.undeclared = 0;
         damping.ready = damping.ready.saturating_add(1);
         if damping.ready >= HEALTHY_PASSES_BEFORE_REPUBLISH {
@@ -439,18 +418,16 @@ pub fn desired_api_delegation(
     below_floor(delegated_now)
 }
 
-/// True for an alias minted PER DEPLOYMENT or PER BRANCH rather than per project (`dpl-<id>`, the
-/// per-commit `<project>-<sha>`, the per-branch `<project>-git-<branch>`): these labels grow with
-/// the number of deployments, so none may occupy a record in the third-party apps zone. They
-/// resolve through its wildcard, or through the fleet-served deploy zone with real affinity; only a
+/// True for an alias minted PER DEPLOYMENT or PER BRANCH (`dpl-<id>`, `<project>-<sha>`,
+/// `<project>-git-<branch>`): these labels grow with deployments and ride the wildcard, so only a
 /// project's own PRODUCTION label is worth a record.
 pub(crate) fn is_preview_label(label: &str) -> bool {
     label.starts_with("dpl-") || label.contains("-git-") || is_commit_alias(label)
 }
 
 /// An immutable per-commit alias like `myapp-c7416ec` (`<prefix>-<6..12 hex>`; `-git-` labels are
-/// not commit aliases). A project genuinely named `foo-abc123` is misclassified, which is harmless:
-/// it only keeps the wildcard behaviour.
+/// not). A project genuinely named `foo-abc123` is misclassified, which only keeps the wildcard
+/// behaviour.
 fn is_commit_alias(label: &str) -> bool {
     if label.contains("-git-") {
         return false;
@@ -465,17 +442,11 @@ fn is_commit_alias(label: &str) -> bool {
     }
 }
 
-/// Deployment-affinity records for the APPS zone: one SPECIFIC A/AAAA per served host label
-/// pointing at the node that hosts it. The wildcard `*.{apps}` resolves to every publishable node,
-/// so a client reached the owner only 1-in-N times and otherwise paid a cross-node forward; a
-/// specific record beats the wildcard in DNS, which stays as the fallback (and TLS coverage). Only
-/// single-label names are emitted (a tenant's custom full-host key would squat labels like `api`
-/// with a record that beats the wildcard) and only a PUBLISHABLE node may be named (a specific
-/// record at an unhealthy node would leave the client no other answer).
-/// `owners` is `(label, node_name)`, first writer wins: the caller orders local READY labels, then
-/// the gossiped peer routes, then local labels held but not READY (naming a node that holds only a
-/// failed build would pin every client to the one node that cannot answer). `cap` bounds the
-/// records (Vercel rate-limits creates) and sorting keeps the surviving set stable across passes.
+/// Deployment-affinity records for the APPS zone: one SPECIFIC A/AAAA per served host label at the
+/// node that hosts it (it beats the wildcard, which stays the fallback). Only single-label names
+/// and PUBLISHABLE nodes; `owners` is `(label, node_name)`, first writer wins (local READY labels,
+/// then peer routes, then labels held but not READY); `cap` bounds the records (Vercel rate-limits
+/// creates).
 pub fn desired_apps_affinity(
     owners: &[(String, String)],
     nodes: &[PublishNode],
@@ -538,13 +509,10 @@ pub fn desired_apps_affinity(
     (out, managed)
 }
 
-/// Deterministic per-region names from the same health-damped publishable set: `<prefix><region>`
-/// resolves to every publishable node in that region (the flat `api.<platform>` and `*.<apps>` sets
-/// can name no region). Returns `(records, names)`; the names MUST join the zone's managed list or
-/// the reconciler can never diff, update or withdraw them. Region codes come from the registry
-/// (DNS-label-shaped, like `san-jose`); anything else, including an empty region, is skipped rather
-/// than published as an invalid name. A region label colliding with a deployed project's label
-/// loses to the project's affinity record.
+/// Per-region names `<prefix><region>` resolving to every publishable node in that region. Returns
+/// `(records, names)`: the names MUST join the zone's managed list or the reconciler can never diff
+/// or withdraw them. Regions that are not DNS-label-shaped are skipped; a collision with a project
+/// label loses to its affinity record.
 pub fn desired_region_names(
     nodes: &[PublishNode],
     prefix: &str,
@@ -588,12 +556,10 @@ pub fn desired_region_names(
     (out, names)
 }
 
-/// Desired records for the PLATFORM zone: `api.` (TTL 60, all publishable nodes) plus
-/// `relay.`/`discovery.` (TTL 300, from env IP lists: those services run on operator-chosen nodes,
-/// not every gateway). `api`, `admin`, `webhook` (the GitOps build-notification receiver) and `sms`
-/// share the gateway A/AAAA set; `dashboard` adds the apex and `www`; `delegate_api` withholds the
-/// api flat set (NS-delegated to Seer, or HELD below the floor: records at a zone cut are occluded
-/// and the diff would fight itself).
+/// Desired records for the PLATFORM zone: `api.` (TTL 60) plus `relay.`/`discovery.` (TTL 300, env
+/// IP lists); `api`, `admin`, `webhook`, `sms` share the gateway set, `dashboard` adds the apex and
+/// `www`, and `delegate_api` withholds the api flat set (NS-delegated or HELD: records at a zone
+/// cut are occluded and the diff would fight itself).
 pub fn desired_platform(
     nodes: &[PublishNode],
     relay_ips: &[String],
@@ -675,10 +641,9 @@ fn norm_value(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
-/// Computes the delta between what exists and what we want, touching ONLY the names this reconciler
-/// manages and ONLY A/AAAA/NS records (TXT, such as the ACME solver's `_acme-challenge`, is never
-/// ours to delete). An ALIAS squatting on a managed name (Vercel adds default ones, and an ALIAS
-/// and an A cannot coexist) is deleted only when addresses are about to be published for it. Pure.
+/// The delta between existing and wanted records, touching ONLY managed names and ONLY A/AAAA/NS (a
+/// TXT such as `_acme-challenge` is never ours to delete); an ALIAS squatting on a managed name is
+/// deleted only when addresses are about to be published for it. Pure.
 pub fn diff(
     current: &[RecordView],
     desired: &[DesiredRecord],
@@ -747,9 +712,8 @@ pub struct ReconcilerStats {
     pub last_pass_ms: AtomicU64,
     /// NS+glue records published for the delegated geo zone (0 = undelegated).
     pub geo_delegation_records: AtomicU64,
-    /// NS records published for the `api` delegation this pass (0 = not delegated, the flat A set
-    /// is published instead); read by acme.rs's delegated-zone best-effort gate, which must key on
-    /// the LIVE delegation state, never static zone config.
+    /// NS records published for the `api` delegation this pass (0 = flat A set); acme.rs's
+    /// delegated-zone gate keys on this LIVE state, never static zone config.
     pub api_delegation_records: AtomicU64,
     /// Nodes whose `dns_ns` claim is currently backed by peer proof.
     pub geo_ns_validated: AtomicU64,
@@ -762,16 +726,15 @@ pub struct ReconcilerStats {
     /// Passes that HELD the `api` label exactly as published because the proven api-capable set
     /// fell below the floor (the api counterpart of `geo_delegation_holds`).
     pub api_delegation_holds: AtomicU64,
-    /// Disengagement NS-deletes and delegation cutovers SKIPPED while the create-health circuit was
-    /// open (Vercel refusing creates account-wide while still allowing deletes): a climbing counter
-    /// means delegations are deliberately left in place rather than stranding names dark.
+    /// Disengagement NS deletes and cutovers SKIPPED while the create-health circuit was open: a
+    /// climbing counter means delegations are deliberately left in place rather than stranding
+    /// names dark.
     pub create_circuit_skips: AtomicU64,
     /// Delegation cutovers completed by the never-dark transaction (flat
     /// addresses removed AND the full NS set confirmed created, same pass).
     pub delegation_cutovers: AtomicU64,
-    /// Cutover attempts rolled back: an NS create failed after the flat addresses were removed, so
-    /// they were immediately restored (a climbing counter means a delegation is RETRYING, not
-    /// stranding).
+    /// Cutover attempts rolled back (an NS create failed after the flat addresses were removed, so
+    /// they were restored): climbing means a delegation is RETRYING, not stranding.
     pub delegation_cutover_rollbacks: AtomicU64,
     /// Orphaned `_acme-challenge.*` TXT records swept (no in-flight order).
     pub acme_orphans_swept: AtomicU64,
@@ -799,16 +762,13 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     acme_orphans_swept: AtomicU64::new(0),
 };
 
-/// Upper bound on deployment-affinity records: Vercel rate-limits record creation and the wildcard
-/// already guarantees every label resolves, so the cap degrades gracefully (labels beyond it keep
-/// the all-nodes behaviour) instead of stalling the pass. Deliberately modest: a much larger cap
-/// drew a sustained 429 storm that aborted every pass.
+/// Upper bound on deployment-affinity records (Vercel rate-limits creates and the wildcard already
+/// resolves every label). Deliberately modest: a much larger cap drew a sustained 429 storm that
+/// aborted every pass.
 const APPS_AFFINITY_CAP: usize = 60;
 
 /// Delay between record creates: Vercel rate-limits creates individually, so an unpaced burst 429s
-/// partway and the pass makes no progress. Creates are individually fault-tolerant (a failure is
-/// recorded and the loop continues, then the pass reports it so the caller backs off), so every
-/// pass lands what it can.
+/// partway and the pass makes no progress.
 const CREATE_PACING: std::time::Duration = std::time::Duration::from_millis(1100);
 
 fn env_ips(key: &str) -> Vec<String> {
@@ -853,15 +813,14 @@ pub struct PublishDamping {
     /// Consecutive-healthy streak per WITHHELD node (drives re-admission).
     healthy: HashMap<String, u32>,
     /// Nodes currently withdrawn; the ONLY way back is `HEALTHY_PASSES_BEFORE_REPUBLISH`
-    /// consecutive healthy passes (a single damped unhealthy pass must not fling the door back
-    /// open).
+    /// consecutive healthy passes.
     withheld: std::collections::HashSet<String>,
 }
 
-/// The publishable node set with two-sided flap damping: a node stays published while its
-/// consecutive-unhealthy streak is below the withdraw threshold and, once withdrawn, re-enters only
-/// after `HEALTHY_PASSES_BEFORE_REPUBLISH` healthy passes (withdrawals stay fast so a dead node
-/// drains; re-adds are damped). A node seen for the FIRST time healthy publishes immediately. Pure.
+/// The publishable node set with two-sided flap damping: withdrawal after
+/// `UNHEALTHY_PASSES_BEFORE_WITHDRAW` unhealthy passes stays fast (a dead node drains), re-entry
+/// takes `HEALTHY_PASSES_BEFORE_REPUBLISH` healthy ones; a node first seen healthy publishes at
+/// once. Pure.
 pub fn publishable(nodes: &[NodeView], damping: &mut PublishDamping) -> Vec<PublishNode> {
     let mut out = Vec::new();
     for n in nodes {
@@ -909,20 +868,17 @@ pub fn publishable(nodes: &[NodeView], damping: &mut PublishDamping) -> Vec<Publ
     out
 }
 
-/// The write plan for one pass, sequenced so neither a delegation cutover nor a disengagement can
-/// strand a name with NEITHER addresses NOR delegation (Vercel forbids NS records coexisting with
-/// any other record on a name): cutovers are restore-on-failure transactions, and a disengagement
-/// deletes NS BEFORE creating the flat addresses, with a symmetric NS restore. Both delete-first
-/// sequences are skipped while the create-health circuit is open (see `ReconcileGuards`). Pure.
+/// The write plan for one pass, sequenced so no name ends with NEITHER addresses NOR delegation
+/// (Vercel forbids NS beside other records): cutovers are restore-on-failure transactions, a
+/// disengagement deletes NS BEFORE creating flat addresses with a symmetric restore, and both are
+/// skipped while the create-health circuit is open. Pure.
 struct WritePlan {
-    /// NS deletes that must precede any address create: a TRUE disengagement only (the name has NO
-    /// desired NS). A rotation on a name that STAYS delegated is not hoisted: the replacement NS is
-    /// created before the old one is removed, so the set never dips below its target count.
+    /// NS deletes that must precede any address create: a TRUE disengagement only (no desired NS);
+    /// a rotation on a still-delegated name creates the replacement NS first.
     ns_deletes_first: Vec<String>,
-    /// Per delegated name: every record currently blocking its NS creation (the address set PLUS
-    /// any squatter: foreign NS target, CNAME, ALIAS, stray TXT; any of them 409s the NS create)
-    /// and the NS records to create, run as ONE transaction with full restore on failure. NS
-    /// records are never blockers (an RRset grows by adding members).
+    /// Per delegated name: the records blocking its NS creation (addresses plus any squatter:
+    /// foreign NS, CNAME, ALIAS, stray TXT) and the NS records to create, run as ONE transaction
+    /// with full restore on failure.
     cutovers: Vec<(String, Vec<RecordView>, Vec<DesiredRecord>)>,
     /// Everything else, in the usual creates-then-deletes order.
     creates: Vec<DesiredRecord>,
@@ -996,11 +952,9 @@ fn plan_writes(
 }
 
 /// Is this `_acme-challenge.*` TXT an orphan candidate? The replicated challenge store is the
-/// placement source of truth; a record under the 15-minute age gate, or whose age the API does not
-/// report (Vercel marks `created`/`createdAt` nullable), is KEPT: a delete is forever, so doubt
-/// means keep (failing open could sweep a live in-flight challenge after a leadership flap). The
-/// sweep runs EVERY pass, converged or not: issuance cleanup races Vercel's eventually-consistent
-/// listing, and a surviving TXT vetoes a later delegation (409 "child records exist"). Pure.
+/// source of truth; a record under the age gate or of unreported age is KEPT (a delete is forever,
+/// and failing open could sweep a live challenge after a leadership flap). The sweep runs every
+/// pass, since a surviving TXT vetoes a later delegation (409). Pure.
 fn is_orphan_candidate(in_flight: bool, created_ms: Option<u64>, now_ms: u64) -> bool {
     if in_flight {
         return false;
@@ -1015,50 +969,35 @@ fn is_orphan_candidate(in_flight: bool, created_ms: Option<u64>, now_ms: u64) ->
 /// never-dark alarm's edge trigger.
 #[derive(Default)]
 struct ReconcileGuards {
-    /// Consecutive zone-passes whose creates ALL failed (>=1 attempted, 0 succeeded); while
-    /// non-zero the circuit is OPEN (Vercel refusing creates account-wide while still allowing
-    /// deletes, as a fair-use 402 block does). Under that asymmetry any delete-before-create
-    /// sequence is unrecoverable by construction (the restore is itself a create), so an open
-    /// circuit skips those deletes outright: a stale-but-answering delegation beats a dark name.
+    /// Consecutive zone-passes whose creates ALL failed; non-zero means the circuit is OPEN (an
+    /// account-wide create block still allows deletes), so delete-before-create sequences, whose
+    /// restore is itself a create, are skipped: a stale-but-answering delegation beats a dark name.
     create_failing_passes: u32,
-    /// Whether a create has SUCCEEDED during this node's current leadership tenure. `false`
-    /// (unknown) is treated exactly like an open circuit, as `api_ns_published: None` means Hold: a
-    /// leader that has not itself proven the account accepts creates never starts a sequence whose
-    /// rollback is a create. A departing leader's counter is hearsay about an account this node has
-    /// not exercised, so the circuit needs no cross-node inheritance; the new leader re-proves on
-    /// its first pass that lands a create.
+    /// Whether a create has SUCCEEDED during this leadership tenure; `false` (unknown) is treated
+    /// like an open circuit, so a fresh leader never starts a sequence whose rollback is a create
+    /// until it has proven one. Nothing is inherited from a departing leader.
     create_proven: bool,
-    /// Delete-first steps skipped SOLELY because create health is unproven this tenure (the circuit
-    /// itself is closed); counted so an indefinite hold (a quiet zone whose only pending change IS
-    /// the delegation transition, so no create ever proves health) becomes an operator-visible
-    /// incident instead of a silently parked cutover.
+    /// Delete-first steps skipped SOLELY for unproven create health (circuit closed), counted so an
+    /// indefinite hold becomes an operator-visible incident instead of a silently parked cutover.
     proof_holds: u32,
 }
 
-/// Stale per-deployment records removed from the apps zone per pass (deletes count against the same
-/// rate-limited API as creates): `dpl-` and per-commit labels are no longer published (they ride
-/// the wildcard), so records created before that were never managed again. Any such A/AAAA name is
-/// managed with nothing desired and the ordinary diff deletes it; branch-preview (`-git-`) records
-/// are swept only once the deploy zone has a certificate, since until then previews are still
-/// minted on the apps domain.
+/// Stale per-deployment records removed from the apps zone per pass (`dpl-` and per-commit labels
+/// ride the wildcard; `-git-` records only once the deploy zone has a certificate). Deletes share
+/// the rate-limited API.
 const STALE_LABEL_SWEEP_PER_PASS: usize = 20;
 
-/// Dead-host pins removed from the apps zone per pass. A specific record BEATS the wildcard, so a
-/// production label pinned to a host that no longer exists resolves ONLY to a dead IP and its
-/// project is dark until swept. Any A/AAAA whose value is not a value we desire (nor an env
-/// relay/discovery address) belongs to a gone host; the owner is gone, so the name is unmanaged and
-/// managing it with nothing desired makes the diff delete the pin.
+/// Dead-host pins removed per pass: a specific record BEATS the wildcard, so a label pinned to a
+/// host that no longer exists resolves only to a dead IP; an A/AAAA whose value we no longer desire
+/// is managed with nothing desired and the diff deletes it.
 const DEAD_PIN_SWEEP_PER_PASS: usize = 40;
 
-/// Validity of one pass's incident observation: three passes at the backoff-extended ceiling (5
-/// min); incidents are re-asserted each pass while their condition holds and cleared on the pass
-/// that sees it gone.
+/// Validity of one pass's incident observation: three passes at the backoff ceiling (5 min).
 const INCIDENT_TTL_MS: u64 = 3 * 5 * 60 * 1000;
 
-/// Delete-first steps skipped for want of create-health proof before the hold itself is alarmed (at
-/// most one skip per zone per pass, so ~5 minutes at the default cadence): long enough that an
-/// ordinary handover never alarms, short enough that a delegation parked because nothing else needs
-/// creating reaches an operator. Nothing is dark while it holds.
+/// Delete-first steps skipped for want of create-health proof before the hold itself is alarmed (~5
+/// minutes at the default cadence): long enough that a handover never alarms, short enough that a
+/// parked delegation reaches an operator.
 const CREATE_PROOF_ALARM_HOLDS: u32 = 10;
 
 impl ReconcileGuards {
@@ -1095,9 +1034,8 @@ impl ReconcileGuards {
         }
     }
 
-    /// One delete-first step was skipped: only a skip attributable to MISSING PROOF counts here (a
-    /// skip under a genuinely open circuit is already alarmed by the account-wide create-failure
-    /// incident).
+    /// One delete-first step was skipped: only a skip for MISSING PROOF counts here (an open
+    /// circuit is already alarmed by the create-failure incident).
     fn note_skip(&mut self, cloud: &Arc<CloudState>, domain: &str) {
         if self.create_proven || self.create_failing_passes > 0 {
             return;
@@ -1124,12 +1062,10 @@ impl ReconcileGuards {
     }
 }
 
-/// The NEVER-DARK invariant alarm: a MANAGED name this pass desired A/AAAA/NS records for must end
-/// the pass with at least one published; names with nothing desired are skipped (emptying a name is
-/// a withdrawal, not an outage). Edge-triggered per name (`guards.dark_alarmed`), so a sustained
-/// block opens one incident, not one per pass. `end_count` is the pass-start listing folded with
-/// this pass's CONFIRMED writes, never a re-list (it would race Vercel's eventually-consistent
-/// listing and cry wolf).
+/// The NEVER-DARK alarm: a MANAGED name this pass desired records for must end it with at least one
+/// published (a name with nothing desired is a withdrawal, not an outage). Level-triggered through
+/// `incidents::open`/`clear`; `end_count` is the pass-start listing folded with this pass's
+/// CONFIRMED writes, never a re-list (it would race Vercel's eventually-consistent listing).
 fn alarm_dark_names(
     domain: &str,
     desired: &[DesiredRecord],
@@ -1172,15 +1108,12 @@ fn alarm_dark_names(
     }
 }
 
-/// One reconcile pass over one zone: returns the pass-start zone listing on success (the caller
-/// reads live delegation state from it) and `Err` on API failure (the caller backs off). Phase 0
-/// runs a disengagement's NS deletes (remembered per name, and restored when every flat-address
-/// create then fails), phase 1 the delegation cutovers, phase 2 the ordinary creates-then-deletes.
-/// An address delete is skipped when every address create for its own name failed this pass (a
-/// rotation whose replacement create 429s keeps the stale address: stale beats dark), and a managed
-/// name with ZERO desired addresses (a degraded registry view) keeps its address records unless an
-/// NS delegation is desired for it, since a delegated name is deliberately address-less at the
-/// parent.
+/// One reconcile pass over one zone: returns the pass-start listing (the caller reads live
+/// delegation state from it), `Err` on API failure (the caller backs off). Phase 0 runs a
+/// disengagement's NS deletes, phase 1 the cutovers, phase 2 the ordinary creates-then-deletes; an
+/// address delete is skipped when every create for its name failed (stale beats dark), and a
+/// managed name with ZERO desired addresses keeps its records unless an NS delegation is desired
+/// for it.
 async fn reconcile_zone<A: DnsApi>(
     api: &A,
     domain: &str,
@@ -1669,9 +1602,8 @@ async fn reconcile_zone<A: DnsApi>(
     Ok(current)
 }
 
-/// Node-local sidecar holding the flap memory under `persist::data_dir()`, like `dns_geo.json`:
-/// derived node-local state that must NOT ride `PlatformSnapshot`/`store_sync` or any gossip
-/// snapshot arm.
+/// Node-local sidecar for the flap memory under `persist::data_dir()`, like `dns_geo.json`: derived
+/// node-local state that must NOT ride `PlatformSnapshot`, `store_sync` or any gossip snapshot arm.
 const DAMPING_FILE: &str = "dns_damping.json";
 const DAMPING_FORMAT_VERSION: u32 = 1;
 /// Damping is a short-horizon memory, not a durable fact: a snapshot older than this describes a
@@ -1702,13 +1634,10 @@ struct DampingDisk {
     api_undeclared: u32,
 }
 
-/// The reconciler's cross-pass flap memory, made to survive a leader handover. It is a function of
-/// THIS node's own registry view (health verdicts are per-observer), so it is warmed on EVERY node
-/// that could ever act, not only the leader, and a newly elected leader inherits the streaks and
-/// `withheld` set it has been maintaining instead of a zeroed counter that lets a flapping node
-/// straight back in. Replication is deliberately NOT used (adopting a peer's streaks would publish
-/// on verdicts this node never made); the node-local, age-gated file covers a fleet-wide binary
-/// roll, which restarts every node at once and is exactly the reconvergence that flaps nodes.
+/// The reconciler's cross-pass flap memory, surviving a leader handover. It follows THIS node's own
+/// registry view (health verdicts are per-observer), so it is warmed on every node that could act;
+/// replication is deliberately NOT used (a peer's streaks would publish on verdicts this node never
+/// made), and the node-local, age-gated file covers a fleet-wide binary roll.
 struct DampingMemory {
     publish: PublishDamping,
     api: DelegationDamping,
@@ -1718,9 +1647,9 @@ struct DampingMemory {
 }
 
 impl DampingMemory {
-    /// Loads the persisted memory; EVERY failure (missing, unreadable, oversized, corrupt, wrong
-    /// version, stale) degrades to an empty memory plus a log line: a bad scratch file costs one
-    /// flap window, never a boot failure on the node that publishes the fleet's DNS.
+    /// Loads the persisted memory; EVERY failure degrades to an empty memory plus a log line: a bad
+    /// scratch file costs one flap window, never a boot failure on the node that publishes the
+    /// fleet's DNS.
     fn load() -> Self {
         let enabled = std::env::var("HIVE_DNS_DAMPING_PERSIST")
             .map(|v| v.trim() != "0")
@@ -1787,10 +1716,9 @@ impl DampingMemory {
         out
     }
 
-    /// The comparable (timestamp-free) on-disk projection of the live memory. Every streak is
-    /// CLAMPED to the threshold it feeds (reads are `>=` against K=2, so clamping is
-    /// behaviour-identical), which keeps the byte-compare write gate meaningful: a monotonically
-    /// ticking counter would otherwise rewrite the file every pass forever.
+    /// The comparable (timestamp-free) on-disk projection: every streak is CLAMPED to the threshold
+    /// it feeds, which keeps the byte-compare write gate meaningful (a ticking counter would
+    /// rewrite the file every pass).
     fn rows(&self) -> DampingDisk {
         let mut withheld: Vec<String> = self.publish.withheld.iter().cloned().collect();
         withheld.sort();
@@ -1815,9 +1743,8 @@ impl DampingMemory {
         }
     }
 
-    /// Persists when, and only when, the memory changed: atomic temp-file + fsync + rename (the
-    /// sidecar durability shape, like `persist::save` and `dns_geo`) on `spawn_blocking`, since the
-    /// write ends in an fsync that must not run on a runtime worker.
+    /// Persists when, and only when, the memory changed: atomic temp-file + fsync + rename on
+    /// `spawn_blocking`, since the write ends in an fsync that must not run on a runtime worker.
     async fn persist(&mut self) {
         if !self.enabled {
             return;
@@ -1860,11 +1787,10 @@ fn write_atomic(name: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, dir.join(name))
 }
 
-/// Names the reconciler owns in the PLATFORM zone. Every name `desired_platform` or
-/// `desired_region_names` publishes MUST be listed here, because `diff()` never considers an
-/// unmanaged name (a created record could never be updated or withdrawn, and a colliding foreign
-/// record would stay forever). `api` is UNMANAGED during a HOLD, so the diff never sees its records
-/// and cannot plan the very disengagement the hold exists to prevent.
+/// Names the reconciler owns in the PLATFORM zone: every name
+/// `desired_platform`/`desired_region_names` publishes MUST be listed, or `diff()` never updates or
+/// withdraws it. `api` is UNMANAGED during a HOLD, so the diff cannot plan the disengagement the
+/// hold exists to prevent.
 fn platform_managed_names(
     dashboard: bool,
     region_names: Vec<String>,
@@ -1886,22 +1812,14 @@ fn platform_managed_names(
 }
 
 /// The reconcile loop. It runs on EVERY node but writes only where `leadership::may_act(DnsWrite)`
-/// admits: the flap memory is warmed on every pass BEFORE the leader gate (a handover then applies
-/// the same damping, and nothing there writes to the DNS API or to STATS; the
-/// `api_delegation_records`/`geo_ns_*` gauges stay leader-only because acme.rs keys its
-/// delegated-zone behaviour off them). Enabled when a `VERCEL_API_TOKEN` is present AND
-/// (`HIVE_INGRESS != ngrok` or `HIVE_DNS_RECONCILE=1` for pre-cutover testing); cadence
-/// `HIVE_DNS_RECONCILE_SECS` (30 s), with exponential backoff (30 s * 2^n, capped at 5 min) on the
-/// writer only.
-/// A takeover is a new ownership TERM (`leadership::Verdict::term`), never a `may_act` edge (which
-/// also flips on quorum or isolation blips inside one tenure); only when the term ends do the
-/// tenure-scoped observations (the backoff and `api_ns_published`, the last observed `api`
-/// delegation) reset to unknown, so a returning leader re-proves instead of resuming and a fresh
-/// leader's first pass HOLDS. Nameserver eligibility is decided ONCE per pass from the same
-/// registry snapshot as everything else, by the function `GET /v1/dns/stats` calls. A node told to
-/// JOIN a fleet (`HIVE_BOOTSTRAP_PEERS` set) that sees only itself has not synced gossip and
-/// neither reconciles nor warms the memory (a single-self view would delete every peer's record,
-/// publish only itself and wipe the `withheld` set); a founding node is exempt.
+/// admits; the flap memory is warmed on every pass BEFORE that gate, and the
+/// `api_delegation_records`/`geo_ns_*` gauges stay leader-only. Enabled with `VERCEL_API_TOKEN` and
+/// (`HIVE_INGRESS != ngrok` or `HIVE_DNS_RECONCILE=1`); `HIVE_DNS_RECONCILE_SECS` cadence,
+/// exponential backoff capped at 5 min on the writer only. A takeover is a new ownership TERM,
+/// never a `may_act` edge: only a new term resets the tenure-scoped observations (backoff,
+/// `api_ns_published`), so a fresh leader's first pass HOLDS. A node told to JOIN a fleet
+/// (`HIVE_BOOTSTRAP_PEERS`) that sees only itself has not synced gossip and neither reconciles nor
+/// warms the memory.
 pub fn spawn_reconciler(cloud: Arc<CloudState>) {
     let forced = std::env::var("HIVE_DNS_RECONCILE")
         .map(|v| v == "1")
