@@ -24,8 +24,9 @@ pub struct Claims {
     pub sub: String,
     /// Tenant: the org/team id that scopes the token (multi-tenancy).
     pub tenant: String,
-    /// TENANT-scoped role: `owner` | `member` | `service`; never a platform-operator signal (see
-    /// `platform_admin`).
+    /// TENANT-scoped role: `owner` | `admin` | `member` | `viewer` (`apikeys::MINTABLE_ROLES`);
+    /// `service` only on a mesh delegation token ([`is_mesh_internal`]). Never a platform-operator
+    /// signal (see `platform_admin`).
     pub role: String,
     /// Expiry, unix seconds.
     pub exp: usize,
@@ -146,7 +147,8 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
 /// Resolve a bearer that is a dashboard-issued API key (`hive_…`, see `apikeys.rs`) into
 /// synthesized tenant-scoped [`Claims`], so the CLI/SDK credential clears the same mutation gates
 /// as a platform JWT. `platform_admin` is always false: a key scopes to its team, never to operator
-/// authority.
+/// authority, and its role is `apikeys::effective_role` of the stored one, so a key can never
+/// authenticate as the mesh's `service` role whatever was stored.
 pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claims> {
     if !token.starts_with("hive_") {
         return None;
@@ -156,7 +158,7 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
     Some(Claims {
         sub: format!("key:{}", k.id),
         tenant: k.team,
-        role: k.role,
+        role: crate::apikeys::effective_role(&k.role).to_string(),
         iat: now,
         exp: now + 3600,
         platform_admin: false,

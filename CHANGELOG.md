@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-13 — an API key can no longer carry the mesh's `service` role, or a role above its creator's
+
+`POST /v1/apikeys` stored the request's `role` string verbatim (`apikeys::create`) and
+`auth::api_key_claims` returned it as the claim role, while the mesh's own delegation role is
+the string `service` and three gates trusted that role alone: `GET /v1/browser/metering?
+local=true` (answered WITHOUT the operator check), `GET /v1/functions` (every tenant's function
+rows: unfiltered under `?local=true`, and the top-level re-scope is skipped for an internal
+caller) and `require_fleet_read` (`role == "service" && tenant == "mesh"`). Any tenant, a
+`member` included, could mint a key with `role: "service"` and read other tenants' metering and
+function stats, and could also mint an `owner` key from a `member` token. The role is now an
+allow-list: `apikeys::MINTABLE_ROLES` (`viewer`, `member`, `admin`, `owner`), enforced by
+`check_new_role` in `apikey_create` (400 for anything else, 403 for a role above the caller's
+own; a platform operator and an unauthenticated dev-mode caller are unbounded), and
+`api_key_claims` authenticates a stored key through `apikeys::effective_role`, which maps any
+stored role outside the list to `member`, so a `service` key persisted before this change keeps
+working as an ordinary member key and never as the mesh. Every mesh-delegation gate now asks one
+predicate, `auth::is_mesh_internal` (subject `mesh-internal` AND role `service`; an API key's
+subject is `key:<id>`), including the three that read the role alone. Witnessed on a throwaway
+auth-enforced node: before, tenant `ta`'s `member` token minted a `service` key (200), that key
+read operator-only `/v1/browser/metering?local=true` (200), a `service` key injected into
+`state.json` (the pre-fix persisted shape) authenticated as `service` and read it too, and a
+`member` minted an `owner` key; after, the mint is 400 `role must be one of viewer, member,
+admin, owner`, the persisted key authenticates as `member` and is refused metering (403), and the
+`member` to `owner` mint is 403, while owner and member mints of every allowed role, the real
+mesh-internal `?local=true` aggregation (200) and an ordinary tenant JWT's 403 on operator
+metering are unchanged (14 of 14). The `/v1/functions` half has no local witness: a function row
+needs a live function cell and the macOS node has no Firecracker, so it rests on the metering
+differential and the shared predicate. Operator note: nothing to migrate; callers that minted
+`service` keys now receive 400 and existing ones act as `member`. Not rolled.
+
 ## 2026-10-13 — webhooks are scoped to their team: no cross-tenant read, registration or event delivery
 
 `WebhookStore` filtered nothing by owner. `GET /v1/projects/:project/webhooks` (ownership

@@ -2459,7 +2459,7 @@ fn clear_internal_orchestration_fields(req: &mut fluid_core::GitDeployRequest) {
 }
 
 fn mesh_deploy_authority(claims: Option<&crate::auth::Claims>) -> bool {
-    claims.is_some_and(|claims| claims.sub == "mesh-internal" && claims.role == "service")
+    claims.is_some_and(crate::auth::is_mesh_internal)
 }
 
 pub(crate) async fn git_deploy(
@@ -3526,7 +3526,7 @@ pub(crate) fn require_fleet_read(
     if !crate::auth::enforced() {
         return Ok(());
     }
-    if matches!(claims, Some(cl) if cl.platform_admin || (cl.role == "service" && cl.tenant == "mesh"))
+    if matches!(claims, Some(cl) if cl.platform_admin || (crate::auth::is_mesh_internal(cl) && cl.tenant == "mesh"))
     {
         return Ok(());
     }
@@ -5013,7 +5013,7 @@ fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>)
 }
 
 fn delete_forward_is_internal(headers: &HeaderMap, claims: Option<&crate::auth::Claims>) -> bool {
-    let service_claim = claims.is_some_and(|cl| cl.sub == "mesh-internal" && cl.role == "service");
+    let service_claim = claims.is_some_and(crate::auth::is_mesh_internal);
     let shared_secret = std::env::var("HIVE_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
@@ -8197,8 +8197,7 @@ pub async fn functions(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let internal = claims
         .as_ref()
-        .map(|e| e.0.role == "service")
-        .unwrap_or(false);
+        .is_some_and(|e| crate::auth::is_mesh_internal(&e.0));
     let mut list: Vec<Value> = c
         .fluid
         .stats()
@@ -11628,19 +11627,39 @@ async fn apikeys_list(
         .collect::<Vec<_>>()))
 }
 
+/// Mints a team-scoped API key. Its role must be one a tenant may carry
+/// (`apikeys::MINTABLE_ROLES`, never the mesh's `service`) and no higher than the caller's own
+/// (`apikeys::check_new_role`): a role string is stored data, and fleet-internal gates read it.
 async fn apikey_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateApiKey>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let creator = claims
+        .as_ref()
+        .map(|e| (e.0.role.as_str(), e.0.platform_admin));
+    let role =
+        crate::apikeys::check_new_role(&b.role, creator).map_err(|refusal| match refusal {
+            crate::apikeys::RoleRefusal::NotMintable => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "role must be one of {}",
+                    crate::apikeys::MINTABLE_ROLES.join(", ")
+                ),
+            ),
+            crate::apikeys::RoleRefusal::AboveCreator => (
+                StatusCode::FORBIDDEN,
+                "a key cannot carry a higher role than its creator".into(),
+            ),
+        })?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let (key, token) = c.apikeys.create(&b.name, &t, &b.role);
+    let (key, token) = c.apikeys.create(&b.name, &t, role);
     crate::persist::persist(&c);
     // The plaintext token is returned exactly once.
     let mut v = key.public();
     v["token"] = json!(token);
-    Json(v)
+    Ok(Json(v))
 }
 
 async fn apikey_revoke(

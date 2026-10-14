@@ -198,8 +198,7 @@ fn require_internal_hop(
         }
     }
     if let Some(cl) = claims.as_ref().map(|e| &e.0) {
-        if cl.role == "service"
-            && cl.sub == "mesh-internal"
+        if crate::auth::is_mesh_internal(cl)
             && crate::admin::norm(&cl.tenant) == crate::admin::norm(tenant)
         {
             return Ok(());

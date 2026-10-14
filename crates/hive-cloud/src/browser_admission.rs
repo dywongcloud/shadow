@@ -2433,7 +2433,7 @@ async fn accept_admission(
     Path(endpoint_id): Path<String>,
 ) -> ApiResult {
     let claims = claims_required(claims)?;
-    if !claims.platform_admin && !(claims.sub == "mesh-internal" && claims.role == "service") {
+    if !claims.platform_admin && !crate::auth::is_mesh_internal(&claims) {
         return Err((
             StatusCode::FORBIDDEN,
             "browser admission acceptance is mesh-internal".into(),

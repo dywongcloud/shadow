@@ -25,6 +25,62 @@ fn rand_token() -> String {
     )
 }
 
+/// Roles a tenant may give a key it mints, weakest first. `service` is the mesh's own delegation
+/// role (`auth::MESH_SERVICE_ROLE`) and is never mintable: a role string is data a tenant stores,
+/// and several fleet-internal gates read it.
+pub const MINTABLE_ROLES: &[&str] = &["viewer", "member", "admin", "owner"];
+
+fn rank(role: &str) -> Option<usize> {
+    MINTABLE_ROLES.iter().position(|r| *r == role)
+}
+
+/// The role a stored key authenticates as. A stored role outside [`MINTABLE_ROLES`] (a key minted
+/// with `service` before the allow-list existed) authenticates as `member`, the default, so no
+/// persisted key can ever carry a role reserved for the mesh.
+pub fn effective_role(stored: &str) -> &str {
+    if rank(stored).is_some() {
+        stored
+    } else {
+        "member"
+    }
+}
+
+/// Why a requested key role was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RoleRefusal {
+    /// Not one of [`MINTABLE_ROLES`].
+    NotMintable,
+    /// Above the creator's own role: a key never carries more authority than its minter.
+    AboveCreator,
+}
+
+/// Validates the role of a key about to be minted: empty means `member`, anything else must be in
+/// [`MINTABLE_ROLES`] and no higher than the creator's own role. `creator` is `(claim role,
+/// platform_admin)`; `None` is an unauthenticated dev-mode caller, who is unbounded (a platform
+/// operator ranks as owner, and a role outside the list, such as the mesh's own, ranks lowest).
+pub fn check_new_role(
+    requested: &str,
+    creator: Option<(&str, bool)>,
+) -> Result<&'static str, RoleRefusal> {
+    let requested = if requested.is_empty() {
+        "member"
+    } else {
+        requested
+    };
+    let Some(wanted) = rank(requested) else {
+        return Err(RoleRefusal::NotMintable);
+    };
+    let ceiling = match creator {
+        None => MINTABLE_ROLES.len() - 1,
+        Some((_, true)) => MINTABLE_ROLES.len() - 1,
+        Some((role, false)) => rank(role).unwrap_or(0),
+    };
+    if wanted > ceiling {
+        return Err(RoleRefusal::AboveCreator);
+    }
+    Ok(MINTABLE_ROLES[wanted])
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApiKey {
     pub id: String,
@@ -87,11 +143,7 @@ impl ApiKeyStore {
             } else {
                 team.to_string()
             },
-            role: if role.is_empty() {
-                "member".into()
-            } else {
-                role.to_string()
-            },
+            role: effective_role(if role.is_empty() { "member" } else { role }).to_string(),
             created_ms: now_ms(),
             last_used_ms: 0,
         };

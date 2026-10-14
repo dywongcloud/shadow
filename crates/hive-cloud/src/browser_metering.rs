@@ -212,12 +212,13 @@ pub fn routes() -> Router<Arc<CloudState>> {
 }
 
 /// `GET /v1/browser/metering`: operator-only, the fleet view by default and `?local=true` for one
-/// node's slice. A verified claim with role `service` asking for its own local slice is the
-/// internal aggregation path (the `/v1/functions?local=true` precedent) and is answered WITHOUT the
-/// operator check, because the calling node already enforced operator on the outer request. The
-/// fleet view merges this node's counters with every healthy peer's local slice (the
-/// `fleet_function_stats` fan-out shape): an unreachable or pre-upgrade peer is silently absent,
-/// never failing the whole read, and `peers_answered` counts the ones that answered.
+/// node's slice. A mesh delegation (`auth::is_mesh_internal`: subject AND `service` role, never a
+/// tenant's key) asking for its own local slice is the internal aggregation path (the
+/// `/v1/functions?local=true` precedent) and is answered WITHOUT the operator check, because the
+/// calling node already enforced operator on the outer request. The fleet view merges this node's
+/// counters with every healthy peer's local slice (the `fleet_function_stats` fan-out shape): an
+/// unreachable or pre-upgrade peer is silently absent, never failing the whole read, and
+/// `peers_answered` counts the ones that answered.
 async fn browser_metering(
     State(cloud): State<Arc<CloudState>>,
     claims: Claims,
@@ -225,8 +226,7 @@ async fn browser_metering(
 ) -> ApiResult {
     let internal = claims
         .as_ref()
-        .map(|extension| extension.0.role == "service")
-        .unwrap_or(false);
+        .is_some_and(|extension| crate::auth::is_mesh_internal(&extension.0));
     if query.local == Some(true) && internal {
         return Ok(Json(local_view(&cloud)));
     }
