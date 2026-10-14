@@ -15405,8 +15405,9 @@ fn resolve_identity_sync(
 /// Some when the caller's verified JWT tenant equals the claimed org, and the mirror is gated on
 /// `x-hive-internal` so the email is exactly the Clerk-verified one the server-side mint route
 /// posts: a browser-originated sync cannot write an arbitrary body email into its org's roster.
-/// Members are added if absent only (`add_member` overwrites an existing member's role, and a
-/// manually granted Owner/Admin must never be demoted by a routine sync).
+/// Members are added if absent only (`TeamStore::add_member_if_absent`, the one primitive every
+/// directory sync uses: `add_member` overwrites an existing member's role, and a manually granted
+/// Owner/Admin must never be demoted by a routine sync).
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15453,19 +15454,12 @@ async fn identity_sync(
                     .unwrap_or(slug.as_str());
                 let _ = c.teams.create_with_slug(slug, name, "pro", &c.owner_email);
             }
-            let already = c
-                .teams
-                .get(slug)
-                .map(|t| t.member(email).is_some())
-                .unwrap_or(false);
-            if !already {
-                let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
-                    crate::teams::Role::Admin
-                } else {
-                    crate::teams::Role::Member
-                };
-                c.teams.add_member(slug, email, role);
-            }
+            let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
+                crate::teams::Role::Admin
+            } else {
+                crate::teams::Role::Member
+            };
+            c.teams.add_member_if_absent(slug, email, role);
         }
     }
     c.identity.upsert_user(

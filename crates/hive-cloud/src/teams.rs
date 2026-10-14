@@ -34,6 +34,17 @@ impl Role {
     }
 }
 
+/// What [`TeamStore::remove_plain_member`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRemoval {
+    /// A Member or Viewer was removed.
+    Removed,
+    /// Nobody by that email is on the roster.
+    Absent,
+    /// The email is an Owner or Admin: nothing was changed.
+    Privileged,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub email: String,
@@ -465,6 +476,57 @@ impl TeamStore {
             team.updated_ms = next_version(team.updated_ms, tombstone);
         }
         Some(team.clone())
+    }
+
+    /// Adds `email` as `role` ONLY when nobody on the roster has it (case-insensitive), under one
+    /// lock, and returns the team plus whether a member was added. An existing member keeps its role.
+    /// [`Self::add_member`] OVERWRITES an existing member's role: right for an owner's explicit role
+    /// change, wrong for a routine sync. Everything that mirrors an external directory into the
+    /// roster (SCIM provisioning, SAML auto-provision, the Clerk org mirror in `identity_sync`) adds
+    /// through this, so a directory entry can never demote an owner or admin or promote a viewer.
+    pub fn add_member_if_absent(
+        &self,
+        slug: &str,
+        email: &str,
+        role: Role,
+    ) -> Option<(Team, bool)> {
+        let mut state = self.state.write();
+        let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
+        let team = state.teams.get_mut(slug)?;
+        if team.member(email).is_some() {
+            return Some((team.clone(), false));
+        }
+        team.members.push(Member {
+            email: email.to_string(),
+            role,
+            name: String::new(),
+            added_ms: now_ms(),
+        });
+        team.synthetic_seed = false;
+        team.updated_ms = next_version(team.updated_ms, tombstone);
+        Some((team.clone(), true))
+    }
+
+    /// Removes `email` ONLY when it is a plain member (Member or Viewer), under one lock. An Owner or
+    /// Admin is left in place ([`MemberRemoval::Privileged`]): a directory deprovisioning (SCIM
+    /// PATCH/DELETE) must never strip the people who run the team, that takes a person
+    /// (`team_remove_member`). `None` when the team does not exist.
+    pub fn remove_plain_member(&self, slug: &str, email: &str) -> Option<MemberRemoval> {
+        let mut state = self.state.write();
+        let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
+        let team = state.teams.get_mut(slug)?;
+        let Some(member) = team.member(email) else {
+            return Some(MemberRemoval::Absent);
+        };
+        if member.role.rank() >= Role::Admin.rank() {
+            return Some(MemberRemoval::Privileged);
+        }
+        let email_lower = email.to_lowercase();
+        team.members
+            .retain(|member| member.email.to_lowercase() != email_lower);
+        team.synthetic_seed = false;
+        team.updated_ms = next_version(team.updated_ms, tombstone);
+        Some(MemberRemoval::Removed)
     }
 
     pub fn remove_member(&self, slug: &str, email: &str) -> Option<Team> {

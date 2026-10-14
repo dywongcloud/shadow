@@ -29,7 +29,7 @@ use crate::enterprise::{
     ConformancePolicy, ConformanceReport, ConformanceResult, MfeChild, MfeGroup, SamlConfig, RULES,
 };
 use crate::state::CloudState;
-use crate::teams::Role;
+use crate::teams::{MemberRemoval, Role};
 use hive_core::now_ms;
 
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
@@ -381,8 +381,11 @@ async fn saml_acs(
     let Some(email) = decode_saml_nameid(&form.saml_response) else {
         return (StatusCode::BAD_REQUEST, "could not parse SAML assertion").into_response();
     };
-    if cfg.auto_provision && !c.teams.is_member(&team, &email) {
-        c.teams.add_member(&team, &email, Role::Member);
+    let provisioned = cfg.auto_provision
+        && c.teams
+            .add_member_if_absent(&team, &email, Role::Member)
+            .is_some_and(|(_, added)| added);
+    if provisioned {
         c.enterprise.scim_upsert_user(&team, &email, &email, true);
         c.audit.record(
             &team,
@@ -446,13 +449,34 @@ async fn scim_get(
     }))
 }
 
-/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE.
+/// The roles that may manage a team's SCIM connection: the bearer is the directory's whole
+/// authority over the roster, and (re)issuing it invalidates the IdP's current token, so a viewer or
+/// member who could mint it could both provision arbitrary members and lock the IdP out. On an
+/// unenforced dev node there are no verified roles and the floor steps aside (`require_team_floor`).
+fn require_scim_admin(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: &Claims,
+    team: &str,
+) -> Result<(), (StatusCode, String)> {
+    crate::admin::require_team_floor(
+        c,
+        headers,
+        claims.as_ref().map(|e| &e.0),
+        team,
+        &["owner", "admin"],
+    )
+    .map(|_| ())
+}
+
+/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE. Owner or admin only.
 async fn scim_enable(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_scim_admin(&c, &headers, &claims, &t)?;
     if !crate::billing::plan_allows_scim(&plan_of(&c, &t)) {
         return Err(forbid("SCIM directory sync"));
     }
@@ -466,16 +490,18 @@ async fn scim_enable(
     ))
 }
 
+/// Disables the team's SCIM connection. Owner or admin only, like enabling it.
 async fn scim_disable(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    require_scim_admin(&c, &headers, &claims, &t)?;
     c.enterprise.scim_disable(&t);
     c.audit.record(&t, "user", "disable", "scim", &t, "");
     crate::persist::persist(&c);
-    Json(json!({ "ok": true }))
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn scim_auth(c: &Arc<CloudState>, headers: &HeaderMap) -> Option<String> {
@@ -535,7 +561,9 @@ struct ScimCreate {
 }
 
 /// Creates (or updates) a directory user and, when active, adds them to the team roster as a
-/// Member, so the directory drives real membership.
+/// Member, so the directory drives real membership. Only when they are NOT on the roster yet
+/// (`add_member_if_absent`): the directory never changes an existing member's role, so provisioning
+/// an owner's, an admin's or a viewer's email is a no-op for the roster.
 async fn scim_users_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -553,7 +581,8 @@ async fn scim_users_create(
         .enterprise
         .scim_upsert_user(&team, &b.user_name, &display, b.active);
     if b.active {
-        c.teams.add_member(&team, &b.user_name, Role::Member);
+        c.teams
+            .add_member_if_absent(&team, &b.user_name, Role::Member);
     }
     c.audit.record(
         &team,
@@ -581,11 +610,31 @@ async fn scim_user_get(
     }
 }
 
+/// The answer to a deprovisioning (PATCH `active:false`, DELETE) of a user who is a team Owner or
+/// Admin: 403 in SCIM's error envelope, and NOTHING changed (the directory record and the roster
+/// both stay as they were, so the IdP sees an error rather than a deprovisioning that did not
+/// happen). Removing the people who run a team is a dashboard action by a person
+/// (`team_remove_member`), never a directory sync.
+fn scim_privileged_refusal(user_name: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+            "status": "403",
+            "detail": format!(
+                "{user_name} is a team owner or admin: directory sync never removes one, remove them from the team in the dashboard"
+            ),
+        })),
+    )
+        .into_response()
+}
+
 /// SCIM PATCH — Okta/Azure use this to deactivate (`active:false`) on offboard.
 ///
 /// Only `active:false` is honored, found in any operation either as `path: "active"` with a `false`
 /// value or as a `value` object carrying `active: false`; every other operation (re-activation
-/// included) is ignored and the current user is returned.
+/// included) is ignored and the current user is returned. Deactivating a user who is a team Owner
+/// or Admin is refused ([`scim_privileged_refusal`]); a plain member is removed from the roster.
 async fn scim_user_patch(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -609,9 +658,11 @@ async fn scim_user_patch(
         })
         .unwrap_or(false);
     if deactivate {
-        c.enterprise.scim_deactivate_user(&team, &id);
         if let Some(u) = c.enterprise.scim_user(&team, &id) {
-            c.teams.remove_member(&team, &u.user_name);
+            if c.teams.remove_plain_member(&team, &u.user_name) == Some(MemberRemoval::Privileged) {
+                return scim_privileged_refusal(&u.user_name);
+            }
+            c.enterprise.scim_deactivate_user(&team, &id);
             c.audit.record(
                 &team,
                 "scim",
@@ -630,7 +681,8 @@ async fn scim_user_patch(
 }
 
 /// Erases the user (`scim_purge_user`, not a soft deactivate: SCIM DELETE is deprovisioning, often
-/// an offboarding or a data-subject erasure request) and removes them from the team roster. The
+/// an offboarding or a data-subject erasure request) and removes them from the team roster, unless
+/// they are a team Owner or Admin ([`scim_privileged_refusal`]: nothing is erased or removed). The
 /// audit trail still records WHO was removed (the `user_name` at deletion time).
 async fn scim_user_delete(
     State(c): State<Arc<CloudState>>,
@@ -641,8 +693,10 @@ async fn scim_user_delete(
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
     if let Some(u) = c.enterprise.scim_user(&team, &id) {
+        if c.teams.remove_plain_member(&team, &u.user_name) == Some(MemberRemoval::Privileged) {
+            return scim_privileged_refusal(&u.user_name);
+        }
         c.enterprise.scim_purge_user(&team, &id);
-        c.teams.remove_member(&team, &u.user_name);
         c.audit.record(
             &team,
             "scim",
