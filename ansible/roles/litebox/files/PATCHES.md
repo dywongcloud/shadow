@@ -353,9 +353,21 @@ cannot check it out, but `git fetch origin <full-sha>` still retrieves it (the
 role's `git` module fetches by sha, so the role still builds) -- GitHub may
 garbage-collect it at any time. Hunks 1-5 apply cleanly to `c325d5d9`;
 against current main only the runner `lib.rs` hunk 1 no longer applies.
-Re-pinning to a reachable commit needs the six-step legitimacy check
-(`litebox-upstream-history-wipe-20260904` memory) and a rebase of that one
-hunk -- deliberately not done inside a production incident.
+Re-pinning to a reachable commit needs the six-step legitimacy check below and a rebase of that one
+hunk -- deliberately not done inside a production incident. A history wipe on a dependency built from
+source is the supply-chain shape no diff review catches, so before trusting a new commit:
+1. `gh api repos/AnEntrypoint/litebox --jq '.created_at, .fork, .archived'`: repository identity and timing
+   (not a fork merged by mistake).
+2. `gh api repos/AnEntrypoint/litebox/commits/<sha>`: the new commit's author name and email.
+3. `gh api users/<author-login>` (account age, followers, repos) and `gh api orgs/AnEntrypoint/members --jq
+   '.[].login'`: a long-lived account that is a current org member is evidence; a brand-new account
+   committing to a wiped repo is the red flag.
+4. Read the checkout's README and layout: it is the same project, not a name-squat under the old URL.
+5. The strongest check: `git apply --check networking.patch` against the new tree passes with no changes (a
+   structural match is much harder to fake than a README).
+6. Re-derive the exact evidence the earlier docs cited (the `fork()` fix is still present:
+   `required_clone_flags` has zero matches) instead of trusting the account alone.
+Then re-run `hive-cloud --litebox-probe` on a live node: both tiers must pass.
 
 **Landed on fc-sanjose 2026-09-10 (operator-approved):** `/usr/local/bin/
 litebox-runner` = `ba293cc870250604…` (sj's own current source tree at the
@@ -378,7 +390,7 @@ the probe build `/root/hive-cloud-probe-bin`, and the witness scripts
 
 Applied AFTER `networking.patch` by the role (`git apply ../litebox-fork-inplace.patch`), touching only
 `litebox_shim_linux/src/{lib.rs, syscalls/mm.rs, syscalls/process.rs}` (180 lines). Root-caused by a
-subagent with gdb on va (see the `litebox-fork-child-corruption` memory): `do_clone` gives a plain
+subagent with gdb on va (standalone repro below): `do_clone` gives a plain
 `fork()` an eager copy of the guest's writable memory at RELOCATED host addresses and runs the child on a
 second host thread. Only registers, the TCB self-pointer, a 4 KB stack window and a few writable ELF data
 words are patched (`fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers`); everything else in the copy
@@ -387,6 +399,18 @@ whole heap). The child runs a mix of its own and the parent's libc and rewrites 
 (stack lists), malloc and stdio state: `malloc(): unaligned tcache chunk`, `glibc detected an invalid stdio
 handle` (`_IO_vtable_check` failing on a translated vtable pointer), and the second child spinning in
 `__libc_fork`'s inlined `reclaim_stacks` walk over a stack list the first child corrupted.
+
+Standalone repro (the exact staged tar and a scratch TUN, no hive-node):
+
+    ip tuntap add dev lbtrepro mode tun; ip addr add 10.250.0.1/30 dev lbtrepro; ip link set lbtrepro up
+    env -i LITEBOX_GUEST_IP=10.250.0.2 LITEBOX_GATEWAY_IP=10.250.0.1 HOME=/root PATH=/usr/bin:/bin \
+      litebox-runner -Z --rewrite-syscalls --forward-env --tun-device-name=lbtrepro \
+      --initial-files=<staged tar> -- /usr/bin/sh -c '<CMD>' < /dev/null
+
+Before the patch `echo hi; /usr/bin/ls /` (fork plus an immediate exec) works; `ls / | head -3` or
+`v=$(echo hi)` dies with `malloc(): unaligned tcache chunk detected`; `cat x 2>/dev/null` or one not-found
+command with `glibc detected an invalid stdio handle`; two not-found commands in a row leave the second child
+spinning at 100% CPU. In an interactive shell the SECOND external command wedges the session.
 
 Three hunks:
 1. **process.rs, in-place fork.** A plain `fork()` of a SINGLE-THREADED caller snapshots its writable non-shared
