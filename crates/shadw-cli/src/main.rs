@@ -353,10 +353,7 @@ enum KeyCmd {
     List,
     Create {
         name: String,
-        /// hive-cloud mints a key no higher than the CALLER's own team role (never above it,
-        /// regardless of what is requested here); "owner" as a default would make the command fail
-        /// for anyone who is not themselves an owner, so the default is "member" — the role every
-        /// team role from member upward may mint for itself.
+        /// Role of the new key; hive-cloud caps it at your own team role.
         #[arg(long, default_value = "member")]
         role: String,
     },
