@@ -94,7 +94,7 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   (`/v1/functions`, `/v1/metrics`, `/v1/admin/overview`) stay at or under the backend's 15 s polled-response
   cache TTL (`OVERVIEW_POLL_MS`, `FUNCTIONS_POLL_MS`).
 - Dashboard numbers are measured or absent, never invented: tenant counters come from `/v1/metrics` and
-  `/v1/functions` , usage prices only from the billing API's `rate_card`, and a value the node did not
+  `/v1/functions`, usage prices only from the billing API's `rate_card`, and a value the node did not
   measure renders as absent (the node serves `DomainRecord`'s
   `registrar`/`renewal_price`/`auto_renew`/`expires_ms` EMPTIED for older nodes: `ui/lib/api.ts` declares
   none, and the dashboard rolls BEFORE or WITH the nodes).
@@ -143,7 +143,7 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   the compiled `@workflow/web` bundles (anchors target the PRISTINE package: `no-anchor` means reinstall it
   fresh); `ui/lib/wf-console/hive-world.mjs` is its `WORKFLOW_TARGET_WORLD` (`HIVE_WF_TIMEOUT_MS` must
   exceed its `/v1/workflows/runs` budgets); the iframe mounts only after the first `hive_jwt` mint (a
-  cookie-less first rpc settles the runs table on a false "No workflow runs found") .
+  cookie-less first rpc settles the runs table on a false "No workflow runs found").
   `ui/app/wf-console/[[...slug]]/route.ts` keeps `import "@workflow/web/server"` so Next traces the package:
   never delete it as unused.
 

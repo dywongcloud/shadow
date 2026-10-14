@@ -312,7 +312,7 @@ load-bearing, delete the memories it absorbs. Nested files load where you work: 
 
 **BLAKE3 mints every NEW content identity** (`fluid_core::content_hash`, `ContentHasher`); `verify_content` accepts a
 stored digest under BLAKE3 or the legacy hex(SHA-256) over the same domain and alone decides which algorithm it came
-from . Pre-domain-separation digests are bare hashes (`raw_content_hash`/`verify_raw_content`), never mixed with a
+from. Pre-domain-separation digests are bare hashes (`raw_content_hash`/`verify_raw_content`), never mixed with a
 domain-separated site. A digest that NAMES stored bytes keeps its writer until every node's `content_verify_stats()`
 reports `accepted_sha256` flat across a full deploy cycle (`runtime_artifact.rs`'s `content_sha256` IS the store
 directory name: a rehash orphans every staged artifact).
