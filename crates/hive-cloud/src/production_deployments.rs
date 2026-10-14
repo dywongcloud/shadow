@@ -1,23 +1,18 @@
-//! Durable, fleet-replicated record of which node hosts each project's
-//! current PRODUCTION deployment — the missing piece for node-death self-heal.
+//! Durable, fleet-replicated record of which node hosts each project's current PRODUCTION
+//! deployment, the piece node-death self-heal needs: `gw.deployment_records()` (node-local) and
+//! `peer_deployments` (a gossip CACHE, see `state.rs`) both describe 'what is deployed where', but
+//! neither survives the deploying node's death (`merge_deployments_ttl` in `state.rs` drops a
+//! peer's entire deployment list the instant that peer ages out of `registry.nodes()`, the SAME 30
+//! s no-gossip window that marks it dead), so the one moment the platform most needs to know
+//! 'project X's source was `repo@commit`, last hosted on node Y' is exactly the moment that fact
+//! disappears. This store survives past that point.
 //!
-//! `gw.deployment_records()` (node-local) and `peer_deployments` (a gossip
-//! CACHE, see `state.rs`) both describe "what's deployed where" today, but
-//! neither survives the deploying node's death: `merge_deployments_ttl`
-//! (main.rs) drops a peer's entire deployment list the instant that peer ages
-//! out of `registry.nodes()` — the SAME 30s no-gossip window that marks it
-//! dead. So the one moment this platform most needs to know "project X's
-//! source was `repo@commit`, last hosted on node Y" is exactly the moment
-//! that fact disappears. This store exists to survive past that point.
-//!
-//! Shape mirrors `project_settings::SyncedProjects` (the `store_sync.rs`
-//! `"projects"` entry): a `BTreeMap` keyed by project, `updated_ms`
-//! newest-wins merge, permanent tombstones so an absent row replicates as an
-//! explicit deletion rather than "this peer hasn't synced yet". Deliberately
-//! narrower than `DeployRecord`/`ProjectSettings` — only the fields a
-//! from-scratch rebuild via `git::start_build` actually needs (see
-//! `admin::redeploy_request`, the human "Redeploy" button's own request
-//! shape, which this record's fields are chosen to reconstruct).
+//! Its shape mirrors `project_settings::SyncedProjects` (the `store_sync.rs` `"projects"` entry): a
+//! `BTreeMap` keyed by project, a newest-`updated_ms`-wins merge, and permanent tombstones so an
+//! absent row replicates as an explicit deletion rather than 'this peer has not synced yet'. It is
+//! deliberately narrower than `DeployRecord`/`ProjectSettings`: only the fields a from-scratch
+//! rebuild via `git::start_build` needs (see `admin::redeploy_request`, the 'Redeploy' button's
+//! request shape, which these fields are chosen to reconstruct).
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -29,11 +24,10 @@ use std::collections::BTreeMap;
 pub struct ProductionDeploymentRecord {
     pub project: String,
     pub git: fluid_core::GitSource,
-    /// The node this deployment was actually running on as of `updated_ms`.
-    /// Read, never trusted blindly — the reconciler re-checks that the host
-    /// has actually been gone from the fleet's gossip (`registry.nodes()`)
-    /// for its whole grace before treating the record as needing relocation,
-    /// since the record itself only proves "true then".
+    /// The node this deployment was actually running on as of `updated_ms`. Read, never trusted
+    /// blindly: the reconciler re-checks that the host has actually been gone from the fleet's
+    /// gossip (`registry.nodes()`) for its whole grace before treating the record as needing
+    /// relocation, since the record itself only proves 'true then'.
     pub host_node: String,
     pub updated_ms: u64,
 }
@@ -45,9 +39,8 @@ pub struct SyncedProductionDeployments {
     pub tombstones: BTreeMap<String, u64>,
 }
 
-/// A generation timestamp further in the future than plausible clock skew
-/// explains is a poisoned write, not a real future fact — same discipline as
-/// `project_settings::project_time_ceiling`.
+/// A generation timestamp further in the future than plausible clock skew explains is a poisoned
+/// write, not a real future fact (the same discipline as `project_settings::project_time_ceiling`).
 const MAX_FUTURE_SKEW_MS: u64 = 60_000;
 
 fn time_ceiling(now: u64) -> u64 {
@@ -67,11 +60,10 @@ impl ProductionDeploymentStore {
         }
     }
 
-    /// Record (or update) `project`'s current production host + source. Called
-    /// wherever a production build actually lands — see `git::run_build`'s
-    /// post-success path. A re-record after a tombstone revives the row (the
-    /// project was legitimately redeployed after being deleted-and-recreated),
-    /// matching `ProjectStore`'s own tombstone-vs-recreation precedent.
+    /// Records (or updates) `project`'s current production host + source. Called wherever a
+    /// production build actually lands (see `git::run_build`'s post-success path). A re-record
+    /// after a tombstone revives the row (the project was legitimately redeployed after being
+    /// deleted and recreated), matching `ProjectStore`'s own tombstone-vs-recreation precedent.
     pub fn record(&self, project: &str, git: fluid_core::GitSource, host_node: &str) {
         let now = now_ms();
         self.map.write().insert(
@@ -85,10 +77,9 @@ impl ProductionDeploymentStore {
         );
     }
 
-    /// Explicit removal (project deleted). Permanent tombstone — same
-    /// reasoning as `ProjectStore::tombstones`: an offline node returning
-    /// after any bounded window must not resurrect a deleted project's last
-    /// known host.
+    /// Explicit removal (project deleted). A permanent tombstone, for the same reason as
+    /// `ProjectStore::tombstones`: an offline node returning after any bounded window must not
+    /// resurrect a deleted project's last known host.
     pub fn remove(&self, project: &str) {
         let now = now_ms();
         self.map.write().remove(project);
@@ -99,10 +90,9 @@ impl ProductionDeploymentStore {
         }
     }
 
-    /// Rename a project's production-host record IN PLACE. Dropping this row
-    /// (rather than moving it) would blind node-death self-heal for the whole
-    /// project. The OLD name is tombstoned exactly like a delete, so a sparse
-    /// peer still holding the old row cannot resurrect it.
+    /// Renames a project's production-host record IN PLACE. Dropping this row (rather than moving
+    /// it) would blind node-death self-heal for the whole project. The OLD name is tombstoned
+    /// exactly like a delete, so a sparse peer still holding the old row cannot resurrect it.
     pub fn rename(&self, from: &str, to: &str) {
         if from == to {
             return;
@@ -140,11 +130,12 @@ impl ProductionDeploymentStore {
         }
     }
 
-    /// Merge a peer's snapshot. NEWEST-`updated_ms`-per-row wins; a tombstone
-    /// at-or-after a row's last write drops it; a row re-created after its own
-    /// tombstone survives. Never a wholesale replace — a sender simply
-    /// missing a row can never erase it here (the `projects`/`teams`
-    /// precedent this mirrors).
+    /// Merges a peer's snapshot. NEWEST-`updated_ms`-per-row wins; a tombstone at or after a row's
+    /// last write drops it; a row re-created after its own tombstone survives. Never a wholesale
+    /// replace: a sender simply missing a row can never erase it here (the `projects`/`teams`
+    /// precedent this mirrors). Tombstones are also applied to any locally held row they cover, so
+    /// a tombstone that arrived before its row cannot leave a deleted project's row stranded until
+    /// the next sync tick.
     pub fn merge_synced(&self, remote: SyncedProductionDeployments) -> usize {
         let now = now_ms();
         let ceiling = time_ceiling(now);
@@ -190,9 +181,6 @@ impl ProductionDeploymentStore {
                 }
             }
         }
-        // Apply tombstones to any locally-held row they cover (a tombstone
-        // that arrived before its row would otherwise leave a deleted
-        // project's row stranded until the next sync tick).
         for (project, &deleted_ms) in tombs.iter() {
             if let Some(local) = map.get(project) {
                 if deleted_ms >= local.updated_ms {
@@ -203,9 +191,8 @@ impl ProductionDeploymentStore {
         adopted
     }
 
-    /// Load from a durable snapshot at boot (persist.rs), replacing local
-    /// state wholesale — this is the ONE path where replace-not-merge is
-    /// correct, since it runs before any peer sync could race it.
+    /// Loads from a durable snapshot at boot (persist.rs), replacing local state wholesale: the ONE
+    /// path where replace-not-merge is correct, since it runs before any peer sync could race it.
     pub fn load(&self, rows: Vec<ProductionDeploymentRecord>, tombstones: BTreeMap<String, u64>) {
         *self.map.write() = rows.into_iter().map(|r| (r.project.clone(), r)).collect();
         *self.tombstones.write() = tombstones;
@@ -218,39 +205,12 @@ impl Default for ProductionDeploymentStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Node-death reconciler: detect a project's host gone from the fleet, redeploy
-// it elsewhere via the SAME mechanism the dashboard's own "Redeploy" button
-// uses (`git::start_build`), then leave an incident recording what happened.
-//
-// OFF by default (`HIVE_NODE_DEATH_SELF_HEAL=1` opts in). On 2026-09-24 a
-// follower whose own view flapped to "I am the leader" and "the leader's host
-// is unhealthy" redeployed a LIVE node's 22 production projects 1512 times in
-// 10 h — every attempt a real build, a real placement and a new incident.
-// Relocating a tenant is destructive enough that it needs evidence no single
-// observer's transport blip can manufacture, and a durable per-attempt ledger
-// the fleet shares; until both exist the safe default is a human redeploy.
-// When enabled, every one of these must hold:
-// - `leadership::may_act(NodeDeathRelocate)`: strict chain owner, 10 min
-//   continuous tenure, not isolated, a direct voter majority;
-// - the host is ABSENT from `registry.nodes()` — no gossip from it through
-//   ANY relay for 30 s — continuously for `RELOCATION_GRACE_MS`, measured
-//   from when this node first saw it absent (never from the row's last build
-//   time), and its last gossip is itself older than the grace. A host this
-//   observer merely cannot reach (`healthy == false` while still gossiping)
-//   is alive and serving; it is never relocated;
-// - no attempt for the same (project, host, commit) in the last
-//   `RELOCATION_COOLDOWN_MS`, and fewer than `RELOCATIONS_PER_HOUR`
-//   relocations started by this node in the trailing hour.
-// ---------------------------------------------------------------------------
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-/// A host must be continuously absent from the fleet's gossip for this long
-/// (and silent in gossip for as long) before its projects are relocated. A
-/// restart, a roll or a relay blip must never trigger a full
-/// redeploy-elsewhere.
+/// A host must be continuously absent from the fleet's gossip for this long (and silent in gossip
+/// for as long) before its projects are relocated. A restart, a roll or a relay blip must never
+/// trigger a full redeploy-elsewhere.
 const RELOCATION_GRACE_MS: u64 = 10 * 60 * 1000;
 
 /// At most one relocation attempt per (project, host, commit) in this window.
@@ -260,14 +220,12 @@ const RELOCATION_COOLDOWN_MS: u64 = 6 * 60 * 60 * 1000;
 /// the fleet-level brake on a wrong verdict.
 const RELOCATIONS_PER_HOUR: usize = 3;
 
-/// How often the reconciler sweeps `production_deployments` for rows whose
-/// host has been gone past the grace period. Cheap per tick (no network I/O
-/// unless something actually needs relocating).
+/// How often the reconciler sweeps `production_deployments` for rows whose host has been gone past
+/// the grace period. Cheap per tick (no network I/O unless something actually needs relocating).
 const RECONCILE_TICK_SECS: u64 = 30;
 
-/// In-memory evidence and brakes. Deliberately per process: absence onset is
-/// what THIS node observed, and a restart re-earns it (the leadership tenure
-/// has to be re-earned anyway).
+/// In-memory evidence and brakes. Deliberately per process: absence onset is what THIS node
+/// observed, and a restart re-earns it (the leadership tenure has to be re-earned anyway).
 #[derive(Default)]
 struct SelfHealState {
     /// host -> epoch-ms this node first saw it absent from `registry.nodes()`.
@@ -279,16 +237,14 @@ struct SelfHealState {
 }
 
 impl SelfHealState {
-    /// Fold this tick's registry view in: start an absence clock for every
-    /// recorded host missing from the gossip-fresh set, drop the clock of every
-    /// host that is present again (or no longer hosts anything). Only from a
-    /// FRESH view (`leadership::view_is_fresh`: a gossip round done, not
-    /// isolated, a voter majority when voters are configured): a node that
-    /// cannot hear the fleet sees every host as gone, so while its view is
-    /// stale every clock is discarded, and an onset only counts once it was
-    /// observed with the fleet audible — otherwise the first ticks after this
-    /// node's own isolation clears (contact back one gossip round before the
-    /// relayed records) would read as ten minutes of absence.
+    /// Folds this tick's registry view in: starts an absence clock for every recorded host missing
+    /// from the gossip-fresh set, and drops the clock of every host that is present again (or no
+    /// longer hosts anything). Only from a FRESH view (`leadership::view_is_fresh`: a gossip round
+    /// done, not isolated, a voter majority when voters are configured): a node that cannot hear
+    /// the fleet sees every host as gone, so while its view is stale every clock is discarded, and
+    /// an onset only counts once it was observed with the fleet audible, otherwise the first ticks
+    /// after this node's own isolation clears (contact back one gossip round before the relayed
+    /// records) would read as ten minutes of absence.
     fn observe(&mut self, cloud: &crate::state::CloudState, rows: &[ProductionDeploymentRecord]) {
         let now = now_ms();
         if crate::leadership::view_is_fresh(cloud) {
@@ -317,6 +273,33 @@ impl SelfHealState {
     }
 }
 
+/// Starts the node-death reconciler: detects a project's host gone from the fleet and redeploys it
+/// elsewhere through the SAME mechanism the dashboard's own 'Redeploy' button uses
+/// (`git::start_build`), leaving an incident that records what happened.
+///
+/// OFF by default (`HIVE_NODE_DEATH_SELF_HEAL=1` opts in): one observer's verdict (for instance a
+/// follower whose own view flapped to 'I am the leader' and 'the leader's host is unhealthy') must
+/// never redeploy a LIVE node's production projects, every attempt being a real build, a real
+/// placement and a new incident. Relocating a tenant is destructive enough that it needs evidence
+/// no single observer's transport blip can manufacture, and a durable per-attempt ledger the fleet
+/// shares; until both exist the safe default is a human redeploy. When enabled, every one of these
+/// must hold:
+///
+/// * `leadership::may_act(NodeDeathRelocate)`: strict chain owner, 10 min continuous tenure, not
+///   isolated, a direct voter majority. Exactly one node redeploys a given dead host's projects,
+///   through the shared background-job gate and never the bare request-path leader test;
+/// * the host is ABSENT from `registry.nodes()` (no gossip from it through ANY relay for 30 s)
+///   continuously for `RELOCATION_GRACE_MS`, measured from when this node first saw it absent
+///   (never from the row's last build time), and its last gossip is itself older than the grace. A
+///   host this observer merely cannot reach (`healthy == false` while still gossiping) is alive and
+///   serving, and is never relocated;
+/// * no attempt for the same (project, host, commit) in the last `RELOCATION_COOLDOWN_MS`, and
+///   fewer than `RELOCATIONS_PER_HOUR` relocations started by this node in the trailing hour.
+///
+/// Absence evidence is gathered on EVERY node, writer or not, so a node that becomes the writer
+/// already holds the onset it observed instead of starting the grace from zero. The first sweep
+/// waits 45 s so boot-time gossip and store_sync settle (a freshly booted node would otherwise see
+/// every OTHER node as not yet in its registry).
 pub fn spawn_node_death_reconcile(cloud: Arc<crate::state::CloudState>) {
     let enabled = std::env::var("HIVE_NODE_DEATH_SELF_HEAL")
         .map(|v| v.trim() == "1")
@@ -332,12 +315,6 @@ pub fn spawn_node_death_reconcile(cloud: Arc<crate::state::CloudState>) {
         let cloud = cloud.clone();
         async move {
             let mut state = SelfHealState::default();
-            // Let boot-time gossip/store_sync settle before the first sweep —
-            // otherwise a freshly-booted node would see every OTHER node as
-            // "not yet in my registry". The leadership tenure (10 min) and the
-            // absence grace (10 min, measured from this process's own first
-            // observation) already dominate; this only keeps the first
-            // observation off the cold registry.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
             let mut tick =
                 tokio::time::interval(std::time::Duration::from_secs(RECONCILE_TICK_SECS));
@@ -346,13 +323,7 @@ pub fn spawn_node_death_reconcile(cloud: Arc<crate::state::CloudState>) {
                 tick.tick().await;
                 crate::supervise::beat("production-deployment-node-death-reconcile");
                 let rows = cloud.production_deployments.snapshot();
-                // Absence evidence is gathered on EVERY node, writer or not,
-                // so a node that becomes the writer already holds the onset
-                // it observed instead of starting the grace from zero.
                 state.observe(&cloud, &rows);
-                // LEADER ONLY — exactly one node redeploys a given dead host's
-                // projects, through the shared background-job gate (tenure +
-                // voter quorum), never the bare request-path leader test.
                 if !crate::leadership::may_act(&cloud, crate::leadership::Job::NodeDeathRelocate) {
                     continue;
                 }
@@ -370,7 +341,7 @@ async fn reconcile_once(
     let now = now_ms();
     for row in rows {
         let Some(&absent_since) = state.absent_since.get(&row.host_node) else {
-            continue; // present in the fleet's gossip: alive, whatever this node's transport says
+            continue;
         };
         if now.saturating_sub(absent_since) < RELOCATION_GRACE_MS {
             continue;
@@ -388,7 +359,7 @@ async fn reconcile_once(
             row.git.commit.clone(),
         );
         if state.attempts.contains_key(&key) {
-            continue; // attempted inside the cooldown window already
+            continue;
         }
         if state.recent.len() >= RELOCATIONS_PER_HOUR {
             tracing::warn!(
@@ -408,16 +379,21 @@ async fn reconcile_once(
 
 /// Start one relocation. Returns whether an attempt was made (a build start
 /// was tried), which is what the cooldown and the hourly cap count.
+/// A build already in flight for the project (for example a genuine push that landed around the
+/// time the host died) makes relocation redundant: whichever finishes first re-records a fresh row
+/// through `record`'s normal call site, and a second build would only race it. One incident is
+/// opened per (project, dead host) while it stays unresolved, never one per attempt (`open` dedups
+/// on its condition); the next attempt for the same pair re-asserts it, which may not come for a
+/// whole cooldown, so its TTL is the cooldown plus the grace, and a host that returns, or a row
+/// that is superseded, stops the re-assertion so the incident resolves itself. The build pins the
+/// EXACT last-known-good commit: this is a recovery action, not a chance to pick up whatever the
+/// branch has advanced to since, and a genuine new push is handled by the ordinary git-poll/webhook
+/// path, which supersedes this build the normal way.
 async fn relocate_one(
     cloud: &Arc<crate::state::CloudState>,
     row: ProductionDeploymentRecord,
 ) -> bool {
     let project = row.project.clone();
-    // A concurrent build already in flight for this project (e.g. a genuine
-    // push landed around the same time the host died) means relocation is
-    // redundant — whichever finishes first will re-record a fresh row via
-    // `record`'s normal call site, and starting a second build here would
-    // just race it.
     let already_building = cloud.builds.list().iter().any(|b| {
         b.project == project
             && matches!(
@@ -429,12 +405,6 @@ async fn relocate_one(
         return false;
     }
 
-    // One incident per (project, dead host) while it stays unresolved, never
-    // one per attempt (`open` dedups on title + affected).
-    // Re-asserted by the next attempt for the same (project, host); it may
-    // not come for a whole cooldown, so the observation stays valid that long
-    // plus the grace. A host that returns, or a row that is superseded, stops
-    // the re-assertion and the incident resolves itself.
     let incident = cloud.incidents.open(crate::incidents::OpenReq {
         condition: format!("relocate:{project}:{}", row.host_node),
         ttl_ms: RELOCATION_COOLDOWN_MS + RELOCATION_GRACE_MS,
@@ -454,10 +424,6 @@ async fn relocate_one(
     let req = fluid_core::GitDeployRequest {
         repo_url: row.git.repo_url.clone(),
         branch: Some(row.git.branch.clone()).filter(|b| !b.is_empty()),
-        // Pin the EXACT last-known-good commit — this is a recovery action,
-        // not a chance to pick up whatever the branch has advanced to since.
-        // A genuine new push is handled by the ordinary git-poll/webhook
-        // path, which will supersede this build the normal way if one lands.
         commit: Some(row.git.commit.clone()),
         head_repo_url: None,
         project: Some(project.clone()),
@@ -531,9 +497,11 @@ async fn relocate_one(
     }
 }
 
-/// Watch the started build to a terminal state and resolve (or re-flag) the
-/// incident opened for it — bounded, so a build that never terminates for
-/// some unrelated reason cannot leave this task running forever.
+/// Watches the started build to a terminal state and resolves (or re-flags) the incident opened for
+/// it, bounded so a build that never terminates for some unrelated reason cannot leave this task
+/// running forever. If the build record itself is gone (superseded and pruned) there is nothing
+/// left to watch, and the incident is left as it is for an operator to notice rather than guessing
+/// an outcome.
 fn monitor_relocation(
     cloud: Arc<crate::state::CloudState>,
     incident_id: String,
@@ -559,9 +527,6 @@ fn monitor_relocation(
                 return;
             }
             let Some(build) = cloud.builds.get(&build_id) else {
-                // The build record itself is gone (e.g. superseded and
-                // pruned) — nothing left to watch; leave the incident as-is
-                // for an operator to notice rather than guessing an outcome.
                 return;
             };
             match build.state {

@@ -1,53 +1,41 @@
-//! Peer health demotion — the ONE chokepoint allowed to withdraw a live node.
+//! Peer health demotion: the ONE chokepoint allowed to withdraw a live node.
 //!
-//! A health verdict is per-OBSERVER (AGENTS.md), and the verdict that decides
-//! traffic is whichever node happens to be reading it: the control-plane
-//! leader's copy drives client DNS and placement, every node's copy drives its
-//! own request routing. So `set_health(id, _, false)` is not a local opinion —
-//! on the leader it is a fleet-wide withdrawal of a node that may be perfectly
-//! alive.
+//! A health verdict is per-OBSERVER (AGENTS.md), and the verdict that decides traffic is whichever
+//! node reads it: the control-plane leader's copy drives client DNS and placement, every node's
+//! copy drives its own request routing. So `set_health(id, _, false)` is not a local opinion: on
+//! the leader it is a fleet-wide withdrawal of a node that may be perfectly alive.
 //!
-//! `spawn_health_loop`'s prober already learned this the expensive way and
-//! carries the guard: a peer whose gossip `last_seen_ms` is fresh is alive by
-//! INDEPENDENT evidence (it is still announcing to us, and `upsert_peer`
-//! deliberately refreshes `last_seen_ms` without touching `healthy`), so a
-//! probe failing against it is a local mesh-path artifact — a stale cached
-//! addr, a wedged trunk — not a dead peer. Witnessed: a leader marked 10 of 17
-//! live nodes unhealthy and withheld them from DNS/placement until it was
-//! restarted, while two other vantages saw 0 and 1 unhealthy.
-//!
-//! That guard lived inside the prober, so **five other writers withdrew nodes
-//! with no guard and no threshold at all**, each on a SINGLE failure:
+//! A peer whose gossip `last_seen_ms` is fresh is alive by INDEPENDENT evidence (it is still
+//! announcing to us, and `upsert_peer` deliberately refreshes `last_seen_ms` without touching
+//! `healthy`), so a failed probe, fetch or dial against it is a local mesh-path artifact (a stale
+//! cached addr, a wedged trunk), not a dead peer. Every writer that withdraws a node on a transport
+//! failure therefore goes through [`demote`] (or [`demote_exact`]), which consults that evidence
+//! first, so one failure on one observer cannot pull a healthy peer out of DNS and placement. Four
+//! of the six run on the REQUEST path, where one tenant request landing on a trunk that went stale
+//! (as happens after a peer restarts with new socket addrs) would otherwise do exactly that:
 //!
 //! | site | trigger |
 //! |---|---|
-//! | `main.rs` gossip round | one failed `/v1/nodes` fetch |
-//! | `edge.rs` mesh route | one `DeadPeerTimeout` on a p2p forward |
-//! | `edge.rs` `ws_proxy` | one `DeadPeerTimeout` opening a raw trunk |
-//! | `raw_proxy.rs` | one `DeadPeerTimeout` opening a raw port |
-//! | `udp_relay.rs` | one `DeadPeerTimeout` opening the UDP leg |
+//! | `main.rs` health prober (`spawn_health_loop`) | consecutive failed mesh probes |
+//! | `main.rs` gossip round | a failed `/v1/nodes` fetch |
+//! | `edge.rs` mesh route | `DeadPeerTimeout` on a p2p forward |
+//! | `edge.rs` `ws_proxy` | `DeadPeerTimeout` opening a raw trunk |
+//! | `raw_proxy.rs` | `DeadPeerTimeout` opening a raw port |
+//! | `udp_relay.rs` | `DeadPeerTimeout` opening the UDP leg |
 //!
-//! Four of those five run on the REQUEST path, so one tenant request landing
-//! on a trunk that went stale (exactly what the mesh docs say happens after a
-//! peer restarts with new socket addrs) could pull a healthy peer out of DNS
-//! and placement on that observer, with no counter-evidence consulted and no
-//! second opinion. That is the class of bug this module closes: every writer
-//! now goes through [`demote`], which consults the gossip liveness evidence
-//! first.
+//! What the callers actually want is still delivered without misreporting fleet health: [`demote`]
+//! records a NODE-LOCAL, time-boxed routing penalty (the cold mark, [`mark_cold`] / [`is_cold`]) so
+//! the caller stops re-paying a connect budget against a trunk that just timed out. Cold is a
+//! preference (this node, this window); `healthy` is a fleet-visible verdict. The deployment
+//! circuit breaker makes the same split (a broken app opens a circuit; it does not mark the host
+//! unhealthy).
 //!
-//! What the callers actually wanted is still delivered, just not by lying
-//! about fleet health: [`mark_cold`] records a NODE-LOCAL, time-boxed routing
-//! penalty so the caller stops re-paying a connect budget against a trunk that
-//! just timed out. Cold is a preference (this node, this window); `healthy` is
-//! a fleet-visible verdict. Keeping them separate is the whole fix — the same
-//! decomposition the deployment circuit breaker uses (a broken app opens a
-//! circuit; it does not mark the host unhealthy).
-//!
-//! One stale reading is not enough either: [`demote`] withdraws a peer only
-//! once its gossip has been stale at the end of [`DEMOTE_STALE_ROUNDS`]
-//! consecutive gossip rounds ([`note_gossip_round`]); before that — and while
-//! the gossip loop is not ending rounds at all — it is `Deferred` and only
-//! marked cold.
+//! One stale reading is not enough either: [`demote`] withdraws a peer only once its gossip has
+//! been stale at the end of [`DEMOTE_STALE_ROUNDS`] consecutive gossip rounds
+//! ([`note_gossip_round`]); before that, and while the gossip loop is not ending rounds at all, it
+//! is `Deferred` and only marks the peer cold. [`restore_gossip_alive`] reverses a withdrawal the
+//! gossip evidence no longer supports, after `RESTORE_HYSTERESIS_ROUNDS` consecutive fresh probe
+//! rounds.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -55,33 +43,25 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// How fresh a peer's gossiped `last_seen_ms` must be to count as independent
-/// proof of liveness.
+/// How fresh a peer's gossiped `last_seen_ms` must be to count as independent proof of liveness.
 ///
-/// Sized against MEASURED behaviour, not the nominal announce cadence. Gossip
-/// announces every 3-4s, but on the live fleet delivery is itself lossy: peers
-/// that were provably up (answering HTTP on their public IP) showed last_seen
-/// ages of 11-24s. A tighter bound (12s was tried first) therefore fails to
-/// protect exactly the nodes this guard exists for, which is how a majority of
-/// the fleet stayed grey after the first attempt.
+/// Sized against MEASURED delivery, not the nominal announce cadence: gossip delivery is itself
+/// lossy, and peers provably up (answering HTTP on their public IP) have shown `last_seen` ages of
+/// 11-24 s, so a tighter bound fails to protect exactly the nodes this guard exists for.
 ///
-/// 25s sits just under `NodeRegistry::nodes()`'s own 30s staleness drop, which
-/// is the mechanism that ACTUALLY removes a dead node from service — a silent
-/// node disappears from the registry entirely and stops being served regardless
-/// of this flag. So the practical rule becomes: still gossiping ⇒ still served;
-/// gone quiet ⇒ aged out. A probe's (or a forward's, or a relay leg's) verdict
-/// is retained for the narrow 25-30s band and, more importantly, for its real
-/// purpose — diagnosing mesh reachability — rather than silently withdrawing
-/// live nodes from client DNS, which clients reach directly by public IP and
-/// never through the mesh.
+/// 25 s sits just under `NodeRegistry::nodes()`'s own 30 s staleness drop, the mechanism that
+/// ACTUALLY removes a dead node from service: a silent node disappears from the registry entirely
+/// and stops being served regardless of this flag. So the practical rule is: still gossiping means
+/// still served, gone quiet means aged out. A probe's (or a forward's, or a relay leg's) verdict is
+/// retained for the narrow 25-30 s band and for its real purpose, diagnosing mesh reachability,
+/// rather than withdrawing live nodes from client DNS, which clients reach directly by public IP
+/// and never through the mesh.
 pub const GOSSIP_ALIVE_MS: u64 = 25_000;
 
-/// Consecutive gossip rounds that must END with a peer gossip-stale before
-/// any transport failure may withdraw it. One stale reading is a round-timing
-/// artifact as often as a dead peer: a relayed `last_seen_ms` ages past
-/// `GOSSIP_ALIVE_MS` whenever this observer's round (or the relay's) runs
-/// long, and the next round refreshes it. Witnessed 2026-09-24: fc-virginia
-/// demoted fc-sanjose 57 times while three other nodes heard it throughout.
+/// Consecutive gossip rounds that must END with a peer gossip-stale before any transport failure
+/// may withdraw it. One stale reading is as often a round-timing artifact as a dead peer: a relayed
+/// `last_seen_ms` ages past `GOSSIP_ALIVE_MS` whenever this observer's round (or the relay's) runs
+/// long, and the next round refreshes it.
 pub const DEMOTE_STALE_ROUNDS: u32 = 2;
 
 /// The active prober's cadence (`HIVE_HEALTH_INTERVAL`, seconds, default 5).
@@ -160,9 +140,8 @@ fn stale_long_enough(identity: &hive_edge::region::PeerIdentity) -> bool {
             .is_some_and(|n| *n >= DEMOTE_STALE_ROUNDS)
 }
 
-/// How long a peer stays locally cold after a transport failure. Deliberately
-/// SHORTER than the health-probe interval's recovery path: it is a routing
-/// hint, and an over-long penalty is itself a way to strand a live node.
+/// How long a peer stays locally cold after a transport failure (`HIVE_PEER_COLD_MS`, default 30
+/// s). Cold is only a routing hint, and an over-long penalty is itself a way to strand a live node.
 fn cold_window_ms() -> u64 {
     std::env::var("HIVE_PEER_COLD_MS")
         .ok()
@@ -339,23 +318,21 @@ pub fn demote_exact(
     )
 }
 
-/// Consecutive fresh rounds a withdrawn peer must show before it is
-/// restored — the restore-side hysteresis (refutation finding F5): demotion
-/// needs threshold probe misses AND >25s gossip silence, but restoration
-/// previously needed a SINGLE fresh timestamp, so a lossy-announce peer
-/// oscillated withdrawn↔restored and DNS/placement flapped with it. Three
-/// rounds at the 5s cadence is ~15s of sustained evidence — still far
-/// faster than the probe-driven demotion path.
+/// Consecutive fresh rounds a withdrawn peer must show before `restore_gossip_alive` restores it
+/// (the prober calls it once per probe round, `HIVE_HEALTH_INTERVAL`, default 5 s). Restoring on a
+/// SINGLE fresh timestamp let a lossy-announce peer oscillate withdrawn↔restored and flap
+/// DNS/placement with it; three rounds is about 15 s of sustained evidence at the default cadence.
 const RESTORE_HYSTERESIS_ROUNDS: u8 = 3;
 
 static RESTORE_STREAKS: std::sync::OnceLock<
     parking_lot::RwLock<std::collections::HashMap<String, u8>>,
 > = std::sync::OnceLock::new();
 
-/// Reverse withdrawals that current gossip evidence no longer supports —
-/// gated on RESTORE_HYSTERESIS_ROUNDS of sustained freshness (F5). Health
-/// mutation and immutable endpoint capture happen under one registry lock,
-/// so callers can close only the trunks that were actually restored.
+/// Reverse withdrawals that current gossip evidence no longer supports, gated on
+/// `RESTORE_HYSTERESIS_ROUNDS` consecutive rounds of sustained freshness: a peer that goes silent
+/// mid-streak starts over, because the streak counts CONSECUTIVE rounds, never cumulative
+/// sightings. Health mutation and immutable endpoint capture happen under one registry lock, so
+/// callers can close only the trunks that were actually restored; returns those endpoint ids.
 pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<String> {
     let streaks =
         RESTORE_STREAKS.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
@@ -365,8 +342,6 @@ pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<S
         .collect();
     let ready: Vec<String> = {
         let mut w = streaks.write();
-        // A peer that went silent mid-streak starts over — the streak must
-        // be CONSECUTIVE rounds, not cumulative sightings.
         w.retain(|id, _| candidates.contains(id));
         let mut ready = Vec::new();
         for id in &candidates {
@@ -398,13 +373,28 @@ pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> Vec<S
     restored
 }
 
-/// Operator view (node-local, like `/v1/dns/stats`): how often this observer
-/// withdrew a peer, how often it declined to, and who is currently cold.
+/// Operator view (node-local, like `/v1/dns/stats`): how often this observer withdrew a peer, how
+/// often it declined to, and who is currently cold.
 ///
-/// `refused_gossip_alive` is the number that matters during an incident: a
-/// large value means this node's transports are failing against peers that are
-/// demonstrably alive — i.e. the fault is local, and before this guard existed
-/// every one of those would have been a fleet-visible withdrawal.
+/// `refused_gossip_alive` is the number that matters during an incident: a large value means this
+/// node's transports are failing against peers that are demonstrably alive, i.e. the fault is
+/// local, and each of those would otherwise have been a fleet-visible withdrawal. The counters:
+///
+/// * `demoted`: peers withdrawn (transport failed AND gossip stale for `DEMOTE_STALE_ROUNDS`
+///   rounds);
+/// * `refused_gossip_alive`: withdrawals declined because the peer was still gossiping;
+/// * `deferred_stale`: stale peers NOT withdrawn because their staleness had not yet lasted
+///   `DEMOTE_STALE_ROUNDS` consecutive gossip rounds (or the gossip loop was not ending rounds);
+/// * `unknown_peer`: calls naming an id the registry has never held (a bare endpoint id from the
+///   gossip round, a seed that never meshed), neither a withdrawal nor a refusal, counted apart so
+///   the counters above stay readable;
+/// * `cold_marks` and `cold_now`: node-local cold penalties recorded, and the peers currently
+///   inside their window;
+/// * `restored_gossip_alive`: withdrawals REVERSED because the peer kept gossiping
+///   (`restore_gossip_alive`); a steadily climbing value means this node's probe path is failing
+///   against demonstrably live peers, the same signal as `refused_gossip_alive` for verdicts
+///   already written;
+/// * `gossip_rounds`: the gossip loop's own round counters (`gossip_round::stats`).
 pub fn stats() -> serde_json::Value {
     let now = now_ms();
     let cold_now: Vec<serde_json::Value> = cold()
@@ -419,20 +409,10 @@ pub fn stats() -> serde_json::Value {
         "demote_stale_rounds": DEMOTE_STALE_ROUNDS,
         "demoted": DEMOTED.load(Ordering::Relaxed),
         "refused_gossip_alive": REFUSED_GOSSIP_ALIVE.load(Ordering::Relaxed),
-        // Stale peers NOT withdrawn because their staleness had not yet
-        // lasted DEMOTE_STALE_ROUNDS consecutive gossip rounds.
         "deferred_stale": DEFERRED_STALE.load(Ordering::Relaxed),
         "gossip_rounds": crate::gossip_round::stats(),
-        // Calls naming an id the registry has never held (a bare endpoint id
-        // from the gossip round, a seed that never meshed). Neither a
-        // withdrawal nor a refusal — reported so the two real counters above
-        // stay readable.
         "unknown_peer": UNKNOWN_PEER.load(Ordering::Relaxed),
         "cold_marks": COLD_MARKS.load(Ordering::Relaxed),
-        // Withdrawals REVERSED because the peer kept gossiping (see
-        // `restore_gossip_alive`). A steadily climbing value means this node's
-        // probe path is failing against demonstrably-live peers — the same
-        // signal as `refused_gossip_alive`, for verdicts already written.
         "restored_gossip_alive": RESTORED.load(Ordering::Relaxed),
         "cold_now": cold_now,
     })
