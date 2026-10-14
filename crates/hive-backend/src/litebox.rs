@@ -2545,6 +2545,9 @@ fn guest_path(relative: &Path) -> anyhow::Result<String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Cache key of a runtime archive: every input that shapes the guest's content is hashed in
+/// (closure files, artifact identity, bind shim, runtime guard, guest `/etc` files and the CA
+/// bundle), so changing any of them invalidates every cached archive.
 async fn runtime_source_sha256(
     bin: &Path,
     deps: &[PathBuf],
@@ -2568,17 +2571,10 @@ async fn runtime_source_sha256(
     hasher.update(bind_shim.as_bytes());
     hasher.update((runtime_guard.len() as u64).to_le_bytes());
     hasher.update(runtime_guard.as_bytes());
-    // The guest /etc files are part of the artifact's CONTENTS, so they belong
-    // in its key. Without this, editing them leaves every cached runtime
-    // archive still valid and the change never reaches a guest — measured
-    // 2026-10-08: `use-vc` was rolled twice and a live guest still reported the
-    // old resolv.conf.
     hasher.update((GUEST_RESOLV_CONF.len() as u64).to_le_bytes());
     hasher.update(GUEST_RESOLV_CONF);
     hasher.update((GUEST_NSSWITCH_CONF.len() as u64).to_le_bytes());
     hasher.update(GUEST_NSSWITCH_CONF);
-    // The CA bundle is guest CONTENT too: without it in the key, shipping
-    // roots wouldn't invalidate artifacts built before they were added.
     if let Some(ca) = host_ca_bundle() {
         for path in GUEST_CA_PATHS {
             hasher.update((path.len() as u64).to_le_bytes());
@@ -2641,16 +2637,10 @@ fn launch_refusal(reason: impl std::fmt::Display) -> anyhow::Error {
     )
 }
 
-/// The one message for "this backend cannot run Bun at all", shared by
-/// `start_function`'s entry-point refusal (the authoritative `func.runtime`
-/// check, which makes this unreachable in the ordinary case) and the
-/// belt-and-braces check right after `resolve_direct_launch` (which would
-/// otherwise trust `start_cmd`'s argv-derived runtime alone for a
-/// mismatched — `func.runtime == Node` but `start_cmd[0] == "bun"` — launch).
-/// A NODE fault, not a launch-shape refusal: this backend genuinely cannot
-/// run Bun on ANY node, regardless of what is staged, so it is
-/// `NODE_RUNTIME_MISSING` rather than `launch_refusal`'s
-/// `NODE_BACKEND_UNAVAILABLE`.
+/// The one refusal for "this backend cannot run Bun", shared by `start_function`'s `func.runtime`
+/// check and the check after `resolve_direct_launch` (which catches `func.runtime == Node` with
+/// `start_cmd[0] == "bun"`). A NODE fault (`NODE_RUNTIME_MISSING`), not a launch-shape refusal: no
+/// node of this backend can run Bun, whatever is staged.
 fn bun_unsupported_refusal() -> anyhow::Error {
     anyhow::anyhow!(
         "{}: litebox has no supported Bun runtime on this node — its syscall shim panics on \
@@ -2817,6 +2807,35 @@ fn expand_package_manager(
     Ok(direct)
 }
 
+/// Joins a relative entry onto `guest_workdir`, normalizing `..` lexically on the JOINED path. The
+/// entry is already the resolved physical path of a package manager's symlinked `.bin/<tool>`
+/// launcher, which legitimately climbs out of the app directory into a shared store inside the
+/// artifact (pnpm: `../../node_modules/next/dist/bin/next`). Seeding with the workdir makes `pop()`
+/// step out of a real directory and fail only above the artifact root; the caller re-checks the
+/// result with `validate_guest_workdir`.
+fn join_entry_under_workdir(path: &Path, guest_workdir: &str) -> anyhow::Result<PathBuf> {
+    let mut absolute = PathBuf::from(guest_workdir);
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => absolute.push(value),
+            Component::ParentDir => {
+                anyhow::ensure!(
+                    absolute.pop(),
+                    "{}",
+                    launch_refusal("the direct runtime entry escapes the validated artifact")
+                );
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(launch_refusal(
+                    "the direct runtime entry is not artifact-relative",
+                ))
+            }
+        }
+    }
+    Ok(absolute)
+}
+
 fn validated_direct_entry(
     runtime: DirectRuntime,
     entry: &str,
@@ -2861,46 +2880,7 @@ fn validated_direct_entry(
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        // Lexically NORMALIZE `..` rather than refusing it outright: a package
-        // manager resolves its launcher through a symlinked `.bin/<tool>`
-        // whose target legitimately climbs out of the application directory
-        // into a shared store that is still inside the artifact (pnpm:
-        // `apps/web/node_modules/.bin/next` ->
-        // `node_modules/.pnpm/next@<ver>/node_modules/next/bin/next`, i.e.
-        // `../../node_modules/next/dist/bin/next` from the app dir). The entry
-        // here is already the RESOLVED physical path, so lexical normalization
-        // is sound.
-        //
-        // Normalize the JOINED absolute path, never the raw relative one:
-        // popping `..` off a bare relative path starts from nothing, so the
-        // FIRST `..` — exactly the leading climb a pnpm target has — was
-        // refused as an escape (witnessed 2026-09-26, Nodes.WTF: "the direct
-        // runtime entry escapes the validated artifact" for
-        // `../../node_modules/next/dist/bin/next`, which resolves to
-        // `/workspace/node_modules/...` and is plainly inside the artifact).
-        // Seeding with the workdir makes `pop()` mean what it should: stepping
-        // out of a real directory, and only failing when it steps above the
-        // artifact root. `validate_guest_workdir` then re-checks the result.
-        let mut absolute = PathBuf::from(guest_workdir);
-        for component in path.components() {
-            match component {
-                Component::CurDir => {}
-                Component::Normal(value) => absolute.push(value),
-                Component::ParentDir => {
-                    anyhow::ensure!(
-                        absolute.pop(),
-                        "{}",
-                        launch_refusal("the direct runtime entry escapes the validated artifact")
-                    );
-                }
-                Component::RootDir | Component::Prefix(_) => {
-                    return Err(launch_refusal(
-                        "the direct runtime entry is not artifact-relative",
-                    ))
-                }
-            }
-        }
-        absolute
+        join_entry_under_workdir(path, guest_workdir)?
     };
     let absolute = absolute.to_str().ok_or_else(|| {
         launch_refusal("the direct runtime entry is not valid UTF-8 after normalization")
@@ -2934,6 +2914,10 @@ fn validated_direct_entry(
     Ok(absolute.to_string())
 }
 
+/// GNU tar's member-miss stderr: the deployment's own fault (its start command names a file the
+/// sealed tree never had), never a node fault.
+const TAR_MEMBER_MISS_STDERR: &str = "Not found in archive";
+
 async fn validate_archive_main_entry(archive: &File, guest_entry: &str) -> anyhow::Result<()> {
     let archive_entry = Path::new(guest_entry)
         .strip_prefix("/")
@@ -2955,15 +2939,7 @@ async fn validate_archive_main_entry(archive: &File, guest_entry: &str) -> anyho
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // GNU tar's member-miss is the DEPLOYMENT's fault (its start_cmd names
-        // a file the sealed tree never had — the build-time preflight in
-        // hive-cloud refuses this before sealing; reaching it here means an
-        // artifact sealed by an older binary), so it carries the app-fault
-        // marker, never `NODE_BACKEND_UNAVAILABLE`: fluid-compute records that
-        // marker as a NODE fault on the pool, blaming this node's backend for
-        // a missing tenant file. Any other tar failure (unreadable archive) is
-        // still this node's problem and keeps the launch-refusal class.
-        if stderr.contains("Not found in archive") {
+        if stderr.contains(TAR_MEMBER_MISS_STDERR) {
             anyhow::bail!(
                 "{}: main entry {guest_entry:?} does not exist in this deployment's sealed \
                  application tree (the start_cmd names a file that was never committed or \
@@ -3098,6 +3074,11 @@ fn validated_next_arguments(
     Ok(result)
 }
 
+/// The one Node runtime flag the platform's own exported-server launcher emits (TypeScript
+/// entries): a loader toggle with no eval/exec/stdin semantics, so allowing exactly it ahead of the
+/// entry does not widen the launch grammar; every other option still refuses on the leading dash.
+const NODE_STRIP_TYPES_FLAG: &str = "--experimental-strip-types";
+
 async fn resolve_direct_launch(
     func: &FunctionLaunch,
     reference: &LiteboxImageReference,
@@ -3147,19 +3128,11 @@ async fn resolve_direct_launch(
             )))
         }
     };
-    // `--experimental-strip-types` is the ONE Node runtime flag the platform's
-    // own exported-server launcher emits (TypeScript entries). It is a loader
-    // toggle with no eval/exec/stdin semantics, so permitting exactly it ahead
-    // of the entry does not widen the launch grammar — every other option
-    // still refuses via validated_direct_entry's leading-dash check. Without
-    // this, litebox refused the platform's OWN launcher shape and every
-    // TypeScript exported-server deploy placed on a litebox node failed
-    // (witnessed live: examples/express on fc-frankfurt).
     let mut entry_index = 0usize;
     if runtime == DirectRuntime::Node {
         while args
             .get(entry_index)
-            .is_some_and(|arg| arg == "--experimental-strip-types")
+            .is_some_and(|arg| arg == NODE_STRIP_TYPES_FLAG)
         {
             entry_index += 1;
         }
@@ -3180,19 +3153,10 @@ async fn resolve_direct_launch(
     Ok(DirectLaunch { runtime, bin, args })
 }
 
-/// Kill-and-reap a still-running guest child on ANY exit from the scope this
-/// guard is armed in — a normal `Err` return, an early `?`, or the whole
-/// future being DROPPED because the caller gave up (`ColdStartGuard` in
-/// `fluid-compute` releases the scheduler's own `provisioning` reservation on
-/// exactly that path, but has no reach into this process — a genuinely
-/// separate resource at a different layer). `tokio::process::Child`'s own
-/// `kill_on_drop` sends the signal synchronously but is documented to NOT
-/// reap: the OS keeps the process a zombie until something calls `wait()` on
-/// it. Witnessed live on fc-phoenix (2026-08-29): three real zombie
-/// `litebox-runner` processes, all direct children of the running hive-cloud
-/// PID, accumulated purely from repeated timed-out/abandoned cold starts.
-/// `disarm()` on the success path hands the child back for its normal,
-/// already-correct long life (`terminate()` reaps it then).
+/// Kills and reaps a still-running guest child on any exit from the scope it is armed in: an `Err`,
+/// an early `?`, or the whole future being dropped because the caller gave up. `kill_on_drop`
+/// signals but never reaps, so abandoned cold starts left zombie runners; `disarm()` on the success
+/// path hands the child back (`terminate()` reaps it then).
 struct ChildReapGuard<'a> {
     child: Option<&'a mut Child>,
 }
@@ -3202,10 +3166,6 @@ impl<'a> ChildReapGuard<'a> {
         Self { child: Some(child) }
     }
 
-    /// Reborrow the guarded child. The guard, not this call, owns the
-    /// underlying reference for its whole lifetime, so callers may reborrow
-    /// through it as many times as needed without ever holding a second
-    /// independent `&mut Child`.
     fn child_mut(&mut self) -> &mut Child {
         self.child.as_deref_mut().expect("guard already disarmed")
     }
@@ -3215,17 +3175,14 @@ impl<'a> ChildReapGuard<'a> {
     }
 }
 
+/// `Drop` cannot await, so the reap runs in a detached task: it still happens when this drop is
+/// itself part of another future's cancellation teardown.
 impl Drop for ChildReapGuard<'_> {
     fn drop(&mut self) {
         let Some(child) = self.child.take() else {
             return;
         };
         let _ = child.start_kill();
-        // `Drop` cannot `.await`; a detached task still guarantees the reap
-        // happens even when THIS guard's own drop is running inside another
-        // future's cancellation teardown (no runtime-context requirement
-        // beyond `tokio::spawn` needing a live handle, true everywhere this
-        // guard is ever constructed).
         if let Some(pid) = child.id() {
             tokio::spawn(async move {
                 // SAFETY: reaping our own just-killed child by raw pid — the
@@ -3284,18 +3241,10 @@ impl Default for LiteboxBackend {
     }
 }
 
-/// litebox's own `register_exception_handlers` (`litebox_platform_linux_
-/// userland/src/lib.rs`) installs handlers for `SIGINT`/`SIGALRM` and
-/// ASSERTS the PREVIOUS disposition was `SIG_DFL` — a real, reproducible
-/// crash (`assertion left == right failed: signal 2 handler already
-/// installed`) whenever that isn't true, confirmed live on fc-frankfurt
-/// (2026-08-08): a process spawned with no controlling terminal (`setsid`,
-/// and — the actual production case — any child of a process itself run
-/// without a tty, e.g. over SSH without `-t` or under systemd) commonly
-/// inherits a non-default SIGINT disposition. `pre_exec` runs in the forked
-/// child before exec, the same technique `crate::mock::apply_rlimits`
-/// already uses, so litebox always starts from a clean slate regardless of
-/// what its parent's own disposition happened to be.
+/// Resets `SIGINT`/`SIGALRM` to `SIG_DFL` in the forked child before exec: litebox's
+/// `register_exception_handlers` asserts the previous disposition was the default and crashes
+/// otherwise, and a child of a process run without a tty (SSH without `-t`, systemd) commonly
+/// inherits a non-default SIGINT.
 fn reset_signal_dispositions_before_exec(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
@@ -3309,12 +3258,9 @@ fn reset_signal_dispositions_before_exec(cmd: &mut Command) {
     }
 }
 
-/// Resolve a runtime binary name to an absolute host path the litebox CLI
-/// can open directly. The CLI does its own `open()`, not an `execvp`-style
-/// PATH search (confirmed from its source: it lexically resolves the
-/// program argument relative to CWD, nothing more), so a bare command name
-/// like `"node"` (the common `FunctionLaunch::start_cmd[0]` shape) must be
-/// resolved here first, the same job the OS shell/`execvp` normally does.
+/// Resolves a runtime binary name to the absolute host path the litebox CLI can open: the CLI does
+/// its own `open()` with no `execvp`-style PATH search, so a bare `node` (the usual `start_cmd[0]`)
+/// must be resolved here first.
 async fn resolve_bin(name: &str) -> PathBuf {
     if name.contains('/') {
         return PathBuf::from(name);
@@ -3337,11 +3283,9 @@ async fn resolve_bin(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// The absolute-path shared-library closure of `bin` (interpreter + every
-/// `NEEDED` entry `ldd` resolves), skipping the kernel-provided VDSO (no
-/// backing file). A genuinely static binary makes `ldd` exit non-zero ("not
-/// a dynamic executable") — that means zero deps to stage, not a real
-/// error, so it returns `Ok(vec![])` rather than propagating the failure.
+/// The absolute-path shared-library closure of `bin`: its interpreter and every `NEEDED` entry
+/// `ldd` resolves, without the VDSO. A static binary (`ldd` exits non-zero) is zero deps,
+/// `Ok(vec![])`, not an error.
 async fn ldd_closure(bin: &Path) -> anyhow::Result<Vec<PathBuf>> {
     let out = Command::new("ldd")
         .arg(bin)
