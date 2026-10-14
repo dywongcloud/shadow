@@ -76,17 +76,40 @@ pub fn place_for_project(
             let reachable = n.name == cloud.node_name
                 || cloud.node_admins.read().contains_key(&n.name)
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
-            let capable_ok = meets_capability_needs(
-                n,
-                needs_gpu,
-                needs_interpreter,
-                needs_runtime_artifact,
-                needs_build_isolation,
-                needs_build_toolchain,
-            );
-            if n.healthy && region_ok && reachable && capable_ok {
+            let gpu_ok = !needs_gpu || n.gpu_count > 0;
+            let wasm_ok = wasm_capable(n, needs_interpreter.wasm);
+            let bun_ok = bun_capable(n, needs_interpreter.bun);
+            let runtime_artifact_ok = runtime_artifact_capable(n, needs_runtime_artifact);
+            let build_isolation_ok = build_isolation_capable(n, needs_build_isolation);
+            let build_toolchain_ok = build_toolchain_capable(n, needs_build_toolchain);
+            if n.healthy
+                && region_ok
+                && reachable
+                && gpu_ok
+                && wasm_ok
+                && bun_ok
+                && runtime_artifact_ok
+                && build_isolation_ok
+                && build_toolchain_ok
+            {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
-                return vec![target_of(cloud, n)];
+                let target = if n.name == cloud.node_name {
+                    Target {
+                        node: n.name.clone(),
+                        admin: None,
+                        iroh: None,
+                    }
+                } else {
+                    Target {
+                        node: n.name.clone(),
+                        admin: cloud.node_admins.read().get(&n.name).cloned(),
+                        iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
+                            (Some(id), Some(addr)) => Some((id, addr)),
+                            _ => None,
+                        },
+                    }
+                };
+                return vec![target];
             }
         }
     }
@@ -255,34 +278,15 @@ fn reachable(cloud: &Arc<CloudState>, n: &NodeInfo) -> bool {
         || (n.peer_id.is_some() && n.iroh_addr.is_some() && dialable(n))
 }
 
-/// The hard needs of one deployment, shared by `capable` and lease stickiness so the two never
-/// disagree.
-fn meets_capability_needs(
-    n: &NodeInfo,
-    needs_gpu: bool,
-    needs_interpreter: InterpreterNeeds,
-    needs_runtime_artifact: bool,
-    needs_build_isolation: bool,
-    needs_build_toolchain: Option<&str>,
-) -> bool {
-    (!needs_gpu || n.gpu_count > 0)
-        && wasm_capable(n, needs_interpreter.wasm)
-        && bun_capable(n, needs_interpreter.bun)
-        && runtime_artifact_capable(n, needs_runtime_artifact)
-        && build_isolation_capable(n, needs_build_isolation)
-        && build_toolchain_capable(n, needs_build_toolchain)
-}
-
-/// Mock builds and runs directly on the host (`mock::run_build_process`), needing neither
-/// BuildExecutor nor the split runtime-artifact contract `eligible` enforces for Firecracker, so a
-/// region made only of mock nodes can still place any deployment.
-fn healthy_mock_node(n: &NodeInfo) -> bool {
-    n.healthy && n.backend == "mock"
+fn is_mock_backend(n: &NodeInfo) -> bool {
+    n.backend == "mock"
 }
 
 /// Capability filter: the hard needs, the disk floor, then an eligible backend or a healthy Mock
-/// node. A container also needs a public address: it is served from the node's own host, never
-/// through the microVM guest network.
+/// node (Mock builds and runs directly on the host, so it needs neither BuildExecutor nor the split
+/// runtime-artifact contract `eligible` enforces for Firecracker, and a region made only of mock
+/// nodes can still place any deployment). A container also needs a public address: it is served
+/// from the node's own host, never through the microVM guest network.
 fn capable(
     n: &NodeInfo,
     is_container: bool,
@@ -292,20 +296,33 @@ fn capable(
     needs_build_isolation: bool,
     needs_build_toolchain: Option<&str>,
 ) -> bool {
-    if !meets_capability_needs(
-        n,
-        needs_gpu,
-        needs_interpreter,
-        needs_runtime_artifact,
-        needs_build_isolation,
-        needs_build_toolchain,
-    ) {
+    if needs_gpu && n.gpu_count == 0 {
         return false;
     }
-    if below_disk_floor(n, disk_floor_gb()) {
+    if !wasm_capable(n, needs_interpreter.wasm) {
         return false;
     }
-    (!is_container || has_public_address(n)) && (eligible(n) || healthy_mock_node(n))
+    if !bun_capable(n, needs_interpreter.bun) {
+        return false;
+    }
+    if !runtime_artifact_capable(n, needs_runtime_artifact) {
+        return false;
+    }
+    if !build_isolation_capable(n, needs_build_isolation) {
+        return false;
+    }
+    if !build_toolchain_capable(n, needs_build_toolchain) {
+        return false;
+    }
+    let floor_gb = disk_floor_gb();
+    if below_disk_floor(n, floor_gb) {
+        return false;
+    }
+    if is_container {
+        has_public_address(n) && (eligible(n) || (n.healthy && is_mock_backend(n)))
+    } else {
+        eligible(n) || (n.healthy && is_mock_backend(n))
+    }
 }
 
 fn coordinator_geo(nodes: &[NodeInfo], me: &str) -> Option<(f64, f64)> {
@@ -635,12 +652,12 @@ fn placement_blocker(
             n.disk_free_gb
         ));
     }
-    if is_container && !has_public_address(n) {
+    if is_container && n.public_ip.is_none() && n.public_ip6.is_none() {
         return Some(
             "no public address (a container is served from the node's own host)".to_string(),
         );
     }
-    if !eligible(n) && !healthy_mock_node(n) {
+    if !eligible(n) && !is_mock_backend(n) {
         if n.mem_total_mb < MEM_FLOOR_MB {
             return Some(format!(
                 "below the {} MiB placement memory floor ({} MiB)",
