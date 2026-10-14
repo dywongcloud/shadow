@@ -8,3 +8,4 @@ description = "The one guard for HTTP requests the node makes to a URL a tenant 
 [dependencies]
 reqwest = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }

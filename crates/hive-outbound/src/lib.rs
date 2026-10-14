@@ -19,7 +19,11 @@
 //!   it never follows a redirect, because whoever answers can aim it anywhere.
 //!
 //! `HIVE_OUTBOUND_ALLOW_PRIVATE=1` lifts the scheme and address rules of [`validate_url`] and the
-//! connect-time filter, for a developer's machine; production never sets it.
+//! connect-time filter, for a developer's machine; it is REFUSED outright on an enforced node
+//! (mirrors `hive_cloud::auth::enforced()`: `HIVE_JWT_SECRET` set and non-empty, checked directly
+//! since this crate does not depend on `hive-cloud`), so an accidental ansible/env leak into
+//! production cannot silently open every tenant-URL fetcher — only a genuinely unauthenticated dev
+//! node honors it, and a boot WARN names the var the first time it is consulted.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
@@ -33,8 +37,36 @@ use reqwest::Url;
 pub const MAX_REDIRECTS: usize = 5;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Mirrors `hive_cloud::auth::enforced()` without a cross-crate dependency: a node is enforced iff
+/// `HIVE_JWT_SECRET` is set and non-empty. Kept in sync by hand; both read the same env var by the
+/// same rule.
+fn auth_enforced() -> bool {
+    std::env::var("HIVE_JWT_SECRET").is_ok_and(|secret| !secret.is_empty())
+}
+
 fn dev_escape() -> bool {
-    std::env::var("HIVE_OUTBOUND_ALLOW_PRIVATE").is_ok_and(|value| value == "1")
+    if !std::env::var("HIVE_OUTBOUND_ALLOW_PRIVATE").is_ok_and(|value| value == "1") {
+        return false;
+    }
+    if auth_enforced() {
+        static WARNED_REFUSED: OnceLock<()> = OnceLock::new();
+        WARNED_REFUSED.get_or_init(|| {
+            tracing::warn!(
+                "HIVE_OUTBOUND_ALLOW_PRIVATE=1 is set but this node has auth enforced \
+                 (HIVE_JWT_SECRET is set) — the escape is REFUSED; it only applies to an \
+                 unauthenticated dev node"
+            );
+        });
+        return false;
+    }
+    static WARNED_ACTIVE: OnceLock<()> = OnceLock::new();
+    WARNED_ACTIVE.get_or_init(|| {
+        tracing::warn!(
+            "HIVE_OUTBOUND_ALLOW_PRIVATE=1 is set — every tenant-URL fetcher accepts http and \
+             private/loopback addresses; never set this on a production node"
+        );
+    });
+    true
 }
 
 /// Why a URL was refused: a fixed sentence, safe to hand back to the tenant (it never carries a
@@ -83,6 +115,13 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
     if s[0] == 0x0064 && s[1] == 0xff9b {
         return s[2..6] == [0, 0, 0, 0] && public_v4(embedded(s[6], s[7]));
+    }
+    // SIIT's `::ffff:0:a.b.c.d` (the 0xffff marker one segment later than the standard v4-mapped
+    // `::ffff:a.b.c.d` form `to_ipv4()` already handles above): `s[0..4]` zero, `s[4]==0xffff`,
+    // `s[5]==0`, v4 in `s[6..8]`. Without this arm the embedded v4 address (which can be loopback
+    // or RFC1918) is invisible to every check below and the whole address reads as public.
+    if s[0..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0 {
+        return public_v4(embedded(s[6], s[7]));
     }
     if s[0] == 0x2002 {
         return public_v4(embedded(s[1], s[2]));
