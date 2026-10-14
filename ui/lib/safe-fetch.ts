@@ -4,16 +4,23 @@ import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { LookupFunction } from "node:net";
 import { Readable, Transform, pipeline } from "node:stream";
+import { createGunzip, createInflate } from "node:zlib";
 import { isPublicAddress, refusedHost } from "@/lib/public-address";
 
 const MAX_REDIRECTS = 3;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 const SOCKET_IDLE_TIMEOUT_MS = 10_000;
+const ENCODED_OVERHEAD_BYTES = 16 * 1024;
+const DECODERS: Record<string, () => Transform> = {
+  gzip: createGunzip,
+  "x-gzip": createGunzip,
+  deflate: createInflate,
+};
 
 /** A failure that already knows the HTTP status a route should answer with. */
 export class UpstreamError extends Error {
   constructor(
-    readonly status: 400 | 403 | 502,
+    readonly status: 400 | 403 | 415 | 502,
     message: string,
   ) {
     super(message);
@@ -81,30 +88,48 @@ export async function safeGet(
   }
 }
 
-/** The whole body in memory, destroying the upstream the moment it exceeds `maxBytes`. */
-export async function readBounded(source: IncomingMessage, maxBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
+/** The response's one content-coding: `""` for a plain body, its name when the proxy can undo it (gzip and deflate, 32 KiB windows), `null` for anything else (a chain, zstd, compress,
+ *  brotli: its 16 MiB window is too much memory per request for an origin that ignored `accept-encoding: identity`). */
+export function contentCoding(headers: IncomingHttpHeaders): string | null {
+  const coding = String(headers["content-encoding"] ?? "").trim().toLowerCase();
+  if (coding === "" || coding === "identity") return "";
+  return Object.hasOwn(DECODERS, coding) ? coding : null;
+}
+
+function capped(limit: number): Transform {
   let seen = 0;
-  for await (const chunk of source as AsyncIterable<Buffer>) {
-    seen += chunk.length;
-    if (seen > maxBytes) {
-      source.destroy();
-      throw new UpstreamError(502, "upstream body exceeds the size cap");
-    }
-    chunks.push(chunk);
+  return new Transform({
+    transform(chunk: Buffer, _encoding, done) {
+      seen += chunk.length;
+      done(seen > limit ? new UpstreamError(502, "upstream body exceeds the size cap") : null, chunk);
+    },
+  });
+}
+
+/** The origin's bytes as the caller meant them, at most `maxBytes` of them, the upstream torn down when the stream ends for any reason. A gzip/deflate body (an origin that ignored
+ *  `accept-encoding: identity`) is decoded with the cap on BOTH sides of the decoder: the decoded side stops a bomb, the encoded side stops an endless stream that decodes to nothing. */
+function boundedSource(response: SafeResponse, maxBytes: number): Readable {
+  const coding = contentCoding(response.headers);
+  if (coding === null || (coding !== "" && response.status === 206)) {
+    response.body.destroy();
+    throw coding === null
+      ? new UpstreamError(415, "unsupported upstream content-encoding")
+      : new UpstreamError(502, "a partial upstream response in a content-coding cannot be decoded");
   }
+  const decoded = capped(maxBytes);
+  const decoding = coding === "" ? [] : [capped(maxBytes + ENCODED_OVERHEAD_BYTES), DECODERS[coding]()];
+  pipeline([response.body, ...decoding, decoded], () => {});
+  return decoded;
+}
+
+/** The whole body in memory (decoded if the origin encoded it), the upstream destroyed the moment it exceeds `maxBytes`. */
+export async function readBounded(response: SafeResponse, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of boundedSource(response, maxBytes)) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);
 }
 
-/** The body as a web stream that errors, and tears the upstream connection down, past `maxBytes` or when the consumer cancels. */
-export function boundedBody(source: IncomingMessage, maxBytes: number): ReadableStream<Uint8Array> {
-  let seen = 0;
-  const counter = new Transform({
-    transform(chunk: Buffer, _encoding, done) {
-      seen += chunk.length;
-      done(seen > maxBytes ? new UpstreamError(502, "upstream body exceeds the size cap") : null, chunk);
-    },
-  });
-  pipeline(source, counter, () => {});
-  return Readable.toWeb(counter) as unknown as ReadableStream<Uint8Array>;
+/** The body as a web stream (decoded if the origin encoded it) that errors, and tears the upstream connection down, past `maxBytes` or when the consumer cancels. */
+export function boundedBody(response: SafeResponse, maxBytes: number): ReadableStream<Uint8Array> {
+  return Readable.toWeb(boundedSource(response, maxBytes)) as unknown as ReadableStream<Uint8Array>;
 }
