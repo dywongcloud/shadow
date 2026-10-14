@@ -8,6 +8,14 @@
 //! 2. `$HIVE_DATA/secret.key` (generated once, persisted, chmod 600);
 //! 3. a fresh random key written to that file.
 //!
+//! Every failure in that resolution is a HARD BOOT ERROR (`load_or_create_key` returns `Err`, and
+//! `key()`/`raw_key()` exit the process rather than ever return a key nobody agreed on): a malformed
+//! `HIVE_SECRET_KEY` never falls back to the node's own file key (the fleet would silently stop
+//! sharing one key), an existing `secret.key` that is not 64 hex is never regenerated over
+//! (everything sealed under it would be orphaned), and a key that could not be persisted never runs
+//! as a memory-only key (every value sealed this boot would be unreadable after the next restart).
+//! Only genuine first-boot absence (no env, no file) creates and persists a fresh key.
+//!
 //! `decrypt` is a passthrough for non-`enc:v1:` input, so plaintext values written before
 //! encryption was added still load (and are re-sealed on the next save).
 
@@ -34,7 +42,15 @@ fn key() -> &'static LessSafeKey {
 /// deliberately does not expose its bytes.
 fn raw_key() -> &'static [u8; 32] {
     static RAW: OnceLock<[u8; 32]> = OnceLock::new();
-    RAW.get_or_init(load_or_create_key)
+    RAW.get_or_init(|| {
+        load_or_create_key().unwrap_or_else(|reason| {
+            // Loud and deterministic: a key this boot cannot trust or cannot keep is worse than no
+            // boot at all (AGENTS.md "fail fast, loud, deterministic" / never weaken a security gate).
+            tracing::error!(%reason, "fatal: at-rest secret key resolution failed");
+            eprintln!("fatal: at-rest secret key resolution failed: {reason}");
+            std::process::exit(1);
+        })
+    })
 }
 
 /// Key material for deriving *other* secrets deterministically (see `zkauth::derive_secret`). One
@@ -190,34 +206,60 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 /// Key resolution, in order: `HIVE_SECRET_KEY` (64 hex chars); else `$HIVE_DATA/secret.key`; else a
-/// fresh random key written to that file (chmod 600 on unix). A `HIVE_SECRET_KEY` that is not 64
-/// hex chars is IGNORED with a WARN and the node falls back to its own file key, which the rest of
-/// the fleet does not share.
-fn load_or_create_key() -> [u8; 32] {
+/// fresh random key written to that file (chmod 600 on unix). Every branch that cannot produce a key
+/// everyone will agree on, or cannot persist one it just made, is `Err` (see the module doc) — the
+/// dev flow (no env, no file) is the only path that succeeds by creating state.
+fn load_or_create_key() -> Result<[u8; 32], String> {
+    let data_dir = crate::persist::data_dir();
     if let Ok(h) = std::env::var("HIVE_SECRET_KEY") {
-        if let Some(k) = hex_to_32(&h) {
-            return k;
-        }
-        tracing::warn!("HIVE_SECRET_KEY is not 64 hex chars — ignoring");
+        return hex_to_32(&h).ok_or_else(|| {
+            format!(
+                "HIVE_SECRET_KEY is set but is not 64 hex characters ({} chars) — refusing to fall \
+                 back to this node's own {}/secret.key, which the rest of the fleet does not share",
+                h.trim().len(),
+                data_dir.display()
+            )
+        });
     }
-    let path = crate::persist::data_dir().join("secret.key");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        if let Some(k) = hex_to_32(&s) {
-            return k;
+    let path = data_dir.join("secret.key");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => hex_to_32(&s).ok_or_else(|| {
+            format!(
+                "{} exists but is not 64 hex characters ({} bytes) — refusing to regenerate over it \
+                 (every value already sealed under it would be orphaned); restore the correct key or \
+                 remove the file to mint a fresh one",
+                path.display(),
+                s.trim().len()
+            )
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut k = [0u8; 32];
+            SystemRandom::new()
+                .fill(&mut k)
+                .map_err(|_| "system RNG failed while generating a new secret key".to_string())?;
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("could not create {}: {e}", data_dir.display()))?;
+            std::fs::write(&path, hex_encode(&k)).map_err(|e| {
+                format!(
+                    "could not persist a new key to {}: {e} — refusing to run on a memory-only key \
+                     (everything sealed this boot would be unreadable after the next restart)",
+                    path.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| format!("could not chmod 600 {}: {e}", path.display()))?;
+            }
+            tracing::info!(path = ?path, "generated at-rest secret key for env-var encryption");
+            Ok(k)
         }
+        Err(e) => Err(format!(
+            "could not read {}: {e} — refusing to treat an existing key file as absent and replace it",
+            path.display()
+        )),
     }
-    let mut k = [0u8; 32];
-    SystemRandom::new().fill(&mut k).expect("system RNG");
-    let _ = std::fs::create_dir_all(crate::persist::data_dir());
-    if std::fs::write(&path, hex_encode(&k)).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-        tracing::info!(path = ?path, "generated at-rest secret key for env-var encryption");
-    }
-    k
 }
 
 /// Has this value already been sealed?

@@ -33,26 +33,36 @@ impl IntegritySigner {
     /// Loads this node's persisted signing key, or generates and persists a fresh one on first
     /// boot. A key file whose content is invalid hex or an unparsable PKCS#8 document is a loud
     /// error, not a reason to overwrite history's signing identity with a fresh key nobody has
-    /// cross-checked; a path that cannot be read as text at all (absent, unreadable, non-UTF-8) is
-    /// treated as absent and gets a fresh key.
+    /// cross-checked; so is any OTHER reason the file cannot be read as text (EACCES after a
+    /// restore, non-UTF-8 content) — only a genuinely ABSENT file (`NotFound`) is treated as
+    /// first-boot and gets a fresh key.
     pub fn open_or_create(node: &str) -> anyhow::Result<Self> {
         let path = crate::persist::data_dir().join("integrity_signing.key");
-        let pkcs8 = if let Ok(hex_str) = std::fs::read_to_string(&path) {
-            hex::decode(hex_str.trim())
-                .map_err(|e| anyhow::anyhow!("integrity_signing.key is not valid hex: {e}"))?
-        } else {
-            let doc = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-                .map_err(|_| anyhow::anyhow!("failed to generate Ed25519 signing key"))?;
-            let bytes = doc.as_ref().to_vec();
-            let _ = std::fs::create_dir_all(crate::persist::data_dir());
-            std::fs::write(&path, hex::encode(&bytes))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        let pkcs8 = match std::fs::read_to_string(&path) {
+            Ok(hex_str) => hex::decode(hex_str.trim())
+                .map_err(|e| anyhow::anyhow!("integrity_signing.key is not valid hex: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let doc = Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                    .map_err(|_| anyhow::anyhow!("failed to generate Ed25519 signing key"))?;
+                let bytes = doc.as_ref().to_vec();
+                std::fs::create_dir_all(crate::persist::data_dir())?;
+                std::fs::write(&path, hex::encode(&bytes))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                tracing::info!(path = ?path, "generated per-node integrity signing key");
+                bytes
             }
-            tracing::info!(path = ?path, "generated per-node integrity signing key");
-            bytes
+            Err(e) => {
+                anyhow::bail!(
+                    "{} exists but could not be read as text ({e}) — refusing to overwrite this \
+                     node's signing identity with a fresh key nobody has cross-checked; fix the \
+                     file's permissions/encoding, or move it aside to intentionally rotate",
+                    path.display()
+                );
+            }
         };
         let keypair = Ed25519KeyPair::from_pkcs8(&pkcs8)
             .map_err(|e| anyhow::anyhow!("integrity_signing.key failed to parse: {e}"))?;
