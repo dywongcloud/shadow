@@ -235,9 +235,11 @@ load-bearing, delete the memories it absorbs. Nested files load where you work: 
   `roles::QUEUE_CLIENT_ROUTES` to enqueue + stats. It sits in a tenant's env, so `world_queue::rotate_queue_tokens`
   re-issues an aged or sealed one in each local deployment's function env about 90 s after boot and every 6 h
   (`HIVE_QUEUE_TOKEN_ROTATE_SECS`), as a PLAINTEXT token (a project row's `enc:v1:` copy is no bearer).
-- A project transfer is a MOVE: the settings row is the owner of record (`admin::row_holder`: every gate that reads a
-  deployment's tag asks it first, via `deployment_tenant`; the copies are evidence only for a row with NO tag), a
-  claim never takes a project (`ProjectStore::claim_team` is a compare-and-set), and deployments follow the row
+- A project transfer is a MOVE: the settings row is the owner of record (`admin::row_holder`; the copies are evidence
+  only for a row with NO tag), so a read keyed by a DEPLOYMENT ID (integrity chain, build, resources) asks ONE
+  predicate, `admin::deployment_owned_by`, never an inline copy and never a project NAME or team SLUG compared with a
+  tenant (a slug is whatever its creator types; `record_tenant` takes a stored tag). A claim never takes a project
+  (`ProjectStore::claim_team` is a compare-and-set), and deployments follow the row
   (`Gateway::retag_project`, then every host in `tenancy_reconcile::retag_deployments_to_rows`:
   `HIVE_DEPLOYMENT_RETAG_SECS` 15, `HIVE_DEPLOYMENT_RETAG=0` disables; its first pass after a roll re-tags earlier
   transfers). A move needs a destination the caller administers (`caller_administers`) or the operator.
