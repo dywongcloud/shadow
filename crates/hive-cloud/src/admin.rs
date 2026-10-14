@@ -13101,7 +13101,10 @@ pub(crate) async fn database_teardown_local(
 /// customer asked for the database gone). Replication lag is retried (3 x 400 ms), both for the
 /// record itself (a database created on a peer via `database_provision_local` may not have
 /// replicated here yet, and a no-op on an unknown id used to answer `removed: true` while the
-/// container ran on forever) and for an unset `host_node`, which is NEVER read as "must be local":
+/// container ran on forever). An id still unknown after those retries is a 404, never `removed`:
+/// the old answer also planted a tombstone for an id this node could not see, and a tombstone
+/// (replicated fleet-wide, matched by id alone) drops whichever record that id later names, another
+/// tenant's included. The retry covers an unset `host_node` too, which is NEVER read as "must be local":
 /// an unknown host is logged loudly (the backing was NOT torn down, the catalog entry is removed
 /// regardless) so an operator can find it through the orphan sweep. The catalog removal also purges
 /// the queue/vector/blob PAYLOAD data (keyed by a team-prefixed connection name, not the db id):
@@ -13174,6 +13177,8 @@ async fn database_delete(
                 );
             }
         }
+    } else {
+        return Err(StatusCode::NOT_FOUND);
     }
     c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
@@ -15734,7 +15739,15 @@ async fn billing_checkout(
             }
             _ => {
                 let plan = req.plan.unwrap_or_else(|| "pro".into());
-                let spec = crate::billing::plan_spec(&plan);
+                let Some(spec) = crate::billing::known_plan(&plan) else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown plan '{plan}': the plans are {}",
+                            crate::billing::plan_ids()
+                        ),
+                    ));
+                };
                 (
                     plan,
                     spec.price_cents,
@@ -16129,9 +16142,9 @@ struct BillingGrantReq {
 /// this one targets an explicit `tenant` chosen by the caller, so it is hard-gated to
 /// `require_operator` like every other platform-wide admin mutation.
 ///
-/// An unknown plan id is rejected up front: `plan_spec()` falls back to Hobby (`PLANS[0]`) for an
-/// unrecognized id rather than erroring, so the resolved spec's own id is compared back against
-/// what was asked for. The tier lock is applied AFTER any plan change, so a grant that both
+/// An unknown plan id is rejected up front through `billing::known_plan`, the lookup that does not
+/// fall back to Hobby (`plan_spec` does, so it would accept any string). The tier lock is applied
+/// AFTER any plan change, so a grant that both
 /// switches the plan and locks it lands in the right order; `set_tier_lock` also raises the live
 /// plan to the floor, which repairs an account whose stored plan was downgraded before the lock
 /// existed, and the teams half is kept in step with it (the two halves must never disagree: that
@@ -16147,7 +16160,7 @@ async fn billing_grant(
     if t.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tenant is required".into()));
     }
-    if !req.plan.is_empty() && crate::billing::plan_spec(&req.plan).id != req.plan {
+    if !req.plan.is_empty() && crate::billing::known_plan(&req.plan).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("unknown plan '{}'", req.plan),
@@ -16163,7 +16176,7 @@ async fn billing_grant(
     }
     if let Some(lock) = req.lock_tier.as_deref() {
         let floor = lock.trim();
-        if !floor.is_empty() && crate::billing::plan_spec(floor).id != floor {
+        if !floor.is_empty() && crate::billing::known_plan(floor).is_none() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("unknown lock_tier '{floor}'"),

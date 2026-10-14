@@ -131,8 +131,23 @@ pub fn plan_resource_ceiling(plan: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// The plan whose id is exactly `id`, or `None`. A REQUEST that names a plan (checkout, operator
+/// grant, tier lock) must go through this, never through [`plan_spec`]: that one falls back to
+/// Hobby so a stored legacy plan string still prices, which made an unknown requested plan look
+/// like a valid free one and get stored verbatim as the tenant's plan.
+pub fn known_plan(id: &str) -> Option<&'static PlanSpec> {
+    PLANS.iter().find(|p| p.id == id)
+}
+
+/// The accepted plan ids, for a refusal that names them.
+pub fn plan_ids() -> String {
+    PLANS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
+}
+
+/// The plan priced for `id`: Hobby for an id no plan carries (a stored legacy value). For a
+/// plan named by a request use [`known_plan`].
 pub fn plan_spec(id: &str) -> &'static PlanSpec {
-    PLANS.iter().find(|p| p.id == id).unwrap_or(&PLANS[0])
+    known_plan(id).unwrap_or(&PLANS[0])
 }
 
 /// Max projects on a plan (0 = unlimited).
