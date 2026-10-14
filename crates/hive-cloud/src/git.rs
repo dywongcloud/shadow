@@ -9537,26 +9537,17 @@ async fn dockerfile_container_manifest(
     image_pids: u32,
     image_ports: Option<Vec<PortSpec>>,
 ) -> anyhow::Result<Manifest> {
-    // No repository command runs on this lane, so the builder session (if one
-    // was opened) must be closed rather than left dangling — same discipline as
-    // the fluid.json lane below.
     if let Some(session) = isolated {
         session.finish().await?;
     }
     let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
     let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
     let log = |s: String| cloud.builds.log(bid, s);
-    // Port: an explicit override wins, else the Dockerfile's own `EXPOSE` /
-    // `ENV PORT=` (`image_container_manifest` still falls back to inspecting
-    // the built image, then 8080).
     let exposed = parse_expose(dockerfile).await;
     let port = image_port.or(exposed);
     if let Some(p) = exposed {
         log(format!("Dockerfile exposes port {p}."));
     }
-    // A stable, project-scoped local tag: the same project always rebuilds into
-    // the same tag, so redeploys replace the image instead of accumulating
-    // orphan tags.
     let tag = format!("hive-{}-{project}:latest", sanitize_tag(project));
     let path = podman_path_env();
     log(format!(
@@ -9570,10 +9561,8 @@ async fn dockerfile_container_manifest(
     let out = Command::new("podman")
         .args([
             "build",
-            // `--layers` enables BuildKit-style cache mounts
-            // (`RUN --mount=type=cache,...`); without it those steps fail
-            // outright, which is most real Dockerfiles (see the compose lane's
-            // note — docker/awesome-compose/flask is one).
+            // --layers enables BuildKit-style cache mounts (`RUN --mount=type=cache`); without it
+            // such steps fail outright.
             "--layers",
             "-t",
             &tag,
@@ -9614,10 +9603,9 @@ async fn dockerfile_container_manifest(
     .await
 }
 
-/// Locate a repo's container build file: a `Dockerfile` or its identical twin
-/// `Containerfile` (the vendor-neutral OCI/Buildah/Podman name — byte-for-byte the
-/// same format and instructions). Returns the path to whichever exists, preferring
-/// `Dockerfile` when both are present (the more common name; either builds the same).
+/// Locates a repo's container build file: `Dockerfile`, or its identical twin `Containerfile` (the
+/// vendor-neutral OCI/Buildah/Podman name, byte-for-byte the same format), preferring `Dockerfile`
+/// when both exist.
 fn container_build_file(dir: &Path) -> Option<PathBuf> {
     ["Dockerfile", "Containerfile"]
         .iter()
@@ -9658,12 +9646,10 @@ async fn parse_expose(path: &Path) -> Option<u16> {
     env_port
 }
 
-/// A container deployment: the function "process" is `podman run`. The app is
-/// told to listen on `internal` (via PORT env) and we publish the cell's $PORT →
-/// that internal port, so the gateway proxies to 127.0.0.1:$PORT.
-/// Merge a parsed `vercel.json` into the deployment manifest: routing
-/// (redirects/rewrites/headers, prepended so vercel.json wins), cleanUrls,
-/// trailingSlash, images, crons, and per-function overrides (matched by glob).
+/// Merges a parsed `vercel.json` into the deployment manifest: routing (redirects and rewrites
+/// prepended so vercel.json wins, headers), cleanUrls, trailingSlash, images, crons and
+/// per-function overrides (matched by glob; more than 2 GB of memory selects Vercel's Performance
+/// tier, 2 vCPUs, since Vercel scales CPU with memory).
 fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
     use fluid_core::{
         redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
@@ -9686,7 +9672,6 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
             .collect()
     };
 
-    // Redirects (vercel.json first → highest precedence).
     if !vc.redirects.is_empty() {
         let mut conv: Vec<Redirect> = vc
             .redirects
@@ -9703,7 +9688,6 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
         m.redirects = conv;
     }
 
-    // Rewrites (vercel.json first).
     if !vc.rewrites.is_empty() {
         let mut conv: Vec<Rewrite> = vc
             .rewrites
@@ -9719,7 +9703,6 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
         m.rewrites = conv;
     }
 
-    // Response headers.
     if !vc.headers.is_empty() {
         m.headers = vc
             .headers
@@ -9790,7 +9773,6 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
             .collect();
     }
 
-    // Per-function overrides (glob → matched functions).
     for (glob, fnc) in &vc.functions {
         for f in m.functions.iter_mut() {
             if glob_match(glob, &f.name) {
@@ -9799,8 +9781,8 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
                 }
                 if let Some(mem) = fnc.memory {
                     f.memory_mib = mem;
-                    // Vercel scales CPU with memory; >2 GB ⇒ Performance tier.
-                    f.vcpus = if mem > 2048 { 2 } else { 1 };
+                    let performance_tier = mem > 2048;
+                    f.vcpus = if performance_tier { 2 } else { 1 };
                 }
                 if !fnc.regions.is_empty() {
                     f.regions = fnc.regions.clone();
@@ -9818,7 +9800,6 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
         }
     }
 
-    // Project-level regions apply to any function without its own preference.
     if !vc.regions.is_empty() {
         for f in m.functions.iter_mut() {
             if f.regions.is_empty() {
@@ -9839,9 +9820,9 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
     ));
 }
 
-/// Convert a Vercel 5-field cron (`min hour dom mon dow`) to the scheduler's
-/// 6-field form (`sec min hour dom mon dow`) by prepending a 0-second field.
-/// Already-6-field expressions pass through unchanged.
+/// Converts a Vercel 5-field cron (`min hour dom mon dow`) to the scheduler's 6-field form (`sec
+/// min hour dom mon dow`) by prepending a 0-second field; 6-field expressions pass through
+/// unchanged.
 fn to_six_field_cron(expr: &str) -> String {
     let fields = expr.split_whitespace().count();
     if fields == 5 {
@@ -9851,11 +9832,9 @@ fn to_six_field_cron(expr: &str) -> String {
     }
 }
 
-/// Glob match for `vercel.json` `functions` keys against a function name.
-/// Supports `*` (within a path segment) and `**` (across segments). Because our
-/// function names are extension-less (e.g. `api/hello`), a trailing file
-/// extension on the pattern (e.g. `api/*.js`) is also tried with the extension
-/// stripped.
+/// Glob match for `vercel.json` `functions` keys against a function name: `*` stays within a path
+/// segment, `**` crosses segments, and because function names are extension-less (`api/hello`) a
+/// trailing file extension on the pattern (`api/*.js`) is also tried stripped.
 fn glob_match(pattern: &str, name: &str) -> bool {
     if wild(pattern.as_bytes(), name.as_bytes()) {
         return true;
@@ -9885,7 +9864,6 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
             if i >= s.len() {
                 return false;
             }
-            // A single `*` may not consume `/`.
             if !dbl && s[i] == b'/' {
                 return false;
             }
@@ -9898,13 +9876,11 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-/// The mount point for the automatic per-container persistent volume.
-/// `project_override` — a project's dashboard-managed
-/// `ContainerSettings::volume_mount_path` (see `project_settings.rs`) — wins
-/// when set; falls back to the node-wide `HIVE_CONTAINER_VOLUME_PATH` env,
-/// then `/data`. The per-project override exists because not every image
-/// follows the `/data` convention `itzg/minecraft-server` uses, and a
-/// node-wide env var would misconfigure every OTHER project on the node too.
+/// The mount point for the automatic per-container persistent volume: a project's dashboard-managed
+/// `ContainerSettings::volume_mount_path` wins, then the node-wide `HIVE_CONTAINER_VOLUME_PATH`,
+/// then `/data`. The per-project override exists because not every image follows the `/data`
+/// convention (`itzg/minecraft-server` does), and a node-wide env var would misconfigure every
+/// OTHER project on the node.
 fn container_volume_path(project_override: Option<&str>) -> String {
     if let Some(p) = project_override.map(str::trim).filter(|s| !s.is_empty()) {
         return p.to_string();
@@ -9916,10 +9892,13 @@ fn container_volume_path(project_override: Option<&str>) -> String {
         .unwrap_or_else(|| "/data".to_string())
 }
 
-/// The run-config JSON (container `start_cmd[3]`) that attaches an automatic
-/// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
-/// (+ optional service suffix for compose), so a container's data survives instance
-/// restarts and redeploys. Merged into the compose network cfg when present.
+/// The run-config JSON (container `start_cmd[3]`) that attaches an automatic persistent volume: a
+/// host-backed named volume (≥1 GB) keyed STABLY per project (plus an optional service suffix for
+/// compose), so a container's data survives instance restarts and redeploys. It also puts the
+/// container on its own per-project podman network (the compose subnet scheme), because on podman's
+/// shared default bridge ANY tenant's container could reach any other's by bridge IP; no static ip
+/// is pinned (unlike compose), so scale-out instances coexist and the backend assigns dynamic
+/// addresses within the project subnet. Merged into the compose network cfg when present.
 fn container_volume_cfg(
     project: &str,
     incarnation: ProjectIncarnation,
@@ -9927,12 +9906,6 @@ fn container_volume_cfg(
     volume_path: Option<&str>,
 ) -> String {
     let name = project_volume_name(project, incarnation, service);
-    // TENANT/PROJECT NETWORK ISOLATION: standalone containers also get their own
-    // per-project DNS-less podman network (same deterministic subnet scheme as
-    // compose). Without this they land on podman's shared default bridge, where
-    // ANY tenant's container can reach ANY other's by bridge IP. No static `ip`
-    // is pinned (unlike compose) so scale-out instances coexist; the backend
-    // assigns dynamic addresses within the project subnet.
     let (net, subnet, gw) = project_net(project);
     serde_json::json!({
         "vol": name,
@@ -9944,11 +9917,10 @@ fn container_volume_cfg(
     .to_string()
 }
 
-/// Deterministic per-project podman network (name, /24 subnet, gateway) in the
-/// 10.128-191/16 space — identical scheme to the compose path so a project keeps
-/// one network regardless of how it's deployed. Shared with the databases module
-/// so a managed DB container joins the SAME network the app containers use (and
-/// is reachable by its network-alias).
+/// Deterministic per-project podman network (name, /24 subnet, gateway) in the 10.128-191/16 space,
+/// the same scheme as the compose path so a project keeps one network however it is deployed;
+/// shared with the databases module so a managed DB container joins the SAME network as the app
+/// containers (reachable by its network alias).
 pub(crate) fn project_net(project: &str) -> (String, String, String) {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -9962,6 +9934,20 @@ pub(crate) fn project_net(project: &str) -> (String, String, String) {
     )
 }
 
+/// Manifest for a container deployment: the function "process" is `podman run`. `start_cmd` is the
+/// structured `__container__` marker the backend recognizes,
+/// `[marker, image, internal port, run-config JSON]` (the JSON carries the automatic persistent
+/// volume and the per-project network); the app is told to listen on `internal` via PORT and the
+/// cell's $PORT is published to that internal port, so the gateway proxies to 127.0.0.1:$PORT.
+/// `protocol` is a free-form string (a Railway-style `fluid.json` override, or an already-resolved
+/// wire string from an image deploy) parsed into the typed enum, falling back to http for anything
+/// unrecognized rather than rejecting the build: `FunctionConfig`'s own JSON deserialize boundary
+/// is where a malformed value is rejected hard. A `memory_mib`/`cpus`/`pids` of 0 means the node's
+/// generous, env-tunable container defaults (a real value comes from `fluid.json`
+/// `container.memory`/`cpus`/`pids` or an `ImageDeployReq`'s equivalents; the old hardcoded 512m
+/// OOM-killed monolith containers). A raw-protocol (tcp/udp/grpc) deployment gets no `/` route: it
+/// is reached through its allocated raw public port (`raw_ports`/`raw_proxy`), and an HTTP route
+/// would advertise an endpoint that was never there.
 fn container_manifest(
     project: &str,
     incarnation: ProjectIncarnation,
@@ -9973,12 +9959,6 @@ fn container_manifest(
     pids: u32,
     volume_path: Option<&str>,
 ) -> Manifest {
-    // `protocol` is a free-form string here (Railway-style `fluid.json` override for
-    // the Dockerfile-build path, or an already-resolved wire string from an image
-    // deploy) — parse it into the typed enum, falling back to the http default for
-    // anything unrecognized rather than rejecting the build outright (this synthesis
-    // step has never validated the string; `FunctionConfig`'s own JSON deserialize
-    // boundary is where a genuinely malformed value is rejected hard).
     let proto: ServiceProtocol = protocol.parse().unwrap_or_default();
     Manifest {
         project: project.to_string(),
@@ -9986,9 +9966,6 @@ fn container_manifest(
         functions: vec![FunctionConfig {
             name: "web".into(),
             runtime: "container".into(),
-            // Structured marker the backend recognizes: run this image as a
-            // detached container, mapping the cell $PORT -> internal port.
-            // start_cmd[3] = run-config JSON (here: the automatic persistent volume).
             start_cmd: vec![
                 "__container__".into(),
                 image.to_string(),
@@ -9997,10 +9974,6 @@ fn container_manifest(
             ],
             env: Default::default(),
             vcpus: 1,
-            // 0/0.0 = use the node's generous, env-tunable container defaults (a
-            // real value here comes from fluid.json `container.memory`/`cpus`/
-            // `pids` or an `ImageDeployReq`'s equivalents). NOT the old hardcoded
-            // 512m, which OOM-killed monolith containers.
             memory_mib,
             cpus,
             pids,
@@ -10010,21 +9983,9 @@ fn container_manifest(
             idle_ttl_secs: 120,
             max_duration_secs: 300,
             protocol: proto,
-            // Bridge the single port this function actually runs into the
-            // forward-looking multi-port list (see `PortSpec::from_legacy_port`'s
-            // doc comment — this call site is exactly the bridging it names) so a
-            // stored deployment record always carries a recoverable port+protocol,
-            // e.g. for `image_port_spec_for_project_fleet` on redeploy.
             ports: PortSpec::from_legacy_port(Some(internal), proto),
             ..Default::default()
         }],
-        // A raw-protocol (tcp/udp/grpc) deployment has no HTTP request to
-        // route — its gateway leg would tunnel-frame into what
-        // `FunctionLaunch::raw_proxy` now serves as a pure byte splice
-        // (garbage either way), and it's reached through its allocated raw
-        // public port instead (`raw_ports`/`raw_proxy`), never `/`. Skip
-        // creating the meaningless HTTP route rather than advertising an
-        // endpoint that was never really there.
         routes: if proto.needs_raw_proxy() {
             Vec::new()
         } else {
@@ -10043,45 +10004,47 @@ pub(crate) fn podman_path_env() -> String {
     format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base}")
 }
 
-/// Fully qualify a container-image reference for podman. Linux podman ENFORCES
-/// short-name resolution (`user/img:tag` fails with "short-name resolution
-/// enforced" unless registries.conf lists search registries — macOS podman-machine
-/// resolves docker.io implicitly, which is why short names work there). A ref whose
-/// first path component isn't a registry host (no `.`/`:`, not `localhost`) gets
-/// the Docker Hub prefix; single-component names also get the `library/` namespace.
+/// Fully qualifies a container-image reference for podman: Linux podman ENFORCES short-name
+/// resolution (`user/img:tag` fails with "short-name resolution enforced" unless registries.conf
+/// lists search registries; macOS podman-machine resolves docker.io implicitly). A ref whose first
+/// path component is not a registry host (no `.`/`:`, not `localhost`) gets the Docker Hub prefix,
+/// and single-component names also get the `library/` namespace.
 pub(crate) fn qualify_image_ref(image: &str) -> String {
     let image = image.trim();
     match image.split_once('/') {
-        // No slash: an official Docker Hub image (`nginx`, `redis:7`) — the `:` here
-        // is a TAG, never a host:port (that only occurs before a `/`).
         None => format!("docker.io/library/{image}"),
         Some((first, _)) => {
-            // Slash present: `first` is a registry host iff it looks like one
-            // (dots, a port, or `localhost`); otherwise it's a Hub namespace.
             let is_registry_host =
                 first.contains('.') || first.contains(':') || first == "localhost";
             if is_registry_host {
                 image.to_string()
             } else {
-                format!("docker.io/{image}") // user/img[:tag]
+                format!("docker.io/{image}")
             }
         }
     }
 }
 
-/// Deploy a PRE-BUILT OCI image from any registry (Docker Hub / Quay / arbitrary):
-/// `podman pull` it on this (target) node, auto-detect its listening port from the
-/// image's `ExposedPorts` (unless overridden), and synthesize a container manifest
-/// with the automatic persistent volume. Project env is injected by the caller.
-///
-/// Podman-only, even on macOS (unlike the single-Dockerfile build path above,
-/// which does use Apple's `container` there): verified live that Apple's
-/// `container image inspect` does not expose the OCI `Config.ExposedPorts`
-/// field at all (podman: `{"80/tcp":{}}` for nginx; the identical field is
-/// simply absent from `container`'s inspect output for the same image) — so
-/// port auto-detection, a real shipped feature for registry-image deploys
-/// without an explicit override, would silently stop working. See
-/// `hive_backend::container_cli`'s module doc for the general policy.
+/// Deploys a PRE-BUILT OCI image from any registry (Docker Hub / Quay / arbitrary): `podman pull`
+/// it on this (target) node, auto-detect its listening port from the image's `ExposedPorts` (unless
+/// overridden) and synthesize a container manifest with the automatic persistent volume; project
+/// env is injected by the caller. `skip_pull` is true when THIS build just built the image from a
+/// Dockerfile: a locally built tag is not in any registry, so it is neither pulled nor qualified
+/// (it already resolves in podman's store as `localhost/<tag>`, and rewriting it to
+/// `docker.io/library/<tag>` would point at an image that does not exist, so the container would
+/// never start). Port and protocol: explicit values win outright, an explicit port without a
+/// protocol assumes http (the detected protocol could belong to a DIFFERENT exposed port),
+/// otherwise both are detected from the image, falling back to 8080/http, so a UDP-only image such
+/// as Minecraft Bedrock keeps the protocol it can actually speak. An image deploy has no
+/// `fluid.json`, so `ProjectSettings::container` is the only way to move the volume's mount path. A
+/// declared multi-port list REPLACES the single-port list (the first entry is the primary, kept in
+/// sync with `protocol`); only raw-protocol specs get a public allocation
+/// (`raw_ports::allocate_raw_ports_coordinated`), an http/https secondary entry just documents an
+/// extra exposed port, as for a compose service's un-exposed ports. Podman-only, even on macOS
+/// (unlike the single-Dockerfile build path, which uses Apple's `container` there): Apple's
+/// `container image inspect` does not expose the OCI `Config.ExposedPorts` field at all, so port
+/// auto-detection, a shipped feature for registry-image deploys, would silently stop working (see
+/// `hive_backend::container_cli`'s module doc for the general policy).
 async fn image_container_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -10094,28 +10057,16 @@ async fn image_container_manifest(
     cpus: f64,
     pids: u32,
     ports_override: Option<Vec<PortSpec>>,
-    // `true` when the image already exists in the local podman store because
-    // THIS build just built it from a Dockerfile. Pulling a locally built tag
-    // would fail (it is not in any registry), so the pull is skipped and the
-    // build log says so instead of implying a registry fetch.
     skip_pull: bool,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let path = podman_path_env();
-    // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
-    // rejects unqualified refs ("short-name resolution enforced") — but ONLY for
-    // images that come from a registry. A locally built tag already resolves in
-    // podman's own store as `localhost/<tag>`; rewriting it to
-    // `docker.io/library/<tag>` points at an image that does not exist, so the
-    // container never starts and the build dies at the readiness probe.
     let qualified = if skip_pull {
         image.to_string()
     } else {
         qualify_image_ref(image)
     };
     let image = qualified.as_str();
-    // Pull the image (fail the build with the registry error if it can't be fetched —
-    // e.g. not found / private registry needing auth).
     if skip_pull {
         log(format!(
             "Using locally built image {image} (no registry pull)."
@@ -10143,15 +10094,6 @@ async fn image_container_manifest(
         ));
     }
 
-    // Port + protocol: explicit values win outright. Otherwise auto-detect from the
-    // image's own `ExposedPorts` (falling back to 8080/http when nothing is exposed
-    // either) — `detect_image_port` now surfaces the actual detected protocol too,
-    // so a UDP-only image (e.g. Minecraft Bedrock, 19132/udp, no TCP port at all) no
-    // longer gets forced through the http default it can't actually speak. An
-    // explicit port WITHOUT an explicit protocol assumes http (the pre-existing
-    // behavior for an overridden port) rather than cross-referencing the detected
-    // port's protocol, which could belong to a DIFFERENT exposed port than the one
-    // the caller just asked for.
     let (port, protocol) = match (port_override, protocol_override) {
         (Some(p), Some(proto)) => (p, proto),
         (Some(p), None) => (p, ServiceProtocol::Http),
@@ -10163,10 +10105,6 @@ async fn image_container_manifest(
             None => (8080, protocol_override.unwrap_or_default()),
         },
     };
-    // An image deploy has no fluid.json to read a `container` override from at
-    // all, so the dashboard-managed `ProjectSettings::container` is the ONLY
-    // way to redirect the automatic volume's mount path here (unlike the
-    // Dockerfile-build path, which also honors an explicit fluid.json value).
     let volume_path = cloud
         .projects
         .get_exact(project, incarnation)?
@@ -10192,13 +10130,6 @@ async fn image_container_manifest(
         pids,
         volume_path.as_deref(),
     );
-    // A full multi-port declaration REPLACES the single-port ports list built
-    // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
-    // above already reflect it, since callers pass the primary as `port`/
-    // `protocol_override` too). Only raw-protocol specs get a public
-    // allocation (`raw_ports::allocate_raw_ports_coordinated`); an http/https
-    // secondary entry here just documents an extra exposed port with no
-    // public ingress, same as a compose service's un-exposed ports.
     if let Some(ports) = ports_override.filter(|p| !p.is_empty()) {
         log(format!(
             "Declared {} additional port(s): {}.",
@@ -10210,10 +10141,6 @@ async fn image_container_manifest(
                 .join(", ")
         ));
         if let Some(f) = manifest.functions.first_mut() {
-            // Keep `protocol` (drives needs_raw_proxy()/routing for the whole
-            // function) in sync with the declared PRIMARY entry, in case a
-            // caller's primary protocol here disagrees with the single
-            // `protocol_override`/detected value used above.
             if let Some(primary) = ports.first() {
                 f.protocol = primary.protocol;
             }
@@ -10223,9 +10150,9 @@ async fn image_container_manifest(
     Ok(manifest)
 }
 
-/// Auto-detect a container's listening port + protocol from the image's
-/// `Config.ExposedPorts` (`podman image inspect`). See [`parse_exposed_ports`] for
-/// the selection order (prefers TCP, falls back to UDP-only images).
+/// Auto-detects a container's listening port and protocol from the image's `Config.ExposedPorts`
+/// (`podman image inspect`); see [`parse_exposed_ports`] for the selection order (TCP first,
+/// falling back to UDP-only images).
 async fn detect_image_port(path_env: &str, image: &str) -> Option<PortSpec> {
     let out = Command::new("podman")
         .args([
@@ -10245,17 +10172,14 @@ async fn detect_image_port(path_env: &str, image: &str) -> Option<PortSpec> {
     parse_exposed_ports(&String::from_utf8_lossy(&out.stdout))
 }
 
-/// Parse `podman image inspect --format '{{json .Config.ExposedPorts}}'` output
-/// (e.g. `{"8080/tcp":{},"9090/tcp":{}}`) → the lowest exposed TCP port (protocol
-/// `Http`, matching the pre-existing default for the common case). When the image
-/// exposes NO tcp port at all, falls back to the lowest exposed UDP port instead
-/// (protocol `Udp`) rather than discarding it — a UDP-only service (e.g. Minecraft
-/// Bedrock, `19132/udp`, no TCP port) is otherwise impossible to auto-detect at all.
-/// `null` / empty / unparseable → `None`.
+/// Parses `podman image inspect --format '{{json .Config.ExposedPorts}}'` output
+/// (`{"8080/tcp":{},"9090/tcp":{}}`) to the lowest exposed TCP port (protocol `Http`). An image
+/// that exposes NO tcp port falls back to the lowest UDP port (protocol `Udp`), so a UDP-only
+/// service such as Minecraft Bedrock (`19132/udp`) can be auto-detected at all. `null`, empty or
+/// unparseable input gives `None`.
 fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
     let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
     let obj = v.as_object()?;
-    // Keys look like "8080/tcp" / "19132/udp".
     let mut tcp_ports: Vec<u16> = Vec::new();
     let mut udp_ports: Vec<u16> = Vec::new();
     for k in obj.keys() {
@@ -10279,10 +10203,10 @@ fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
         .map(|p| PortSpec::single(*p, ServiceProtocol::Udp))
 }
 
-/// Railway-style per-service overrides for a CONTAINER project, read from an optional
-/// `fluid.json` `container` block (e.g. `{ "container": { "port": 50051, "protocol":
-/// "grpc" } }`). Lets a Dockerfile/Containerfile project pin its listen port and
-/// declare its wire protocol without changing the image. All fields optional.
+/// Railway-style per-service overrides for a CONTAINER project from an optional `fluid.json`
+/// `container` block (`{ "container": { "port": 50051, "protocol": "grpc" } }`): lets a
+/// Dockerfile/Containerfile project pin its listen port and declare its wire protocol without
+/// changing the image. All fields optional.
 #[derive(Debug, Default, serde::Deserialize)]
 struct ContainerOverride {
     #[serde(default)]
@@ -10293,14 +10217,12 @@ struct ContainerOverride {
     /// Overrides the node's generous default; lets a heavy monolith request more.
     #[serde(default)]
     memory: Option<String>,
-    /// CPU quota for the container (podman `--cpus`), e.g. "4", "2.0", "0.5".
-    /// Overrides the node's generous default. Clamped to a fleet-wide ceiling in
-    /// `ContainerLimits::for_container` (`HIVE_CONTAINER_CPUS_MAX`).
+    /// CPU quota for the container (podman `--cpus`), e.g. "4", "2.0", "0.5"; overrides the node
+    /// default and is clamped to `HIVE_CONTAINER_CPUS_MAX` (`ContainerLimits::for_container`).
     #[serde(default)]
     cpus: Option<String>,
-    /// Max-PIDs ceiling for the container's cgroup (podman `--pids-limit`) — a
-    /// fork-bomb guard. Overrides the node's default. Clamped to a fleet-wide
-    /// ceiling (`HIVE_CONTAINER_PIDS_MAX`).
+    /// Max-PIDs ceiling for the container's cgroup (podman `--pids-limit`), a fork-bomb guard;
+    /// overrides the node default and is clamped to `HIVE_CONTAINER_PIDS_MAX`.
     #[serde(default)]
     pids: Option<u32>,
 }
@@ -10321,7 +10243,7 @@ fn parse_mem_mib(s: &str) -> u32 {
     } else if let Some(n) = t.strip_suffix("mb") {
         (n, 1.0)
     } else {
-        (t.as_str(), 1.0) // bare number = MiB
+        (t.as_str(), 1.0)
     };
     num.trim()
         .parse::<f64>()
@@ -10330,9 +10252,6 @@ fn parse_mem_mib(s: &str) -> u32 {
         .unwrap_or(0)
 }
 
-/// Parse a CPU quota string ("4", "2.0", "0.5") into a fractional vCPU count.
-/// Returns 0.0 (→ use the node's default) for empty/unparseable/non-positive
-/// input.
 fn parse_cpus_quota(s: &str) -> f64 {
     let t = s.trim();
     if t.is_empty() {
@@ -10354,10 +10273,12 @@ fn parse_container_override(fluid_json: &str) -> ContainerOverride {
         .unwrap_or_default()
 }
 
-/// Build a manifest for a Next.js deployment adapter (OpenNext / vinext): the
-/// framework's Node HTTP server runs as the Fluid `api` function while immutable
-/// assets are served from the CDN, falling through to the server on a miss. Returns
-/// `None` for non-adapter frameworks (caller uses the generic node-server path).
+/// Builds a manifest for a Next.js deployment adapter (OpenNext / vinext): the framework's Node
+/// HTTP server runs as the Fluid `api` function while immutable assets are served from the CDN,
+/// falling through to the server on a miss. Both adapters emit one bundled server file, the shape
+/// `bun run <file>` needs and `warmup_bun_bytecode` can bytecode-cache, so an explicit Bun runtime
+/// runs that same file through Bun instead of Node. `None` for non-adapter frameworks (the caller
+/// uses the generic node-server path).
 async fn adapter_manifest(
     project: &str,
     slug: &str,
@@ -10365,27 +10286,19 @@ async fn adapter_manifest(
     runtime: Option<hive_core::Runtime>,
 ) -> Option<Manifest> {
     let bun = runtime == Some(hive_core::Runtime::Bun);
-    // (start command, relative assets dir) per adapter. Both adapters emit a
-    // single bundled server file — exactly the shape `bun run <file>` needs (and
-    // the shape `warmup_bun_bytecode` can bytecode-cache), so under an explicit
-    // Bun runtime we run that same file directly through Bun instead of Node.
     let (start_cmd, assets_dir): (Vec<String>, &str) = match slug {
         "opennext" => {
             let server = ".open-next/server-functions/default/index.mjs";
             if !dir.join(server).exists() {
-                return None; // build didn't produce the expected server function
+                return None;
             }
             let runner = if bun { "bun" } else { "node" };
             (vec![runner.into(), server.into()], ".open-next/assets")
         }
         "vinext" => {
-            // Prefer running Nitro's node server directly; else `vinext start`
-            // (both honor $PORT). `--no-install` avoids a runtime network fetch.
-            // `--bun` on the CLI-fallback path: the `vinext` CLI internally
-            // boots a Nitro server, which may itself invoke `node` for
-            // sub-tasks — same "prefer Bun for shebang-invoked children"
-            // reasoning as the package.json#scripts.start fix above, and
-            // documented as valid `bunx` usage (`bunx --bun vite dev …`).
+            // Prefer Nitro's node server directly, else `vinext start` (both honor $PORT);
+            // `--no-install` avoids a runtime network fetch and `--bun` keeps the CLI's
+            // shebang-invoked children on Bun.
             let start = if dir.join(".output/server/index.mjs").exists() {
                 let runner = if bun { "bun" } else { "node" };
                 vec![runner.into(), ".output/server/index.mjs".into()]
@@ -10427,9 +10340,6 @@ async fn adapter_manifest(
         ..Default::default()
     };
 
-    // Serve immutable assets from the CDN when they exist, with a fallthrough to the
-    // origin function; otherwise route everything to the function (the server serves
-    // its own assets).
     if dir.join(assets_dir).exists() {
         Some(Manifest {
             project: project.to_string(),
@@ -10569,10 +10479,9 @@ fn build_failed_page(project: &str, commit: &str, err: &str, repo: &str) -> Stri
     )
 }
 
-/// A self-refreshing "Building…" placeholder, served at the project's domain the
-/// moment a FIRST deploy starts — so the URL always resolves instead of 404'ing
-/// for the whole build. It reloads every few seconds and flips to the real app
-/// automatically once the deployment is ready.
+/// A self-refreshing "Building…" placeholder served at the project's domain the moment a FIRST
+/// deploy starts, so the URL resolves instead of 404ing for the whole build; it reloads every few
+/// seconds and flips to the real app once the deployment is ready.
 fn building_page(project: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -10609,13 +10518,14 @@ fn building_page(project: &str) -> String {
     )
 }
 
-/// First-deploy only: register the project's host immediately with a "Building…"
-/// page, so the domain resolves during the build. Returns the placeholder
-/// deployment id (removed once the real deployment is live). A redeploy returns
-/// None — the current version stays live until the new build is ready.
-/// `bid` uniquifies the scratch dir: two concurrent first deploys of the same
-/// project (both pass `project_has_deployment` before either registers) must not
-/// point two deployment records at ONE shared placeholder root.
+/// First-deploy only: registers the project's host immediately with a "Building…" page so the
+/// domain resolves during the build, and returns the placeholder deployment id (removed once the
+/// real deployment is live). A redeploy returns `None`: the current version stays live until the
+/// new build is ready, and `project_has_deployment` is fleet-wide because the old local-only
+/// `serves_host` check missed remotely placed projects and created a bogus "Building…" Preview row
+/// on every redeploy. `bid` uniquifies the scratch dir: two concurrent first deploys of the same
+/// project (both pass `project_has_deployment` before either registers) must not point two
+/// deployment records at ONE shared placeholder root.
 async fn register_building_placeholder(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -10626,11 +10536,6 @@ async fn register_building_placeholder(
     let _lifecycle = crate::project_settings::lifecycle_write(project).await;
     let settings = cloud.projects.get_exact(project, incarnation).ok()?;
     if project_has_deployment(cloud, project) {
-        // Redeploy (the project already has a live deployment somewhere in the
-        // fleet) — keep the live version serving until the new build is ready, and
-        // never spawn a phantom placeholder. The local-only `serves_host` check used
-        // to miss remotely-placed projects, producing a bogus "Building…" Preview
-        // deployment row on every redeploy.
         return None;
     }
     let dir = deploy_root().join(format!(
@@ -10643,13 +10548,14 @@ async fn register_building_placeholder(
     tokio::fs::write(dir.join("index.html"), building_page(project))
         .await
         .ok()?;
+    let is_production = false;
     let info = cloud.gw.deploy_full_with_runtime_exact(
         dir.to_string_lossy().into_owned(),
         None,
         static_manifest(project, "."),
         req.creator.clone().unwrap_or_else(|| "you".into()),
         None,
-        false, // not production — superseded by the real deploy when it's ready
+        is_production,
         DeployState::Building,
         settings.team,
         incarnation,
@@ -10659,21 +10565,16 @@ async fn register_building_placeholder(
     Some(info.id.to_string())
 }
 
-/// The infix `register_building_placeholder` stamps into a placeholder's root
-/// dir (`<tag>-building-<ms>-<bid>`). It is the only durable marker that tells a
-/// placeholder apart from a real deployment after a restart, so both the boot
-/// reconciler and the reaper below key off it.
+/// The infix `register_building_placeholder` stamps into a placeholder's root dir
+/// (`<tag>-building-<ms>-<bid>`): the only durable marker that tells a placeholder from a real
+/// deployment after a restart, so the boot reconciler and the reaper below both key off it.
 pub(crate) const PLACEHOLDER_ROOT_INFIX: &str = "-building-";
 
-/// Is this deployment root a `Building…` placeholder's scratch dir, and which
-/// build minted it?
-///
-/// Returns the build id parsed out of the dir name, or `None` when the root is
-/// not a placeholder at all.
+/// Whether this deployment root is a `Building…` placeholder's scratch dir: returns the id of the
+/// build that minted it, parsed from the dir name, or `None` when the root is not a placeholder.
 pub(crate) fn placeholder_build_id(root: &str) -> Option<&str> {
     let name = std::path::Path::new(root).file_name()?.to_str()?;
     let (_, tail) = name.rsplit_once(PLACEHOLDER_ROOT_INFIX)?;
-    // tail = `<ms>-<bid>`; the build id is everything after the first `-`.
     let (_ms, bid) = tail.split_once('-')?;
     (!bid.is_empty()).then_some(bid)
 }
@@ -10686,24 +10587,15 @@ pub(crate) fn is_placeholder_record(rec: &fluid_core::DeployRecord) -> bool {
         && rec.manifest.functions.is_empty()
 }
 
-/// Reap `Building…` placeholders whose build is over.
-///
-/// The placeholder is removed exactly once, on the happy path of the task
-/// `start_build` spawned — so ANY way that task fails to reach its last line
-/// leaks it permanently: a user cancel (`BuildCancelRegistry` aborts the task
-/// handle, and an aborted future never runs the removal), a panic, or the
-/// process dying mid-build. A leaked placeholder is not inert: `deploy_full`
-/// hands a project's FIRST deployment the production alias, so the shell owns
-/// `<project>` on that node forever, `persist::restore` then reconciles it from
-/// `Building` to a permanent `Error`, and the node both serves it and publishes
-/// a DNS affinity record for it. Witnessed on `archive-zip.shadw.app`
-/// (2026-08-05): fc-sanjose answered the project host from a 2-day-old
-/// placeholder while fc-sanjose-gpu-1 held the Ready deployment.
-///
-/// The reap condition is "the build that minted it is no longer in flight",
-/// which is decidable from local state alone and is exactly the condition the
-/// removal call was standing in for. An unknown build id counts as over: build
-/// records do not outlive a restart, and a placeholder for a build nobody
+/// Reaps `Building…` placeholders whose build is over. The placeholder is removed exactly once, on
+/// the happy path of the task `start_build` spawned, so ANY way that task fails to reach its last
+/// line leaks it permanently: a user cancel (an aborted future never runs the removal), a panic, or
+/// the process dying mid-build. A leaked placeholder is not inert: `deploy_full` hands a project's
+/// FIRST deployment the production alias, so the shell owns `<project>` on that node forever,
+/// `persist::restore` reconciles it from `Building` to a permanent `Error`, and the node both
+/// serves it and publishes a DNS affinity record for it. The reap condition is "the build that
+/// minted it is no longer in flight", decidable from local state alone; an unknown build id counts
+/// as over, since build records do not outlive a restart and a placeholder for a build nobody
 /// remembers can never be superseded by it.
 pub async fn reap_orphan_placeholders(cloud: &Arc<CloudState>) -> usize {
     let stale: Vec<(String, String, Option<ProjectIncarnation>)> = cloud
@@ -10758,45 +10650,32 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
-// ===========================================================================
-// Webhook-less git auto-deploy: commit-polling reconciler.
-//
-// The GitHub webhook (`admin::git_webhook`) is the ONLY event-driven auto-deploy
-// trigger, and it only ever fires if a hook was actually installed on the repo.
-// A project imported as a plain public URL (the common "paste a repo URL" flow)
-// or whose owner never completed the GitHub OAuth/App connection gets NEITHER a
-// webhook NOR the Actions-workflow fallback (`git_ci == None`), so GitHub never
-// notifies us of a push and no `git push` ever deploys — with zero visible error
-// (no failed delivery, because no webhook object exists).
-//
-// This reconciler closes that gap WITHOUT any credential or owner action: it
-// polls each git-sourced project's tracked-branch HEAD with `git ls-remote` and
-// starts the SAME build the webhook would, whenever HEAD has advanced past the
-// deployed commit. It is the credential-free build-past for the chronically-dead
-// GitHub connection — for a public repo it needs nothing at all.
-// ===========================================================================
+/// Settle delay before the first git poll, so the initial gossip and deployment-record sync gives
+/// every project a real deployed-commit baseline (a cold leader would otherwise treat every project
+/// as unknown at once).
+const GIT_POLL_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
+/// Period of the git commit poll.
+const GIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(90);
 
-/// Spawn the leader-only git commit-poll reconciler. See the module comment
-/// above. Cheap when nothing changed (one `ls-remote` per git project per tick,
-/// short-circuited by an in-memory SHA cache).
+/// Spawns the leader-only git commit-poll reconciler. The GitHub webhook is the only event-driven
+/// auto-deploy trigger and only fires if a hook was installed: a project imported as a plain public
+/// URL, or whose owner never completed the GitHub OAuth/App connection, gets neither a webhook nor
+/// the Actions-workflow fallback (`git_ci == None`), so no `git push` ever deploys, with no visible
+/// error. This reconciler closes that gap with no credential or owner action (a public repo needs
+/// nothing): it polls each git-sourced project's tracked-branch HEAD with `git ls-remote` and
+/// starts the SAME build the webhook would whenever HEAD has advanced past the deployed commit.
+/// Cheap when nothing changed: one `ls-remote` per git project per tick, short-circuited by an
+/// in-memory SHA cache.
 pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
     crate::supervise::spawn_supervised("git-poll-reconcile", move || {
         let cloud = cloud.clone();
         async move {
-            // Let the initial gossip / deployment-record sync settle so projects have
-            // a real deployed-commit baseline before the first poll (else a cold
-            // leader would treat every project as "unknown" at once).
-            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(90));
+            tokio::time::sleep(GIT_POLL_SETTLE_DELAY).await;
+            let mut tick = tokio::time::interval(GIT_POLL_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 crate::supervise::beat("git-poll-reconcile");
-                // LEADER ONLY: exactly one node polls + deploys — otherwise each
-                // node would start the same build for the same push. The shared
-                // background-job gate (tenure + voter quorum), never the bare
-                // request-path leader test: a flapping follower ran 21 poll
-                // cycles and deployed on 2026-09-24.
                 if !crate::leadership::may_act(&cloud, crate::leadership::Job::GitPoll) {
                     continue;
                 }
@@ -10806,9 +10685,8 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
     });
 }
 
-/// One project's outcome from a single `git_poll_cycle` pass — folded into the
-/// cycle's aggregate counters after every project's check has run, so the
-/// concurrent fan-out below never needs a shared mutable counter.
+/// One project's outcome from a single `git_poll_cycle` pass, folded into the cycle's counters
+/// after every check has run so the concurrent fan-out needs no shared mutable counter.
 enum GitPollOutcome {
     /// Not a git source, or a never-deployed/unbound project — not counted.
     NotGit,
@@ -10821,19 +10699,12 @@ enum GitPollOutcome {
     Deployed,
 }
 
-/// Concurrent `git_poll_one` fan-out width, per cycle. Unlike the fleet/peer
-/// fan-outs this pattern was borrowed from (`vercel_dns.rs`, `gpu_pool.rs`,
-/// `admin.rs` — all bounded by the ~14-node fleet roster), the input here is
-/// `cloud.projects` — platform-wide and, on the "enterprise" plan tier,
-/// literally unbounded per tenant (`billing.rs`'s `plan_max_projects`). An
-/// unbounded `join_all` over that set forks one OS `git ls-remote` subprocess
-/// PER PROJECT simultaneously on the single control-plane leader every tick —
-/// real FD/process-table/socket pressure that scales with tenant-controlled
-/// project count, not with anything this node's own resources bound.
-/// `buffer_unordered` keeps the "one slow remote can't block another" property
-/// the unbounded version was written for, while capping how many `git`
-/// subprocesses exist at once; `HIVE_GIT_POLL_CONCURRENCY` overrides the
-/// default for a fleet running an unusually large git-sourced project count.
+/// Concurrent `git_poll_one` fan-out width per cycle (`HIVE_GIT_POLL_CONCURRENCY`, default 16). The
+/// input is `cloud.projects`: platform-wide and, on the enterprise tier, unbounded per tenant
+/// (`plan_max_projects`), so an unbounded `join_all` would fork one `git ls-remote` per project at
+/// once on the single control-plane leader every tick (FD, process-table and socket pressure that
+/// scales with tenant-controlled project count). `buffer_unordered` keeps one slow remote from
+/// blocking another while capping the number of `git` subprocesses.
 fn git_poll_concurrency() -> usize {
     std::env::var("HIVE_GIT_POLL_CONCURRENCY")
         .ok()
@@ -10842,15 +10713,11 @@ fn git_poll_concurrency() -> usize {
         .unwrap_or(16)
 }
 
-/// One poll pass over every git-sourced project. Never panics: a per-project
-/// failure (unreachable remote, missing branch, auth failure) is logged at debug
-/// and skipped so it can't wedge the other projects or the loop.
-///
-/// Each project's check does its own network round trip (`git ls-remote`, up to
-/// a 20s timeout) before deciding whether to deploy. A bounded concurrent
-/// fan-out (see [`git_poll_concurrency`]) means one project's stale/slow check
-/// never blocks another's — while capping the simultaneous `git` subprocess
-/// count regardless of how many git-sourced projects the platform has.
+/// One poll pass over every git-sourced project. Never panics: a per-project failure (unreachable
+/// remote, missing branch, auth failure) is skipped so it cannot wedge the other projects or the
+/// loop. Each check does its own network round trip (`git ls-remote`, up to 20 s), so the bounded
+/// fan-out ([`git_poll_concurrency`]) keeps one slow project from blocking another while capping
+/// simultaneous `git` subprocesses.
 async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
     let outcomes: Vec<GitPollOutcome> =
@@ -10879,9 +10746,6 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
             }
         }
     }
-    // INFO when anything was skipped, so a fleet at RUST_LOG=info sees that
-    // auto-deploy is silently not running for some projects; debug otherwise, to
-    // keep a healthy cycle quiet.
     if n_skipped > 0 {
         tracing::info!(
             git_projects = n_git,
@@ -10899,21 +10763,28 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     }
 }
 
-/// One project's check-and-maybe-deploy, factored out of `git_poll_cycle` so it
-/// can run concurrently with every other project's — every side effect
-/// (`git_poll_seen` dedup, the already-building guard, `start_build`) is
-/// unchanged from the prior serial loop, just scoped to a single project.
+/// One project's check-and-maybe-deploy, factored out of `git_poll_cycle` so projects run
+/// concurrently; every side effect (`git_poll_seen` dedup, the already-building guard,
+/// `start_build`) is scoped to the single project. Only git sources are polled (not zip `upload://`
+/// or image `image://`, nor never-deployed or unbound projects), on the production branch, else the
+/// deployment's own branch. The baseline is the in-memory last-seen SHA, else the deployed commit,
+/// so the FIRST poll after a boot deploys pushes that were never deployed (deployed != HEAD) and
+/// leaves current projects alone. An unreadable remote HEAD (branch missing, remote unreachable,
+/// auth failed) WARNs and skips the cycle, never reading as "no commit, deploy"; `had_token=false`
+/// on a private repo means this node has no credential (GitHub App private key or `GITHUB_TOKEN`).
+/// `git_poll_seen` is written BEFORE the build is enqueued, so a slow build is not re-enqueued next
+/// tick and a webhook plus this poller cannot double-fire (the in-flight check is local and
+/// best-effort; the SHA dedup is the real guard). The request pins the EXACT polled SHA, as the
+/// webhook path does. If `start_build` rejects the deploy the baseline is restored, but only when
+/// nothing newer raced in: otherwise the next cycle would read the undeployed HEAD as current and
+/// silently drop the push.
 async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcome {
-    // Fleet-aware source; skip non-git (zip `upload://`, image `image://`)
-    // and never-deployed / unbound projects.
     let Some(src) = crate::admin::git_for_project_fleet(cloud, &project) else {
         return GitPollOutcome::NotGit;
     };
     if !src.is_real_git() {
         return GitPollOutcome::NotGit;
     }
-    // Tracked branch: the project's production branch, else the deployment's
-    // own branch. Empty => nothing to poll.
     let branch = {
         let pb = cloud.projects.production_branch_of(&project);
         if pb.is_empty() {
@@ -10926,25 +10797,10 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         return GitPollOutcome::Polled;
     }
 
-    // Token for a PRIVATE github repo (public repos need none): the same
-    // resolution `git_webhook` uses — a GitHub App installation token first,
-    // else a node-wide GITHUB_TOKEN. Carried into both the `ls-remote` read
-    // and the deploy request's clone.
     let token = resolve_git_poll_token(&src.repo_url).await;
 
     let head = match git_ls_remote_head(&src.repo_url, &branch, token.as_deref()).await {
         Some(h) if !h.is_empty() => h,
-        // Branch not found / remote unreachable / auth failure: skip this
-        // cycle, retry next tick. Never treated as "no commit -> deploy".
-        //
-        // WARN, not debug and not silent. This arm is the single point where
-        // "my pushes stopped deploying" becomes invisible: it swallows an
-        // auth failure identically to a renamed branch, and the fleet runs
-        // RUST_LOG=info so a debug line would not be read even if one
-        // existed (the function's own doc claimed one that was never
-        // written). The token-presence flag is the actionable half — with no
-        // App private key and no GITHUB_TOKEN on a node, EVERY private repo
-        // lands here forever, and without this line nothing anywhere says so.
         _ => {
             tracing::warn!(
                 project = %project,
@@ -10959,10 +10815,6 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         }
     };
 
-    // Baseline: the in-memory last-seen SHA if we've observed this project
-    // before, else the currently-deployed commit. This is what makes the
-    // FIRST poll after a boot deploy shoomoo-style undeployed pushes (deployed
-    // != HEAD) while leaving already-current projects alone (deployed == HEAD).
     let baseline = cloud
         .git_poll_seen
         .read()
@@ -10971,22 +10823,15 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         .unwrap_or_else(|| src.commit.clone());
 
     if commit_eq(&head, &baseline) {
-        // Up to date: record HEAD so subsequent cycles are a cheap compare.
         cloud.git_poll_seen.write().insert(project.clone(), head);
         return GitPollOutcome::Polled;
     }
 
-    // A genuine advance. Don't stack on a build for this exact commit that's
-    // already in flight LOCALLY (best-effort — a build placed on a peer node
-    // isn't in this leader's list; the SHA-dedup below is the real guard).
     let already_building = cloud.builds.list().iter().any(|b| {
         b.project == project
             && matches!(b.state, DeployState::Queued | DeployState::Building)
             && commit_eq(&b.commit, &head)
     });
-    // Record BEFORE enqueue so a slow build can't be re-enqueued next tick and
-    // a real webhook + this poller can't double-fire (whoever deploys HEAD
-    // first, the other sees deployed == HEAD and skips).
     cloud
         .git_poll_seen
         .write()
@@ -11000,7 +10845,6 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         source_deployment_ids: Vec::new(),
         repo_url: src.repo_url.clone(),
         branch: Some(branch.clone()).filter(|b| !b.is_empty()),
-        // Pin the EXACT polled SHA (same race protection as the webhook path).
         commit: Some(head.clone()),
         head_repo_url: None, // polling only ever tracks the project's own repo
         project: Some(project.clone()),
@@ -11029,15 +10873,6 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
         Err(e) => {
-            // The pre-enqueue `git_poll_seen` write above already advanced the
-            // baseline to `head` (needed to guard the in-flight race against a
-            // slow build / a racing webhook) — but a failed `start_build` means
-            // that commit was never actually deployed. Left uncorrected, the
-            // NEXT poll cycle's `commit_eq(&head, &baseline)` check above would
-            // read this exact same `head` back as the baseline and conclude
-            // "already up to date," permanently and silently dropping the push
-            // with no retry — directly contradicting this log line's own claim.
-            // Revert only if nothing newer raced in while `start_build` ran.
             {
                 let mut seen = cloud.git_poll_seen.write();
                 if seen.get(&project) == Some(&head) {
@@ -11079,12 +10914,10 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
     GitPollOutcome::Deployed
 }
 
-/// True when two commit strings refer to the same commit, tolerant of one being
-/// an abbreviated prefix of the other (a deployment record may store a short
-/// SHA while `ls-remote` returns the full 40-char one). Empty never matches.
-///
-/// `pub(crate)`: `admin::git_webhook` reuses this for its own already-building
-/// dedup, matching `git_poll_cycle`'s.
+/// Whether two commit strings name the same commit, tolerating one being an abbreviated prefix (at
+/// least 7 chars) of the other (a deployment record may store a short SHA while `ls-remote` returns
+/// the full one); empty never matches. `pub(crate)` because `admin::git_webhook` reuses it for its
+/// own already-building dedup.
 pub(crate) fn commit_eq(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
@@ -11096,26 +10929,21 @@ pub(crate) fn commit_eq(a: &str, b: &str) -> bool {
     short.len() >= 7 && long.starts_with(short)
 }
 
-/// `git ls-remote <url> refs/heads/<branch>` → the branch HEAD SHA. Host-agnostic
-/// (github/gitlab/bitbucket/self-hosted) and free of GitHub's REST rate limit.
-/// Bounded by a hard timeout so a hung remote can't wedge the poll cycle, and it
-/// never prompts for credentials (a private repo without a token just fails and
-/// is skipped). Returns None on any failure or an absent branch.
+/// `git ls-remote <url> refs/heads/<branch>` to the branch HEAD SHA: host-agnostic
+/// (github/gitlab/bitbucket/self-hosted) and free of GitHub's REST rate limit. A hard 20 s timeout
+/// keeps a hung remote from wedging the poll cycle, it never prompts for credentials (a private
+/// repo without a token just fails and is skipped), and it returns `None` on any failure or an
+/// absent branch. The token reaches git through the same FD-backed credential helper as the clone
+/// path, never embedded in the URL (argv-visible), and is only offered for github.com.
 async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -> Option<String> {
-    // Same FD-backed credential helper as the clone path — never a token
-    // embedded in the URL (argv-visible), and only ever offered for
-    // github.com (the helper itself is scoped there; `token` is already
-    // resolved only for github.com callers, see `resolve_git_poll_token`).
     let mut cmd = Command::new("git");
     let _cred = apply_credential(&mut cmd, token).ok()?;
     cmd.arg("ls-remote")
         .arg(repo_url)
         .arg(format!("refs/heads/{branch}"))
-        .env("GIT_TERMINAL_PROMPT", "0") // never block on an interactive prompt
-        // Own the process group and reap on drop — `tokio::time::timeout` below
-        // drops (not cancels-and-waits) this future on expiry, and without
-        // these two the underlying `git` process would be orphaned rather than
-        // killed, silently leaking a hung process per timed-out poll.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Own the process group and kill on drop: the timeout below drops the future on expiry,
+        // which would otherwise orphan a hung `git` per timed-out poll.
         .process_group(0)
         .kill_on_drop(true);
     let out = tokio::time::timeout(std::time::Duration::from_secs(20), cmd.output())
@@ -11125,7 +10953,6 @@ async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -
     if !out.status.success() {
         return None;
     }
-    // Output line: "<sha>\trefs/heads/<branch>".
     String::from_utf8_lossy(&out.stdout)
         .split_whitespace()
         .next()
@@ -11133,11 +10960,12 @@ async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -
         .map(|s| s.to_string())
 }
 
-/// Token for polling/cloning a PRIVATE github repo: a GitHub App installation
-/// token (minted server-side, no user session) first, else a node-wide
-/// `GITHUB_TOKEN`. `None` for a public repo (or a non-github host) — nothing is
-/// needed there. Mirrors `git_webhook`'s own resolution so the two auto-deploy
-/// paths authenticate identically.
+/// Token for polling/cloning a PRIVATE github repo: a GitHub App installation token (minted
+/// server-side, no user session) first, else a node-wide `GITHUB_TOKEN`; `None` for a public repo
+/// or a non-github host. Mirrors `git_webhook`'s resolution so both auto-deploy paths authenticate
+/// identically. A working App key with the App not INSTALLED on the repo's org is named (once per
+/// repo) rather than swallowed, because it otherwise reads like "no credential configured"
+/// (`had_token=false`) and mis-steers the diagnosis toward installing keys that already exist.
 async fn resolve_git_poll_token(repo_url: &str) -> Option<String> {
     if !repo_url.starts_with("https://github.com/") {
         return None;
@@ -11149,13 +10977,6 @@ async fn resolve_git_poll_token(repo_url: &str) -> Option<String> {
         if let Some((owner, repo)) = path.split_once('/') {
             match crate::github_app_auth::installation_token_for_repo(owner, repo).await {
                 Ok(Some(tok)) => return Some(tok),
-                // Name the failure instead of swallowing it: a working App key
-                // with the App simply NOT INSTALLED on the repo's org reads
-                // identically to "no credential configured" downstream
-                // (had_token=false), which mis-steered a real diagnosis toward
-                // installing keys that already existed. Live-witnessed: App
-                // 4658598 valid, installed on dywongcloud only —
-                // numo-gg/numo0 404s until that org installs the App.
                 Ok(None) => {
                     static REPORTED: std::sync::OnceLock<
                         parking_lot::Mutex<std::collections::HashSet<String>>,
