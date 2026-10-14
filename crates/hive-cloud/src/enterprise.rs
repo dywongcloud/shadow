@@ -283,7 +283,11 @@ fn password_matches(project: &str, stored: &str, submitted: &str) -> bool {
         };
     }
     if stored.starts_with("enc:v1:") {
-        return crate::admin::ct_eq(&crate::secrets::decrypt(stored), submitted);
+        // `try_decrypt`, never `decrypt`: an envelope no key opens (a key change without
+        // `HIVE_SECRET_KEY_OLD`) comes back from `decrypt` as the ciphertext itself, which would
+        // then equal a submitted password that IS that ciphertext.
+        return crate::secrets::try_decrypt(stored)
+            .is_some_and(|plain| !plain.is_empty() && crate::admin::ct_eq(&plain, submitted));
     }
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();

@@ -344,6 +344,11 @@ fn issue_cookie(project: &str) -> String {
 }
 
 /// True if the request carries a valid, unexpired access cookie for `project`.
+///
+/// The cookie is only evidence when THIS fleet sealed it: `secrets::try_decrypt` opens it or the
+/// cookie is ignored. `secrets::decrypt` is a passthrough that hands any input back unchanged, so
+/// with it a visitor's own `shadw_zk=<project>|99999999999999` was read as if the node had issued it
+/// and unlocked every team-private preview.
 pub fn cookie_access(project: &str, headers: &[(String, String)]) -> bool {
     let Some(cookie_hdr) = headers
         .iter()
@@ -355,7 +360,9 @@ pub fn cookie_access(project: &str, headers: &[(String, String)]) -> bool {
     for kv in cookie_hdr.split(';') {
         let kv = kv.trim();
         if let Some(tok) = kv.strip_prefix(&format!("{COOKIE}=")) {
-            let plain = crate::secrets::decrypt(tok);
+            let Some(plain) = crate::secrets::try_decrypt(tok) else {
+                continue;
+            };
             if let Some((p, exp)) = plain.split_once('|') {
                 if p == project {
                     if let Ok(e) = exp.parse::<u64>() {

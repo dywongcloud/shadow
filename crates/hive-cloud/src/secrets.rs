@@ -312,6 +312,11 @@ pub fn encrypt(plaintext: &str) -> String {
 /// `HIVE_SECRET_KEY` on a node that had been using its persisted `secret.key` silently orphaned
 /// everything sealed beforehand, and callers received the raw `enc:v1:...` ciphertext as if it were
 /// the secret. Use [`try_decrypt`] to tell "plaintext" from "ciphertext no key opens".
+///
+/// Never let the result of this function decide ACCESS: it returns whatever string it is given, so
+/// a cookie, token or stored password checked through it accepts the attacker's own plaintext (or
+/// the unopenable ciphertext itself). Anything that authenticates uses [`try_decrypt`] and fails
+/// closed on `None`.
 pub fn decrypt(s: &str) -> String {
     let Some(b64) = s.strip_prefix(PREFIX) else {
         return s.to_string();
