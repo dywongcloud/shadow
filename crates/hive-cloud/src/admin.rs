@@ -31,6 +31,8 @@ const MINT_ATTEMPTS_PER_WINDOW: u32 = 20;
 const ADMIN_REQUESTS_PER_WINDOW: u32 = 600;
 const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 const MINTED_TOKEN_TTL_SECS: i64 = 60 * 60;
+/// Lifetime of a minted token for a role a Clerk org assigns (see [`minted_token_ttl`]).
+const ORG_TOKEN_TTL_SECS_DEFAULT: i64 = 15 * 60;
 const DOMAIN_VERIFY_DEFAULT_SECS: u64 = 45;
 const MESH_FORWARD_TIMEOUT_SECS: u64 = 20;
 const PROJECT_DELETE_QUICK_PASS_PEER_BUDGET: Duration = Duration::from_secs(28);
@@ -492,6 +494,25 @@ async fn tls_bundle_mesh(
         .into_response())
 }
 
+/// Lifetime of a minted token, in seconds. A token carries its role for its whole life and nothing
+/// consults the roster per request (the dashboard takes the role from Clerk when it mints), so a
+/// member demoted or removed in Clerk keeps the old role until their token expires. The roles a
+/// Clerk org assigns (`admin`, `member`, and `viewer`) therefore live `HIVE_ORG_TOKEN_TTL_SECS`
+/// (default 900 s, clamped to 60..=3600): the dashboard re-mints from the live Clerk session
+/// whenever its cookie (maxAge from `expires_in`) lapses. `owner` (the dashboard mints it only for
+/// a personal namespace, whose owner nobody can demote), a platform operator and every other role
+/// keep the hour.
+fn minted_token_ttl(role: &str, platform_admin: bool) -> i64 {
+    if platform_admin || !matches!(role, "admin" | "member" | "viewer") {
+        return MINTED_TOKEN_TTL_SECS;
+    }
+    std::env::var("HIVE_ORG_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|secs| secs.clamp(60, MINTED_TOKEN_TTL_SECS))
+        .unwrap_or(ORG_TOKEN_TTL_SECS_DEFAULT)
+}
+
 async fn mint_token(
     State(c): State<Arc<CloudState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -523,7 +544,7 @@ async fn mint_token(
             apply_admin_enterprise(&c, admin_tenant);
         }
     }
-    let ttl = MINTED_TOKEN_TTL_SECS;
+    let ttl = minted_token_ttl(&req.role, platform_admin);
     match crate::auth::issue(&req.sub, &req.tenant, &req.role, platform_admin, ttl) {
         Ok(token) => Ok(Json(json!({ "token": token, "expires_in": ttl }))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
