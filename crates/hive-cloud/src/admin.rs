@@ -11686,10 +11686,61 @@ fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     local_clean && peer_clean
 }
 
-/// Moves a project to another team (or changes its protection): only the CURRENT owning team may,
-/// EXCEPT that a platform operator may adopt an UNOWNED project (`project_unowned`, which refuses
-/// the moment any deployment names a real tenant); without that exception an orphaned project is
-/// frozen forever, since no tenant matches `__untagged__`.
+/// Whether `dest` is shaped like a tenant slug: a team slug, `personal` or a `u_<uid>` personal
+/// namespace (ASCII letters, digits, `-`, `_`, `.`), and none of the sentinels that are not a
+/// tenant: the empty team (which `norm` reads as the OPERATOR's `personal`), the anonymous and
+/// untagged tenants and the fleet's `mesh`.
+fn is_tenant_slug(dest: &str) -> bool {
+    !dest.is_empty()
+        && dest.len() <= 128
+        && dest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        && !matches!(dest, ANON_TENANT | UNTAGGED_TENANT | "mesh")
+}
+
+/// Whether the verified caller administers the tenant `dest`: it is the caller's OWN personal
+/// namespace (`u_<uid>`, what the dashboard mints for a signed-in user), or the identity mirror
+/// knows the caller (`claims.sub`, a Clerk user id) and that user's email is on `dest`'s roster as
+/// an admin or owner. An API key (`sub` = `key:<id>`) is no user and administers nothing.
+fn caller_administers(c: &Arc<CloudState>, claims: &crate::auth::Claims, dest: &str) -> bool {
+    if dest == format!("u_{}", claims.sub) {
+        return true;
+    }
+    let email = c
+        .identity
+        .users()
+        .into_iter()
+        .find(|user| user.id == claims.sub)
+        .map(|user| user.email)
+        .filter(|email| !email.trim().is_empty());
+    let Some(email) = email else { return false };
+    c.teams
+        .get(dest)
+        .and_then(|team| team.member(&email).map(|member| member.role))
+        .is_some_and(|role| role.rank() >= crate::teams::Role::Admin.rank())
+}
+
+/// Whether `dest` is a tenant this node knows: a team row, the operator's `personal`, or the
+/// personal namespace of a user the identity mirror has seen.
+fn tenant_exists(c: &Arc<CloudState>, dest: &str) -> bool {
+    dest == "personal"
+        || c.teams.get(dest).is_some()
+        || dest
+            .strip_prefix("u_")
+            .is_some_and(|uid| c.identity.users().iter().any(|user| user.id == uid))
+}
+
+/// Changes a project's protection or moves it to another team. The role floor (admin) is the
+/// matrix's (`roles`); this handler decides WHERE the project may go. The current owning team may
+/// always save its own team again (that is how the dashboard toggles preview protection). A move to
+/// ANOTHER tenant needs the platform operator (into a team that exists) or a destination the caller
+/// administers (`caller_administers`): without that, any admin could hand a project, its settings
+/// and its env to a tenant of their choosing, or park it in a tenant that does not exist. A
+/// platform operator may also adopt an UNOWNED project (`project_unowned`, which refuses the moment
+/// any deployment names a real tenant); without that exception an orphaned project is frozen
+/// forever, since no tenant matches `__untagged__`. An unenforced dev node has no tenant boundary
+/// and stays open apart from the slug shape.
 async fn project_team_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11697,18 +11748,57 @@ async fn project_team_put(
     Path(project): Path<String>,
     Json(b): Json<ProjectTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let adopting_orphan =
-        project_unowned(&c, &project) && require_operator(claims.as_ref().map(|e| &e.0)).is_ok();
-    if !adopting_orphan {
-        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let cl = claims.as_ref().map(|e| &e.0);
+    let dest = b.team.trim();
+    if !is_tenant_slug(dest) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "team must be a team slug (letters, digits, '-', '_', '.')".into(),
+        ));
+    }
+    let operator = require_operator(cl).is_ok();
+    let adopting_orphan = project_unowned(&c, &project) && operator;
+    let from = if !adopting_orphan {
+        require_project(&c, &headers, cl, &project)?
     } else {
         tracing::warn!(
             %project,
-            new_team = %b.team,
+            new_team = %dest,
             "adopting an UNOWNED project into a tenant (operator action)"
         );
+        UNTAGGED_TENANT.to_string()
+    };
+    let same_team = norm(dest) == norm(&from) || norm(dest) == norm(&c.projects.team_of(&project));
+    if !same_team && crate::auth::enforced() {
+        let allowed = if operator {
+            tenant_exists(&c, dest)
+        } else {
+            cl.is_some_and(|cl| caller_administers(&c, cl, dest))
+        };
+        if !allowed {
+            return Err(if operator {
+                (StatusCode::NOT_FOUND, format!("no such team: {dest}"))
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    "moving a project to another team needs an owner or admin of that team, or a platform operator"
+                        .into(),
+                )
+            });
+        }
     }
-    c.projects.set_team(&project, &b.team);
+    if !same_team {
+        let audited_under = if adopting_orphan { dest } else { &from };
+        c.audit.record(
+            audited_under,
+            "user",
+            "transfer",
+            "project",
+            &project,
+            &format!("project moved from {from} to {dest}"),
+        );
+    }
+    c.projects.set_team(&project, dest);
     c.projects
         .set_preview_protection(&project, b.preview_protection);
     crate::persist::persist(&c);
