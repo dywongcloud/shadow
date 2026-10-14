@@ -1,34 +1,68 @@
 "use client";
 
 import { useEffect, useState, use } from "react";
+import Link from "next/link";
 import { Lock } from "lucide-react";
 import { Button, Switch, SettingCard } from "@/components/ui";
-import { apiGet, apiSend, usePoll, type ProjectSettings, type Team } from "@/lib/api";
+import { apiGet, apiSend, usePlatformAdmin, usePoll, type ProjectSettings, type Team } from "@/lib/api";
+import { PLAN_TIERS, followCheckout, planAction, planRefusal, startPlanCheckout } from "@/lib/plan-change";
 import { cn } from "@/lib/utils";
 
 export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
   const project = decodeURIComponent(params.project);
-  const { data: teams, refresh: refreshTeams } = usePoll<Team[]>("/v1/teams", 10000);
+  const { data: teams, error: teamsError, refresh: refreshTeams } = usePoll<Team[]>("/v1/teams", 10000);
+  const platformAdmin = usePlatformAdmin();
   const [settings, setSettings] = useState<ProjectSettings | null>(null);
   const [team, setTeam] = useState("personal");
   const [protect, setProtect] = useState(true);
   const [saved, setSaved] = useState(false);
   const [planBusy, setPlanBusy] = useState("");
+  const [planErr, setPlanErr] = useState("");
 
   const owning = (teams ?? []).find((t) => t.slug === team);
   const plan = owning?.plan ?? "hobby";
   const ssoOn = !!owning?.sso_enabled;
+  const planScope = !teams || settings === null ? "loading" : owning ? "team" : "none";
+  const planFooter =
+    planScope === "team"
+      ? `Current plan for ${owning?.name ?? team}: ${plan}.`
+      : planScope === "none"
+        ? `No plan record for ${team}.`
+        : teamsError
+          ? "The plan could not be loaded."
+          : "Loading the plan…";
+  const planNote =
+    planScope === "team"
+      ? platformAdmin === true
+        ? "Platform operator: a plan change applies immediately, without a payment."
+        : "Upgrading opens checkout and the plan changes once the payment is confirmed; lowering a plan applies immediately. Only a platform operator can change a plan without paying."
+      : planScope === "none"
+        ? "This project's team has no plan record that can be changed here. The Billing page manages the plan of the team you are working in."
+        : "";
 
-  async function changePlan(p: string) {
-    setPlanBusy(p);
+  async function changePlan(target: string) {
+    const action = planAction(plan, target, platformAdmin);
+    if (action === "none") return;
+    setPlanErr("");
+    setPlanBusy(target);
+    let leaving = false;
     try {
-      await apiSend("PUT", `/v1/teams/${encodeURIComponent(team)}/plan`, { plan: p });
+      if (action === "checkout") {
+        const checkout = await startPlanCheckout(target);
+        if (!checkout.applied) {
+          leaving = true;
+          followCheckout(checkout.url);
+          return;
+        }
+      } else {
+        await apiSend("PUT", `/v1/teams/${encodeURIComponent(team)}/plan`, { plan: target });
+      }
       await refreshTeams();
     } catch (e) {
-      alert(String(e));
+      setPlanErr(planRefusal(e));
     } finally {
-      setPlanBusy("");
+      if (!leaving) setPlanBusy("");
     }
   }
   async function toggleSso(v: boolean) {
@@ -171,23 +205,55 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
       <SettingCard
         title="Plan & Enterprise"
         desc="Your team's tier. Enterprise unlocks automatic region fail-over, 1-hour function runtimes (3600s), and optional Org SSO."
-        footer={`Current plan for ${owning?.name ?? team}: ${plan}.`}
+        footer={planFooter}
       >
         <div className="flex flex-wrap gap-2">
-          {(["hobby", "pro", "enterprise"] as const).map((p) => (
-            <button
-              key={p}
-              onClick={() => changePlan(p)}
-              disabled={!!planBusy}
-              className={cn(
-                "rounded-md border px-3 py-1.5 text-sm capitalize transition-colors disabled:opacity-50",
-                plan === p ? "border-fg bg-fg text-bg" : "border-border hover:bg-subtle"
-              )}
-            >
-              {planBusy === p ? "…" : p}{plan === p ? " ✓" : ""}
-            </button>
-          ))}
+          {PLAN_TIERS.map((p) => {
+            const known = planScope === "team";
+            const current = known && plan === p;
+            const action = known ? planAction(plan, p, platformAdmin) : "none";
+            return (
+              <button
+                key={p}
+                onClick={() => changePlan(p)}
+                disabled={!!planBusy || !known}
+                aria-current={current ? "true" : undefined}
+                title={action === "checkout" ? "Opens checkout; the plan changes once your payment is confirmed." : undefined}
+                className={cn(
+                  "rounded-md border px-3 py-1.5 text-sm transition-colors disabled:opacity-50",
+                  current ? "border-fg bg-fg text-bg" : "border-border hover:bg-subtle"
+                )}
+              >
+                {planBusy === p ? (
+                  "…"
+                ) : (
+                  <>
+                    {action === "checkout" ? "Upgrade to " : ""}
+                    <span className="capitalize">{p}</span>
+                    {current ? " ✓" : ""}
+                  </>
+                )}
+              </button>
+            );
+          })}
         </div>
+        {planNote ? (
+          <p className="mt-3 text-xs text-secondary">
+            {planNote}
+            {platformAdmin === true ? null : (
+              <>
+                {" "}
+                <Link href="/billing" className="underline hover:text-fg">Open Billing</Link>
+              </>
+            )}
+          </p>
+        ) : null}
+        {planErr ? (
+          <p className="mt-3 text-sm text-red-500">
+            {planErr}{" "}
+            <Link href="/billing" className="underline">Open Billing</Link>
+          </p>
+        ) : null}
         <div className="mt-4 flex items-center gap-3 border-t border-border pt-4">
           <Switch checked={ssoOn} disabled={plan !== "enterprise"} onChange={toggleSso} label="Org SSO" />
           <span className="text-sm text-secondary">Team / Org SSO (SAML &amp; OIDC) login</span>

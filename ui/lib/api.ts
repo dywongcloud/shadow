@@ -306,7 +306,7 @@ const CONFIG_PATHS =
   /^\/v1\/(projects\/(?![^/]+\/sandboxes(?:\/|$))|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy|deploy\/(image|zip)|enterprise\/|routing|webhooks|domains|cron)/;
 const GITOPS_BADGE = "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
 
-/** A server refusal carrying the API's typed error envelope (`code` such as "PLAN_UPGRADE_REQUIRED"). */
+/** A server refusal: `status` and the node's own sentence as `message` (what `apiSend` throws, so a caller can tell a 403 from a 502), plus the typed error envelope's `code` such as "PLAN_UPGRADE_REQUIRED" when the API sent one. */
 export class ApiError extends Error {
   status: number;
   code: string;
@@ -351,7 +351,7 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
   }, 30_000);
   if (!r.ok) {
     const detail = await r.text().catch(() => "");
-    throw new Error(detail?.trim() ? detail.trim() : `${method} ${path} -> ${r.status}`);
+    throw new ApiError(r.status, detail?.trim() ? detail.trim() : `${method} ${path} -> ${r.status}`);
   }
   const isMutation = method !== "GET" && method !== "HEAD";
   if (isMutation) invalidateApiCache();
