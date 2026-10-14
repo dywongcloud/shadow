@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-10-13 — an amount from a request body can no longer wrap into a credit: every cents input is bounded (0342ebc567)
+
+`POST /v1/billing/charge` debits the caller's own account by `cents`, a `u64` straight from the request
+body, and `BillingStore::charge` cast it `as i64`. Above `i64::MAX` the cast is negative, the balance
+check passed and `balance -= negative` CREDITED the account, so any tenant minted credits:
+`{"cents":18445744073709551616}` took a hobby account from 4000 to 1000000000004000 cents. Amounts around
+`i64::MAX` panicked the handler ("attempt to subtract with overflow"; the release profile has overflow
+checks off, so a release build wraps silently). Amounts are now bounded by `billing::MAX_AMOUNT_CENTS`
+($10 billion) at every entry point that takes one: `charge()` returns the typed `ChargeError::OutOfRange`
+(the route answers 400; insufficient credits stays 402 with its text), a credits checkout and an operator
+grant answer 400 above it, `add_credits` converts with `i64::try_from` and every balance update saturates.
+A refused charge no longer leaves the allowance it had started to consume (the decision is made before the
+account is touched: `used_cents` 100 -> 500 before, 100 -> 100 after), and a credits checkout of 0 cents
+answers its own 400 instead of falling into the free-plan branch. Witnessed on a real enforced node
+(`scratch2/work/secfix2-billing-charge.sh`): before, 10 defects (credit minted by 2^64-10^15 and u64-max,
+panics on 2^63, one cent past the bound accepted, an unpayable 4.6e18 debt accepted, a credits checkout and
+an operator grant above the bound applied, a refused charge consuming the allowance); after, none: 400
+with the balance unchanged, a charge at exactly the bound still applies, and normal charges, charges
+against prepaid credits and operator grants within the bound are unchanged. The route has no caller in
+this repository (no dashboard, CLI or SDK uses it): retiring it is the owner's call. Not rolled.
+
+## 2026-10-13 — a checkout is applied only when a payment stands behind it: Stripe failing no longer hands out a mock session (fb3b773810)
+
+`billing_checkout` opened a real Stripe Checkout when `STRIPE_SECRET_KEY` was set and, when Stripe
+errored (an amount over its limit, an outage), logged "falling back to mock" and returned a MOCK
+session; with no key it always did, on any node. `billing_confirm` applied any checkout whose
+`stripe_session_id` was empty without verifying a payment. So any tenant bought credits or a plan for
+nothing: credits of $1,000,000.00 (an amount Stripe refuses, so the fallback fired) and the enterprise
+plan, on an enforced platform with a Stripe key and on one without. The rule now lives where a purchase
+becomes applied, `BillingStore::confirm_checkout(id, Payment)`: `Payment::Stripe` (a session verified
+with Stripe, or a signature-verified webhook) or `Payment::Unproven`, which completes an amount due only
+where `billing::mock_checkout_allowed()` (no Stripe key AND no `HIVE_JWT_SECRET`: a developer's node),
+else `Unconfirmed::Unpaid` (402) without consuming the record, so a mock checkout persisted or replicated
+from a dev node cannot be spent on a platform either. `billing_checkout` answers 503 on an enforced node
+with no Stripe key (before any record opens) and 502 plus a discarded record when Stripe cannot open
+one. Witnessed on real nodes (`scratch2/work/secfix2-billing-mock.sh`: {enforced, dev} x {Stripe key set
+but unreachable behind a dead HTTPS proxy, no key}, plus a dev checkout persisted and confirmed after a
+restart as an enforced platform): before, 13 defects (credits and plan purchases applied with no payment
+in three of the four combinations, a leftover mock checkout spent: balance 0 -> 7777); after, none: 502,
+503 or 402 with balance and plan unchanged and no open checkout left behind, while the dev flow (no key,
+auth not enforced) still credits and switches plans and a free hobby checkout still applies. The Stripe
+success path needs a live Stripe account and is unchanged. Operator note: an enforced platform with no
+`STRIPE_SECRET_KEY` now refuses paid checkouts (503) where it used to grant them; set the key, or grant
+through `POST /v1/admin/billing/grant`. Not rolled.
+
 ## 2026-10-13 — a plan is bought or granted, never self-assigned: the tier-change primitive decides who may raise it (f00b3ebe32)
 
 `PUT /v1/teams/:slug/plan` was gated only by `require_team(owner|admin)`, so a team's owner, an admin,
@@ -85,7 +130,11 @@ platform state, so removing one is a rollback and mixed-fleet hazard. The dead a
 setter are gone (404). Witnessed on a real node (`scratch2/work/secfix2-dns.sh`): before, a fresh record
 read OpenEdge / $13 per year / true / +365d, the toggle answered 200 and a persisted record kept serving
 the invented values after a restart; after, empty, false, 0, a 404, scrubbed on load, and the older binary
-still boots on the data dir the new one wrote. Not rolled.
+still boots on the data dir the new one wrote. The dashboard stops rendering them in `6ef9c7427b`
+(`DomainRecord` no longer declares the keys; the attached domain's Expiration Date row and the list's
+"auto-renews" are gone), witnessed in headless Chrome against throwaway nodes: roll the dashboard BEFORE or
+WITH the nodes, because an old dashboard against an upgraded node renders an epoch-zero expiry ("Dec 31,
+1969") for an attached domain and still prints "auto-renews". Not rolled.
 
 ## 2026-10-13 — a checkout names a real plan, and deleting a database that does not exist is a 404 that plants no tombstone (71f14d7300)
 
