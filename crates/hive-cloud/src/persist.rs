@@ -1,18 +1,7 @@
-//! Durable persistence for platform state.
-//!
-//! The platform's operational records (deployments, per-project settings, WAF
-//! rules, cron jobs, routing) are snapshotted to disk so a node restart restores
-//! the full state — the underlying persisted database for platform operation.
-//!
-//! Backends:
-//! * **file** (default) — atomic JSON snapshot under `$HIVE_DATA` (default
-//!   `~/.hive-cloud`). Always available, no external services.
-//! * **guardian-db** (cargo feature `guardian`) — an iroh-native, content-
-//!   addressed, P2P-replicated store ([wmaslonek/guardian-db]) so state
-//!   replicates across the mesh. Enabled with `--features guardian`; the file
-//!   snapshot remains the local source of truth and bootstrap.
-//!
-//! [wmaslonek/guardian-db]: https://github.com/wmaslonek/guardian-db
+//! Durable persistence for platform state: the atomic JSON snapshot `state.json` under `$HIVE_DATA`
+//! (default `~/.hive-cloud`) that boot restores, per-tenant namespace documents under `ns/`, and
+//! the GuardianDB replica (`guardian::replicate`), whose rollback guard restores a replica newer
+//! than the disk.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -26,14 +15,15 @@ use serde_json::{json, Value};
 use crate::project_settings::{ProjectSettings, SyncedProjects};
 use crate::state::CloudState;
 
+const GLOBAL_NAMESPACE: &str = "_global";
+/// Namespace of a project absent from the snapshot: UNOWNED, never the owner's real "personal" one.
+const UNOWNED_NAMESPACE: &str = "__untagged__";
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct PlatformSnapshot {
-    /// When this snapshot was SAVED (ms epoch). The guardian restore-on-rollback
-    /// guard compares this against replicated commit time to detect a local snapshot
-    /// that regressed (older file restored after a crash / disk swap): if the
-    /// GuardianDB replica is NEWER than what's on disk, the replica wins at boot.
-    /// Guardian canonical payloads omit this write-attempt-only field and restore
-    /// it from the iroh-docs entry timestamp, avoiding a new blob for unchanged state.
+    /// Save time (ms epoch): `guardian::spawn_restore_guard` restores a GuardianDB replica whose
+    /// `saved_ms` is newer than the on-disk snapshot. Canonical Guardian payloads omit it and
+    /// restore it from the iroh-docs entry timestamp.
     #[serde(default)]
     pub saved_ms: u64,
     #[serde(default)]
@@ -66,34 +56,27 @@ pub struct PlatformSnapshot {
     /// restart like blob (disk) and the DB records themselves.
     #[serde(default)]
     pub database_data: crate::databases::DataSnapshot,
-    /// Deletions of database records, kept durable on purpose: a node that
-    /// forgets its tombstones on restart re-imports every database it had
-    /// deleted from whichever peer still holds them.
+    /// Durable on purpose: a node that forgets these re-imports every deleted database from any
+    /// peer that still holds it.
     #[serde(default)]
     pub database_tombstones: std::collections::BTreeMap<String, u64>,
     /// One-use Studio replay facts are resource-independent so a live Guardian
     /// restore omitting a database record cannot erase them.
     #[serde(default)]
     pub database_studio_replay: crate::databases::StudioReplaySnapshot,
-    /// Cloudflare Queues metadata (queue/consumer records + their tombstones)
-    /// — durable on disk exactly like the `databases` fields above, separate
-    /// from store_sync's cross-node replication path. Message BODIES are
-    /// deliberately excluded (node-local + GuardianDB-mirrored, see
-    /// `crate::queues` module doc) — this snapshot only ever holds metadata.
+    /// Queue and consumer records plus their tombstones; message bodies are node-local and never
+    /// part of this snapshot (see the `crate::queues` module doc).
     #[serde(default)]
     pub queues: crate::queues::SyncedQueues,
-    /// Durable "what's deployed where" for node-death self-heal — see
-    /// `production_deployments.rs` module doc. Rows + tombstones together
-    /// (unlike `projects`/`project_tombstones`) since there is no separate
-    /// incarnation-tombstone concept here to justify splitting them.
+    /// What is deployed where, for node-death self-heal (`production_deployments`); rows and
+    /// tombstones travel together.
     #[serde(default)]
     pub production_deployments: crate::production_deployments::SyncedProductionDeployments,
     /// Same rationale for the projects store (see `SyncedProjects`).
     #[serde(default)]
     pub project_tombstones: std::collections::BTreeMap<String, u64>,
-    /// Old names of renamed projects, kept durable for the same reason the
-    /// delete tombstones are: a restart must not forget that a name is
-    /// reserved, or it would let someone create it and inherit its traffic.
+    /// Durable like the delete tombstones: a restart must not un-reserve a renamed-away name, or
+    /// someone could create it and inherit its traffic.
     #[serde(default)]
     pub project_rename_tombstones:
         std::collections::BTreeMap<String, crate::project_settings::ProjectRenameTombstone>,
@@ -102,14 +85,8 @@ pub struct PlatformSnapshot {
         String,
         std::collections::BTreeMap<fluid_core::ProjectIncarnation, u64>,
     >,
-    /// Hour/day consumption-breakdown rollups (Weekly/Monthly chart data) —
-    /// minute-resolution buckets are excluded (short retention, refill within
-    /// minutes; see metrics.rs's module doc comment for why).
     #[serde(default)]
     pub metrics_rollup: crate::metrics::RollupSnapshot,
-    /// Build records incl. logs (newest-capped; see BuildStore::snapshot) —
-    /// previously in-memory only, so every restart erased all build logs while
-    /// the deployments they built lived on.
     #[serde(default)]
     pub builds: Vec<crate::git::Build>,
     #[serde(default)]
@@ -133,21 +110,12 @@ pub struct PlatformSnapshot {
     pub billing_ledger: Vec<crate::billing::LedgerEntry>,
     #[serde(default)]
     pub billing_invoices: Vec<crate::billing::Invoice>,
-    /// Per-tenant metering watermarks (`BillingStore::meters`). `None` is
-    /// load-bearing and means UNKNOWN — a snapshot written by a node from
-    /// before this field existed, which is NOT the same as "every tenant is at
-    /// zero": billing charges `current − watermark`, so a zero watermark
-    /// against still-climbing fleet counters re-bills the entire cumulative
-    /// total. `BillingStore::meters_load` turns `None` into a re-baseline
-    /// (charge nothing on the first reading) instead.
+    /// `None` means UNKNOWN (a snapshot from before this field), never "every tenant at zero":
+    /// `BillingStore::meters_load` re-baselines on it. This build always writes `Some`.
     #[serde(default)]
     pub billing_meters: Option<Vec<crate::billing::MeterWatermark>>,
-    /// Open (unconfirmed) checkouts. Previously in-memory only, so a node
-    /// restart between "user redirected to Stripe" and "user redirected back"
-    /// made `confirm_checkout` return `None` for a session the customer had
-    /// actually paid for. The relational mirror's `billing_checkouts` table is
-    /// a read-only projection for the admin/SQL view — nothing ever loads it
-    /// back — so it was not, and is not, a restore path.
+    /// Open (unconfirmed) checkouts, so a restart between the Stripe redirect and the return keeps
+    /// `confirm_checkout` working.
     #[serde(default)]
     pub billing_checkouts: Vec<crate::billing::Checkout>,
     #[serde(default)]
@@ -156,26 +124,18 @@ pub struct PlatformSnapshot {
     pub docs: Vec<crate::docstore::Doc>,
     #[serde(default)]
     pub gitops: Vec<crate::gitops::GitOpsLink>,
-    /// Workflow definitions (incl. WDK-ingested ones with their graphs). Persisted
-    /// so a deployed app's workflows survive node restarts — the manifest is only
-    /// ingested during a live deploy, so without this they vanished on reboot.
+    /// Workflow definitions, WDK-ingested graphs included: the manifest is ingested only during a
+    /// live deploy.
     #[serde(default)]
     pub workflow_defs: Vec<WorkflowDef>,
-    /// Engine-defined-workflow run history (`hive_edge::WorkflowEngine::runs`).
-    /// Previously pure in-memory and lost on every restart — an in-flight run
-    /// has no way to resume (its driving background task died with the
-    /// process), so `WorkflowEngine::runs_load` reconciles any restored
-    /// Pending/Running row to Failed, the same orphan-reconciliation shape
-    /// `persist::restore` already applies to in-flight deployments below.
     #[serde(default)]
     pub workflow_runs: Vec<WorkflowRun>,
     /// Enterprise feature suite state (secrets AEAD-encrypted in-struct). See
     /// [`crate::enterprise::EnterpriseSnapshot`].
     #[serde(default)]
     pub enterprise: crate::enterprise::EnterpriseSnapshot,
-    /// Sandboxes (records only — live cell handles/vsock sockets don't survive
-    /// a restart and are re-provisioned on next use). See
-    /// [`crate::sandboxes::SandboxesSnapshot`].
+    /// Sandbox records only: live cell handles do not survive a restart and are re-provisioned on
+    /// next use.
     #[serde(default)]
     pub sandboxes: crate::sandboxes::SandboxesSnapshot,
 }
@@ -191,11 +151,8 @@ fn peer_iroh_path() -> PathBuf {
     data_dir().join("peer_iroh.json")
 }
 
-/// Persist the gossip-transport map (peer admin URL -> (node_id, iroh addr_json)) so
-/// a node can bootstrap gossip over iroh on restart WITHOUT the HTTP-over-SSH
-/// tunnels. Safe to call every gossip round — atomic temp+rename. Paired with
-/// persistent iroh identities (stable EndpointId), the saved addresses stay valid
-/// across restarts, so the SSH tunnels are no longer required for rendezvous.
+/// Persist the gossip-transport map (peer admin URL -> (node id, iroh addr JSON)); atomic, so safe
+/// to call every gossip round.
 pub fn save_peer_iroh(map: &std::collections::HashMap<String, (String, String)>) {
     let dir = data_dir();
     let tmp = dir.join("peer_iroh.json.tmp");
@@ -219,17 +176,10 @@ fn peer_guardian_addr_path() -> PathBuf {
     data_dir().join("peer_guardian_addr.json")
 }
 
-/// Persist peers' GuardianDB-specific addresses (node name -> serialized
-/// `iroh::EndpointAddr`) — a SEPARATE identity/endpoint from the mesh
-/// addresses in `peer_iroh.json` above (GuardianDB runs its own independent
-/// iroh client per node). Loaded at boot to seed `guardian::set_boot_seed_peers`
-/// before GuardianDB's one-time KV-store open (the only window its automatic
-/// DocTicket exchange is consulted in — see guardian.rs). On a node's FIRST
-/// ever boot with this feature, this file doesn't exist yet (nothing has ever
-/// gossiped a guardian address) — boot-seeding is empty and this node falls
-/// back to the pre-existing single-namespace-per-node behavior; the NEXT
-/// restart, after the gossip loop has had a chance to populate and persist
-/// this file, is when boot-seeding actually has something to work with.
+/// Persist peers' GuardianDB addresses (node name -> serialized `iroh::EndpointAddr`), a SEPARATE
+/// identity from the mesh addresses in `peer_iroh.json`. Loaded at boot to seed
+/// `guardian::set_boot_seed_peers` before GuardianDB's one-time KV-store open; empty on a node's
+/// first boot.
 pub fn save_peer_guardian_addr(map: &std::collections::HashMap<String, String>) {
     let dir = data_dir();
     let tmp = dir.join("peer_guardian_addr.json.tmp");
@@ -291,28 +241,34 @@ pub fn load() -> PlatformSnapshot {
     }
 }
 
-fn save_with_guardian_generation(snap: &PlatformSnapshot) -> std::io::Result<Option<u64>> {
-    let dir = data_dir();
-    std::fs::create_dir_all(&dir)?;
-    let tmp = dir.join("state.json.tmp");
-    let json = serde_json::to_string_pretty(snap).unwrap_or_else(|_| "{}".into());
-    // Durability: write + fsync the temp file, then atomically rename into place.
+/// Write and fsync `tmp`, rename it over the state file, then fsync the directory: a rename is not
+/// crash-durable until its directory entry is, and a power loss must not resurrect a row whose
+/// tombstone was already acknowledged.
+fn write_state_file_durably(
+    dir: &std::path::Path,
+    tmp: &std::path::Path,
+    json: &str,
+) -> std::io::Result<()> {
     {
-        let f = std::fs::File::create(&tmp)?;
+        let f = std::fs::File::create(tmp)?;
         use std::io::Write;
         let mut w = std::io::BufWriter::new(&f);
         w.write_all(json.as_bytes())?;
         w.flush()?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, state_path())?;
-    // The rename is not crash-durable until the directory entry itself reaches
-    // stable storage. A power loss must not resurrect a row whose tombstone was
-    // already acknowledged and written.
-    std::fs::File::open(&dir)?.sync_all()?;
-    // Write per-tenant namespace documents (the multi-tenant schema partition).
+    std::fs::rename(tmp, state_path())?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+fn save_with_guardian_generation(snap: &PlatformSnapshot) -> std::io::Result<Option<u64>> {
+    let dir = data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join("state.json.tmp");
+    let json = serde_json::to_string_pretty(snap).unwrap_or_else(|_| "{}".into());
+    write_state_file_durably(&dir, &tmp, &json)?;
     save_namespaces(snap)?;
-    // Replicate into the always-on GuardianDB (durable + peer-replicated copy).
     Ok(crate::guardian::replicate(snap))
 }
 
@@ -330,23 +286,17 @@ fn ns_norm(team: &str) -> String {
     }
 }
 
-/// Partition the global snapshot into **per-tenant namespace documents**. Every
-/// tenant-owned record (projects, deployments, databases, api keys, webhooks,
-/// the team itself) is filed under its org/team namespace; platform-level edge
-/// config (WAF, cron, routing, incidents) lives under the reserved `_global`
-/// namespace. This is the schema that guardian-db replicates so data is scoped
-/// and isolated by namespace across the mesh.
+/// Partition the snapshot into per-tenant namespace documents; platform-level edge config (WAF,
+/// cron, routing, incidents) lives under the reserved `_global` namespace. Team rows and tombstones
+/// are included so a team-only mutation refreshes GuardianDB's full rollback snapshot. Set-valued
+/// arrays are sorted (several stores are HashMap-backed, so capture order varies); WAF, redirect
+/// and rewrite order is routing policy and stays as is.
 pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
-    // A project entirely absent from the snapshot's `projects` map (settings
-    // lost, or a record whose project was deleted out from under it) is
-    // UNOWNED, never the owner's real "personal" namespace — filing it there
-    // let another tenant's deployment/webhook re-materialize as personal-owned
-    // on any node that later restores/clones this namespace doc.
     let team_of = |project: &str| -> String {
         snap.projects
             .get(project)
             .map(|s| ns_norm(&s.team))
-            .unwrap_or_else(|| "__untagged__".into())
+            .unwrap_or_else(|| UNOWNED_NAMESPACE.into())
     };
     let mut docs: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
     let mut push = |ns: String, key: &str, val: Value| {
@@ -373,7 +323,6 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
         push(ns_norm(&k.team), "api_keys", json!(k));
     }
     for i in &snap.integrations {
-        // Redacted view in the namespace docs — never persist secrets here.
         push(ns_norm(&i.team), "integrations", i.public());
     }
     for w in &snap.webhooks {
@@ -391,10 +340,6 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for g in &snap.gitops {
         push(ns_norm(&g.tenant), "gitops", json!(g));
     }
-    // Team aggregates are authoritative for membership/plan gates even though
-    // orgs/users mirror the identity provider. Include both rows and deletion
-    // generations in the namespace signature so a team-only mutation also
-    // refreshes GuardianDB's full rollback snapshot.
     for (slug, team) in &snap.teams {
         if !team.synthetic_seed {
             push(ns_norm(slug), "teams", json!(team));
@@ -408,18 +353,13 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
         );
     }
 
-    // Platform-level config under the reserved global namespace.
-    let global = docs.entry("_global".into()).or_default();
+    let global = docs.entry(GLOBAL_NAMESPACE.into()).or_default();
     global.insert("waf_rules".into(), json!(snap.waf_rules));
     global.insert("cron".into(), json!(snap.cron));
     global.insert("redirects".into(), json!(snap.redirects));
     global.insert("rewrites".into(), json!(snap.rewrites));
     global.insert("incidents".into(), json!(snap.incidents));
 
-    // These arrays represent keyed sets, not insertion sequences. Several of
-    // their stores are HashMap-backed, so iteration order changes between
-    // otherwise identical captures. Normalize only those set-valued arrays;
-    // WAF/redirect/rewrite order is routing policy and must remain untouched.
     const SET_FIELDS: [&str; 14] = [
         "deployments",
         "projects",
@@ -449,14 +389,12 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
         .collect()
 }
 
-/// Guardian snapshot protocol v2's namespace projection. The ordinary local
-/// namespace files retain cron for backwards compatibility; the disjoint v2
-/// Guardian lane omits it because cron is node-local. Project arrays use the
-/// project identity as their deterministic primary key and reject malformed or
-/// duplicate identities instead of publishing an ambiguous tenant document.
+/// Guardian snapshot protocol v2's namespace projection: `namespaced` without the node-local
+/// `cron`, project arrays keyed and sorted by project identity, malformed or duplicate identities
+/// rejected.
 pub fn guardian_v2_namespaced(snap: &PlatformSnapshot) -> anyhow::Result<BTreeMap<String, Value>> {
     let mut docs = namespaced(snap);
-    if let Some(global) = docs.get_mut("_global") {
+    if let Some(global) = docs.get_mut(GLOBAL_NAMESPACE) {
         let fields = global
             .as_object_mut()
             .ok_or_else(|| anyhow::anyhow!("Guardian namespace _global is not an object"))?;
@@ -508,7 +446,6 @@ pub fn guardian_v2_namespaced(snap: &PlatformSnapshot) -> anyhow::Result<BTreeMa
 pub fn save_namespaces(snap: &PlatformSnapshot) -> std::io::Result<()> {
     let dir = data_dir().join("ns");
     std::fs::create_dir_all(&dir)?;
-    // Track current namespaces so stale files can be pruned.
     let docs = namespaced(snap);
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (ns, doc) in &docs {
@@ -531,10 +468,6 @@ pub fn save_namespaces(snap: &PlatformSnapshot) -> std::io::Result<()> {
 
 /// Capture the current platform state into a snapshot.
 pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
-    // ONE billing read: this was two separate `cloud.billing.snapshot()` calls
-    // (`.0` and `.1`), which takes the accounts and ledger locks twice and can
-    // therefore write an account balance from before a ledger entry that is
-    // already in the same file.
     let (billing_accounts, billing_ledger) = cloud.billing.snapshot();
     let SyncedProjects {
         rows: projects,
@@ -542,9 +475,6 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         rename_tombstones: project_rename_tombstones,
         incarnation_tombstones: project_incarnation_tombstones,
     } = cloud.projects.snapshot_synced();
-    // ONE team read: live rows and tombstones share a lock and must describe one
-    // causal instant. Splitting the reads could persist a tombstone without the
-    // recreation that already superseded it (or vice versa).
     let crate::teams::SyncedTeams {
         rows: team_rows,
         tombstones: team_tombstones,
@@ -593,8 +523,6 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         billing: billing_accounts,
         billing_ledger,
         billing_invoices: cloud.billing.invoices_snapshot(),
-        // Always `Some` from this build — an empty vec means "known: nothing
-        // metered yet", which `None` (unknown) must never be confused with.
         billing_meters: Some(cloud.billing.meters_snapshot()),
         billing_checkouts: cloud.billing.checkouts_snapshot(),
         domains: cloud.domains.snapshot(),
@@ -615,37 +543,18 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Coalescing background persister.
-//
-// `persist()` used to serialize the ENTIRE platform state + fsync + rename +
-// namespace-partition + guardian-replicate SYNCHRONOUSLY on the calling request
-// thread — paid in full on every single mutation (env edit, domain add, …), so a
-// burst of edits did N full-state fsyncs back-to-back on the hot path.
-//
-// This replaces that with a single background writer that COALESCES bursts while
-// preserving durability: `persist()` bumps a generation counter and wakes the
-// writer; the writer always captures + saves the LATEST state, and if more
-// mutations arrived during a save it immediately saves again. Properties:
-//   * No lost mutation under normal operation — after the last `persist()` the
-//     writer performs a save that captures state at-or-after that call.
-//   * Bounded crash-loss window (the in-flight capture), vs the old zero-window
-//     synchronous write — this is the accepted latency↔durability trade.
-//   * `flush_blocking()` (wired to SIGTERM/SIGINT in main) makes a graceful
-//     restart lose nothing.
-//   * Synchronous fallback when the writer isn't started (early boot / tests),
-//     so persistence is never silently dropped.
-// ---------------------------------------------------------------------------
-
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
+/// Coalescing background writer on a dedicated OS thread (capture and fsync block): `persist()`
+/// bumps the requested generation and wakes it; it always saves the newest state and saves again
+/// when more mutations arrived during a save. Before it starts, `persist()` saves synchronously.
 struct Persister {
     cloud: Arc<CloudState>,
-    dirty: AtomicU64,  // bumped on each persist() request
-    saved: AtomicU64,  // highest generation durably written
-    lock: Mutex<bool>, // admission-open flag paired with `cv`; does NOT guard state
-    writer: Mutex<()>, // serializes capture + save + `saved` advancement
+    requested: AtomicU64,
+    saved: AtomicU64,
+    admission_open: Mutex<bool>,
+    snapshot_writer: Mutex<()>,
     cv: Condvar,
 }
 static PERSISTER: OnceLock<Arc<Persister>> = OnceLock::new();
@@ -654,33 +563,28 @@ static PERSISTER: OnceLock<Arc<Persister>> = OnceLock::new();
 pub fn spawn_persister(cloud: Arc<CloudState>) {
     let p = Arc::new(Persister {
         cloud,
-        dirty: AtomicU64::new(0),
+        requested: AtomicU64::new(0),
         saved: AtomicU64::new(0),
-        lock: Mutex::new(true),
-        writer: Mutex::new(()),
+        admission_open: Mutex::new(true),
+        snapshot_writer: Mutex::new(()),
         cv: Condvar::new(),
     });
-    if PERSISTER.set(p.clone()).is_err() {
-        return; // already started
+    let already_started = PERSISTER.set(p.clone()).is_err();
+    if already_started {
+        return;
     }
-    // Dedicated OS thread: capture + fsync are blocking, so keep them entirely off
-    // the async runtime's worker threads.
     std::thread::Builder::new()
         .name("hive-persister".into())
         .spawn(move || loop {
             {
-                let mut g = p.lock.lock().unwrap();
-                while p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
+                let mut g = p.admission_open.lock().unwrap();
+                while p.requested.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
                     g = p.cv.wait(g).unwrap();
                 }
             }
-            // Drain: coalesce everything up to the newest generation seen after
-            // acquiring the exclusive snapshot-writer slot. A shutdown flush may
-            // have satisfied this wake while we waited, in which case there is
-            // nothing left to write.
             let write_result = {
-                let _writer = p.writer.lock().unwrap();
-                let target = p.dirty.load(Ordering::SeqCst);
+                let _writer = p.snapshot_writer.lock().unwrap();
+                let target = p.requested.load(Ordering::SeqCst);
                 if target <= p.saved.load(Ordering::SeqCst) {
                     continue;
                 }
@@ -693,31 +597,21 @@ pub fn spawn_persister(cloud: Arc<CloudState>) {
             };
             if let Err(e) = write_result {
                 tracing::warn!(error = %e, "persist(bg) failed; will retry on next mutation");
-                // Don't advance `saved` → the next persist() re-triggers a write.
                 std::thread::sleep(std::time::Duration::from_millis(250));
             }
         })
         .expect("spawn persister thread");
 }
 
-/// Logged-once latch for post-barrier refusals: the first late producer warns,
-/// the rest (the follower-sync adopt, the metrics tick, mirrored gossip
-/// writes keep arriving for the whole graceful tail) stay silent.
+/// Logged-once latch: the first producer refused after the shutdown barrier warns, the rest stay
+/// silent.
 static PERSIST_REFUSED_WARNED: AtomicBool = AtomicBool::new(false);
 
-/// Admit one generation, or `None` once `flush_blocking` has closed admission.
-///
-/// This NEVER waits. A post-barrier producer is a tokio worker thread, and a
-/// condvar wait there parks that worker for the rest of the process's life;
-/// when that worker is the one driving tokio's IO/timer driver no other worker
-/// re-takes it, so every timer and socket on the runtime stops — the guardian
-/// shutdown timeout and the shutdown hard deadline included — and systemd
-/// SIGKILLs the node at its stop timeout (measured on 34 of 56 stops: 0 threads
-/// in epoll, all 131 in futex, journal silent for 74 s). The terminal snapshot
-/// is already durable when admission closes, so the refusal costs the caller
-/// nothing it could still have saved.
+/// Admit one generation, or `None` once `flush_blocking` has closed admission. Never waits: a
+/// post-barrier producer is a tokio worker, and parking it in a condvar can stall the whole runtime
+/// until systemd SIGKILLs the node.
 fn admit_generation(p: &Persister) -> Option<u64> {
-    let admission_open = p.lock.lock().unwrap();
+    let admission_open = p.admission_open.lock().unwrap();
     if !*admission_open {
         drop(admission_open);
         if !PERSIST_REFUSED_WARNED.swap(true, Ordering::SeqCst) {
@@ -727,53 +621,41 @@ fn admit_generation(p: &Persister) -> Option<u64> {
         }
         return None;
     }
-    Some(p.dirty.fetch_add(1, Ordering::SeqCst).saturating_add(1))
+    Some(p.requested.fetch_add(1, Ordering::SeqCst).saturating_add(1))
 }
 
-/// Persist the current state to disk (call after any mutation). Non-blocking when
-/// the background writer is running (just marks dirty + wakes it); synchronous
-/// fallback otherwise so a mutation is never silently un-persisted. A no-op once
-/// the shutdown barrier has closed admission (see `admit_generation`).
+/// Persist the current state (call after any mutation). Non-blocking while the background writer
+/// runs (marks dirty and wakes it), so a crash loses at most the mutations the in-flight save had
+/// not captured; before the writer starts it saves synchronously. A no-op once shutdown closed
+/// admission (`admit_generation`).
 pub fn persist(cloud: &Arc<CloudState>) {
     if let Some(p) = PERSISTER.get() {
-        // Admission and the generation bump are one transaction with the
-        // shutdown flush's final dirty==saved check: before it closes, every
-        // admitted generation is drained; after it, admission is refused
-        // without waiting and there is nothing to wake.
         if admit_generation(p).is_some() {
             p.cv.notify_one();
         }
         return;
     }
-    // Writer not started (early boot / tests) → write synchronously.
     let snap = capture(cloud);
     if let Err(e) = save(&snap) {
         tracing::warn!(error = %e, "failed to persist platform state");
     }
 }
 
-/// Persist a security decision before acknowledging it. Unlike [`persist`],
-/// this serializes with the background writer and reports fsync failure to the
-/// caller, which can then fail closed instead of minting a session whose replay
-/// fact exists only in memory.
+/// Persist a security decision before acknowledging it. Unlike [`persist`] it serializes with the
+/// background writer and reports an fsync failure, so the caller can fail closed instead of minting
+/// a session whose replay fact exists only in memory. Runs under `block_in_place`: the capture
+/// clones and serializes the whole state.
 pub fn persist_durable(cloud: &Arc<CloudState>) -> bool {
-    // Called from request handlers on tokio workers: the capture clones and
-    // serializes the whole state (3-15 s on the leader, audited 2026-10-01)
-    // and the save fsyncs. `block_in_place` hands this worker's queue to a
-    // fresh thread for the duration; outside a runtime it simply runs.
     tokio::task::block_in_place(|| persist_durable_blocking(cloud))
 }
 
 fn persist_durable_blocking(cloud: &Arc<CloudState>) -> bool {
     if let Some(p) = PERSISTER.get() {
-        // Refused after the shutdown barrier: nothing can be made durable
-        // ahead of process exit any more, and `false` is exactly the
-        // fail-closed answer this function's callers act on.
         if admit_generation(p).is_none() {
             return false;
         }
-        let _writer = p.writer.lock().unwrap();
-        let target = p.dirty.load(Ordering::SeqCst);
+        let _writer = p.snapshot_writer.lock().unwrap();
+        let target = p.requested.load(Ordering::SeqCst);
         let snap = capture(&p.cloud);
         return match save(&snap) {
             Ok(()) => {
@@ -795,11 +677,11 @@ fn persist_durable_blocking(cloud: &Arc<CloudState>) -> bool {
     }
 }
 
-/// Synchronously drain every admitted generation, then atomically close
-/// persistence admission before returning the exact final Guardian generation.
-/// A producer whose mutation reaches `persist()` after that boundary is refused
-/// without waiting (`admit_generation`): the terminal snapshot is already on
-/// disk, and blocking the producer stalls the runtime instead of protecting it.
+/// Synchronously drain every admitted generation, then close persistence admission and return the
+/// final Guardian generation (wired to the shutdown path in `main`). A `persist()` after that
+/// boundary is refused without waiting (`admit_generation`); admission closes under the lock
+/// `persist()` registers under, so a concurrent `persist()` either forces another pass or is
+/// refused.
 pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
     let Some(p) = PERSISTER.get() else {
         return crate::guardian::close_replication_admission(None);
@@ -813,8 +695,8 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
     let started = std::time::Instant::now();
     loop {
         let write_result = {
-            let _writer = p.writer.lock().unwrap();
-            let target = p.dirty.load(Ordering::SeqCst);
+            let _writer = p.snapshot_writer.lock().unwrap();
+            let target = p.requested.load(Ordering::SeqCst);
             let snap = capture(&p.cloud);
             save_with_guardian_generation(&snap).map(|guardian_generation| {
                 p.saved.store(target, Ordering::SeqCst);
@@ -822,12 +704,9 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
             })
         };
 
-        // persist() registers under this same lock. It therefore either bumped
-        // dirty before this stable check (and forces another pass), or observes
-        // closed admission and is refused.
-        let mut admission_open = p.lock.lock().unwrap();
+        let mut admission_open = p.admission_open.lock().unwrap();
         if let Ok(guardian_generation) = write_result {
-            if p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
+            if p.requested.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
                 *admission_open = false;
                 drop(admission_open);
                 return crate::guardian::close_replication_admission(guardian_generation);
@@ -840,7 +719,7 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
             anyhow::bail!(
                 "platform persistence drain timed out after {}ms (dirty={}, saved={})",
                 timeout.as_millis(),
-                p.dirty.load(Ordering::SeqCst),
+                p.requested.load(Ordering::SeqCst),
                 p.saved.load(Ordering::SeqCst)
             );
         }
@@ -848,7 +727,91 @@ pub fn flush_blocking() -> anyhow::Result<Option<u64>> {
     }
 }
 
-/// Apply a loaded snapshot to a freshly constructed CloudState (boot restore).
+fn in_flight(rec: &DeployRecord) -> bool {
+    matches!(
+        rec.state,
+        fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+    )
+}
+
+/// A record still Queued or Building on a fresh boot was mid-flight in a task of the PREVIOUS
+/// process, which died with it. A `Building…` placeholder (a shell with no git, no functions and
+/// one scratch page) is DROPPED, because promoting it to `Error` would make the shell the permanent
+/// owner of the project's alias on this node; every other in-flight record becomes `Error`, a
+/// retryable state instead of a build that spins forever.
+fn reconcile_orphaned_in_flight(mut deployments: Vec<DeployRecord>) -> Vec<DeployRecord> {
+    let orphaned_count = deployments.iter().filter(|d| in_flight(d)).count();
+    let before = deployments.len();
+    deployments.retain(|rec| !(in_flight(rec) && crate::git::is_placeholder_record(rec)));
+    let dropped = before - deployments.len();
+    for rec in &mut deployments {
+        if in_flight(rec) {
+            rec.state = fluid_core::DeployState::Error;
+        }
+    }
+    if dropped > 0 {
+        tracing::warn!(
+            count = dropped,
+            "persist::restore: dropped orphaned Building… placeholder(s) (their builds died with a prior process; the project alias is freed for the real deployment)"
+        );
+    }
+    if orphaned_count > dropped {
+        tracing::warn!(
+            count = orphaned_count - dropped,
+            "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)"
+        );
+    }
+    deployments
+}
+
+/// Re-apply every persisted custom-domain alias into the just-restored `cloud.gw`:
+/// `Gateway::restore` replays only deployments and a runtime domain attach mutated only the
+/// in-memory alias table, so a restart would drop every custom domain until the next redeploy. A
+/// domain whose project is not hosted on THIS node no-ops (the gossiped route table covers it once
+/// the real host restores).
+fn reapply_custom_domain_aliases(cloud: &Arc<CloudState>) {
+    let mut healed_domains = 0u32;
+    for (project, domain) in cloud.projects.all_domains() {
+        if !attach_may_route(cloud, &domain, &project) {
+            continue;
+        }
+        if cloud.gw.add_alias(&domain, &project) {
+            healed_domains += 1;
+        }
+    }
+    if healed_domains > 0 {
+        tracing::info!(
+            count = healed_domains,
+            "persist::restore: re-applied custom-domain aliases"
+        );
+    }
+}
+
+/// The heal honors the ownership-verification gate like a fresh activation: a pending (never
+/// proven) attach is settings intent, not a route. An attach with NO verify record predates the
+/// gate and is grandfathered.
+fn attach_may_route(cloud: &Arc<CloudState>, domain: &str, project: &str) -> bool {
+    match cloud.domains.verify_of(domain) {
+        Some(v) => v.status == "verified" && v.project == project,
+        None => true,
+    }
+}
+
+/// Warm the git-webhook reverse index from the local half only: gossiped `peer_deployments` is
+/// still empty this early in boot, projects hosted only on peers join the index as gossip arrives,
+/// and `git_webhook` falls back to a full scan while the index is empty.
+fn warm_git_webhook_index(cloud: &Arc<CloudState>) {
+    cloud.git_index.rebuild(
+        cloud.projects.snapshot().into_keys().filter_map(|p| {
+            crate::admin::git_for_project_fleet(cloud, &p).map(|g| (p, g.repo_url))
+        }),
+    );
+}
+
+/// Apply a loaded snapshot to a freshly constructed CloudState (boot restore). It also runs from
+/// the asynchronous Guardian rollback guard after newer writes were accepted, so projects and teams
+/// merge by their own generations: the global `saved_ms` is no causal order for one team and must
+/// never wholesale-regress it. Deployments restore oldest first.
 pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud
         .projects
@@ -861,7 +824,6 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     });
     let project_authority = cloud.projects.snapshot_synced();
     let mut deployments = snap.deployments;
-    // Restore in chronological order so the newest becomes the default.
     deployments.sort_by_key(|d| d.created_at_ms);
     let before_authority_filter = deployments.len();
     deployments.retain(|record| match record.project_incarnation {
@@ -930,73 +892,8 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         );
     }
     let n = deployments.len();
-    // Reconcile orphaned in-flight builds. A deployment/build persisted with
-    // state Queued/Building was mid-flight in an async task on the PREVIOUS
-    // process instance — that task died with the process, so on a fresh boot
-    // this state can never legitimately still be in progress. Left as-is, it
-    // stays "Building" forever (an infinite dashboard spinner with zero log
-    // activity, no error, no way to retry) — live-witnessed: a preview
-    // deployment orphaned by an unrelated node restart stayed stuck for 2+
-    // hours, which is indistinguishable from "the build never starts" to the
-    // user. Reconciling to Error on boot gives an actionable, retryable state
-    // instead of a silent hang.
-    let orphaned_count = deployments
-        .iter()
-        .filter(|d| {
-            matches!(
-                d.state,
-                fluid_core::DeployState::Queued | fluid_core::DeployState::Building
-            )
-        })
-        .count();
-    // A `Building…` PLACEHOLDER is the one in-flight record that must be DROPPED
-    // rather than reconciled. It is a shell (no git, no functions, a scratch root
-    // holding one "Building…" page) whose build died with the previous process,
-    // and `deploy_full` gave it the project's production alias because it was the
-    // project's first deployment — so promoting it to `Error` makes the shell the
-    // permanent owner of `<project>` on this node, which then serves it and
-    // publishes a DNS affinity record for it while the real deployment sits on
-    // whichever node placement chose. Witnessed on `archive-zip.shadw.app`
-    // (2026-08-05). Dropping it costs nothing: no build can still be superseding
-    // it, and `crate::git::reap_orphan_placeholders` removes the same shells on a
-    // running node.
-    let before = deployments.len();
-    deployments.retain(|rec| {
-        !(matches!(
-            rec.state,
-            fluid_core::DeployState::Queued | fluid_core::DeployState::Building
-        ) && crate::git::is_placeholder_record(rec))
-    });
-    let dropped = before - deployments.len();
-    for rec in &mut deployments {
-        if matches!(
-            rec.state,
-            fluid_core::DeployState::Queued | fluid_core::DeployState::Building
-        ) {
-            rec.state = fluid_core::DeployState::Error;
-        }
-    }
-    if dropped > 0 {
-        tracing::warn!(
-            count = dropped,
-            "persist::restore: dropped orphaned Building… placeholder(s) (their builds died with a prior process; the project alias is freed for the real deployment)"
-        );
-    }
-    if orphaned_count > dropped {
-        tracing::warn!(
-            count = orphaned_count - dropped,
-            "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)"
-        );
-    }
+    let deployments = reconcile_orphaned_in_flight(deployments);
     for rec in deployments {
-        // Decide whether a persisted deployment can still serve after a restart:
-        //   • container      → runs from a pre-built image; `root` irrelevant.
-        //   • firecracker    → serves from the delivered microVM IMAGE, not the
-        //                       host `root` build dir (which is scratch and may be
-        //                       reaped by the build-dir GC). Restore if it has an
-        //                       image — requiring `root` here wrongly dropped live
-        //                       Firecracker deployments on restart (e.g. shoomoo).
-        //   • mock (static/serverless) → serves files from `root`, so root must exist.
         let is_container = rec
             .manifest
             .functions
@@ -1004,85 +901,24 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             .any(|f| f.runtime == "container");
         let fc_image_backed =
             cloud.gw.backend_name() == "firecracker" && rec.manifest.image.is_some();
-        if is_container || fc_image_backed || std::path::Path::new(&rec.root).exists() {
-            // Re-adopt any PUBLIC raw-port stamps this record carries into the
-            // allocator registry (self-heal for a lost raw_ports.json): the
-            // record and the registry are two durable copies of the same
-            // claim, and a restored service must keep its port claimed so a
-            // parallel deploy can't be handed it.
+        let serves_without_host_root = is_container || fc_image_backed;
+        if serves_without_host_root || std::path::Path::new(&rec.root).exists() {
             crate::raw_ports::adopt_record(&rec);
             cloud.gw.restore(rec);
         }
     }
-    // Re-apply every persisted custom-domain alias into the just-restored
-    // `cloud.gw` — a runtime `POST /v1/projects/:p/domains` call only ever
-    // mutated the in-memory alias table (`cloud.gw.add_alias`), never
-    // anything `Gateway::restore` (above) replays; a bare-metal restart
-    // silently DROPPED every custom domain until the next redeploy or a
-    // fresh `add_alias` call. Live-witnessed standing up sms.shadw.cloud:
-    // it worked fleet-wide, then vanished fleet-wide across an unrelated
-    // binary roll's restarts. Best-effort — a domain whose project isn't
-    // hosted on THIS node correctly no-ops (this node was never going to
-    // serve it locally anyway; the gossiped route-table path handles that
-    // case once the real host's own restore re-adds it).
-    let mut healed_domains = 0u32;
-    for (project, domain) in cloud.projects.all_domains() {
-        // The heal must honor the ownership-verification gate exactly like a
-        // fresh activation: a pending (never-proven) attach is settings
-        // intent, not a route. Without this check every restart re-stole
-        // routing for unproven attaches fleet-wide (adversarial finding:
-        // attach-then-wait-for-a-roll hijacked any domain with zero proof).
-        // Attachments from before the gate existed have NO verify record —
-        // they are the deliberate grandfather clause and keep routing.
-        let routable = match cloud.domains.verify_of(&domain) {
-            Some(v) => v.status == "verified" && v.project == project,
-            None => true, // grandfathered pre-verification attach
-        };
-        if !routable {
-            continue;
-        }
-        if cloud.gw.add_alias(&domain, &project) {
-            healed_domains += 1;
-        }
-    }
-    if healed_domains > 0 {
-        tracing::info!(
-            count = healed_domains,
-            "persist::restore: re-applied custom-domain aliases"
-        );
-    }
-    // Warm the git-webhook reverse index (`gitops::GitRepoIndex`) from what's
-    // already known locally at this point: every deployment this node hosts was
-    // just restored into `cloud.gw` above, so `git_for_project_fleet`'s local
-    // half is fully populated even though gossiped `peer_deployments` is still
-    // empty this early in boot. Projects hosted only on peers self-heal into the
-    // index as gossip arrives (see `main.rs`'s anti-entropy loop); `git_webhook`
-    // also falls back to a full scan defensively for the window before this
-    // call returns.
-    cloud.git_index.rebuild(
-        cloud.projects.snapshot().into_keys().filter_map(|p| {
-            crate::admin::git_for_project_fleet(cloud, &p).map(|g| (p, g.repo_url))
-        }),
-    );
+    reapply_custom_domain_aliases(cloud);
+    warm_git_webhook_index(cloud);
     if !snap.waf_rules.is_empty() {
         cloud.waf.set_rules(snap.waf_rules);
     }
     if let Some((enabled, limit, window_ms)) = snap.ratelimit {
         cloud.ratelimit.set(enabled, limit, window_ms);
     }
-    // replace_all (deduped by id), NOT add() in a loop: add() pushes
-    // unconditionally, so a snapshot that already carried a job — and every
-    // prior restart re-persisted it — duplicated that job on every boot,
-    // making the cron loop fire it N times per schedule (live-witnessed:
-    // vc-shoomoo-0 present 3× on a node). replace_all converges the store.
     cloud.cron.replace_all(snap.cron);
     cloud.cron.recompute_all();
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
-    // `restore` also runs from the asynchronous Guardian rollback guard, after
-    // this process may already have accepted newer writes. Merge by the Team
-    // aggregate's own generations; global snapshot `saved_ms` is not a causal
-    // order for an individual team and must never wholesale-regress it.
     cloud.teams.merge_recovered(crate::teams::SyncedTeams {
         rows: snap.teams.into_iter().collect(),
         tombstones: snap.team_tombstones,
@@ -1100,9 +936,6 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         snap.production_deployments.tombstones,
     );
     cloud.metrics.rollup_load(snap.metrics_rollup);
-    // BuildStore::load() already reconciles Queued/Building -> Error for its
-    // own per-build log records internally (git.rs) -- no duplicate needed
-    // here, only the DeployRecord-side gap above was missing.
     cloud.builds.load(snap.builds);
     let terminal_builds_to_replay_into_rows = cloud.builds.list();
     for build in terminal_builds_to_replay_into_rows {
@@ -1123,9 +956,6 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.identity.load(snap.orgs, snap.users);
     cloud.billing.load(snap.billing, snap.billing_ledger);
     cloud.billing.invoices_load(snap.billing_invoices);
-    // `None` (pre-upgrade snapshot / no snapshot) is passed through as-is:
-    // meters_load must be the one place that decides what an absent watermark
-    // set means, and it means UNKNOWN.
     cloud.billing.meters_load(snap.billing_meters);
     cloud.billing.checkouts_load(snap.billing_checkouts);
     cloud.domains.load(snap.domains);
