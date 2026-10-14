@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-10-13 — the cron page no longer labels a seconds-level or ranged schedule as something else
+
+`describeSchedule` (the English label on a cron job row) dropped the first field of every
+6-field expression whatever its value, so `*/5 * * * * *` (every 5 seconds) and
+`30 * * * * *` were labelled "Every minute", against its own promise never to lie about a
+schedule it cannot confidently describe (found by the ui comment sweep). It now lives in
+`lib/cron-schedule.ts` and drops the leading seconds field only when it is exactly `0`; any
+other seconds field returns null and the row shows the raw expression. The same table
+turned up other shapes it mislabelled, which now fall back to the raw expression too: a
+step that does not divide its field (`*/7`, `*/90`, `*/0`, `0 */5 * * *` fires at uneven
+gaps), lists and ranges in the minute or hour (`0 9-17 * * *` was "Daily at 9-17:00 UTC",
+`0,30 9 * * *` "Daily at 09:0,30 UTC") and out-of-range numbers (`60 9 * * *` "Daily at
+09:60"). Witnessed by running the real function over 44 expressions: 18 were mislabelled
+before (the three seconds-field cases among them) and none are after; and in the browser
+against a throwaway node with four jobs, the page showed `*/5 * * * * *` as "Every minute"
+(the job had run 16 times in 80 s) and `0 9-17 * * *` as "Daily at 9-17:00 UTC" before, and
+shows the raw expression alone for both after, with `0 */5 * * * *` ("Every 5 minutes") and
+`30 9 * * *` ("Daily at 09:30 UTC") labelled as before. Not rolled.
+
 ## 2026-10-13 — every project picker lists the projects whose builds all failed
 
 The Drive page, the Storage page (`useDatabases`, which feeds the SQLite create form and
