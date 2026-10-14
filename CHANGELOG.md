@@ -12,8 +12,9 @@ once in a tab. `/api/token` now echoes the cookie lifetime as `expires_in`, and 
 in a clock the tabs of a browser share (`ui/lib/session-clock.ts`: module state mirrored to localStorage
 `hive_session_clock`, moved by `storage` events). One keeper per tab (`ui/lib/session-keeper.ts`, started by `SessionToken`)
 re-mints at 70% of the lifetime +-5% jitter (the hour when a route predates the field), and a mint in any tab moves every
-tab's mark, so one tab per browser mints per cycle; a hidden tab never mints, and a tab that becomes visible with under 20%
-of the lifetime left, or past its mark, mints at once; a failed mint follows the existing budget (ladder 2/8/30 s,
+tab's mark, so one tab per browser mints per cycle; the keeper of a hidden tab never mints (a request such a tab makes
+itself still waits for a mint), and a tab that becomes visible with under 20% of the lifetime left, or past its mark, mints
+at once; a failed mint follows the existing budget (ladder 2/8/30 s,
 `MINT_MAX_CONSECUTIVE_FAILURES`, then one attempt per period). `mintSessionToken` runs ONE mint at a time per tab with a 20 s
 timeout (explicit mints, a team switch or an identity sync, still always fire, queued) and `renewSession` joins the one under
 way. `ensureSessionMinted` makes a request wait only when no session exists or the credential is lapsing, so a woken tab
