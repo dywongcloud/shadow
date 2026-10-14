@@ -1761,7 +1761,7 @@ fn preview_gate(
                 set(
                     &mut resp,
                     "set-cookie",
-                    &format!("hive_pw={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"),
+                    &unlock_cookie_header(&cookie, host, headers),
                 );
                 set(&mut resp, "x-hive-region", region);
                 set(&mut resp, "x-hive-preview", "password-unlocked");
@@ -1844,6 +1844,47 @@ fn preview_gate(
     set(&mut resp, "x-hive-preview", "protected");
     set(&mut resp, "cache-control", "no-store");
     Some(resp)
+}
+
+/// A host that is this machine itself: `localhost`, any `*.localhost`, or a loopback address
+/// (a port is ignored). Only a plain-http dev node is reached this way.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host.as_str(),
+    };
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The `Set-Cookie` value of a deployment-password unlock: the sealed token (see
+/// `EnterpriseStore::seal_password_cookie`), `HttpOnly`, `SameSite=Lax`, a `Max-Age` equal to the
+/// token's own server-side lifetime, and `Secure` on every request except plain http to a loopback
+/// dev host (a browser stores a `Secure` cookie only from a secure origin, so a `localhost` dev node
+/// without TLS would otherwise never keep the unlock). A request behind a TLS-terminating proxy
+/// says so in `x-forwarded-proto`.
+fn unlock_cookie_header(token: &str, host: &str, headers: &[(String, String)]) -> String {
+    let forwarded_https = header(headers, "x-forwarded-proto").is_some_and(|p| {
+        p.split(',')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("https")
+    });
+    let secure = if forwarded_https || !is_loopback_host(host) {
+        "; Secure"
+    } else {
+        ""
+    };
+    format!(
+        "hive_pw={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        crate::enterprise::password_cookie_ttl_secs()
+    )
 }
 
 /// Extract one cookie value by name from the request headers.

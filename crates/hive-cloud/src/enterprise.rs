@@ -298,6 +298,41 @@ fn password_matches(project: &str, stored: &str, submitted: &str) -> bool {
     crate::admin::ct_eq(&legacy, stored)
 }
 
+/// How long a `hive_pw` unlock token stays valid (`HIVE_PW_COOKIE_TTL_SECS`, default 24 h, never under
+/// 1 s). The token carries its own expiry, so a stolen cookie stops opening the deployment on every
+/// node at that moment; the browser's `Max-Age` is only a courtesy that matches it.
+pub fn password_cookie_ttl_secs() -> u64 {
+    std::env::var("HIVE_PW_COOKIE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(24 * 3600)
+        .max(1)
+}
+
+/// Domain separator of the unlock-token MAC: the key is `secrets::key_material()` (the fleet-shared
+/// at-rest key), the domain keeps this MAC from ever equalling another use of the same key.
+const PW_COOKIE_DOMAIN: &[u8] = b"hive-deployment-password-cookie-v1\0";
+
+/// The MAC state over (deployment, expiry, stored password hash), each length-prefixed where
+/// variable so no two inputs share an encoding.
+fn password_cookie_mac(
+    project: &str,
+    expires_ms: u64,
+    stored_hash: &str,
+) -> hmac::Hmac<sha2::Sha256> {
+    use hmac::Mac;
+    let mut mac =
+        <hmac::Hmac<sha2::Sha256> as Mac>::new_from_slice(&crate::secrets::key_material())
+            .expect("32-byte fleet key is a valid HMAC key");
+    mac.update(PW_COOKIE_DOMAIN);
+    mac.update(&(project.len() as u64).to_be_bytes());
+    mac.update(project.as_bytes());
+    mac.update(&expires_ms.to_be_bytes());
+    mac.update(&(stored_hash.len() as u64).to_be_bytes());
+    mac.update(stored_hash.as_bytes());
+    mac
+}
+
 fn norm(team: &str) -> String {
     if team.trim().is_empty() {
         "personal".into()
@@ -589,18 +624,50 @@ impl EnterpriseStore {
         let stored = self.protection(project).password_hash;
         password_matches(project, &stored, submitted)
     }
-    /// Seals a validated password into an opaque cookie value: the STORED hash itself, never the
-    /// plaintext and never a fresh re-hash (which would differ under the random salt). Every node
-    /// holding the replica compares it in constant time, and it auto-invalidates when the password,
-    /// hence the stored hash, changes.
+    /// Seals a validated password into the `hive_pw` unlock cookie: `v1.<expiry ms>.<hex MAC>`, a
+    /// server-issued token that proves only "this deployment was unlocked until this moment". The MAC
+    /// (HMAC-SHA256, keyed from the fleet-shared at-rest key, so every node verifies a token any
+    /// node issued) covers the deployment, the expiry and the STORED password hash, so a token is
+    /// bound to its deployment, stops working at its own expiry on every node, and dies when the
+    /// password, hence the stored hash, changes. The stored hash itself is never sent to a client: as
+    /// the cookie value it was password-equivalent (replayable forever) and handed the Argon2 hash to
+    /// whoever could read the cookie. Empty when the deployment has no password.
     pub fn seal_password_cookie(&self, project: &str, _submitted: &str) -> String {
-        self.protection(project).password_hash
-    }
-    /// Verify a `hive_pw` cookie against the project's current password hash.
-    /// (Invalidates automatically when the password changes.)
-    pub fn verify_password_cookie(&self, project: &str, cookie_val: &str) -> bool {
+        use hmac::Mac;
         let stored = self.protection(project).password_hash;
-        !stored.is_empty() && !cookie_val.is_empty() && crate::admin::ct_eq(cookie_val, &stored)
+        if stored.is_empty() {
+            return String::new();
+        }
+        let expires_ms = now_ms().saturating_add(password_cookie_ttl_secs().saturating_mul(1000));
+        let tag = password_cookie_mac(project, expires_ms, &stored).finalize();
+        format!("v1.{expires_ms}.{}", hex::encode(tag.into_bytes()))
+    }
+    /// Verifies a `hive_pw` cookie: the format, an expiry still in the future and a MAC (constant-time
+    /// comparison) over this deployment, that expiry and the CURRENT stored password hash. The stored
+    /// hash itself, or any cookie not shaped like a sealed token, never opens the gate.
+    pub fn verify_password_cookie(&self, project: &str, cookie_val: &str) -> bool {
+        use hmac::Mac;
+        let stored = self.protection(project).password_hash;
+        if stored.is_empty() {
+            return false;
+        }
+        let mut parts = cookie_val.splitn(3, '.');
+        let (Some("v1"), Some(expires), Some(tag)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        let Ok(expires_ms) = expires.parse::<u64>() else {
+            return false;
+        };
+        if expires_ms <= now_ms() {
+            return false;
+        }
+        let Ok(tag) = hex::decode(tag) else {
+            return false;
+        };
+        password_cookie_mac(project, expires_ms, &stored)
+            .verify_slice(&tag)
+            .is_ok()
     }
 
     /// A team's microfrontend groups, local plus gossiped from peers, deduped by id (local wins)
@@ -886,9 +953,12 @@ mod tests {
             password_hash("proj", "hunter2"),
             password_hash("proj", "hunter2")
         );
-        // Cookie seal returns the stored hash (constant-time comparable on peers).
-        assert_eq!(s.seal_password_cookie("proj", "hunter2"), stored);
-        assert!(s.verify_password_cookie("proj", &stored));
+        // The unlock cookie is a sealed expiring token, never the stored hash: the token opens the
+        // gate, the stored hash does not.
+        let cookie = s.seal_password_cookie("proj", "hunter2");
+        assert!(cookie.starts_with("v1.") && !cookie.contains("argon2"));
+        assert!(s.verify_password_cookie("proj", &cookie));
+        assert!(!s.verify_password_cookie("proj", &stored));
         // Legacy sha256(project ":" password) hex still verifies via the fallback.
         let legacy: String = {
             use sha2::{Digest, Sha256};
