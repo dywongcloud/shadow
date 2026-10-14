@@ -23,23 +23,21 @@ pub struct PeerRoute {
     /// Last-known round-trip latency (ms) for anycast ordering.
     pub latency_ms: u64,
     pub healthy: bool,
-    /// Epoch-ms this route was last refreshed by gossip (#24). Lets a route from a
-    /// momentarily-unreachable-but-healthy peer survive a transient gossip miss for
-    /// a TTL instead of being dropped instantly (which would 404 the deployment).
+    /// Epoch-ms this route was last refreshed by gossip: a route from a momentarily unreachable but
+    /// healthy peer survives a transient gossip miss for [`ROUTE_TTL_MS`] instead of being dropped
+    /// instantly (which would 404 the deployment).
     #[serde(default)]
     pub last_seen_ms: u64,
 }
 
-/// TTL for gossiped routing mappings (#24): a route survives this long without a
-/// refresh before it's dropped. Matches the node-registry staleness window so the
-/// routing table and the node roster age out consistently.
+/// TTL for gossiped routing mappings: a route survives this long without a refresh. It matches the
+/// node-registry staleness window, so the routing table and the node roster age out consistently.
 pub const ROUTE_TTL_MS: u64 = 30_000;
 
-/// Merge freshly-gossiped routes with the previous table, keeping a route from a
-/// peer NOT reached this round only while it's within the TTL (#24). A peer that
-/// WAS reached this round is authoritative — its fresh list replaces its old
-/// routes, so a genuinely-removed deployment still ages out immediately. Pure +
-/// testable.
+/// Merges freshly gossiped routes with the previous table, keeping a route from a peer NOT reached
+/// this round only while it is within the TTL. A peer that WAS reached this round is authoritative:
+/// its fresh list replaces its old routes, so a genuinely removed deployment still ages out
+/// immediately and a route it dropped is never resurrected. Pure and testable.
 pub fn merge_routes_ttl(
     prev: &std::collections::HashMap<String, Vec<PeerRoute>>,
     fresh: std::collections::HashMap<String, Vec<PeerRoute>>,
@@ -50,8 +48,6 @@ pub fn merge_routes_ttl(
     let mut merged = fresh;
     for (host, routes) in prev {
         for r in routes {
-            // Reached-this-round peers are authoritative (don't resurrect dropped
-            // routes); only carry forward unreached peers within the TTL.
             if seen_nodes.contains(&r.node_id) || now.saturating_sub(r.last_seen_ms) >= ttl_ms {
                 continue;
             }
@@ -64,16 +60,14 @@ pub fn merge_routes_ttl(
     merged
 }
 
-/// Merge the freshly-gossiped fleet deployment map with the previous one so a node's
-/// deployments DON'T vanish on a single missed `/v1/fleet-deployments` fetch (the map
-/// is keyed by node name). Without this, a transient gossip miss to a peer wiped its
-/// projects from the coordinator → the dashboard's workflows/runs tables, the
-/// deployments list, and the per-project proxy all intermittently went empty.
-///
-/// Rules: a node present in `fresh` is authoritative (we reached it this round — even an
-/// empty list means "it genuinely has none now"). A node only in `prev` is carried
-/// forward IFF it's still `alive` (present in the registry); once it ages out of the
-/// registry (real staleness — see `NodeRegistry::nodes`), its deployments drop too.
+/// Merges the freshly gossiped fleet deployment map with the previous one (keyed by node name), so
+/// a node's deployments do NOT vanish on a single missed `/v1/fleet-deployments` fetch: without it
+/// a transient gossip miss to a peer wiped its projects from the coordinator, and the dashboard's
+/// workflows/runs tables, the deployments list and the per-project proxy all intermittently went
+/// empty. A node present in `fresh` is authoritative (we reached it this round: even an empty list
+/// means "it genuinely has none now"); a node only in `prev` is carried forward IFF it is still
+/// `alive` (present in the registry), and once it ages out of the registry (real staleness, see
+/// `NodeRegistry::nodes`) its deployments drop too.
 pub fn merge_deployments_ttl(
     prev: &std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>,
     fresh: std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>,
@@ -82,22 +76,20 @@ pub fn merge_deployments_ttl(
     let mut merged = fresh;
     for (node, deps) in prev {
         if merged.contains_key(node) {
-            continue; // reached this round → authoritative
+            continue;
         }
         if !alive.contains(node) {
-            continue; // node aged out of the registry → drop its deployments
+            continue;
         }
-        merged.insert(node.clone(), deps.clone()); // alive but missed this round → keep
+        merged.insert(node.clone(), deps.clone());
     }
     merged
 }
 
-/// One observed request/event, for the dashboard's live log + analytics.
-///
-/// Also the unit of the DURABLE history (`crate::event_log`): this struct is
-/// what is appended to the day-rotated JSONL log, so it round-trips through
-/// JSON. New fields MUST keep `#[serde(default)]` — older day-files on disk
-/// have fewer keys and must still deserialize.
+/// One observed request/event, for the dashboard's live log and analytics. It is also the unit of
+/// the DURABLE history (`crate::event_log`): this struct is appended to the day-rotated JSONL log,
+/// so it round-trips through JSON, and new fields MUST keep `#[serde(default)]` because older
+/// day-files on disk have fewer keys and must still deserialize.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Event {
     pub ts_ms: u64,
@@ -106,16 +98,16 @@ pub struct Event {
     pub host: String,
     pub path: String,
     pub status: u16,
-    pub action: String, // allow | waf-deny | bot-block | cache-hit | cron | ...
+    /// allow | waf-deny | bot-block | cache-hit | cron | ...
+    pub action: String,
     pub detail: String,
     #[serde(default)]
     pub project: String,
-    /// The exact deployment the request host ALIASED to at record time (empty
-    /// when the host resolved to no deployment on this node) — what scopes a
-    /// deployment-detail log view to that deployment's own traffic, including
-    /// historically (the production alias moves between deployments on promote;
-    /// this field pins each event to the deployment that actually held the
-    /// alias when the request landed).
+    /// The exact deployment the request host ALIASED to at record time (empty when the host
+    /// resolved to no deployment on this node): what scopes a deployment-detail log view to that
+    /// deployment's own traffic, including historically (the production alias moves between
+    /// deployments on promote, and this field pins each event to the deployment that actually held
+    /// the alias when the request landed).
     #[serde(default)]
     pub deployment: String,
     /// Correlation id for tracing a request across nodes (accepted from
@@ -131,27 +123,30 @@ pub struct CloudState {
     /// `uptime_ms` is computed from.
     pub boot_ms: u64,
     pub public_base: String,
-    /// Host suffixes this node will route on (the pooled wildcard ingress roots,
-    /// e.g. `deployment.shadow.ngrok.pizza`). A multi-label Host that doesn't end
-    /// with one is a foreign root and is rejected before routing — so a foreign
-    /// domain whose first label collides with a real alias can't be served.
-    /// Configured via `HIVE_DEPLOY_SUFFIXES` (comma-separated).
+    /// Host suffixes this node will route on (the pooled wildcard ingress roots, e.g.
+    /// `deployment.shadow.ngrok.pizza`), from `HIVE_DEPLOY_SUFFIXES` (comma-separated; default
+    /// `localhost` only, since ngrok is retired and the apps domain is admitted separately by
+    /// `host_allowed`). A multi-label Host that does not end with one is a foreign root and is
+    /// rejected before routing, so a foreign domain whose first label collides with a real alias
+    /// cannot be served.
     pub deploy_suffixes: Vec<String>,
-    /// The user-deployment wildcard domain (`*.{apps_domain}` serves every
-    /// deployment alias, one label only). `HIVE_APPS_DOMAIN`, default `shadw.app`.
-    /// Deliberately a SEPARATE registrable domain from the platform domain so user
-    /// content can never set cookies on / shadow the control plane.
+    /// The user-deployment wildcard domain (`*.{apps_domain}` serves every deployment alias, one
+    /// label only): `HIVE_APPS_DOMAIN`, default `shadw.app`. Deliberately a SEPARATE registrable
+    /// domain from the platform domain, so user content can never set cookies on or shadow the
+    /// control plane.
     pub apps_domain: String,
     /// The platform/control-plane domain (`api.{platform_domain}` = admin API).
     /// `HIVE_PLATFORM_DOMAIN`, default `shadw.cloud`.
     pub platform_domain: String,
-    /// The per-tenant DATABASE wildcard domain (`*.{db_domain}` gives every tenant
-    /// database an external, TLS-SNI-routed endpoint — cross-protocol: Postgres
-    /// wire, Redis wire, HTTP REST). `HIVE_DB_DOMAIN` (e.g. `downstash.xyz`); EMPTY
-    /// disables the DB gateway entirely (no wildcard DNS/cert, no proxy listeners).
+    /// The per-tenant DATABASE wildcard domain (`*.{db_domain}` gives every tenant database an
+    /// external, TLS-SNI-routed endpoint: Postgres wire, Redis wire, HTTP REST). `HIVE_DB_DOMAIN`
+    /// (e.g. `downstash.xyz`); EMPTY (unset) disables the DB gateway entirely (no wildcard
+    /// DNS/cert, no proxy listeners).
     pub db_domain: String,
-    /// Public ingress mode: `ngrok` (today), `dual` (both paths live), `dns`
-    /// (direct DNS + self-terminated TLS; ngrok retired). `HIVE_INGRESS`.
+    /// Public ingress mode (`HIVE_INGRESS`): `dns` is the default (direct DNS with self-terminated
+    /// TLS; ngrok is retired fleet-wide), while `ngrok` and `dual` (both paths live) remain
+    /// accepted as explicit break-glass values. The `ngrok` -> `dual` -> `dns` cutover was staged
+    /// through this setting.
     pub ingress: String,
 
     pub waf: Arc<Waf>,
@@ -161,10 +156,11 @@ pub struct CloudState {
     /// Regional runtime/data cache for tenant functions (Vercel Runtime Cache).
     pub runtime_cache: Arc<RuntimeCache>,
     pub limiter: Arc<ConcurrencyLimiter>,
-    /// Per-DEPLOYMENT concurrency admission (sliding-window burst budget keyed by
-    /// target host), so one busy deployment can only exhaust its OWN budget and
-    /// cannot 503 every other tenant on the node. Checked before the node-wide
-    /// `limiter` backstop (which now trips only under genuine total overload).
+    /// Per-DEPLOYMENT concurrency admission (sliding-window burst budget keyed by target host;
+    /// `HIVE_DEPLOY_BURST`, default 1000 admissions per 10 s, generous for real traffic), so one
+    /// busy deployment can only exhaust its OWN budget and cannot 503 every other tenant on the
+    /// node. It is checked before the node-wide `limiter` backstop, which trips only under genuine
+    /// total overload.
     pub admission: Arc<RateLimiter>,
     /// Per-IP L7 rate limiter (DDoS mitigation) at the edge.
     pub ratelimit: Arc<RateLimiter>,
@@ -177,9 +173,9 @@ pub struct CloudState {
     pub fluid: Arc<Fluid>,
     pub hive: Arc<Hive>,
     pub http: reqwest::Client,
-    /// Subnet → location cache backing the authoritative DNS's client-proximity
-    /// answers (see [`crate::dns_geo`]). Lives here rather than as a static so
-    /// it shares the platform's HTTP client and dies with the state.
+    /// Subnet-to-location cache backing the authoritative DNS's client-proximity answers (see
+    /// [`crate::dns_geo`]). It lives here rather than as a static so it shares the platform's HTTP
+    /// client and dies with the state.
     pub dns_geo: Arc<crate::dns_geo::GeoCache>,
     /// What THIS node has directly PROVEN about its peers' nameservers by
     /// querying their public `:53` from here (see [`crate::dns_probe`]).
@@ -216,9 +212,12 @@ pub struct CloudState {
     /// (`hive_core::integrity`) — per-node, never fleet-shared. See
     /// `integrity_signer.rs`'s module doc.
     pub integrity_signer: Arc<crate::integrity_signer::IntegritySigner>,
-    /// Bounded, durable receiver for exact runtime-artifact packages. Every
-    /// mutation is serialized by its owned worker and bound to the current
-    /// project incarnation before it enters the queue.
+    /// Bounded, durable receiver for exact runtime-artifact packages. Every mutation is serialized
+    /// by its owned worker and bound to the current project incarnation before it enters the queue.
+    /// Its durable-persistence hook is bound in `new()` once the state Arc exists (the service is
+    /// constructed before it): a remote generation Commit publishes a Ready record only when the
+    /// SAME durable write the local deploy path performs succeeds, and the hook captures a Weak
+    /// state, so it never pins the state in a cycle and fails closed if the state is ever gone.
     pub runtime_artifact_transfer: Arc<crate::runtime_artifact_transfer::TransferService>,
     pub cluster: Arc<crate::cluster::Cluster>,
     pub teams: crate::teams::TeamStore,
@@ -246,23 +245,21 @@ pub struct CloudState {
     /// knows the peer's iroh address. Empty until the first roster is read (which
     /// bootstraps over HTTP).
     pub peer_iroh: RwLock<std::collections::HashMap<String, (String, String)>>,
-    /// Control-plane health (#25): epoch-ms of the last SUCCESSFUL gossip sync from
-    /// any peer. The data plane keeps serving from local persisted state when this
-    /// goes stale (peers unreachable) — this just makes the degradation observable
-    /// and lets routing fail closed for unknown deployments. 0 = never synced.
+    /// Control-plane health: epoch-ms of the last SUCCESSFUL gossip sync from any peer (0 = never
+    /// synced). The data plane keeps serving from local persisted state when this goes stale (peers
+    /// unreachable); this just makes the degradation observable and lets routing fail closed for
+    /// unknown deployments.
     pub last_gossip_ok_ms: std::sync::atomic::AtomicU64,
     /// Cross-node routing table: deployment subdomain -> peer nodes that serve it
     /// (learned via gossip). Lets any node route/load-balance requests to the node
     /// that actually hosts a deployment.
     pub peer_routes: RwLock<std::collections::HashMap<String, Vec<PeerRoute>>>,
-    /// The same routing table indexed by OWNING NODE: `node -> (host -> route)`.
-    ///
-    /// The authoritative copy. `peer_routes` is a derived view rebuilt from it.
-    /// It exists because a peer's host list is fetched WHOLE every gossip round
-    /// (the leader's is 2,592 hosts / 56 KB), so the round can no longer rebuild
-    /// the table from scratch: a peer whose route set did not change now answers
-    /// with just its generation, and its previously published routes must survive
-    /// that empty answer intact instead of being dropped for having sent nothing.
+    /// The same routing table indexed by OWNING NODE: `node -> (host -> route)`. This is the
+    /// authoritative copy; `peer_routes` is a derived view rebuilt from it. It exists because route
+    /// sync is incremental (a peer whose route set did not change answers with just its
+    /// generation), so the gossip round cannot rebuild the table from scratch: a peer's previously
+    /// published routes must survive an empty "unchanged" answer intact instead of being dropped
+    /// for having sent nothing.
     pub peer_routes_by_node: RwLock<
         std::collections::HashMap<String, std::collections::HashMap<String, PeerRoute>>,
     >,
@@ -277,10 +274,9 @@ pub struct CloudState {
     pub route_pub_gen: std::sync::atomic::AtomicU64,
     /// The host-set hash `route_pub_gen` was last bumped for.
     pub route_pub_hash: RwLock<u64>,
-    /// Deployments hosted on each peer node (name -> its deployments), learned via
-    /// gossip. Lets the dashboard's per-project deployment list show deployments
-    /// that the placement scheduler placed on OTHER nodes (e.g. the default
-    /// San-Jose placement), not just the ones this coordinator hosts locally.
+    /// Deployments hosted on each peer node (name -> its deployments), learned via gossip: lets the
+    /// dashboard's per-project deployment list show deployments the placement scheduler placed on
+    /// OTHER nodes, not just the ones this coordinator hosts locally.
     pub peer_deployments:
         RwLock<std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>>,
     /// Per-project last-seen tracked-branch HEAD SHA for the webhook-less git
@@ -307,11 +303,10 @@ pub struct CloudState {
     /// the constellation's satellite markers) — separate from `NodeInfo` and
     /// from `browser_admissions`; never read by placement/scheduling/DNS.
     pub browser_presence: crate::browser_presence::BrowserPresenceStore,
-    /// Live relay-set tracker for the bound `iroh` endpoint (dynamic-relay-list):
-    /// diffs [own relay_url + healthy peers' relay_url + the central backstop]
-    /// against what's actually applied via `Endpoint::insert_relay`/`remove_relay`
-    /// on a fixed interval — see `spawn_relay_sync_loop` in main.rs. Set when
-    /// `iroh` binds (alongside `mesh`); `None` = P2P disabled, nothing to sync.
+    /// Live relay-set tracker for the bound `iroh` endpoint: diffs [own relay_url + healthy peers'
+    /// relay_url + the central backstop] against what is applied through
+    /// `Endpoint::insert_relay`/`remove_relay` on a fixed interval (see `spawn_relay_sync_loop` in
+    /// main.rs). Set when `iroh` binds (alongside `mesh`); `None` = P2P disabled, nothing to sync.
     pub relay_set: RwLock<Option<Arc<hive_p2p::RelaySet>>>,
     /// Single-owner placement leases for stateful CONTAINER deployments (fenced,
     /// consensus-free). See `lease.rs`.
@@ -362,13 +357,15 @@ pub struct CloudState {
     pub firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
-    /// Every email that mints a `platform_admin` token — `owner_email` plus
-    /// `HIVE_ADMIN_EMAILS` (comma-separated). Lowercased at load; compared
-    /// case-insensitively at mint (see `admin::mint_token`). Distinct from
-    /// `owner_email`, which stays a SINGLE address because it also seeds the
-    /// default team and names the team creator; admin is a strictly wider set
-    /// that grants the operator console + browser public-node capability
-    /// without touching team ownership.
+    /// Every email that mints a `platform_admin` token: `owner_email` plus `HIVE_ADMIN_EMAILS`,
+    /// both comma-separated (`HIVE_OWNER_EMAIL` may itself be a list, so it is expanded here:
+    /// pushing the unsplit string as one entry would equal nobody's address and silently drop
+    /// `platform_admin` on every node configured with the list form). Lowercased at load and
+    /// compared case-insensitively at mint (see `admin::mint_token`), so the set is order- and
+    /// duplicate-independent. Distinct from `owner_email`, which stays a SINGLE address because it
+    /// also seeds the default team and names the team creator: admin is a strictly wider set that
+    /// grants the operator console and the browser public-node capability without touching team
+    /// ownership.
     pub admin_emails: Vec<String>,
 
     /// Request-event history: a hot in-memory ring (the bounded default poll)
@@ -409,7 +406,7 @@ pub fn host_matches_apps_domain(host: &str, apps_domain: &str) -> bool {
         .trim_start_matches('.')
         .to_ascii_lowercase();
     if h == d {
-        return true; // apex
+        return true;
     }
     match h.strip_suffix(&format!(".{d}")) {
         Some(label) => !label.is_empty() && !label.contains('.'),
@@ -442,18 +439,17 @@ mod apps_domain_tests {
     }
 }
 
-/// Default TTL for control-plane degradation (#25): if no peer gossip has succeeded
-/// within this window (and peers are configured), the node reports degraded. The
-/// gossip loop runs on a ~5s cadence, so 30s tolerates a few missed rounds.
+/// Default TTL for control-plane degradation: if no peer gossip has succeeded within this window
+/// (and peers are configured), the node reports degraded. The gossip loop runs on a ~5 s cadence,
+/// so 30 s tolerates a few missed rounds.
 pub const CP_DEGRADED_TTL_MS: u64 = 30_000;
 
-/// Pure core of control-plane degradation (#25). Degraded = we have peers configured
-/// (so we EXPECT gossip) but the last successful sync is older than the TTL (or never
-/// happened). A single-node deployment (no peers) is never "degraded". Unit-testable
-/// without a node.
+/// Pure core of control-plane degradation. Degraded = peers are configured (so we EXPECT gossip)
+/// but the last successful sync is older than the TTL (or never happened); a single-node deployment
+/// (no peers) is never degraded. Unit-testable without a node.
 pub fn cp_degraded(last_ok_ms: u64, peer_count: usize, now_ms: u64, ttl_ms: u64) -> bool {
     if peer_count == 0 {
-        return false; // standalone node — no control plane to be degraded
+        return false;
     }
     last_ok_ms == 0 || now_ms.saturating_sub(last_ok_ms) > ttl_ms
 }
@@ -471,46 +467,33 @@ pub struct MeshHealth {
     /// Gossip-fresh expected peers regardless of health verdict — see
     /// `mesh_health` for why this exists (wedge vs outage discrimination).
     pub audible_peers: usize,
-    /// Healthy expected peers this node can DIRECTLY exchange with (not
-    /// observer-local cold). Gossip restoration keeps a wedged peer
-    /// service-`healthy`, so `visible_healthy_peers` alone reports a
-    /// transport-wedged node as converged — this is the field the
-    /// never-converged boot wedge hides behind (refutation finding F2), and
-    /// `isolated` derives from it, not from the restorable count.
+    /// Healthy expected peers this node can DIRECTLY exchange with (not observer-local cold).
+    /// Gossip restoration keeps a wedged peer service-`healthy`, so `visible_healthy_peers` alone
+    /// reports a transport-wedged node as converged: this is the field the never-converged boot
+    /// wedge hides behind, and `isolated` derives from it, not from the restorable count.
     pub direct_reachable_peers: usize,
-    /// True iff peers were expected but NONE are currently directly
-    /// reachable — the exact shape of the node-a/node-b isolation incident
-    /// (see `mesh_isolated`).
+    /// True iff peers were expected but NONE are currently directly reachable (see
+    /// `mesh_isolated`).
     pub isolated: bool,
-    /// ms since this process started. Turns "sees only self" from an opaque
-    /// log line into an answerable question: still within the normal
-    /// convergence window, or has it been stuck? Measured live this session:
-    /// a healthy restart converged (first successful DNS reconcile) in ~58s;
-    /// a node stuck past several minutes of this counter climbing while
-    /// `visible_healthy_peers` stays 0 is the genuinely-stuck signal the old
-    /// silent skip-log gave no way to distinguish from "still warming up".
+    /// ms since this process started: turns "sees only self" from an opaque log line into an
+    /// answerable question, still inside the normal convergence window (a healthy restart converged
+    /// in about 58 s) or stuck (the counter climbing past several minutes while
+    /// `visible_healthy_peers` stays 0).
     pub uptime_ms: u64,
 }
 
-/// Pure core of mesh-isolation detection (unit-testable without a node). Compares
-/// the LIVE, gossip-derived set of healthy peer identities actually visible right
-/// now against the boot-immutable expected active peer set, rather than this node's
-/// own self-reported `--peer` CLI list.
+/// Pure core of mesh-isolation detection (unit-testable without a node). It compares the LIVE,
+/// gossip-derived set of healthy peer identities visible right now against the boot-immutable
+/// expected active peer set, rather than this node's own self-reported `--peer` CLI list:
+/// `cp_degraded` is structurally blind to a node launched with zero `--peer` args (peers announce
+/// themselves to it instead), which has `peers.len() == 0` by construction and so reports "not
+/// degraded" even when it is fully isolated from the fleet it was supposed to join
+/// (gossip-signature enforcement rejected its unsigned packets on every OTHER node and logged only
+/// on the REJECTING side, so nothing surfaced that it could see zero of its expected fleet).
 ///
-/// `cp_degraded` above is structurally blind to a specific failure class: a node
-/// launched with zero `--peer` args (peers "announce themselves" to it instead,
-/// per `dev-cluster.sh`'s own comment) has `peers.len() == 0` by construction, so
-/// `cp_degraded` reports "not degraded" — "standalone node — no control plane to
-/// be degraded" — even when that node is fully isolated from an 8-node fleet it
-/// was supposed to join. This happened: an orphaned dev launch script started
-/// node-a this way, gossip-signature enforcement silently rejected its unsigned
-/// packets on every OTHER node (logged only on the REJECTING side), and nothing
-/// ever surfaced "node-a can see zero of its expected fleet."
-///
-/// `expected_peers` comes from `HIVE_EXPECTED_NODE_IDS` when nonempty, otherwise
-/// from an immutable boot snapshot of `HIVE_TRUSTED_NODE_IDS`. It never follows
-/// runtime authorization or discovery state, so a node that should have peers but
-/// currently sees none is isolated, full stop.
+/// `expected_peers` comes from `HIVE_EXPECTED_NODE_IDS` when nonempty, otherwise from an immutable
+/// boot snapshot of `HIVE_TRUSTED_NODE_IDS`. It never follows runtime authorization or discovery
+/// state, so a node that should have peers but currently sees none is isolated, full stop.
 pub fn mesh_isolated(expected_peers: usize, visible_healthy_peers: usize) -> bool {
     expected_peers > 0 && visible_healthy_peers == 0
 }
@@ -550,19 +533,17 @@ fn configured_bool_default_true(name: &str) -> anyhow::Result<bool> {
 }
 
 impl CloudState {
-    /// The control-plane owner as a FORWARDING target, plus where the answer
-    /// came from (see `Cluster::control_plane_owner_with_source`). With
-    /// `HIVE_CP_OWNER_CHAIN` set: the strict chain owner, else the first
-    /// gossip-present chain entry that is not this node (a forwarding guess,
-    /// [`crate::cluster::OwnerSource::Fallback`]), else `None`. Without a chain:
-    /// the identity election, or this node when nothing is electable
-    /// (single-node dev). Never resolves to THIS node unless this node is the
-    /// real owner — the old `unwrap_or(self)` made every node whose chain went
-    /// dark in its own view a self-serving writer.
+    /// The control-plane owner as a FORWARDING target, plus where the answer came from (see
+    /// `Cluster::control_plane_owner_with_source`). With `HIVE_CP_OWNER_CHAIN` set: the strict
+    /// chain owner, else the first gossip-present chain entry that is not this node (a forwarding
+    /// guess, [`crate::cluster::OwnerSource::Fallback`]), else `None`. Without a chain: the
+    /// identity election, or this node when nothing is electable (single-node dev). It never
+    /// resolves to THIS node unless this node is the real owner: a chain that went dark in a node's
+    /// own view must not make it a self-serving writer.
     ///
-    /// Every authoritative resolution feeds the cluster's observed-owner
-    /// tracker so the fencing epoch bumps exactly on real ownership
-    /// transitions; a fallback forwarding guess is never observed as an owner.
+    /// Every authoritative resolution feeds the cluster's observed-owner tracker so the fencing
+    /// epoch bumps exactly on real ownership transitions; a fallback forwarding guess is never
+    /// observed as an owner.
     pub fn control_plane_leader_with_source(
         &self,
     ) -> Option<(String, crate::cluster::OwnerSource)> {
@@ -706,21 +687,6 @@ impl CloudState {
         });
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
-        // The platform-admin set: HIVE_ADMIN_EMAILS (comma-separated) plus the
-        // owner(s), all lowercased so the mint-time compare is case-insensitive
-        // and order/dupe-independent.
-        //
-        // HIVE_OWNER_EMAIL is ITSELF a comma-separated list (ansible's
-        // `hive_owner_email` is `"ops@{{ hive_platform_domain }},dylanwong007@gmail.com"`).
-        // Pushing the unsplit string as one entry — the previous behaviour — made
-        // that combined string the only accepted value, which equals nobody's
-        // address, so on every node configured with the LIST form the owner
-        // silently lost `platform_admin` while keeping it on the nodes whose
-        // inventory line carries a single address (observed live: va/va3/sj list,
-        // sj7/phx single) — a fleet-splitting, intermittent operator-status loss.
-        // `admin_emails` is the strictly wider set, so it is the right place to
-        // expand; `owner_email` stays a single address by design (it seeds the
-        // default team), and is left untouched.
         let admin_emails: Vec<String> = {
             let mut v: Vec<String> = std::env::var("HIVE_ADMIN_EMAILS")
                 .unwrap_or_default()
@@ -739,8 +705,6 @@ impl CloudState {
             }
             v
         };
-        // Allowed wildcard ingress roots. Default to the pooled deployment domain
-        // plus `localhost` for local dev; override with HIVE_DEPLOY_SUFFIXES.
         let deploy_suffixes = std::env::var("HIVE_DEPLOY_SUFFIXES")
             .ok()
             .map(|s| {
@@ -750,15 +714,7 @@ impl CloudState {
                     .collect::<Vec<_>>()
             })
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| {
-                // ngrok is fully retired: the apps domain (handled separately
-                // in host_allowed) is the only public root; keep localhost for
-                // local dev. Extra roots come only from HIVE_DEPLOY_SUFFIXES.
-                vec!["localhost".into()]
-            });
-        // Real-DNS ingress config (ngrok retirement): the two-domain split is
-        // deliberate (user content on apps_domain can never touch the platform
-        // domain). `HIVE_INGRESS` stages the cutover: ngrok -> dual -> dns.
+            .unwrap_or_else(|| vec!["localhost".into()]);
         let apps_domain = std::env::var("HIVE_APPS_DOMAIN")
             .ok()
             .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
@@ -769,7 +725,6 @@ impl CloudState {
             .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "shadw.cloud".into());
-        // Per-tenant DB gateway domain — EMPTY (unset) = gateway disabled.
         let db_domain = std::env::var("HIVE_DB_DOMAIN")
             .ok()
             .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
@@ -779,16 +734,11 @@ impl CloudState {
             .ok()
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| matches!(s.as_str(), "ngrok" | "dual" | "dns"))
-            // ngrok is retired fleet-wide: real DNS ingress is the default.
-            // ("ngrok"/"dual" remain accepted as explicit break-glass values.)
             .unwrap_or_else(|| "dns".into());
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();
         let node_name_for_sandboxes = node_name.clone();
-        // One shared client for general platform HTTP + the geo lookup cache
-        // (reqwest::Client is Arc-backed internally, so cloning it is cheap
-        // and shares one connection pool instead of opening two).
         let http = reqwest::Client::new();
         let state = Arc::new(CloudState {
             region,
@@ -806,9 +756,6 @@ impl CloudState {
             cdn,
             runtime_cache: Arc::new(RuntimeCache::new()),
             limiter,
-            // Per-deployment burst budget (host-keyed). Default: 1000 admissions
-            // / 10s per deployment — generous for real traffic, isolating any
-            // single deployment's surge from every other tenant on the node.
             admission: Arc::new(RateLimiter::new(
                 std::env::var("HIVE_DEPLOY_BURST")
                     .ok()
@@ -902,12 +849,6 @@ impl CloudState {
             req_count: Mutex::new(0),
             blocked_count: Mutex::new(0),
         });
-        // Bind the transfer receiver's durable-persistence hook now that the
-        // state Arc exists (the service is constructed before it). A remote
-        // generation Commit publishes a Ready record only when the SAME
-        // durable write the local deploy path performs succeeds; a Weak
-        // capture keeps the service from pinning the state in a cycle and
-        // fails closed if the state is ever gone.
         {
             let weak_state = Arc::downgrade(&state);
             state
@@ -922,7 +863,7 @@ impl CloudState {
         state
     }
 
-    /// Mark a successful control-plane (gossip) sync (#25).
+    /// Marks a successful control-plane (gossip) sync.
     pub fn mark_gossip_ok(&self) {
         self.last_gossip_ok_ms
             .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
@@ -1036,14 +977,15 @@ impl CloudState {
         ids
     }
 
+    /// Records one request event: counts it (and counts a WAF or bot block), attributes it to the
+    /// OWNING TENANT (the team that owns the project, so per-tenant metrics reads cannot leak
+    /// across tenants; projectless events, host-rejected or platform-internal, go to the system
+    /// tenant) and appends it to the event log.
     pub fn record(&self, ev: Event) {
         *self.req_count.lock() += 1;
         if ev.action == "waf-deny" || ev.action == "bot-block" {
             *self.blocked_count.lock() += 1;
         }
-        // Attribute the event to the OWNING TENANT (the team that owns the project),
-        // so per-tenant metrics reads can't leak across tenants. Projectless events
-        // (host-rejected, platform-internal) go to the system tenant.
         let mtenant = if ev.project.is_empty() {
             crate::metrics::SYSTEM_TENANT.to_string()
         } else {
@@ -1084,65 +1026,52 @@ impl CloudState {
         (*self.req_count.lock(), *self.blocked_count.lock())
     }
 
-    /// Whether this node should route on `host`. A bare/single-label or empty
-    /// host (local/direct/default deployment) is allowed; under real-DNS ingress
-    /// the apps domain (`*.{HIVE_APPS_DOMAIN}`, one label + apex) is allowed; any
-    /// other multi-label host must end with a configured deploy suffix (the ngrok
-    /// zones — kept while `HIVE_INGRESS != dns`), else it's a foreign root.
+    /// Whether this node should route on `host`. A bare/single-label or empty host
+    /// (local/direct/default deployment) is allowed; under real-DNS ingress the apps domain
+    /// (`*.{HIVE_APPS_DOMAIN}`, one label plus the apex) is allowed (gated like `deploy_url`: in
+    /// ngrok mode `*.{apps_domain}` never reaches this node, so admission stays byte-identical to
+    /// the pre-apps-domain behaviour); any other multi-label host must end with a configured deploy
+    /// suffix, else it is a foreign root.
+    ///
+    /// A CUSTOM DOMAIN attached to a project (`POST /v1/projects/:p/domains`) is admitted by two
+    /// paths that match the two ways this node can serve a host: `serves_host` (this node itself
+    /// owns the deployment: its OWN `c.gw.aliases` has the entry) and `peer_routes` (the mesh
+    /// gossip already knows some OTHER node owns it, the same mechanism that makes every node admit
+    /// `*.{apps_domain}` hosts it does not own and mesh-proxy them to the real owner). A customer's
+    /// own custom domain gets no blanket admission, so it needs this per-alias existence check:
+    /// once the real owner's periodic `serve_hosts` publish carries a freshly attached domain (see
+    /// `project_domain_add`, which applies the alias ON the owning node), every OTHER node's
+    /// `peer_routes` picks it up on the next gossip cycle and can admit and mesh-proxy it too.
+    /// `peer_routes` is matched full-host first (custom domains), then by the platform label
+    /// scheme: a peer publishing `numo.gg` admits exactly that host, never the whole `numo.*` label
+    /// space.
     pub fn host_allowed(&self, host: &str) -> bool {
-        // The apps-domain rule only applies under real-DNS ingress (same gate as
-        // `deploy_url`). In ngrok mode `*.{apps_domain}` never reaches this node, so
-        // keep host admission byte-identical to the pre-apps-domain behavior.
         (self.ingress != "ngrok" && host_matches_apps_domain(host, &self.apps_domain))
             || host_has_allowed_suffix(host, &self.deploy_suffixes)
-            // A CUSTOM DOMAIN attached to a project (`POST /v1/projects/:p/domains`)
-            // was rejected here as "a foreign root" 100% of the time — this gate
-            // predates that feature and was never taught about it. Two admission
-            // paths, matching the two ways this node can actually serve a host:
-            // 1. `serves_host` — this node itself owns the deployment (its OWN
-            //    `c.gw.aliases` has the entry directly).
-            // 2. `peer_routes` — the MESH GOSSIP already knows some OTHER node
-            //    owns it (the exact mechanism that already makes every node
-            //    admit `*.{apps_domain}` hosts it doesn't own locally and
-            //    mesh-proxy them to the real owner — apps_domain gets a
-            //    blanket admission above, but a customer's OWN custom domain
-            //    correctly does NOT, so it needs this per-alias existence
-            //    check instead). Once the real owner's periodic `serve_hosts`
-            //    publish carries a freshly-attached domain (see
-            //    `project_domain_add`, which now applies the alias ON the
-            //    owning node instead of wherever the admin write happened to
-            //    land), every OTHER node's `peer_routes` picks it up on the
-            //    next gossip cycle and can admit + mesh-proxy it too.
             || self.gw.serves_host(host)
             || {
                 let h = host.split(':').next().unwrap_or(host);
                 let routes = self.peer_routes.read();
-                // Full-host first (custom domains), then the platform label
-                // scheme — a peer publishing `numo.gg` admits exactly that
-                // host, never the whole `numo.*` label space.
                 routes.contains_key(&h.to_ascii_lowercase())
                     || routes.contains_key(h.split('.').next().unwrap_or(h))
             }
     }
 
-    /// Public URL for a deployment alias. Real-DNS ingress (`HIVE_INGRESS !=
-    /// ngrok`) emits `https://<label>.{apps_domain}` (single-label wildcard);
-    /// ngrok mode keeps today's `https://<alias>` (the UI session-maps domains).
+    /// Public URL for a deployment alias. Real-DNS ingress (`HIVE_INGRESS != ngrok`) emits
+    /// `https://<label>.{apps_domain}` (single-label wildcard); ngrok mode keeps `https://<alias>`
+    /// (the UI session-maps domains).
+    ///
+    /// PREVIEWS go under the fleet-served deploy zone when one is configured AND its certificate is
+    /// installed here: Seer answers any label in that zone with affinity computed per query from
+    /// the route table, so a preview costs zero DNS records and zero extra certificates however
+    /// many deployments exist, while production keeps the project's own namespace on the apps
+    /// domain. It is gated on the certificate on purpose (a name that resolves but fails TLS is
+    /// worse than one that resolves with an extra hop), so until `*.{deploy_zone}` is installed it
+    /// keeps the previous behaviour rather than minting unusable URLs; old preview links on the
+    /// apps domain keep resolving through its wildcard either way.
     pub fn deploy_url(&self, alias: &str) -> String {
         if self.ingress != "ngrok" {
             let sub = alias.split('.').next().unwrap_or(alias);
-            // PREVIEWS go under the fleet-served deploy zone when one is
-            // configured AND its certificate is installed here: Seer answers any
-            // label in that zone with affinity computed per query from the route
-            // table, so a preview costs zero DNS records and zero extra
-            // certificates however many deployments exist. Production keeps the
-            // project's own namespace on the apps domain.
-            //
-            // Gated on the certificate on purpose: a name that resolves but
-            // fails TLS is worse than one that resolves with an extra hop, so
-            // until `*.{deploy_zone}` is installed this keeps the previous
-            // behaviour rather than minting unusable URLs. Old preview links on
-            // the apps domain keep resolving through its wildcard either way.
             if let Some(dz) = crate::dnsserver::deploy_zone() {
                 if crate::vercel_dns::is_preview_label(sub)
                     && crate::acme::zone_tls_ready(dz)
@@ -1166,6 +1095,14 @@ impl CloudState {
         }
     }
 
+    /// Builds an [`Event`] with EXACT attribution only (no default-deployment fallback, no detail
+    /// fallback): an event belongs to a project/deployment iff the request host's subdomain
+    /// actually ALIASES one of this node's deployments. The serving resolution's default-deployment
+    /// fallback stamped every unmatched host (platform bot probes, other tenants' DB hosts,
+    /// peer-hosted projects routed through this node) with this node's default project, leaking
+    /// foreign request lines into that project's log view and corrupting its tenant's metrics
+    /// attribution; unresolved hosts stay UNATTRIBUTED (empty project/deployment) and are
+    /// operator-only in the logs API.
     pub fn event(
         &self,
         region: &str,
@@ -1176,16 +1113,6 @@ impl CloudState {
         action: &str,
         detail: &str,
     ) -> Event {
-        // EXACT attribution only (no default-deployment fallback, no detail
-        // fallback): an event belongs to a project/deployment iff the request
-        // host's subdomain actually ALIASES one of this node's deployments.
-        // The old `project_for_host` path used the serving resolution, whose
-        // default-deployment fallback stamped every unmatched host — platform
-        // bot probes, other tenants' DB hosts, peer-hosted projects routed
-        // through this node — with this node's default project, leaking foreign
-        // request lines into that project's log view and corrupting its tenant's
-        // metrics attribution. Unresolved hosts stay UNATTRIBUTED (empty
-        // project/deployment) and are operator-only in the logs API.
         let (deployment, project) = self.gw.attribution_for_host(host).unwrap_or_default();
         Event {
             ts_ms: now_ms(),
