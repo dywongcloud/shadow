@@ -1,5 +1,90 @@
 # Changelog
 
+## 2026-10-14 — the deployment-password unlock cookie is a server-sealed expiring token, Secure outside plain-http loopback (229e0df6d9)
+
+`EnterpriseStore::seal_password_cookie` returned the STORED password hash as the `hive_pw` cookie value and
+`verify_password_cookie` compared the cookie with it, so the cookie was password-equivalent (replayable, with no
+server-side expiry, for as long as the password stayed the same), handed the Argon2 hash itself to anyone who
+could read the cookie, and was set without `Secure`. The cookie is now `v1.<expiry ms>.<hex HMAC-SHA256>`: the MAC
+covers the deployment, the expiry and the stored hash and is keyed from `secrets::key_material()` (the
+fleet-shared at-rest key, so any node verifies a token any node issued), compared in constant time. A token stops
+at its own expiry (`HIVE_PW_COOKIE_TTL_SECS`, default 24 h), is bound to its deployment and dies when the password
+changes; the stored hash opens nothing. `Set-Cookie` keeps `HttpOnly` and `SameSite=Lax`, `Max-Age` equals the token
+lifetime and `Secure` is set unless the request is plain http to a loopback dev host (`localhost`, `*.localhost`,
+`127.0.0.1`, `::1`) without `x-forwarded-proto: https`, so the unlock still works on a plain-http localhost dev
+node. `shadw_zk` is untouched. Witnessed on a real enforced node over the public listener
+(`scratch2/work/secfix-pwcookie.sh`): before, the value was the `$argon2id$` hash, no `Secure` on a public host or
+behind `x-forwarded-proto: https`, and the cookie still opened the site after the configured lifetime; after, the
+value is `v1.<expiry>.<mac>`, `Secure` on a public host and behind the proxy header, absent on plain-http
+`pwa.localhost` where the unlock still works, a later expiry with the old MAC, a flipped MAC and a made-up token
+401, one deployment's token on another 401, the same token after a 4 s lifetime 401, a changed password
+invalidates earlier cookies. Operator note: cookies issued before the roll stop opening the gate (each visitor
+enters the password once more), and verification needs the fleet-shared `HIVE_SECRET_KEY` like the TLS tickets
+do. Not rolled.
+
+## 2026-10-14 — model downloads share one node-wide concurrency limit and one disk reserve (a21318ab2c)
+
+Each download was admitted and re-checked against the free space on its own: with a 2 GiB reserve and 32 GB
+free, three downloads that each declare 18 GB all passed (18 + 2 < 32) and wrote at once, so N concurrent
+downloads overshot the reserve N-fold, and nothing bounded how many ran. A `DiskClaim` ledger now holds the bytes
+every download in flight still expects to write; a download is admitted only when the volume keeps the reserve
+after the others' remainders and this file, the 256 MiB re-check asks the same of everything in flight, and the
+claim drops on every exit. A node-wide semaphore (`HIVE_INFERENCE_MODEL_DOWNLOADS_MAX`, default 2) limits running
+downloads; a URL with no free slot is tried again on the next tick, nothing queues. Witnessed on a real node
+(`scratch2/work/secfix-model2.sh`): four slow-drip downloads ran four at once before (4 partial files) and two at
+a time after; three 18 GB downloads against 32 GB free were all admitted before (3 partial files) and exactly one
+after, the others failing "insufficient disk space for the model". Not rolled.
+
+## 2026-10-14 — a DB gateway session is bounded while it is unproven and while it drains, capped per source, and a NAT burst is no longer reset (a67a44b67a)
+
+After the first client byte nothing bounded a session: `copy_bidirectional` ends only when BOTH sides reach EOF, so a
+client that stayed open after the engine closed the session (Redis `QUIT`) pinned the gateway's two sockets for good;
+one byte then silence held a database connection slot indefinitely (the previous wave cut it at 10 minutes, this one
+at never); one source address could hold any number of sessions; and the default of 32 pending connections per
+address reset a legitimate NAT'd fleet reconnecting at once. `splice` now copies the two directions itself over a
+shared phase: the backend must send its first reply within `HIVE_DB_GATEWAY_FIRST_REPLY_MS` (30 s; a legitimate
+client is answered at once, one byte then silence never is), the pending slot is held until that reply, and once
+either direction ends the survivor may sit silent for `HIVE_DB_GATEWAY_LINGER_SECS` (60 s) of inactivity (each read
+restarts the clock, so a large reply still draining to a half-closed client is never cut). A proven session has no
+idle bound at all (pools and `LISTEN` stay up). The sessions one SOURCE address may hold at a backend are capped
+(`HIVE_DB_GATEWAY_SESSIONS_PER_IP_MAX`, 4096) before the backend is touched; per source, not per database (one
+address could lock a tenant out of its own database) and not global (one address could lock out every tenant).
+Pending defaults: per address 32 to 256, global 512 to 2048. Witnessed on a real node with a seeded TLS bundle and a
+line-protocol stand-in engine (`scratch2/work/secfix-dbgw3.sh`): after the engine's `QUIT` with the client open, the
+gateway-side socket sat in `FIN_WAIT_2` at 10.5 s before and was gone after; one byte then silence stayed open past
+10 s before and was cut at 3.0 s (first-reply knob 3 s) after; a pooled idle session survived before and after, and
+with the default knobs lived 150 s idle and answered a second command; 8 sessions from one address were 8
+established before and 4 after (cap 4, the other 4 turned away before the engine saw them) while a second address
+still got its sessions; 100 clients from one address completing TLS at once were 32 admitted and 68 turned away
+before and all 100 admitted after. Not rolled.
+
+## 2026-10-14 — the world's loopback exemption accepts the REST URL of any of the project's own Redis databases (ef100e0607)
+
+`DatabaseStore::local_redis_rest_url` returned the FIRST matching record's REST URL and `world_config` accepted a
+loopback URL only when it equalled that one, but every managed Redis database's egress writes its own
+`UPSTASH_REDIS_REST_URL` into the project env and the last one attached wins the key: with two Redis databases on a
+node with no `HIVE_DB_DOMAIN` the env named the second while the check read the first, so the platform's own sidecar
+was refused and the world read nothing. `local_redis_rest_urls` returns the URLs of ALL the project's Redis records
+hosted on this node (same tenant, same project) and the exemption accepts a loopback URL equal to any of them; a
+loopback URL no record holds is still no world at all. Witnessed on a real node with two Redis databases for one
+project (`scratch2/work/secfix-world2.sh`): with the env as the databases' egress left it, 0 world reads reached
+either database before and the read reached the one the env names after; restating the second database's URL was
+refused before and reached after; a tenant-set arbitrary loopback port got 0 requests before and after. Not rolled.
+
+## 2026-10-14 — a team-private preview opens only for a credential of the owning team or a platform operator, never for any tenant's owner role (ffa3e09d15)
+
+`edge::has_preview_access` accepted a verified JWT, as a Bearer or as the `hive_access` cookie, when its tenant matched
+the project's team OR its role was `owner`. `owner` only means owner of the caller's own tenant (every user owns their
+personal namespace), so any other tenant's owner JWT, and any personal-namespace owner, opened every team-private
+preview; a viewer JWT got 401. `claims_open_preview` is now the one question both credential paths ask:
+`platform_admin`, or the caller's tenant equals the project's stored team through `admin::record_tenant` (a lost tag
+resolves to the fail-closed `UNTAGGED_TENANT`, which no claim equals). A repository-wide search for the same shape (a
+`role == "owner"` accepted without a tenant match) found no other site. Witnessed on a real enforced node over the
+public listener with two tenants (`scratch2/work/secfix-preview.sh`): before, tb's owner JWT opened ta's private preview
+as a Bearer and as the cookie, and a personal-namespace owner JWT did too (200 each); after all three are 401, while
+ta's owner and viewer, the operator and every control (no credential, tb viewer, tb admin, tb's API key, a garbage
+cookie) are unchanged. Not rolled.
+
 ## 2026-10-14 — a DNS-only domain record claims no nameservers the platform never measured (71d29ab090)
 
 `dns::default_domain` seeded every record with nameservers `ns1.openedge-dns.com` and
