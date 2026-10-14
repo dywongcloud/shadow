@@ -12863,11 +12863,6 @@ pub(crate) async fn database_teardown_local(
     if let Some(d) = c.databases.get_raw(&id) {
         teardown_db_backing(&d).await;
     } else {
-        // The catalog delete's store_sync can beat this dispatch to the peer —
-        // no record here means the old arm removed NOTHING and still answered
-        // `torn_down`, which is exactly how the witness container kept running
-        // after its catalog entry vanished. The backing names are platform
-        // templates, so a missing record does not blind the teardown.
         tracing::warn!(
             db = %id,
             "database teardown-local: no local record (catalog removal replicated first) — tearing down by platform template"
@@ -12886,7 +12881,10 @@ pub(crate) async fn database_teardown_local(
 /// replicated here yet, and a no-op on an unknown id used to answer `removed: true` while the
 /// container ran on forever) and for an unset `host_node`, which is NEVER read as "must be local":
 /// an unknown host is logged loudly (the backing was NOT torn down, the catalog entry is removed
-/// regardless) so an operator can find it through the orphan sweep.
+/// regardless) so an operator can find it through the orphan sweep. The catalog removal also purges
+/// the queue/vector/blob PAYLOAD data (keyed by a team-prefixed connection name, not the db id):
+/// removing only the catalog entry left customer data, possibly PII in vector metadata or queue
+/// message bodies, orphaned in memory and on disk and re-persisted in every snapshot.
 async fn database_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12894,19 +12892,6 @@ async fn database_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Replication-lag guard, same reasoning as the inner `host_node`-empty
-    // retry below but for the OUTER lookup itself: a database created via
-    // `database_provision_local` on a PEER (this node's own region-aware
-    // placement dispatch) has not necessarily replicated into THIS node's
-    // local `databases` store yet by the time a fast-following delete
-    // arrives — witnessed live: `get_raw` returned `None` here, so the
-    // whole teardown block below (including its own host_node retry) never
-    // ran at all, `remove_db_and_purge_data` no-op'd on an id it had never
-    // heard of, and the API still answered `{"removed": true}` while the
-    // real container kept running on the peer forever. A few hundred ms of
-    // retry closes this for any delete within a couple of store-sync
-    // rounds of the create; a delete on a database that never existed
-    // still 404s after these attempts exhaust, unchanged from before.
     let mut record = c.databases.get_raw(&id);
     if record.is_none() {
         for _ in 0..3 {
@@ -12921,25 +12906,14 @@ async fn database_delete(
         if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
-        // Remove the auto-injected egress env vars from the owning project.
         if !d.project.is_empty() {
             for (k, _, _) in db_egress_pairs(&c, &d) {
                 c.projects.delete_env(&d.project, &k);
             }
         }
-        // Tear down any cross-region replicas (before consuming `d.container`).
         if !d.replicas.is_empty() {
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
         }
-        // A replication-lag guard for the delete-moments-after-create case:
-        // if this node's own copy of the record has no `host_node` yet
-        // (created on a peer via `database_provision_local`, whose write
-        // hasn't finished propagating back here through the ordinary
-        // `databases` store-sync path), briefly re-fetch rather than
-        // immediately concluding "unknown, give up" — closes the race for
-        // any delete landing within a couple of store-sync rounds of the
-        // create, which is the overwhelming common case (a delete seconds
-        // or minutes later already has a fully-replicated `host_node`).
         let mut d = d;
         if d.host_node.is_empty() {
             for _ in 0..3 {
@@ -12955,30 +12929,12 @@ async fn database_delete(
         if d.host_node == c.node_name {
             teardown_db_backing(&d).await;
         } else if d.host_node.is_empty() {
-            // NEVER treat an unset `host_node` as "must be local" — that is
-            // exactly the trap that leaked a real container live: a delete
-            // landing on a node whose replicated copy of the record hasn't
-            // finished catching up from wherever `database_provision_local`
-            // actually created it reads `host_node` as its zero-value, not
-            // as the true owner, and the container silently outlives the
-            // catalog entry with no error anywhere. Loud and honest instead:
-            // this node genuinely does not know where the backing container
-            // lives, so it cannot tear it down — surfaced so an operator can
-            // find it via the orphan-reap sweep rather than trusting a
-            // "removed: true" response that only removed the catalog row.
             tracing::warn!(
                 db = %id,
                 "database delete: host_node unknown on this node (stale replication?) — \
                  backing container/volume was NOT torn down; catalog entry removed regardless"
             );
         } else {
-            // The containers/volume/file live on a PEER — dispatch there
-            // rather than silently no-op'ing a local `podman rm` against a
-            // name that was never created on this host. Best-effort: an
-            // unreachable peer must not block the catalog delete below (the
-            // customer asked for this database gone; a stranded container
-            // on an unreachable node is a leak to catch via the normal
-            // orphan-reap sweep, not a reason to refuse the delete).
             if post_body_to_host(
                 &c,
                 &d.host_node,
@@ -12997,19 +12953,15 @@ async fn database_delete(
             }
         }
     }
-    // Purges the actual queue/vector/blob PAYLOAD data too (keyed by a
-    // team-prefixed connection name, not the db id) — `remove_db` alone only
-    // ever removed the catalog entry, leaving customer data (which may
-    // include PII in vector metadata or queue message bodies) orphaned in
-    // memory/on-disk forever, re-persisted in every future snapshot.
     c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
-/// Regenerate a Blob database's access credentials without touching the
-/// underlying data or bucket identity -- the fix for a leaked credential
-/// (log, transcript, accidental print) that doesn't warrant losing the data.
+/// Regenerates a Blob database's access credentials without touching the underlying data or bucket
+/// identity: the fix for a leaked credential (log, transcript, accidental print) that does not
+/// warrant losing the data. The egress env is refreshed with the new credentials, so deployments
+/// pick them up on their next restart instead of the stale ones.
 async fn database_rotate(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13026,8 +12978,6 @@ async fn database_rotate(
     let Some(rotated) = crate::databases::rotate_blob_credentials(&c.databases, &id) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    // Refresh the egress env with the new credentials so deployments pick
-    // up the rotated values on their next restart instead of the stale ones.
     if !rotated.project.is_empty() {
         apply_db_egress(&c, &rotated);
     }
@@ -13071,18 +13021,12 @@ pub(crate) async fn database_replica(
     }
     match op {
         "register" => {
-            // Default to replica role / this node's region, but let the caller
-            // override either (the primary uses this same endpoint to re-register
-            // a corrected record without code changes).
             if db.role.is_empty() {
                 db.role = "replica".into();
             }
             if db.region.is_empty() {
                 db.region = c.region.clone();
             }
-            // Platform-native kinds serve from THIS node's in-process store (data
-            // arrives via write-mirroring); rewrite endpoint host to our API base.
-            // Postgres/Redis get a real local backing container so reads are local.
             let backed =
                 crate::databases::provision_replica_backing(c.databases.clone(), &db).await;
             db.connection = backed.0;
@@ -13126,15 +13070,17 @@ pub(crate) async fn database_replica(
     }
 }
 
-/// Apply a MIRRORED storage write received over the iroh mesh (the HTTP admin
-/// path goes through the normal handlers). Parses `<team>` from `?team=` and the
-/// kind/name/key from the path, applying to the SAME tenant namespace so the
-/// replica holds identical data. Never re-mirrors (already a replicated write).
+/// Applies a MIRRORED storage write received over the iroh mesh (the HTTP admin path goes through
+/// the normal handlers). The path is `/v1/storage/<kind>/<name>[/<key>]` with `?team=`, and the
+/// write lands in the SAME tenant namespace (`<team>::<name>`) so the replica holds identical data;
+/// it is never re-mirrored (already a replicated write). Realtime rooms ride the same broker as
+/// pub/sub topics, so a fanned-out room frame is published to it like a topic message (room frames
+/// are raw text on the wire, kept raw so a mirrored frame is byte-identical to a locally published
+/// one).
 pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: &[u8]) {
     let team = qs(path, "team").unwrap_or_else(|| "personal".into());
     let no_q = path.split('?').next().unwrap_or(path);
     let segs: Vec<&str> = no_q.trim_start_matches('/').split('/').collect();
-    // segs: ["v1","storage",<kind>, ...]
     let kind = segs.get(2).copied().unwrap_or("");
     match kind {
         "blob" => {
@@ -13175,15 +13121,10 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
                 }
             }
         }
-        // Realtime rooms ride the same broker as pub/sub topics. Without this
-        // arm a fanned-out room frame was accepted and then dropped, so two
-        // browsers in the same room but on different nodes never saw each other.
         "realtime" => {
             if let Some(room) = segs.get(3) {
                 if let Ok(v) = serde_json::from_slice::<Value>(body) {
                     if let Some(msg) = v.get("message") {
-                        // Room frames are raw text on the wire; keep them raw so a
-                        // mirrored frame is byte-identical to a locally-published one.
                         let text = msg
                             .as_str()
                             .map(|s| s.to_string())
@@ -13205,13 +13146,9 @@ fn qs(path: &str, key: &str) -> Option<String> {
     })
 }
 
-// ---- Functional storage REST (Blob / Queue / Vector) ----
-//
-// MULTI-TENANT: every namespace name (bucket/queue/index/topic/room) coming from
-// the request path is tenant-prefixed (`<tenant>::<name>`) before touching the
-// store, so two teams using the same name get DISJOINT storage. Responses echo
-// the caller's un-prefixed name.
-
+/// Tenant-prefixed namespace (`<tenant>::<name>`) for a bucket, queue, index, topic or room named
+/// in a request path, so two teams using the same name get DISJOINT storage. Responses echo the
+/// caller's un-prefixed name.
 fn ns(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -13221,18 +13158,16 @@ fn ns(
     format!("{}::{}", tenant(c, h, claims), name)
 }
 
-/// Resolve the (team, is_mirror) scope for a storage WRITE. A mesh-internal
-/// mirrored write is a trusted replication call from a primary node — its team
-/// is authoritative, so replicated data lands in the SAME tenant namespace on the
-/// replica. This MUST be bound to a verified identity, not header presence: this
-/// admin router is bound to the public API host (main.rs), so an arbitrary
-/// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok`
-/// carries a short-lived signed token (minted the same way as `mesh_team_qs`,
-/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`) — only a
-/// caller holding `HIVE_JWT_SECRET` can produce one, closing the cross-tenant
-/// write bypass. When JWT enforcement is off (dev/single-node), the raw header
-/// is trusted as before (nothing to forge against). Normal writes resolve the
-/// tenant as usual.
+/// Resolves the (team, is_mirror) scope for a storage WRITE. A mesh-internal mirrored write is a
+/// trusted replication call from a primary node, so its team is authoritative and replicated data
+/// lands in the SAME tenant namespace on the replica. That MUST be bound to a verified identity,
+/// never to header presence: this admin router is bound to the public API host, so an arbitrary
+/// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok` carries a
+/// short-lived signed token (minted like `mesh_team_qs`:
+/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`),
+/// which only a caller holding `HIVE_JWT_SECRET` can produce, closing the cross-tenant write
+/// bypass. When JWT enforcement is off (dev/single-node) the raw header is trusted (nothing to
+/// forge against). Normal writes resolve the tenant as usual.
 fn write_scope(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -13292,6 +13227,12 @@ async fn blob_put(
     )
 }
 
+/// Reads a blob from the caller's tenant namespace. Blob bytes live on node-local disk, but
+/// `admin_ingress` forwards mutations to the control-plane leader while serving reads LOCALLY, and
+/// `BLOB_ENDPOINT` handed to every app points at the round-robin api host, so a PUT lands on the
+/// leader and the matching GET lands anywhere. A local miss therefore falls back to the leader (the
+/// same fallback `build_get` uses); without it the GET would 404 forever, with no sync path that
+/// ever heals it.
 async fn blob_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13303,12 +13244,6 @@ async fn blob_get(
     match c.databases.blob_get(&nsb, &key) {
         Some(data) => Ok(data.into_response()),
         None => {
-            // Blob bytes live on node-local disk, but `admin_ingress` forwards
-            // mutations to the control-plane leader while serving reads
-            // LOCALLY. `BLOB_ENDPOINT` handed to every app points at the
-            // round-robin api host, so a PUT lands on the leader and the
-            // matching GET lands anywhere — 404 forever, with no sync path that
-            // ever heals it. Same leader fallback `build_get` already uses.
             if let Some(leader) = c.leader_forward_target() {
                 let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
                 let path = format!("/v1/storage/blob/{bucket}/{key}");
@@ -13321,6 +13256,9 @@ async fn blob_get(
     }
 }
 
+/// Lists a bucket's keys in the caller's tenant namespace. An empty listing on a non-leader almost
+/// always means the objects were PUT on the leader rather than that the bucket is empty, so it
+/// falls back to the leader's listing (see [`blob_get`]).
 async fn blob_list_keys(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13329,8 +13267,6 @@ async fn blob_list_keys(
 ) -> Json<Value> {
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
     let keys = c.databases.blob_list(&nsb);
-    // An empty listing on a non-leader almost always means "the objects were
-    // PUT on the leader" rather than "the bucket is empty" — see `blob_get`.
     if let (true, Some(leader)) = (keys.is_empty(), c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
         if let Some(v) =
@@ -13387,6 +13323,10 @@ async fn queue_pop(
     )
 }
 
+/// Depth of a tenant's queue. `queue_push` and `queue_pop` are mutations and so run on the leader,
+/// while this read serves locally, so every non-leader node would report 0 however deep the real
+/// queue is: a depth of 0 on a non-leader falls back to the leader's answer. Depth is served by GET
+/// on the queue route itself (`/v1/storage/queue/:queue`); there is no `/depth` sub-route.
 async fn queue_depth(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13395,13 +13335,8 @@ async fn queue_depth(
 ) -> Json<Value> {
     let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
     let depth = c.databases.queue_depth(&nsq);
-    // `queue_push`/`queue_pop` are mutations and so run on the leader, while
-    // this read serves locally — so every non-leader node reports 0 no matter
-    // how deep the real queue is.
     if let (0, Some(leader)) = (depth, c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        // NOTE: depth is served by GET on the queue route itself
-        // (`/v1/storage/queue/:queue`) — there is no `/depth` sub-route.
         if let Some(v) =
             fetch_from_host(&c, &leader, &format!("/v1/storage/queue/{queue}"), &t).await
         {
@@ -13466,8 +13401,6 @@ async fn vector_query(
     Json(json!({ "index": index, "matches": c.databases.vector_query(&nsi, &b.vector, b.top_k) }))
 }
 
-// ---- Managed World Queue (Vercel WDK, hive-native, no external queue dep) ----
-
 #[derive(Deserialize)]
 struct WqueueEnqueueReq {
     target_url: String,
@@ -13483,15 +13416,16 @@ fn default_wqueue_max_attempts() -> u32 {
     10
 }
 
+/// Enqueues a delayed HTTP callback (`target_url`, `headers`, `payload`, `delay_seconds`,
+/// `max_attempts`) in the managed world queue, tenant-scoped like every other `/v1/storage/*`-style
+/// mutation. The target URL is caller-supplied, so the caller must resolve to a real authenticated
+/// tenant: an anonymous (`ANON_TENANT`) caller never schedules arbitrary HTTP callbacks.
 async fn wqueue_enqueue(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<WqueueEnqueueReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Tenant-scoped like every other /v1/storage/*-style mutation; the target
-    // URL is caller-supplied so it must resolve to a real, authenticated caller
-    // (never let an anonymous/ANON_TENANT caller schedule arbitrary HTTP callbacks).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
@@ -13515,8 +13449,6 @@ async fn wqueue_stats(
     Ok(Json(c.world_queue.stats()))
 }
 
-// ---- Pub/Sub + Realtime (WebSocket secure streaming) ----
-
 async fn pubsub_info(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13531,6 +13463,10 @@ async fn pubsub_info(
     }))
 }
 
+/// Publishes to the tenant-namespaced topic on the local broker and fans the message out to EVERY
+/// node, not just replica regions: the broker is per-process and subscribers sit on whichever node
+/// their WebSocket landed on, so anything less silently delivers to a subset (usually just the
+/// leader's own).
 async fn pubsub_publish(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13542,9 +13478,6 @@ async fn pubsub_publish(
     let nst = format!("{team}::{topic}");
     let delivered = c.databases.publish(&nst, b.message.to_string());
     let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
-    // Fan to EVERY node, not just replica regions: the broker is per-process and
-    // subscribers sit on whichever node their WebSocket landed on, so anything
-    // less silently delivers to a subset (usually just the leader's own).
     crate::db_replicate::fanout_all(
         &c,
         is_mirror,
@@ -13556,6 +13489,8 @@ async fn pubsub_publish(
     Json(json!({ "topic": topic, "delivered": delivered, "fanout": !is_mirror }))
 }
 
+/// WebSocket subscription to a tenant-namespaced pub/sub topic. A subscriber that lags skips the
+/// frames it missed.
 async fn ws_pubsub(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
@@ -13577,7 +13512,7 @@ async fn ws_pubsub(
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Ok(m) => { if socket.send(Message::Text(m)).await.is_err() { break; } }
-                    Err(_) => continue, // lagged: skip
+                    Err(_) => continue,
                 },
                 client = socket.recv() => match client {
                     Some(Ok(Message::Close(_))) | None => break,
@@ -13588,6 +13523,10 @@ async fn ws_pubsub(
     })
 }
 
+/// WebSocket realtime room (tenant-namespaced, bidirectional): a client message is broadcast to the
+/// whole room. Subscribers sit on whichever node their socket landed on, so every frame is also
+/// fanned out to every node; locally only, two browsers in the same room would never see each
+/// other.
 async fn ws_realtime(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
@@ -13615,12 +13554,8 @@ async fn ws_realtime(
                     Err(_) => continue,
                 },
                 client = socket.recv() => match client {
-                    // Bidirectional: a client message is broadcast to the whole room.
                     Some(Ok(Message::Text(t))) => {
                         db.publish(&room, t.clone());
-                        // Subscribers sit on whichever node their socket landed
-                        // on, so a room frame has to reach every node — locally
-                        // only, two browsers in the same room never see each other.
                         crate::db_replicate::fanout_all(
                             &cloud,
                             false,
@@ -13659,8 +13594,6 @@ async fn ws_echo(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Res
     })
 }
 
-// ====================== Secure compute (WireGuard) ======================
-
 async fn securelinks_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13673,17 +13606,19 @@ async fn securelinks_list(
     ))))
 }
 
+/// Provisions a secure-compute (WireGuard) link. The tenant is always the server-resolved one (a
+/// client-supplied `team` is never trusted, as in `database_create`), and project ownership is
+/// enforced only when wiring into an ALREADY-registered project (an unset or new project name is
+/// the normal "create the tunnel first" flow). The connector's local address is then injected as a
+/// project env var, so deployed functions reach the private backend through the encrypted tunnel
+/// transparently.
 async fn securelink_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut req): Json<crate::securelink::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Always the server-resolved tenant — see the identical fix on
-    // database_create for why a client-supplied `team` must never be trusted.
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Only enforce ownership when wiring into an ALREADY-registered project
-    // (an unset/new project name is a normal "create the tunnel first" flow).
     if let Some(p) = req.project.as_deref().filter(|p| !p.is_empty()) {
         if c.projects.snapshot().contains_key(p) {
             require_project(&c, &headers, claims.as_ref().map(|e| &e.0), p)?;
@@ -13695,9 +13630,6 @@ async fn securelink_create(
         .provision(req, &region)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // Wire the function datapath: inject the connector's local address as a
-    // project env var, so deployed functions reach the private backend through
-    // the encrypted tunnel transparently.
     if !rec.project.is_empty() && !rec.env_var.is_empty() {
         c.projects.put_env(
             &rec.project,
@@ -13744,30 +13676,25 @@ async fn securelink_delete(
     Ok(Json(json!({ "removed": id })))
 }
 
-// ============================ Monitoring ============================
-
 #[derive(Deserialize)]
 struct MetricsQ {
     minutes: Option<usize>,
     project: Option<String>,
-    /// "minute" (default) | "hour" | "day" — the consumption-breakdown chart's
-    /// Daily/Weekly/Monthly toggle (ui/app/usage/page.tsx). Unrecognized/absent
-    /// falls back to "minute" (today's pre-existing behavior) via
-    /// `Granularity::parse` — never a 400, this is a display parameter.
+    /// "minute" (default) | "hour" | "day": the Usage page's Daily/Weekly/Monthly toggle.
+    /// Unrecognized or absent falls back to "minute" via `Granularity::parse`, never a 400: it is a
+    /// display parameter.
     gran: Option<String>,
-    /// Set by the fleet fan-out's own inner call (`metrics_get` -> peer) to
-    /// request ONLY this node's local view, with no further fan-out — stops
-    /// the recursion at one hop. Absent/false = the top-level call, which fans
-    /// out to every other healthy node (see `metrics_get`'s doc comment).
+    /// Set by the fleet fan-out's own inner call to request ONLY this node's local view, with no
+    /// further fan-out (one hop, no recursion). Absent/false is the top-level call, which fans out
+    /// to every other healthy node (see `metrics_get`).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 
-/// Merge one peer's `/v1/metrics?local=true` JSON response into the running
-/// accumulators (series by `t_ms`, status/top-paths/projects by key). Silently
-/// no-ops on a malformed/unreachable peer response — a single unreachable node
-/// must not fail the whole tenant's usage view (matches `fleet_function_stats`'s
-/// best-effort fan-out).
+/// Merges one peer's `/v1/metrics?local=true` JSON response into the running accumulators (series
+/// by `t_ms`, status/top-paths/projects by key). It silently no-ops on a malformed or unreachable
+/// peer response: a single unreachable node must not fail the whole tenant's usage view (matches
+/// `fleet_function_stats`'s best-effort fan-out).
 fn merge_peer_metrics(
     v: &Value,
     series: &mut Vec<crate::metrics::Bucket>,
@@ -13820,17 +13747,20 @@ fn merge_peer_metrics(
     }
 }
 
-/// TENANT-SCOPED usage series + breakdowns for the Usage page. FLEET-AGGREGATE:
-/// `MetricsStore` is confirmed node-local with zero cross-node merge (never
-/// gossiped, and deliberately NOT adopted from a peer on restore — see
-/// `guardian::strip_node_local`'s "would double-count its traffic" comment,
-/// unlike billing which has a single elected metering owner). A tenant's
-/// traffic can land on ANY healthy node the routing mesh sends it to, so
-/// without fanning out, `/v1/metrics` answers depend entirely on which node
-/// happens to serve the dashboard's request — live-witnessed: the SAME tenant
-/// showed 0 requests on 7 of 8 fleet nodes and real traffic only on the 8th.
-/// `q.local=true` (set only on the inner fan-out call below) stops a peer from
-/// ALSO fanning out — single-hop only, no N-way amplification.
+/// TENANT-SCOPED usage series and breakdowns for the Usage page: every series/status/path read is
+/// confined to the caller's tenant (the owner ops console reads global metrics through the separate
+/// operator-gated `admin_overview`). FLEET-AGGREGATE: `MetricsStore` is node-local with zero
+/// cross-node merge (never gossiped, and deliberately NOT adopted from a peer on restore, see
+/// `guardian::strip_node_local`: it would double-count that node's traffic, unlike billing, which
+/// has a single elected metering owner), and a tenant's traffic can land on ANY healthy node the
+/// routing mesh sends it to, so without fanning out `/v1/metrics` answers depend on which node
+/// serves the dashboard's request (the same tenant once showed 0 requests on 7 of 8 nodes and real
+/// traffic only on the 8th). `q.local=true` (set only on the inner fan-out call) stops a peer from
+/// fanning out again: single hop, no N-way amplification. The requested span is clamped to what the
+/// resolution's ring buffer retains (`Granularity::max_span_minutes`: minute 24 h, hour 30 d, day
+/// about 13 months, see `metrics.rs`), and the fleet-fan-out result (never the inner `local=true`
+/// hop) is cached for a few seconds, collapsing redundant fan-outs from several tabs or team
+/// members into one cross-node round.
 async fn metrics_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13838,20 +13768,10 @@ async fn metrics_get(
     Query(q): Query<MetricsQ>,
 ) -> Json<Value> {
     let gran = crate::metrics::Granularity::parse(q.gran.as_deref());
-    // Clamp to what this resolution's ring buffer actually retains (Minute:
-    // 24h, Hour: 30d, Day: ~13mo — see metrics.rs's MAX_*_BUCKETS) so a caller
-    // can never request a span longer than the data that exists to answer it.
     let minutes = q.minutes.unwrap_or(60).min(gran.max_span_minutes());
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // TENANT-SCOPED: every series/status/path read is confined to the caller's
-    // tenant — no cross-tenant telemetry leak. (The owner ops console reads global
-    // metrics through the separate operator-gated `admin_overview`.)
     let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
-    // few seconds — collapses redundant fan-outs from multiple tabs/team
-    // members viewing the same tenant's metrics within the window into one
-    // real cross-node round.
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
         "metrics:{t}:{minutes}:{}:{}",
@@ -13936,9 +13856,9 @@ struct SpeedInsightsQ {
     minutes: Option<usize>,
     /// "desktop" | "mobile" — absent means both.
     device: Option<String>,
-    /// Set by the fleet fan-out's own inner call — same single-hop rationale
-    /// as `metrics_get`'s `MetricsQ.local` (RUM samples are node-local: a
-    /// tenant's visitors can land on any node the routing mesh sends them to).
+    /// Set by the fleet fan-out's own inner call: the same single-hop rationale as
+    /// `MetricsQ::local` (RUM samples are node-local, a tenant's visitors can land on any node the
+    /// routing mesh sends them to).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
@@ -13951,13 +13871,12 @@ fn parse_device(s: Option<&str>) -> Option<RumDevice> {
     }
 }
 
-/// Real User Monitoring summary for the Speed Insights page — p75/p90/p95/p99
-/// per Core Web Vital, a computed Real Experience Score, real top routes by
-/// beacon count, and the true sample count. See `fluid_gateway::RumStore` for
-/// where the underlying beacon data actually lives (this endpoint was
-/// entirely missing before — the beacon fired and was silently 202-accepted
-/// with no storage, and the dashboard's Speed Insights page was a hardcoded
-/// empty stub waiting for exactly this).
+/// Default Speed Insights window: the last 7 days.
+const SPEED_INSIGHTS_DEFAULT_MINUTES: usize = 10_080;
+
+/// Real User Monitoring summary for the Speed Insights page: p75/p90/p95/p99 per Core Web Vital, a
+/// computed Real Experience Score, real top routes by beacon count and the true sample count. See
+/// `fluid_gateway::RumStore` for where the underlying beacon data lives.
 async fn speed_insights_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13965,7 +13884,7 @@ async fn speed_insights_get(
     Query(q): Query<SpeedInsightsQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let minutes = q.minutes.unwrap_or(10_080); // default "Last 7 Days"
+    let minutes = q.minutes.unwrap_or(SPEED_INSIGHTS_DEFAULT_MINUTES);
     let device = parse_device(q.device.as_deref());
     let mut raw = c.gw.rum_raw(&t, minutes, device);
     if q.local.unwrap_or(false) {
@@ -13994,26 +13913,34 @@ async fn speed_insights_get(
     Json(result)
 }
 
-// ============================ Owner / ops dashboard ============================
-
 #[derive(Deserialize, Default)]
 struct OverviewQ {
-    /// Set by the fleet fan-out's own inner call — see `metrics_get`'s doc
-    /// comment for the identical single-hop-fan-out rationale (`c.counters()`
-    /// and `c.metrics` are both confirmed node-local with no live cross-node
-    /// merge, same defect class).
+    /// Set by the fleet fan-out's own inner call: the same single-hop rationale as
+    /// `MetricsQ::local` (`c.counters()` and `c.metrics` are both node-local with no live
+    /// cross-node merge).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 
+/// The operator ops-console overview: GLOBAL across all tenants (owner-only) and FLEET-AGGREGATE.
+/// `c.counters()` and `c.metrics` are node-local (the same defect as `metrics_get`), so without the
+/// fan-out the headline request, blocked and error-rate tiles would reflect only whichever node
+/// serves the request and understate fleet traffic by up to 8x; `local=true` on the fan-out call
+/// stops peer recursion (one hop). The raw 30-minute request/error counts are returned, not just
+/// the ratio, so a fan-out call can weight-average across nodes instead of averaging
+/// already-averaged per-node ratios. The result is cached like `metrics_get` (the fan-out costs
+/// ~100 ms per call on the leader and two admin pages poll this every few seconds). Deployments are
+/// local plus gossiped `peer_deployments` (deduped by id), because the placement scheduler hosts
+/// deployments on peers and a bare `c.gw.list()` would under-count to zero here; projects are the
+/// tenant-tagged projects store (authoritative, gossiped) UNION any project that only shows up as a
+/// hosted deployment, so a project is counted even before its record replicates. Cluster capacity
+/// is the sum of every live node's host resources.
 async fn admin_overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     q: Option<Query<OverviewQ>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    // Cached like `metrics_get`: the fleet fan-out below costs ~100 ms per
-    // call on the leader and two admin pages poll this every few seconds.
     let local = q
         .as_ref()
         .map(|q| q.0.local.unwrap_or(false))
@@ -14032,8 +13959,6 @@ async fn admin_overview(
     let nodes = c.registry.nodes();
     let dbs = c.databases.list(None);
     let live_dbs = dbs.iter().filter(|d| d.mode == "live").count();
-    // Recent error rate from the metrics buckets (last 30m), GLOBAL across all
-    // tenants — this is the operator ops console (owner-only), not tenant-facing.
     let series = c.metrics.series(
         crate::metrics::Granularity::Minute,
         30,
@@ -14043,11 +13968,6 @@ async fn admin_overview(
     );
     let mut req30: u64 = series.iter().map(|b| b.requests).sum();
     let mut err30: u64 = series.iter().map(|b| b.errors).sum();
-    // FLEET-AGGREGATE: `c.counters()`/`c.metrics` are node-local (same confirmed
-    // defect as `metrics_get` — see its doc comment). Without this, the ops
-    // console's headline request/blocked/error-rate tiles reflect only whichever
-    // node happens to serve the request, understating real fleet traffic by up
-    // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
     if !local {
         for v in fan_out_peers_polled(
             &c,
@@ -14068,12 +13988,6 @@ async fn admin_overview(
     } else {
         err30 as f64 / req30 as f64
     };
-    // Fleet-aggregated counts (operator, all tenants): the ops overview runs on
-    // ONE node while the placement scheduler hosts deployments on peers, so a
-    // bare `c.gw.list()` under-counts to zero here. Deployments = local + gossiped
-    // peer_deployments (deduped by id). Projects = the tenant-tagged projects
-    // store (authoritative, gossiped) UNION any project that only shows up as a
-    // hosted deployment — so a project is counted even before its record replicates.
     let fleet_deps = fleet_deployments_all(&c);
     let deployments_count = fleet_deps.len();
     let projects_count = {
@@ -14098,15 +14012,11 @@ async fn admin_overview(
         "requests": reqs,
         "blocked": blocked,
         "error_rate_30m": err_rate,
-        // Raw 30m request/error counts (not just the ratio) so a fleet fan-out
-        // call can correctly weight-average across nodes rather than averaging
-        // already-averaged per-node ratios.
         "req30": req30,
         "err30": err30,
         "incidents_open": c.incidents.open_count(),
         "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
         "webhooks": c.webhooks.list(None).len(),
-        // Real cluster capacity = sum of every live node's host resources.
         "resources": {
             "cpu_cores": nodes.iter().map(|n| n.cpu_cores as u64).sum::<u64>(),
             "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
@@ -14119,12 +14029,12 @@ async fn admin_overview(
     Ok(Json(overview))
 }
 
+/// The durable, append-only audit log of every state mutation, newest first (operator only).
 async fn admin_audit(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    // The durable, append-only audit log of every state mutation (newest first).
     Ok(Json(json!(c.audit.recent(300, None))))
 }
 
@@ -14168,29 +14078,9 @@ async fn status_incidents(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.incidents.public_board()))
 }
 
-/// Leader-forward for mutations of leader→follower REGISTRY-synced stores
-/// (incidents, push): a follower-side write returns 200, persists locally,
-/// then gets silently CLOBBERED by the next sync cycle's wholesale snapshot
-/// adoption (live-hit 2026-07-21: an incident created on fc-lax vanished from
-/// fc-lax itself minutes later). Mutations therefore run ONLY on the leader —
-/// a non-leader node forwards the request there (carrying the caller's own
-/// bearer, so the leader re-verifies the same JWT against the fleet-shared
-/// secret) and returns the leader's response, or fails LOUDLY with 502. It
-/// must never fall back to the local write: accepting a write the sync loop
-/// will erase is strictly worse than refusing it.
-///
-/// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation
-/// tokens are stripped of `platform_admin` on verification (`gossip::
-/// team_claims` — a compromised trusted peer could otherwise forge operator
-/// authority fleet-wide; closing that needs per-node signing keys), so an
-/// operator-gated mutation cannot ride the mesh under the current threat
-/// model. In practice the dashboard's `/ops` proxy already talks to the
-/// leader directly, so this 502 only surfaces on direct API calls against a
-/// follower whose HTTP admin map lacks the leader — which previously LOST the
-/// write silently and now names the fix instead.
-/// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT
-/// send from THIS node so a regional key is presented from an NA-classified
-/// IP. Reached via `put_to_host` (HTTP admin in dev, gossip arm on the mesh).
+/// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT send from THIS node so a
+/// regional key is presented from an NA-classified IP. Reached via `put_to_host` (HTTP admin in
+/// dev, gossip arm on the mesh).
 async fn push_sms_relay(State(c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
     Json(crate::push::sms_relay_exec(&c, v).await)
 }
@@ -14205,6 +14095,27 @@ async fn push_sms_direct_mx(
     Json(crate::push::sms_direct_mx_exec(v).await)
 }
 
+/// Leader-forward for mutations of leader-to-follower REGISTRY-synced stores (incidents, push): a
+/// follower-side write returns 200, persists locally, then gets silently CLOBBERED by the next sync
+/// cycle's wholesale snapshot adoption (an incident created on a follower vanished from it minutes
+/// later). Mutations therefore run ONLY on the leader: a non-leader forwards the request there,
+/// carrying the caller's own credentials so the leader re-verifies the same JWT against the
+/// fleet-shared secret, and returns the leader's response, or fails LOUDLY with 502. It must never
+/// fall back to the local write: accepting a write the sync loop will erase is strictly worse than
+/// refusing it. With no other owner to forward to (a configured chain dark in this node's view, or
+/// this node owns but may not serve: isolated) it answers a retryable 503, never a local apply.
+///
+/// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation tokens are stripped
+/// of `platform_admin` on verification (`gossip::team_claims`, so a compromised trusted peer cannot
+/// forge operator authority fleet-wide; closing that needs per-node signing keys), so an
+/// operator-gated mutation cannot ride the mesh under the current threat model. In practice the
+/// dashboard's `/ops` proxy already talks to the leader directly, so the 502 only surfaces on
+/// direct API calls against a follower whose HTTP admin map lacks the leader, which previously LOST
+/// the write silently and now names the fix. Every credential and tenant-context header the leader
+/// re-derives auth and tenant from is forwarded: Authorization (bearer), Cookie (the dashboard's
+/// `hive_jwt` is a cookie, not a bearer, and dropping it 401'd cookie-auth mutations) and
+/// `x-hive-team` (the tenant selector `tenant()` reads in unenforced mode; dropping it silently
+/// mis-stored the row under "personal").
 async fn forward_mutation_to_leader(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -14212,9 +14123,6 @@ async fn forward_mutation_to_leader(
     path: &str,
     body: &Value,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // No other owner to forward to (a configured chain dark in this node's
-    // view, or this node owns but may not serve — isolated): a retryable 503,
-    // never a local apply — the write belongs to a serving owner.
     let Some(leader) = c.leader_forward_target() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -14236,11 +14144,6 @@ async fn forward_mutation_to_leader(
     if !body.is_null() {
         req = req.json(body);
     }
-    // Forward EVERY credential/tenant-context header the leader re-derives auth
-    // and tenant from: Authorization (bearer), Cookie (the dashboard's hive_jwt
-    // is a cookie, not a bearer — dropping it 401'd cookie-auth mutations), and
-    // x-hive-team (the tenant selector `tenant()` reads in unenforced mode —
-    // dropping it silently mis-stored the row under "personal").
     for h in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -14379,8 +14282,6 @@ async fn incident_delete(
     Ok(Json(json!({ "ok": true, "deleted": inc.id })))
 }
 
-// ============================ Push delivery (web push + SMS) ============================
-
 /// Caller's user id from verified claims (`sub` = Clerk user id via the mint);
 /// "local" in unenforced dev mode. Push/SMS rows are keyed by this so
 /// `push_settings` can never return a teammate's devices or phone number.
@@ -14391,20 +14292,19 @@ fn push_user_id(claims: Option<&crate::auth::Claims>) -> String {
         .unwrap_or_else(|| "local".into())
 }
 
-/// Public VAPID key for `pushManager.subscribe` — requires a signed-in session
-/// (the key itself is public by design; the gate just keeps the surface
-/// consistent with every other dashboard read).
+/// Public VAPID key for `pushManager.subscribe`; it requires a signed-in session (the key itself is
+/// public by design, the gate just keeps the surface consistent with every other dashboard read).
+/// The key is generated ONLY on the leader (a follower minting its own key forks the fleet keypair
+/// and strands every subscription made against the other key), and a follower before the leader's
+/// key has synced in answers a transient, retryable 503.
 async fn push_vapid_key(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
-    // Generate ONLY on the leader (a follower minting its own key forks the
-    // fleet keypair, stranding every subscription made against the other key).
     crate::push::ensure_vapid_on_leader(&c);
     let keys = c.push.vapid();
     if keys.public_b64.is_empty() {
-        // Follower before the leader's key has synced in — transient, retryable.
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "push keys initializing; retry shortly".into(),
@@ -14422,21 +14322,20 @@ pub(crate) struct PushSubscribeBody {
     label: String,
 }
 
-/// Register (or re-register) this browser's push subscription under the
-/// caller's VERIFIED tenant — the tenant comes from `tenant()` (JWT claim
-/// first, never a bare spoofable header under enforcement), which is the
-/// entire cross-tenant isolation story for delivery: the dispatcher only fans
-/// a tenant's notifications to rows stored under that exact tenant.
+/// Registers (or re-registers) this browser's push subscription under the caller's VERIFIED tenant:
+/// the tenant comes from `tenant()` (JWT claim first, never a bare spoofable header under
+/// enforcement), which is the entire cross-tenant isolation story for delivery, since the
+/// dispatcher only fans a tenant's notifications to rows stored under that exact tenant. The
+/// endpoint host must be a recognized push service (so our VAPID-signed server-side POST cannot be
+/// aimed at an arbitrary attacker URL) and the subscriber keys well-formed (garbage keys create
+/// rows that fail encryption on every tick forever); both are validated BEFORE forwarding to the
+/// leader.
 async fn push_subscribe(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<PushSubscribeBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Validate BEFORE forwarding: endpoint host must be a recognized push
-    // service (stops our VAPID-signed server-side POST from being aimed at an
-    // arbitrary attacker URL) and the subscriber keys must be well-formed
-    // (garbage keys create rows that fail encryption on every tick forever).
     if let Err(e) = crate::push::valid_subscription_input(&b.endpoint, &b.p256dh, &b.auth) {
         return Err((StatusCode::BAD_REQUEST, e.into()));
     }
@@ -14505,8 +14404,11 @@ async fn push_unsubscribe(
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
-/// The CALLER's own delivery config for the current tenant — never anyone
-/// else's (rows are filtered by the verified user id AND tenant).
+/// The CALLER's own delivery config for the current tenant, never anyone else's (rows are filtered
+/// by the verified user id AND tenant): registered devices, SMS state (`verified` gates delivery;
+/// `sms_quota` is served from a short-TTL cache so this read never blocks on a live Textbelt round
+/// trip) and the key state for the operator UI (which source is live and a masked tail, never the
+/// key itself).
 async fn push_settings(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14521,15 +14423,11 @@ async fn push_settings(
         .into_iter()
         .map(|d| json!({ "endpoint": d.endpoint, "label": d.label, "created_ms": d.created_ms }))
         .collect();
-    // `verified` gates delivery; `sms_quota` is served from a short-TTL cache so
-    // this read never blocks on a live Textbelt round trip.
     let sms = c
         .push
         .sms_for(&user, &team)
         .map(|s| json!({ "phone": s.phone, "enabled": s.enabled, "verified": s.verified }));
     let quota = crate::push::sms_quota_cached(&c).await;
-    // Key state for the operator UI: which source is live and a masked tail —
-    // never the key itself.
     let (key_source, key_masked) = match c.push.sms_key_override() {
         Some(k) => (
             "override",
@@ -14565,14 +14463,12 @@ pub(crate) struct PushSmsKeyBody {
     key: String,
 }
 
-/// Operator-set Textbelt key (see `PushState::sms_key_override`): refilling
-/// Textbelt is a purchase that funds a specific key, and requiring per-node
-/// env surgery to activate it left SMS dead even after payment. Platform-admin
-/// gated (it changes billing-bearing behavior for the whole platform);
-/// leader-forwarded so the store-sync registry replicates it fleet-wide
-/// (including the NA-egress relay peers) instead of a follower write being
-/// clobbered. Responds with the masked state + the NEW key's live quota so
-/// the dashboard confirms the paste worked in one round trip.
+/// Operator-set Textbelt key (see `PushState::sms_key_override`): refilling Textbelt is a purchase
+/// that funds a specific key, and per-node env surgery to activate it left SMS dead even after
+/// payment. Platform-admin gated (it changes billing-bearing behavior for the whole platform) and
+/// leader-forwarded so the store-sync registry replicates it fleet-wide (including the NA-egress
+/// relay peers) instead of a follower write being clobbered. It responds with the masked state plus
+/// the NEW key's live quota, so the dashboard confirms the paste worked in one round trip.
 async fn push_sms_key_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14618,11 +14514,11 @@ fn sms_verification_code() -> String {
     format!("{:06}", u32::from_be_bytes(b) % 1_000_000)
 }
 
-/// Set (or change) the SMS number. This does NOT enable delivery: it texts a
-/// verification code to the number and stores it PENDING. Delivery starts only
-/// after `push_sms_verify` confirms the code — so a caller can never point
-/// notifications at a phone number they don't control (anti-SMS-bombing).
-/// Toggling an already-verified number on/off skips re-verification.
+/// Sets (or changes) the SMS number. This does NOT enable delivery: it texts a verification code to
+/// the number and stores it PENDING. Delivery starts only after `push_sms_verify` confirms the
+/// code, so a caller can never point notifications at a phone number they do not control
+/// (anti-SMS-bombing). Toggling an already-verified, unchanged number on/off skips re-verification
+/// and sends no text, and a send within the resend cooldown spends no further SMS.
 async fn push_sms_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14652,7 +14548,6 @@ async fn push_sms_put(
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let user = push_user_id(claims.as_ref().map(|e| &e.0));
 
-    // Fast path: toggling an already-verified, unchanged number needs no text.
     if let Some(existing) = c.push.sms_for(&user, &team) {
         if existing.verified && existing.phone == phone {
             c.push.set_sms_enabled(&user, &team, b.enabled);
@@ -14668,7 +14563,6 @@ async fn push_sms_put(
         .push
         .set_sms_pending(&user, &team, &phone, &code, hive_core::now_ms());
     if !sent {
-        // Within resend cooldown — do not spend another SMS.
         crate::persist::persist(&c);
         return Ok(Json(
             json!({ "ok": true, "verified": false, "code_sent": false, "note": "a code was already sent recently; check your messages or wait a minute" }),
@@ -14744,12 +14638,15 @@ static PUSH_TEST_LAST: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 const PUSH_TEST_COOLDOWN_MS: u64 = 30_000;
 
-/// Send a real test notification through the REAL delivery pipeline to the
-/// caller's own registered devices/SMS for the current tenant. Deliberately
-/// NOT leader-gated: it mutates nothing (no store writes), and running it on
-/// any node is exactly what makes dev/non-leader verification possible. Rate-
-/// limited per user; the SMS leg only ever reaches the caller's OWN verified
-/// number.
+/// Sends a real test notification through the REAL delivery pipeline to the caller's own registered
+/// devices/SMS for the current tenant. Deliberately NOT leader-gated: it mutates nothing in the
+/// store apart from pruning, and running it on any node is exactly what makes dev/non-leader
+/// verification possible. It is rate-limited per user, and the SMS leg only ever reaches the
+/// caller's OWN verified and enabled number. A 404/410 from a device means the subscription is
+/// permanently gone (browser profile closed or unsubscribed): it is pruned rather than reported as
+/// a scary failure, so the next test is clean, exactly like the background dispatcher does, durably
+/// (locally on the leader, else through the leader-forwarded DELETE, since the PushStore is
+/// REGISTRY-synced and a follower-local remove would be clobbered by the next sync).
 async fn push_test(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14761,7 +14658,6 @@ async fn push_test(
     let user = push_user_id(claims.as_ref().map(|e| &e.0));
     let opts = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Rate-limit per (user, tenant) — cheap in-memory cooldown.
     let rl_key = format!("{user}|{team}");
     {
         let now = hive_core::now_ms();
@@ -14797,17 +14693,10 @@ async fn push_test(
     for d in &devices {
         match crate::push::send_web_push(&c, d, &payload).await {
             Ok(true) => sent += 1,
-            // A 404/410 means the subscription is permanently gone (the browser
-            // profile closed / unsubscribed). Don't report it as a scary
-            // failure — prune it so the test self-heals and the next one is
-            // clean, exactly like the background dispatcher does.
             Ok(false) => dead.push(d.endpoint.clone()),
             Err(e) => errors.push(format!("{}: {e}", d.label)),
         }
     }
-    // Prune the dead subscriptions durably: locally if we're the leader, else
-    // via the leader-forwarded DELETE (the PushStore is REGISTRY-synced, so a
-    // follower-local remove would be clobbered by the next sync).
     for endpoint in &dead {
         if c.is_control_plane_leader() {
             c.push.remove_subscription(endpoint, None);
@@ -14827,7 +14716,6 @@ async fn push_test(
     }
     let pruned = dead.len();
 
-    // SMS test only ever targets the caller's OWN verified+enabled number.
     let sms_result = match c.push.sms_for(&user, &team) {
         Some(t) if t.enabled && t.verified => match crate::push::send_sms(
             &c,
@@ -14849,12 +14737,17 @@ async fn push_test(
     })))
 }
 
-// ---- Notifications (inbox bell) ----
-
-/// Compute the live notification list for a team from real platform signals
-/// (failed deploys, 5xx error anomalies, blocked-traffic usage anomalies),
-/// applying the user's read/archived state. Archived items keep their `archived`
-/// flag so the client can render an Archive tab.
+/// Computes the live notification list for a team from real platform signals (failed deploys and
+/// builds, 5xx error anomalies, blocked-traffic usage anomalies), applying the user's read/archived
+/// state; archived items keep their `archived` flag so the client can render an Archive tab. A
+/// failed deploy or build is live only while it is still the most recent thing that happened to its
+/// project: the newest event timestamp per project is taken across BOTH deployments and builds, and
+/// a later deployment or build (for example a successful redeploy) makes the failure moot, where
+/// without that check a failure from weeks ago kept notifying forever. Deployment ownership uses
+/// the authoritative record tag (present on the local record, unlike the node-local project row,
+/// which is UNTAGGED on a non-hosting node), while builds and edge events (which carry no tenant
+/// tag) are judged through the fleet-aware `project_owned_by` predicate, so a member's alerts are
+/// not dropped on a node whose project row is absent.
 pub(crate) fn build_notifications(
     c: &Arc<CloudState>,
     team: &str,
@@ -14864,14 +14757,6 @@ pub(crate) fn build_notifications(
     let team = norm(team).to_string();
     let mut out: Vec<Notification> = Vec::new();
 
-    // Newest event timestamp per project, across BOTH deployments and builds --
-    // a failed deploy/build notification is only live while it's still the most
-    // recent thing that happened to its project. Without this, a failure from
-    // weeks ago kept notifying forever even after the project redeployed
-    // successfully since (the "old stale notifs" bug: build_notifications had no
-    // time window and no superseded-by-a-later-event check at all, so every
-    // Error-state deployment/build that ever existed showed up indefinitely
-    // unless the user explicitly archived it).
     let mut newest_per_project: HashMap<String, u64> = HashMap::new();
     for d in c.gw.list() {
         if record_tenant(&d.tenant) != team {
@@ -14888,15 +14773,10 @@ pub(crate) fn build_notifications(
         *e = (*e).max(b.started_ms);
     }
 
-    // 1) Failed deployments.
     for d in c.gw.list() {
-        // Authoritative record tag (present on the local record), not the
-        // node-local project row which is UNTAGGED on a non-hosting node.
         if record_tenant(&d.tenant) != team {
             continue;
         }
-        // Superseded by a later deployment or build for the same project (e.g.
-        // a subsequent successful redeploy) -- the failure is moot, stop notifying.
         if newest_per_project
             .get(&d.project)
             .is_some_and(|&t| t > d.created_at_ms)
@@ -14923,11 +14803,7 @@ pub(crate) fn build_notifications(
         }
     }
 
-    // 1b) Failed builds (git deploys that errored before going live).
     for b in c.builds.list() {
-        // Fleet-aware ownership (project rows are node-local): a failed-build
-        // alert would otherwise silently drop on any node whose project row is
-        // absent, hiding the failure from the owner.
         if !project_owned_by(&c, &b.project, &team) {
             continue;
         }
@@ -14955,16 +14831,12 @@ pub(crate) fn build_notifications(
         }
     }
 
-    // 2) Error / usage anomalies from recent edge events, grouped per project.
     let mut err5xx: HashMap<String, u64> = HashMap::new();
     let mut blocked: HashMap<String, u64> = HashMap::new();
     for ev in c.recent_events(300) {
         if ev.project.is_empty() {
             continue;
         }
-        // Edge events carry no tenant tag — judge via the fleet-aware predicate
-        // (deployment tenant tags) so a member's error/usage alerts aren't
-        // dropped on a node whose project row is absent.
         if !project_owned_by(c, &ev.project, &team) {
             continue;
         }
@@ -15012,6 +14884,13 @@ pub(crate) fn build_notifications(
     out
 }
 
+/// The tenant's notification list (the inbox bell). Every ITEM is derived from node-local sources
+/// (`gw.list`, `builds.list`, `recent_events`) even though the read/archived flags are replicated,
+/// so a deploy that fails on the node hosting it produced no notification on the others and the
+/// bell's poll made the badge appear and vanish depending on which node answered (a failed
+/// production deploy could go unseen). It therefore merges the peers' lists by the
+/// already-deterministic notification id; `local=true` (the inner fan-out call) answers from this
+/// node only.
 async fn notifications_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15023,12 +14902,6 @@ async fn notifications_list(
     if q.local == Some(true) {
         return Json(json!({ "unread": 0, "inbox": 0, "items": items }));
     }
-    // Every ITEM is derived from node-local sources (`gw.list`, `builds.list`,
-    // `recent_events`) even though the read/archived flags are replicated. A
-    // deploy that fails on the FC node hosting it produced no notification on
-    // the other nodes, so the bell's 8s poll made the badge appear and vanish
-    // depending on which node answered — and a failed production deploy could
-    // go unseen. Merge peers by the already-deterministic notification id.
     let mut merged: Vec<Value> = items.iter().map(|n| json!(n)).collect();
     let peers = peer_nodes_for_tenant(&c, &team);
     for v in fan_out_peers_polled(&c, &peers, &team, "/v1/notifications?local=true").await {
@@ -15056,6 +14929,9 @@ async fn notifications_list(
     Json(json!({ "unread": unread, "inbox": inbox, "items": merged }))
 }
 
+/// Archives one notification, only if the id belongs to the caller's own team's feed: the ids are
+/// predictable (`deploy-<id>`, `anom-*`), so an unchecked archive would let one team hide another
+/// team's alert by guessing the format.
 async fn notification_archive(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15063,10 +14939,6 @@ async fn notification_archive(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Only archive an id that actually belongs to the caller's own team's
-    // notification feed — this used to archive ANY id globally, letting one
-    // team hide another team's alert (e.g. a failed-deploy/error-rate
-    // notification) by guessing its predictable `deploy-<id>`/`anom-*` format.
     if !build_notifications(&c, &team).iter().any(|n| n.id == id) {
         return Err((StatusCode::NOT_FOUND, "no such notification".into()));
     }
@@ -15103,8 +14975,6 @@ async fn notifications_read(
     Json(json!({ "read": ids.len() }))
 }
 
-// ============================ Identity sync (orgs & users) ============================
-
 #[derive(Deserialize)]
 struct SyncOrg {
     id: String,
@@ -15134,34 +15004,16 @@ struct IdentitySyncReq {
     org: Option<SyncOrg>,
 }
 
-/// The dashboard syncs the signed-in user + active org from the identity provider
-/// (Clerk). We index them into the store, scoped to the active tenant namespace.
-///
-/// SECURITY (fixes a confirmed cross-tenant data leak): `is_owner` and the
-/// indexed tenant are now derived from the caller's OWN verified JWT claims
-/// (`platform_admin`/`tenant`) when auth is enforced — NEVER from the request
-/// body's `user.email`/`org`. The previous implementation trusted the body
-/// outright: this route requires SOME authenticated caller (any mutation not
-/// in `auth::require_auth`'s open list), but nothing checked that the caller
-/// actually WAS the identity/org they claimed — so any authenticated user,
-/// including one from a completely different, unprivileged tenant, could POST
-/// `{"user":{"email":"<owner's email>"},...}` and get back `is_owner: true`.
-/// The dashboard's own client then persisted that as `hive_is_owner=1` in
-/// their OWN browser's localStorage, and `currentTeam()` (ui/lib/api.ts) reads
-/// that flag to route EVERY subsequent request from that browser to the
-/// owner's "personal" tenant — exposing the owner's real projects,
-/// deployments, and billing data to that caller. Likewise, an org claimed in
-/// `req.org` is only honored if it matches the caller's own verified tenant
-/// (already Clerk-membership-checked at JWT-mint time in `/api/token`), so a
-/// caller can't index themselves into (or read as) an org they don't belong
-/// to. Unenforced (dev/local, no `HIVE_JWT_SECRET`) mode keeps the old
-/// body-trusting behavior — there is no tenant boundary to protect there.
-/// Pure decision core of `identity_sync` (no request/state deps, unit-testable):
-/// given the caller's OWN verified claims (if any), the enforcement mode, the
-/// org they're claiming (if any), and their raw user id, resolve `(tenant,
-/// org_slug_to_index, is_owner)`. `body_email_is_owner` is ONLY consulted in
-/// the unenforced-dev fallback (`auth_is_owner: None, enforced: false`) — it
-/// must never be trusted when `enforced` is true.
+/// Pure decision core of `identity_sync` (no request/state deps, unit-testable): given the caller's
+/// OWN verified claims (if any), the enforcement mode, the org they are claiming (if any) and their
+/// raw user id, resolves `(tenant, org_slug_to_index, is_owner)`. `body_email_is_owner` is ONLY
+/// consulted in the unenforced-dev fallback (`auth_is_owner: None, enforced: false`) and must never
+/// be trusted when `enforced` is true. An org claimed in the request is honoured only if it matches
+/// the caller's own verified tenant (already Clerk-membership-checked at JWT-mint time in
+/// `/api/token`): a caller authenticated as a DIFFERENT tenant never indexes, or reports, an org
+/// they are not verified to belong to, and falls back to their own real tenant. Personal scope: the
+/// OWNER keeps the legacy "personal" namespace and every other verified caller is isolated under
+/// their own `u_<uid>`, never the shared literal "personal".
 fn resolve_identity_sync(
     enforced: bool,
     auth_tenant: Option<&str>,
@@ -15173,9 +15025,6 @@ fn resolve_identity_sync(
     let (tenant, org_slug) = match claimed_org_slug {
         Some(slug) => {
             if enforced && auth_tenant != Some(slug) {
-                // Authenticated as a DIFFERENT tenant than the org claimed here —
-                // never index (or report) an org the caller isn't verified to
-                // belong to. Fall back to their own real tenant.
                 (
                     auth_tenant
                         .map(str::to_string)
@@ -15187,12 +15036,9 @@ fn resolve_identity_sync(
             }
         }
         None => match auth_is_owner {
-            // Personal scope: the OWNER keeps the legacy "personal" namespace;
-            // every other verified caller is isolated under their own `u_<uid>`
-            // — never the shared literal "personal".
             Some(true) => ("personal".to_string(), None),
             Some(false) => (format!("u_{user_id}"), None),
-            None if !enforced => ("personal".to_string(), None), // dev/unenforced fallback
+            None if !enforced => ("personal".to_string(), None),
             None => (ANON_TENANT.to_string(), None),
         },
     };
@@ -15204,6 +15050,23 @@ fn resolve_identity_sync(
     (tenant, org_slug, is_owner)
 }
 
+/// The dashboard syncs the signed-in user and active org from the identity provider (Clerk); we
+/// index them into the store, scoped to the active tenant namespace. `is_owner` and the indexed
+/// tenant come from the caller's OWN verified JWT claims (`platform_admin`/`tenant`) when auth is
+/// enforced, NEVER from the request body's `user.email`/`org` (see [`resolve_identity_sync`]): this
+/// route requires only SOME authenticated caller, so trusting the body let any authenticated user,
+/// even from an unprivileged tenant, POST the owner's email and get back `is_owner: true`, which
+/// the dashboard client then persisted (`hive_is_owner`) and used to route every later request to
+/// the owner's "personal" tenant. Unenforced (dev/local, no `HIVE_JWT_SECRET`) mode keeps the
+/// body-trusting behaviour: there is no tenant boundary to protect there.
+///
+/// Verified org membership is mirrored into the teams roster (`team_create` seeds only the platform
+/// owner, so Clerk org members were otherwise invisible to `GET /v1/teams`). `org_slug` is only
+/// Some when the caller's verified JWT tenant equals the claimed org, and the mirror is gated on
+/// `x-hive-internal` so the email is exactly the Clerk-verified one the server-side mint route
+/// posts: a browser-originated sync cannot write an arbitrary body email into its org's roster.
+/// Members are added if absent only (`add_member` overwrites an existing member's role, and a
+/// manually granted Owner/Admin must never be demoted by a routine sync).
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15235,14 +15098,6 @@ async fn identity_sync(
     if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
         c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
     }
-    // Mirror VERIFIED org membership into the teams roster. Previously nothing
-    // ever did: `team_create` seeds only the platform owner, so every Clerk org
-    // member who signed in and used the team daily was invisible to
-    // GET /v1/teams. `org_slug` is only Some when the caller's verified JWT
-    // tenant equals the claimed org (Clerk-membership-checked at mint). Gated
-    // on `x-hive-internal` so the email is exactly the Clerk-verified one the
-    // server-side mint route posts — a browser-originated sync (no internal
-    // header) can't write an arbitrary body email into its org's roster.
     if let Some(slug) = &org_slug {
         let email = req.user.email.trim();
         if !email.is_empty()
@@ -15258,9 +15113,6 @@ async fn identity_sync(
                     .unwrap_or(slug.as_str());
                 let _ = c.teams.create_with_slug(slug, name, "pro", &c.owner_email);
             }
-            // Add-if-absent only: `add_member` overwrites an existing member's
-            // role, and a manually granted Owner/Admin must never be demoted
-            // by a routine sync.
             let already = c
                 .teams
                 .get(slug)
@@ -15288,27 +15140,25 @@ async fn identity_sync(
     Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
-// ============================ Billing & compute credits ============================
-
-/// The single node currently metering usage into `BillingStore` — the SAME
-/// designation `spawn_billing_meter_loop`'s gate uses
-/// (`leadership::job_owner(BillingMeter)`: the strict chain owner, or on a
-/// chain-less mesh the `HIVE_BILLING_COORDINATOR_NODE` pin / the election) —
-/// every OTHER node's local `BillingStore` is stale/empty for live reads (only
-/// ever bootstrapped from a peer snapshot at boot, never kept live-current).
-/// `None` while no owner is resolvable (the caller serves its local copy).
+/// The single node currently metering usage into `BillingStore`: the SAME designation
+/// `spawn_billing_meter_loop`'s gate uses (`leadership::job_owner(BillingMeter)`: the strict chain
+/// owner, or on a chain-less mesh the `HIVE_BILLING_COORDINATOR_NODE` pin or the election). Every
+/// OTHER node's local `BillingStore` is stale or empty for live reads (only bootstrapped from a
+/// peer snapshot at boot, never kept live-current). `None` while no owner is resolvable (the caller
+/// serves its local copy).
 fn billing_authority_node(c: &Arc<CloudState>) -> Option<String> {
     crate::leadership::job_owner(c, crate::leadership::Job::BillingMeter)
 }
 
-/// Budget for the proxy-to-authority hop on a USER-FACING billing read.
-/// `fetch_from_host`'s own budgets (10 s HTTP admin, then 20 s iroh) are
-/// DIAL-RESILIENCE budgets — right for a one-shot control operation, wrong on
-/// a request path (measured live: a follower's `/v1/billing/ledger` spent
-/// ~20 s inside them). A healthy hop is one mesh round trip (100-200 ms
-/// measured), so 3 s is >10x headroom; a hop that misses it falls through to
-/// this node's own in-process billing state, which is the cheaper correct
-/// answer at that point, not an error. `HIVE_BILLING_PROXY_READ_MS` overrides.
+/// Default `billing_proxy_budget()`: 3 s.
+const BILLING_PROXY_BUDGET_DEFAULT: Duration = Duration::from_millis(3000);
+
+/// Budget for the proxy-to-authority hop on a USER-FACING billing read. `fetch_from_host`'s own
+/// budgets (10 s HTTP admin, then 20 s iroh) are DIAL-RESILIENCE budgets, right for a one-shot
+/// control operation and wrong on a request path (a follower's `/v1/billing/ledger` once spent ~20
+/// s inside them). A healthy hop is one mesh round trip (100-200 ms measured), so 3 s is more than
+/// 10x headroom; a hop that misses it falls through to this node's own in-process billing state,
+/// the cheaper correct answer at that point, not an error. `HIVE_BILLING_PROXY_READ_MS` overrides.
 fn billing_proxy_budget() -> Duration {
     static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
@@ -15317,25 +15167,23 @@ fn billing_proxy_budget() -> Duration {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
-            .unwrap_or(Duration::from_millis(3000))
+            .unwrap_or(BILLING_PROXY_BUDGET_DEFAULT)
     })
 }
 
-/// Proxy a billing GET to the authority node when this node isn't it — fixes the
-/// confirmed bug where `/v1/billing` answers diverge by node (live-witnessed: 5
-/// distinct billing states, including a `plan` disagreement, across 8 nodes for
-/// the SAME tenant). Falls back to serving this node's own (possibly stale)
-/// local value if the proxy is unreachable, rather than erroring the page.
-///
-/// Bounded by `billing_proxy_budget()` on every caller: these are user-facing
-/// reads, and the authority's own answer (the terminal hop of this proxy, see
-/// `gossip::dispatch`'s `/v1/billing/*` arms) is itself bounded now — so a hop
-/// that misses the budget means the mesh is sick, and this node's local state
-/// is the right thing to serve rather than the reason to wait longer.
+/// Proxies a billing GET to the authority node when this node is not it, so `/v1/billing` answers
+/// no longer diverge by node (5 distinct billing states, including a `plan` disagreement, were once
+/// witnessed across 8 nodes for the SAME tenant). It falls back to this node's own (possibly stale)
+/// local value if the proxy is unreachable rather than erroring the page, and `None` means this
+/// node IS the authority (the caller serves its own local read). Every caller is bounded by
+/// `billing_proxy_budget()`: these are user-facing reads, and the authority's own answer (the
+/// terminal hop of this proxy, see `gossip::dispatch`'s `/v1/billing/*` arms) is itself bounded, so
+/// a hop that misses the budget means the mesh is sick and this node's local state is the right
+/// thing to serve rather than the reason to wait longer.
 async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     let authority = billing_authority_node(c)?;
     if authority == c.node_name {
-        return None; // we ARE authoritative; caller serves its own local read
+        return None;
     }
     match tokio::time::timeout(
         billing_proxy_budget(),
@@ -15356,6 +15204,10 @@ async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Opti
     }
 }
 
+/// The tenant's billing view: plan, live quota usage (the business-locking gauges), the metered
+/// rate card and this period's draft invoice, so the UI shows limits, usage and invoicing in one
+/// place. It is proxied to the metering authority when this node is not it (see
+/// [`proxy_billing_read`]).
 pub(crate) async fn billing_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15367,8 +15219,6 @@ pub(crate) async fn billing_get(
     }
     let acc = c.billing.account(&t);
     let plan = acc.plan.clone();
-    // Live quota usage (business-locking gauges) + the metered rate card + this
-    // period's draft invoice, so the UI shows limits/usage/invoicing in one place.
     let projects_used = c.projects.count_for_team(&t) as u32;
     let members_used = c
         .teams
