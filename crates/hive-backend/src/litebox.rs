@@ -1444,13 +1444,11 @@ impl LiteboxBackend {
         Some(net)
     }
 
-    /// Idempotently enable forwarding and NAT for litebox guests (`10.88.0.0/16`): internet egress
-    /// only (guest-to-guest traffic, private ranges, the metadata endpoint and the node's admin
-    /// port are dropped ahead of the ACCEPTs, inserted at the head of FORWARD), plus a hairpin
-    /// redirect of 80/443 for a guest calling its own public hostname. The hairpin address reaches
-    /// the script only as `$HAIRPIN_IP`, never interpolated. The nft branch keeps its own
-    /// `hive_nat_litebox` table, which a lockdown regeneration leaves alone. Failures are
-    /// non-fatal: cells simply get no egress.
+    /// Idempotently enables forwarding and NAT for guests (`10.88.0.0/16`): internet egress only
+    /// (guest-to-guest traffic, private ranges, the metadata endpoint and the node's admin port are
+    /// dropped ahead of the ACCEPTs) plus a hairpin redirect of 80/443 for a guest calling its own
+    /// public hostname. The hairpin address reaches the script only as `$HAIRPIN_IP`, never
+    /// interpolated. Failures are non-fatal: cells simply get no egress.
     #[cfg(target_os = "linux")]
     async fn ensure_guest_nat() {
         use std::sync::atomic::Ordering;
@@ -2127,14 +2125,13 @@ impl LiteboxBackend {
         Ok(true)
     }
 
-    /// Tier 2: functional proof in three checks. (a) Rewriter: `/bin/echo`, staged with its `ldd`
-    /// closure, must print a marker through the live rewriter. (b) Network: a throwaway TUN link
-    /// carries a real HTTP round trip to a Node server (wildcard bind, the case `networking.patch`
-    /// fixes) through the patched litebox and the bind shim. (c) Writable workdir: that guest
-    /// creates, overwrites and renames files inside a read-only tar-layer directory before it
-    /// listens. A PASS licenses `HIVE_LITEBOX_VERIFIED=1` but is never applied automatically, and
-    /// it does not cover Bun, Python or load. Bring-up only: it creates a real TUN device and NAT
-    /// rules, so never run it (`--litebox-probe`) against a node carrying live traffic.
+    /// Tier 2: functional proof in three checks: the rewriter runs `/bin/echo` with its `ldd`
+    /// closure, a throwaway TUN link carries a real HTTP round trip to a Node server through the
+    /// patched litebox and bind shim, and that guest writes, overwrites and renames inside a
+    /// read-only tar-layer directory before it listens. A PASS licenses `HIVE_LITEBOX_VERIFIED=1`
+    /// but is never applied automatically, and covers neither Bun, Python nor load. Bring-up only:
+    /// it creates a real TUN device and NAT rules, so never run it (`--litebox-probe`) on a node
+    /// carrying live traffic.
     pub async fn smoke_test(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.is_supported(),
@@ -2818,13 +2815,12 @@ fn expand_package_manager(
     Ok(direct)
 }
 
-/// Validates one direct runtime entry and returns it as an absolute guest path. A relative entry is
-/// joined onto `guest_workdir` and `..` is normalized lexically on the JOINED path: the entry is
-/// already the resolved physical path of a package manager's symlinked `.bin/<tool>` launcher,
-/// which legitimately climbs out of the app directory into a shared store inside the artifact
-/// (pnpm: `../../node_modules/next/dist/bin/next`), and seeding with the workdir makes `pop()` step
-/// out of a real directory and fail only above the artifact root. `validate_guest_workdir` then
-/// re-checks the result.
+/// Validates one direct runtime entry as an absolute guest path. A relative entry is joined onto
+/// `guest_workdir` and `..` is normalized lexically on the JOINED path: a package manager's
+/// symlinked `.bin/<tool>` launcher resolves to a physical path that climbs out of the app
+/// directory into a shared store inside the artifact (pnpm:
+/// `../../node_modules/next/dist/bin/next`), and `pop()` fails only above the artifact root.
+/// `validate_guest_workdir` re-checks the result.
 fn validated_direct_entry(
     runtime: DirectRuntime,
     entry: &str,
@@ -3544,13 +3540,12 @@ fn trailing_zero_run_start(archive: &mut File, total_blocks: u64) -> anyhow::Res
     Ok(start_block)
 }
 
-/// Appends the runtime layer to a canonical tar and re-terminates it: the `ldd` closure and the
-/// runtime binary (opened `openat2` beneath `/`, no magic links, re-stat'd after the copy), the
-/// artifact marker, `extra_entries` (guest path relative to `/`, bytes, 0o444; the probe plants a
-/// tar-layer directory its guest then writes into), the resolver and CA files and the two preloads.
-/// The runtime binary goes in at its exact launch path because a guest-side `execve` (Next.js
-/// spawning its worker, an app re-execing `process.execPath`) resolves through the guest
-/// filesystem; unlike libraries it is exempt from the library allowlist.
+/// Appends the runtime layer to a canonical tar and re-terminates it: the `ldd` closure, the
+/// runtime binary at its exact launch path (a guest-side `execve` resolves through the guest
+/// filesystem; unlike libraries it is exempt from the library allowlist), the artifact marker,
+/// `extra_entries` (guest path relative to `/`, 0o444), the resolver and CA files and the two
+/// preloads. Files are opened `openat2` beneath `/` without magic links and re-stat'd after the
+/// copy.
 #[cfg(target_os = "linux")]
 fn append_litebox_runtime_augmentation_blocking(
     mut archive: File,
@@ -3772,13 +3767,11 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// at `exit` hit a permission check litebox unwraps (runner exit 101), where a missing directory
 /// gives a silent ENOENT; `HISTFILE` is cleared for the same reason.
 const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
-/// `litebox-shellrc.sh`: its `exec 2>&1` moves the shell's stderr onto the pty (the runner's own
-/// stderr must stay a pipe, since a pty stderr kills it at job-control init, and a separate pipe
-/// and pty are read by two tasks, so the next prompt overtook the previous command's output), and a
-/// no-fork "command not found" guard: interactive bash forks before it looks a command up, which
-/// under the fork emulation kills the child and silences the session, so an `extdebug` DEBUG trap
-/// checks the command word with `command -v` in the parent. Limits: a skipped command leaves `$?`
-/// at 0, a quoted or expanded first word is not checked, and `sh -c` runs read no rc.
+/// `litebox-shellrc.sh`: `exec 2>&1` moves the shell's stderr onto the pty (the runner's stderr
+/// starts as a pipe because a pty stderr kills it at job-control init), and an `extdebug` DEBUG
+/// trap answers "command not found" in the parent, since interactive bash forks before it looks a
+/// command up and under the fork emulation that child dies. Limits: a skipped command leaves `$?`
+/// at 0, a quoted or expanded first word is not checked, and `sh -c` reads no rc.
 #[cfg(target_os = "linux")]
 const SHELL_RC_BYTES: &[u8] = include_bytes!("litebox-shellrc.sh");
 
@@ -3828,12 +3821,9 @@ const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
 ];
 
 /// The toolchain a sandbox shell (and a `shell: true` exec) offers: `python3`, `git`, `curl` and
-/// `wget`; `npx` rides the node support tree. Closed like the lists above and staged optionally, so
-/// a base image missing `wget` still boots a shell. Unlike them these load runtime data that `ldd`
-/// never names, which `support_plan_for` stages (python's stdlib and `lib-dynload` closure, git's
-/// helpers and templates); `curl` and `wget` are ordinary ELFs. A host symlink is staged as the
-/// real file under its canonical path plus a matching symlink entry (`/usr/bin/node` ->
-/// `/usr/bin/node-22`), so a shebang naming the real interpreter resolves.
+/// `wget` (`npx` rides the node support tree). Staged optionally, so a base image missing `wget`
+/// still boots a shell; `python3` and `git` also load runtime data that `ldd` never names, which
+/// `support_plan_for` stages.
 const SHELL_GUEST_TOOL_PROGRAMS: &[&str] = &[
     "/usr/bin/python3",
     "/usr/bin/git",
@@ -4006,30 +3996,22 @@ async fn pump_exec_lines<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// A support tree plus the `$PATH`-visible entry points that make its commands reachable by name:
-/// the guest shell resolves a typed `npm` through `PATH=/usr/bin:/bin`, and on the host
-/// `/usr/bin/npm` is a symlink into the tree (one the walk skips), so without an entry at
-/// `/usr/bin/npm` the search finds nothing. `entry_points` are `(guest_path, real_target)`,
-/// `real_target` being a path the walk already stages; the entry is written as a REAL FILE carrying
-/// its bytes, because a symlink entry point is invisible to the guest's `PATH` search
-/// (`build_shell_tar_blocking`'s `copies`). An entry point is staged only when the host's symlink
-/// canonicalizes to exactly `real_target` (`readlink` text is often relative), so a base-image
-/// change that moves the real file stages nothing rather than a copy of nothing.
+/// A support tree plus the `$PATH`-visible entry points `(guest_path, real_target)` that make its
+/// commands reachable by name: the guest shell resolves a typed `npm` through `PATH=/usr/bin:/bin`,
+/// while the host's `/usr/bin/npm` is a symlink the walk skips. An entry is written as a REAL FILE
+/// (a symlink entry is invisible to the guest's `PATH` search) and only when the host symlink
+/// canonicalizes to exactly `real_target`, so a base-image change that moves the real file stages
+/// nothing.
 struct SupportPlan {
     trees: Vec<PathBuf>,
     entry_points: Vec<(PathBuf, PathBuf)>,
 }
 
-/// Support trees a resolved `extra` program needs beyond its `ldd` closure: `node` and `python3`
-/// are interpreters whose standard library is a tree of plain files. Keyed by the resolved
-/// program's file NAME (`resolve_guest_program` already turned `node` into `/usr/bin/node`); a tree
-/// the host lacks is skipped harmlessly (see `walk_support_tree`). `git` brings its helpers and
-/// templates, with `git-remote-https` (a symlink the walk skips) as an explicit entry point.
-/// `python3.x` takes the first existing of `/usr/lib64/python3.x` and `/usr/lib/python3.x`: lib64
-/// comes first because on RHEL-family hosts `/usr/lib/python3.x` holds site-packages only (no
-/// `os.py`, no `encodings/`), which would leave the interpreter unable to boot. `node` takes the
-/// bundled npm tree, since `npm` and `npx` are scripts under it (`npm/bin/*-cli.js`), not binaries:
-/// staging `node` alone leaves `npm install` not found.
+/// Support trees a resolved `extra` program needs beyond its `ldd` closure, keyed by the resolved
+/// file NAME: `git` (helpers, templates, and `git-remote-https` as an entry point), `python3.x`
+/// (its stdlib, `/usr/lib64` before `/usr/lib` because RHEL-family `/usr/lib/python3.x` holds
+/// site-packages only) and `node` (the bundled npm tree: `npm` and `npx` are scripts under it). A
+/// tree the host lacks is skipped harmlessly (see `walk_support_tree`).
 fn support_plan_for(resolved: &Path) -> Option<SupportPlan> {
     let name = resolved.file_name().and_then(|n| n.to_str())?;
     if name == "git" {
@@ -4207,13 +4189,10 @@ async fn build_guest_tar(archive: File, extra: Vec<PathBuf>) -> anyhow::Result<(
         .context("litebox shell guest tar construction task failed")?
 }
 
-/// When `program` is a host SYMLINK: the real file it points at. The guest gets the real file under
-/// BOTH spellings, the canonical one as a normal staged file and the symlink's own path as a byte
-/// copy (`stage_guest_program`'s `copies`), because a litebox guest's `stat`/`lstat` of a symlink
-/// stored in the tar layer answers ENOSYS: anything that LOOKS A PROGRAM UP rather than exec'ing a
-/// literal path (`command -v`, `PATH` search) never finds it, and a shebang naming
-/// `/usr/bin/node-22` needs the real file. Duplicating the bytes costs a few KiB; the closure and
-/// the support tree are shared by inode dedup.
+/// When `program` is a host SYMLINK: the real file it points at. The guest gets both spellings (the
+/// canonical path as a normal file, the symlink's own path as a byte copy via `copies`), because a
+/// symlink in the guest tar answers `stat`/`lstat` with ENOSYS and is never found by `command -v`
+/// or a `PATH` search.
 fn canonical_target(program: &Path) -> Option<PathBuf> {
     let meta = std::fs::symlink_metadata(program).ok()?;
     if !meta.file_type().is_symlink() {
@@ -4322,17 +4301,12 @@ async fn stage_guest_program(
     programs.push(staged);
 }
 
-/// Writes the shell guest tar: each of `paths` at its host path (opened `openat2` beneath `/`
-/// without magic links, deduped by inode), then `copies`, the `$PATH`-visible second spellings of a
-/// symlinked program (`/usr/bin/python3` for `python3.12`, `/usr/bin/node` for `node-22`,
-/// `/usr/bin/npm` and `npx` for the npm tree). Those are written as REAL FILES, not symlink
-/// entries, which a guest cannot see (`canonical_target`), and they bypass the inode dedup on
-/// purpose: two names for one file is the point. A script among them is wrapped, not copied, since
-/// it resolves its `require`/imports relative to its REAL location (a copy at `/usr/bin/npx` fails
-/// with `Cannot find module '../lib/cli.js'`): the wrapper execs the real path through the script's
-/// own shebang interpreter, which is what must be on `$PATH`. This tar is a separate archive from
-/// the runtime augmentation's, so the resolver, nsswitch and CA files are planted here too (without
-/// them a typed `curl` has no resolver and no CA roots), followed by the shell rc.
+/// Writes the shell guest tar: each of `paths` at its host path (opened `openat2` beneath `/`, no
+/// magic links, deduped by inode), then `copies`, the `$PATH`-visible second spellings of a
+/// symlinked program, as REAL FILES that bypass the inode dedup (`canonical_target`); a script
+/// among them is wrapped, not copied, since a copy resolves its imports relative to the wrong
+/// location. A separate archive from the runtime augmentation, it plants its own resolver, nsswitch
+/// and CA files, then the shell rc.
 #[cfg(target_os = "linux")]
 fn build_shell_tar_blocking(
     archive: File,
@@ -4723,15 +4697,11 @@ impl CellBackend for LiteboxBackend {
         artifact.guest_workdir(DELIVERED_WORKDIR).map(Some)
     }
 
-    /// Launches the function in a guest; container cells bypass litebox for host podman. A Bun
-    /// launch is refused first, before any reservation, network or tar setup or spawn, on
-    /// `func.runtime` alone (the platform's own discriminator, never a parse of the
-    /// tenant-controlled `start_cmd`): the syscall shim panics on Bun's boot probe and
-    /// `resources::detect` already reports `bun_runtime: Some(false)`, so reaching it means a stale
-    /// registry entry or a launch forced past placement. The artifact lock is held while the
-    /// reference, archive and runtime tar are resolved and released as soon as the runner has been
-    /// spawned (it holds the archive descriptor), never across readiness: holding it through the
-    /// boot queued every other cold start on the node behind one guest.
+    /// Launches the function in a guest; container cells bypass litebox for host podman. Bun is
+    /// refused first, before any reservation, setup or spawn, on `func.runtime` alone (never a
+    /// parse of the tenant-controlled `start_cmd`): the syscall shim panics on Bun's boot probe.
+    /// The artifact lock is held while the reference, archive and runtime tar are resolved and
+    /// released once the runner is spawned, never across readiness.
     async fn start_function(
         &self,
         cell: &CellHandle,
@@ -5120,15 +5090,12 @@ impl CellBackend for LiteboxBackend {
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
 
-    /// One argv command inside `cell` (Sandboxes `run_command`), through the same guest mechanism
-    /// as `exec_pty`: a fresh runner on its own TUN link with a guest tar holding the fixed
-    /// shell/coreutils set plus the resolved program and its `ldd` closure (for a shebang script
-    /// also the script itself: `resolve_guest_argv` turns `npx` into `/usr/bin/node-22
-    /// /usr/bin/npx`). stdout and stderr stream as separate `ExecOutput` lines, then exactly one
-    /// `ExecDone { exit_code }` after every output line, `None` when the runner died by signal (a
-    /// `kill_exec`), never a fake `Some(0)`. The runner leads its own process group, so `kill_exec`
-    /// ends the whole guest tree by exec id; `sudo` is refused, since the runner is an unprivileged
-    /// host process. Returns once the runner is spawned; the caller drains the channel.
+    /// One argv command inside `cell` (Sandboxes `run_command`) on a fresh runner with its own TUN
+    /// link and a guest tar of the fixed shell/coreutils set plus the resolved program (and, for a
+    /// shebang script, the script itself). stdout and stderr stream as separate `ExecOutput` lines,
+    /// then exactly one `ExecDone { exit_code }` after every output line, `None` when the runner
+    /// died by signal, never a fake `Some(0)`. Returns once the runner is spawned; `kill_exec` ends
+    /// its whole process group; `sudo` is refused.
     async fn exec_command(
         &self,
         cell: &CellHandle,
@@ -5303,23 +5270,15 @@ impl CellBackend for LiteboxBackend {
         }
     }
 
-    /// Opens an interactive shell in the cell. The guest is this host's own runner child (syscall
-    /// interception, not virtualization), so unlike Firecracker's vsock `exec_pty` no wire protocol
-    /// is needed: a REAL host pty handed to the runner gives the shell genuine raw-mode terminal
-    /// behavior, as over SSH. The shell's runner gets its own TUN link (`allocate_link`); its tool
-    /// set is the fixed one plus the caller's `programs`, and a requested program the host cannot
-    /// resolve is skipped with a warning, since a shell without `node` is still a shell. stdin and
-    /// stdout ride the pty but stderr is a PIPE pumped into the same terminal stream: litebox
-    /// answers the job-control ioctls with ENOSYS, and a shell whose stderr IS the pty runs
-    /// job-control setup and kills the runner (status 21) before the first prompt. `-i` asks for
-    /// the interactive shell that a non-tty stderr would suppress, and the staged rc (`ENV`,
-    /// `SHELL_RC_BYTES`) moves stderr onto the pty once job-control init is behind the shell. The
-    /// stderr pump forwards raw chunks, never lines (a prompt has no trailing newline), turns `\n`
-    /// into `\r\n` (the pipe bypasses the pty's output translation) and drops the two one-line
-    /// job-control warnings. The runner leads its own process group, tracked in `execs` under the
-    /// session id like a one-shot exec, so `terminate` kills a shell with its cell; the guest tar
-    /// and its alias are held by the waiter task until the runner exits, never dropped when this
-    /// function returns (the runner opens the alias path after spawn).
+    /// Opens an interactive shell: a REAL host pty handed to the runner (the guest is this host's
+    /// own child process, so no wire protocol as for Firecracker's vsock). The shell's runner has
+    /// its own TUN link, and a requested program the host cannot resolve is skipped with a warning.
+    /// stdin and stdout ride the pty but stderr is a PIPE pumped into the same stream: litebox
+    /// answers the job-control ioctls with ENOSYS, so a shell whose stderr IS the pty kills the
+    /// runner (status 21) before the first prompt; `-i` asks for the interactive shell and the
+    /// staged rc moves stderr onto the pty afterwards. The pump forwards raw chunks (a prompt has
+    /// no newline), maps `\n` to `\r\n` and drops the two job-control warnings. The guest tar and
+    /// its alias are held by the waiter task until the runner exits.
     async fn exec_pty(
         &self,
         cell: &CellHandle,
