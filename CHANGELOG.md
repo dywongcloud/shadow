@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-10-14 — the dashboard offers only what the team role can do, and a role refusal reads as a sentence (8a7a6844b0)
+
+The role matrix (`d79bc7c1f0`) refuses a viewer's or member's write with 403 `insufficient team role`, but every settings
+page still drew the buttons, and the refusal surfaced as a raw body, an `alert()` or an unhandled rejection with nothing
+shown. `ui/lib/team-role.ts` is now the ONE client mirror of `roles.rs`: `TEAM_ACTIONS` maps an action to its floor role and
+the backend routes it covers (drift is a diff against `RULES`: a scratch script parses the 29 rows and checks every route's
+floor, 15/15), `can(role, action)` answers it, and an unknown role (no mint yet, an unenforced node, a role the table does
+not name) is offered every control, because the server is the authority. The role is the `role` the mint route returns,
+mirrored to `hive_role` at every mint beside `hive_platform_admin` (`useTeamRole`, `useCan`; an operator counts as owner).
+`RoleGate` (a disabled `<fieldset>` with a tooltip and a one-line note) wraps the webhook writes, integration links, the
+owning-team and preview Save, the plan chips and the SSO switch, enterprise config (IP blocks, SAML, SCIM, SIEM, protection),
+project delete (settings, project header, list menu), API-key create and revoke and team members; the API-key role list
+stops at the caller's own role, and a webhook signing secret a member is not sent reads "visible to team admins". A 403 whose
+body starts `insufficient team role` becomes an `ApiError` coded `ROLE_REFUSED` carrying one sentence ("Your role can't do
+this. Ask a team admin.", or "...the team owner."), built once in `apiGet`/`apiSend` and shown inline or by `reportError` (a
+toast), never an `alert`; the integrations link route and a plan change's `planRefusal` pass it through. `HIVE_DEV_ROLE`
+(dev mint only) gives the local mint a role, which is how it was witnessed. Witnessed in headless Chrome on `next dev` plus a
+throwaway enforced node (`scratch2/uifix/cdp-role-pages.mjs`, 8 pages, viewer/member/admin/owner/unknown): before, every
+control was enabled for a member and a viewer and a click ended in a raw alert, an unhandled `ApiError` or raw text; after, a
+member has the admin-floor controls disabled ("Needs a team admin") and a viewer also the member-floor ones ("Read-only:
+needs team member access") with no request sent, admin and owner keep everything, and an unknown role keeps every control
+and shows the sentence inline (0 alerts, 0 unhandled rejections). Not changed: `/api/token` still maps any Clerk org role
+without "admin" to `member`, so a Clerk viewer is minted as a member today; `LocalTeams` still creates teams as `pro` (402
+for a non-operator). Not rolled.
+
 ## 2026-10-14 — only the dashboard server writes the identity mirror's email, so a browser-originated sync can no longer pose as a team's admin or owner (26674b3fa7)
 
 `POST /v1/identity/sync` wrote the body's user email into the identity mirror for ANY authenticated caller: the dashboard's
