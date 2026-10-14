@@ -16130,13 +16130,23 @@ async fn billing_webhook(
         .unwrap_or_else(|| json!({}));
 
     match event_type {
-        "checkout.session.completed" => {
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             let checkout_id = obj
                 .get("metadata")
                 .and_then(|m| m.get("checkout_id"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
-            if !checkout_id.is_empty() {
+            if !crate::billing::session_paid(&obj) {
+                // A delayed payment method (a bank debit) completes the session before the money
+                // arrives: nothing is applied until Stripe says it is paid (this event again, or
+                // `checkout.session.async_payment_succeeded`), because a payment that can still fail
+                // must not already have bought the credits or the plan.
+                tracing::info!(
+                    event = event_type,
+                    checkout = checkout_id,
+                    "stripe webhook: the checkout is not paid yet, nothing applied"
+                );
+            } else if !checkout_id.is_empty() {
                 if let Ok((co, _acc)) = c
                     .billing
                     .confirm_checkout(checkout_id, crate::billing::Payment::Stripe)
@@ -16172,11 +16182,23 @@ async fn billing_webhook(
                         "charge",
                         "billing",
                         &co.id,
-                        "stripe webhook: checkout.session.completed",
+                        &format!("stripe webhook: {event_type}"),
                     );
                     crate::persist::persist(&c);
                 }
             }
+        }
+        "checkout.session.async_payment_failed" => {
+            // The delayed payment never arrived: the checkout stays unapplied (it expires with the
+            // 24 h retention) and the buyer opens a new one.
+            tracing::warn!(
+                checkout = obj
+                    .get("metadata")
+                    .and_then(|m| m.get("checkout_id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(""),
+                "stripe webhook: a delayed payment failed, nothing applied"
+            );
         }
         "customer.subscription.deleted" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");

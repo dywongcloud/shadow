@@ -4,6 +4,8 @@
 //! real Stripe Checkout Session; otherwise a fully-working **mock checkout** is
 //! used for local/dev. Every balance change is recorded in an append-only ledger
 //! and the audit log, so billing is ACID-durable and historically auditable.
+//! `STRIPE_API_BASE` points the two Stripe calls (open a session, read it back) at a stand-in
+//! instead of `https://api.stripe.com` ([`stripe_api_base`]).
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -1668,6 +1670,34 @@ mod tests {
     }
 }
 
+/// Where the Stripe API lives: `https://api.stripe.com`, or `STRIPE_API_BASE` for a stand-in (a
+/// stripe-mock process, an egress proxy, a witness). The secret key rides every request as basic
+/// auth, so only `https://`, or `http://` to a loopback host, is honoured; anything else is logged
+/// and ignored, and the real API is used.
+fn stripe_api_base() -> String {
+    const DEFAULT: &str = "https://api.stripe.com";
+    let Ok(raw) = std::env::var("STRIPE_API_BASE") else {
+        return DEFAULT.to_string();
+    };
+    let base = raw.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return DEFAULT.to_string();
+    }
+    let honoured = reqwest::Url::parse(base).is_ok_and(|url| match url.scheme() {
+        "https" => url.host_str().is_some(),
+        "http" => matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]")),
+        _ => false,
+    });
+    if honoured {
+        base.to_string()
+    } else {
+        tracing::warn!(
+            "STRIPE_API_BASE must be https:// (or http:// to a loopback host): ignoring it, using {DEFAULT}"
+        );
+        DEFAULT.to_string()
+    }
+}
+
 /// Creates a real Stripe Checkout Session (best-effort). `price_id` is `Some` for a plan upgrade (a
 /// recurring subscription, `mode=subscription`) and `None` for a one-time purchase (a credit
 /// top-up, `mode=payment` with ad-hoc `price_data`). `checkout_id` is OUR `Checkout.id`, stamped
@@ -1714,7 +1744,7 @@ pub async fn stripe_checkout(
         }
     }
     let resp = http
-        .post("https://api.stripe.com/v1/checkout/sessions")
+        .post(format!("{}/v1/checkout/sessions", stripe_api_base()))
         .basic_auth(&key, Some(""))
         .form(&params)
         .send()
@@ -1731,9 +1761,19 @@ pub async fn stripe_checkout(
     Ok((url.to_string(), session_id.to_string()))
 }
 
+/// Whether a Checkout Session's money has actually been taken: Stripe's `payment_status` is
+/// `"paid"`. `status == "complete"` is NOT enough: a delayed payment method (a bank debit)
+/// completes the session while `payment_status` is still `"unpaid"`, and funds that have not
+/// cleared can still fail. `"no_payment_required"` is refused as well: this platform creates no
+/// zero-amount session (a free plan is applied directly and never reaches Stripe), so it could only
+/// mean a trial or coupon nobody configured. Used by both ways a purchase is confirmed (the
+/// `billing_confirm` read-back and the signed webhook).
+pub fn session_paid(session: &serde_json::Value) -> bool {
+    session.get("payment_status").and_then(|s| s.as_str()) == Some("paid")
+}
+
 /// Real payment/subscription status of a Stripe Checkout Session, fetched from Stripe: `paid` is
-/// true when it actually completed (`payment_status == "paid"`, or `status == "complete"` for a
-/// $0-due subscription setup). The authoritative check `billing_confirm` uses instead of a client's
+/// [`session_paid`]. The authoritative check `billing_confirm` uses instead of a client's
 /// redirect-back.
 pub struct StripeSessionStatus {
     pub paid: bool,
@@ -1748,7 +1788,8 @@ pub async fn stripe_verify_session(
     let key = std::env::var("STRIPE_SECRET_KEY")?;
     let resp = http
         .get(format!(
-            "https://api.stripe.com/v1/checkout/sessions/{session_id}"
+            "{}/v1/checkout/sessions/{session_id}",
+            stripe_api_base()
         ))
         .basic_auth(&key, Some(""))
         .send()
@@ -1757,10 +1798,8 @@ pub async fn stripe_verify_session(
     if v.get("error").is_some() {
         anyhow::bail!("stripe: session lookup failed ({v})");
     }
-    let paid = v.get("payment_status").and_then(|s| s.as_str()) == Some("paid")
-        || v.get("status").and_then(|s| s.as_str()) == Some("complete");
     Ok(StripeSessionStatus {
-        paid,
+        paid: session_paid(&v),
         customer: v
             .get("customer")
             .and_then(|c| c.as_str())
