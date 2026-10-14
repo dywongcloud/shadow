@@ -1,5 +1,60 @@
 # Changelog
 
+## 2026-10-13 — an HLS key a server labels as a playlist reaches the player
+
+`/api/tv/hls` chose its playlist lane from the URL (`.m3u8`) or a content type containing
+`mpegurl`, then required the body to start with `#EXTM3U`, so an AES-128 key served as
+`application/vnd.apple.mpegurl` (seen live on Pluto `ts_aes` streams, flagged while
+surveying 600 catalog channels) was refused with 415 and the encrypted stream died on a
+fatal `keyLoadError`. The body now decides: a body that starts with `#EXTM3U` is rewritten
+as a playlist; a non-playlist body that a server labels as `mpegurl` at a URL that does not
+name a playlist is served as at most 4096 bytes of `application/octet-stream` (same
+`nosniff`, `no-store`, the SSRF checks and the 2 MiB read bound untouched); anything larger,
+empty, or at a `.m3u8` URL stays a 415, as does a key labelled `text/html`. Witnessed with a
+real encrypted stream, not a stub: `ffmpeg` produced a 4-segment AES-128 HLS stream, served
+by a local origin through a cloudflared quick tunnel (an ordinary public https host to the
+route), and real hls.js in headless Chrome played it through the route: with the key labelled
+`mpegurl` it died on `keyLoadError http=415` before and plays after (320x180, key loaded 4
+times, 4 fragments parsed, no errors); the same stream with a key labelled
+`application/octet-stream` played before and after, and with `text/html` fails before and
+after. A key-size table (16 and 4096 bytes served; 4097, 5000, empty, `.m3u8` path, `text/html`
+refused) and the 47-row hostile-URL table (0 recorded connections) and the 53 bound checks all
+pass on the new code. Not rolled.
+
+## 2026-10-13 — a tenant URL can no longer aim the node at its own network: one outbound guard for webhooks, world-queue targets, SIEM sinks, workflow Redis URLs and remote images
+
+Five features make the NODE send an HTTP request to a URL a tenant sets, and none checked where
+it pointed: a webhook endpoint (`WebhookStore`'s plain `reqwest::Client`), a world-queue
+`target_url` (`world_queue.rs`, with tenant-chosen headers and body), a SIEM sink
+(`enterprise::deliver_siem`, which also sent the sink's bearer token), a project's
+`UPSTASH_REDIS_REST_URL` (`world::cmd`/`pipeline`) and, in `fluid-gateway`, the remote image
+behind `/_next/image?url=` (allowed only by the tenant's own `images.remotePatterns`, followed
+redirects, buffered the whole body before its 16 MiB check, and with `dangerouslyAllowSVG`
+returned the fetched bytes verbatim, so a visitor read any internal URL). A tenant could aim any
+of them at loopback admin ports, the VPC or the cloud metadata address. The new `hive-outbound`
+crate is the one guard: `validate_url` (static: https only, no userinfo, no internal name, no
+non-public address literal, including v4-mapped, NAT64 and 6to4 forms), `client()` (connect time:
+its resolver drops every address that is not public unicast, so a name that resolved publicly at
+registration and rebinds later is refused; no redirects, no proxy) and `following_client()` (the
+image fetch: up to 5 redirects, each hop re-validated). Registration refuses a bad URL with 400
+(`WebhookStore::add`, `WorldQueue::enqueue` and `EnterpriseStore::set_siem` now return the
+refusal, so a caller cannot skip it), and every delivery re-checks, so a row persisted before
+this change is refused too instead of delivered. A refusal or failure is recorded as a fixed
+sentence (never the URL, address or OS error), and a world REST reply is read at most 32 MiB.
+Witnessed on a throwaway auth-enforced node with a connection recorder standing in for the
+internal service: before, 11 of 11 attacks reached it (hooks on `http://127.0.0.1` and
+`http://[::1]`, on a name resolving to 127.0.0.1, on a public https URL that 307-redirects into
+loopback, and a persisted hook; world-queue jobs on both forms; a SIEM sink, which received the
+bearer token; a workflow Redis POST; the image optimizer, whose SVG passthrough returned the
+internal body to the visitor and which followed a public host's redirect into loopback); after,
+the recorder saw 0 connections, the literal-address registrations were 400 and the rest were
+refused at delivery ("the host does not resolve to a public address", a 307 recorded and not
+followed), while a public https hook, a world-queue job, a SIEM sink, a public SVG and a public
+PNG still work (9 of 9). Operator note: nothing to migrate; hooks, queue targets and SIEM sinks on
+`http://` or private addresses stop delivering (`GET /v1/webhooks` lists them; re-register on
+https), an image `url` must be a public address, and `HIVE_OUTBOUND_ALLOW_PRIVATE=1` lifts the
+guard for a developer's machine only. Ships `Cargo.lock` with the new crate. Not rolled.
+
 ## 2026-10-13 — ZK roster enrollment runs the same membership check as preview unlock
 
 `POST /api/zk-enroll` (`ui/app/api/zk-enroll/route.ts`) skipped the Clerk membership check

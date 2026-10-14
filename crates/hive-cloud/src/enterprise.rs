@@ -384,6 +384,8 @@ impl EnterpriseStore {
     pub fn siem(&self, team: &str) -> Option<SiemConfig> {
         self.siem.read().get(&norm(team)).cloned()
     }
+    /// Stores `team`'s SIEM sink. A non-empty endpoint is a tenant URL the node will POST to, so it
+    /// must pass `hive_outbound::validate_url` (https, a public host); empty clears the sink.
     pub fn set_siem(
         &self,
         team: &str,
@@ -391,7 +393,11 @@ impl EnterpriseStore {
         endpoint: &str,
         token_plain: Option<&str>,
         enabled: bool,
-    ) -> SiemConfig {
+    ) -> Result<SiemConfig, hive_outbound::Refused> {
+        let endpoint = endpoint.trim();
+        if !endpoint.is_empty() {
+            hive_outbound::validate_url(endpoint)?;
+        }
         let mut m = self.siem.write();
         let e = m.entry(norm(team)).or_default();
         e.format = format.to_string();
@@ -401,7 +407,7 @@ impl EnterpriseStore {
         }
         e.enabled = enabled;
         e.updated_ms = now_ms();
-        e.clone()
+        Ok(e.clone())
     }
     /// All enabled SIEM configs with the token DECRYPTED (for the streamer only).
     fn siem_targets(&self, team: &str) -> Option<(SiemConfig, String)> {
@@ -728,9 +734,9 @@ static SIEM_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<crate::au
 /// Starts the background SIEM streamer: every audit entry passed to [`siem_emit`] is matched to its
 /// tenant's [`SiemConfig`] and, if enabled, POSTed to the endpoint (best-effort, never blocking the
 /// audit write path) in a vendor-shaped payload (`http`, `datadog`, `splunk-hec`) so a real
-/// endpoint accepts it. Called once at boot with the shared state and HTTP client; later calls are
-/// no-ops.
-pub fn spawn_siem_streamer(store: Arc<EnterpriseStore>, http: reqwest::Client) {
+/// endpoint accepts it. Called once at boot with the shared state; later calls are no-ops. The sink
+/// is a tenant URL, so every POST goes through `hive_outbound` (https, public addresses only).
+pub fn spawn_siem_streamer(store: Arc<EnterpriseStore>) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::audit::AuditEntry>();
     if SIEM_TX.set(tx).is_err() {
         return;
@@ -740,7 +746,7 @@ pub fn spawn_siem_streamer(store: Arc<EnterpriseStore>, http: reqwest::Client) {
             let Some((cfg, token)) = store.siem_targets(&entry.tenant) else {
                 continue;
             };
-            let ok = deliver_siem(&http, &cfg, &token, &entry).await;
+            let ok = deliver_siem(&cfg, &token, &entry).await;
             if let Some(c) = store.siem.write().get_mut(&norm(&entry.tenant)) {
                 if ok {
                     c.delivered += 1;
@@ -759,12 +765,10 @@ pub fn siem_emit(entry: &crate::audit::AuditEntry) {
     }
 }
 
-async fn deliver_siem(
-    http: &reqwest::Client,
-    cfg: &SiemConfig,
-    token: &str,
-    e: &crate::audit::AuditEntry,
-) -> bool {
+async fn deliver_siem(cfg: &SiemConfig, token: &str, e: &crate::audit::AuditEntry) -> bool {
+    let Ok(endpoint) = hive_outbound::validate_url(&cfg.endpoint) else {
+        return false;
+    };
     let body = match cfg.format.as_str() {
         "datadog" => serde_json::json!({
             "ddsource": "shadw", "service": "platform", "ddtags": format!("team:{}", e.tenant),
@@ -777,8 +781,8 @@ async fn deliver_siem(
         }),
         _ => serde_json::to_value(e).unwrap_or_default(),
     };
-    let mut req = http
-        .post(&cfg.endpoint)
+    let mut req = hive_outbound::client()
+        .post(endpoint)
         .json(&body)
         .timeout(std::time::Duration::from_secs(8));
     if !token.is_empty() {

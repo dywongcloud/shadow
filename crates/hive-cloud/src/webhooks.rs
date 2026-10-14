@@ -166,7 +166,7 @@ impl WebhookStore {
         WebhookStore {
             hooks: RwLock::new(Vec::new()),
             deliveries: RwLock::new(VecDeque::with_capacity(256)),
-            http: reqwest::Client::new(),
+            http: hive_outbound::client(),
         }
     }
 
@@ -225,9 +225,13 @@ impl WebhookStore {
     /// before it is stored or persisted (`secrets::encrypt`, idempotent: re-adding an already sealed
     /// secret is safe). A webhook secret leaked from a snapshot, backup or GuardianDB replica lets an
     /// attacker forge signed deliveries, which is why it sits under the primitive that protects
-    /// sensitive project env vars.
-    pub fn add(&self, mut w: Webhook) -> Webhook {
+    /// sensitive project env vars. The endpoint must pass `hive_outbound::validate_url` (https, a
+    /// public host): the node makes the request, so a tenant URL never reaches the node's own
+    /// network.
+    pub fn add(&self, mut w: Webhook) -> Result<Webhook, hive_outbound::Refused> {
         debug_assert!(real_team(&w.team), "a webhook needs a real owning team");
+        hive_outbound::validate_url(&w.url)?;
+        w.url = w.url.trim().to_string();
         if w.id.is_empty() {
             w.id = format!("wh_{}", uuid::Uuid::new_v4().simple());
         }
@@ -237,7 +241,7 @@ impl WebhookStore {
         w.secret = crate::secrets::encrypt(&w.secret);
         w.created_ms = now_ms();
         self.hooks.write().push(w.clone());
-        w
+        Ok(w)
     }
 
     /// Removes row `id` when `scope` admits it.
@@ -378,18 +382,22 @@ pub async fn dispatch_durable(
         let event_id = event_id.to_string();
         async move {
             let signature = sign(&crate::secrets::decrypt(&webhook.secret), &body_str);
-            let response = store
-                .http
-                .post(&webhook.url)
-                .header("content-type", "application/json")
-                .header("x-hive-event", &event)
-                .header("x-hive-delivery", &event_id)
-                .header("x-hive-signature", &signature)
-                .header("user-agent", "Hive-Webhooks/1.0")
-                .body(body_str)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await;
+            let response = match hive_outbound::validate_url(&webhook.url) {
+                Ok(url) => store
+                    .http
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .header("x-hive-event", &event)
+                    .header("x-hive-delivery", &event_id)
+                    .header("x-hive-signature", &signature)
+                    .header("user-agent", "Hive-Webhooks/1.0")
+                    .body(body_str)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(|error| hive_outbound::describe(&error)),
+                Err(refused) => Err(refused.0),
+            };
             let delivery = match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -404,7 +412,7 @@ pub async fn dispatch_durable(
                         error: String::new(),
                     }
                 }
-                Err(error) => Delivery {
+                Err(reason) => Delivery {
                     id: event_id,
                     webhook_id: webhook.id.clone(),
                     event,
@@ -412,7 +420,7 @@ pub async fn dispatch_durable(
                     status: 0,
                     ok: false,
                     ts_ms: now_ms(),
-                    error: error.to_string(),
+                    error: reason.to_string(),
                 },
             };
             let ok = delivery.ok;
@@ -442,16 +450,18 @@ mod tests {
     #[test]
     fn webhook_secret_is_encrypted_at_rest_but_recoverable_for_owner_and_signing() {
         let store = WebhookStore::new();
-        let created = store.add(Webhook {
-            id: String::new(),
-            team: "acme".into(),
-            project: "*".into(),
-            url: "https://example.com/hook".into(),
-            events: vec![],
-            secret: "whsec_realvalue123".into(),
-            enabled: true,
-            created_ms: 0,
-        });
+        let created = store
+            .add(Webhook {
+                id: String::new(),
+                team: "acme".into(),
+                project: "*".into(),
+                url: "https://example.com/hook".into(),
+                events: vec![],
+                secret: "whsec_realvalue123".into(),
+                enabled: true,
+                created_ms: 0,
+            })
+            .expect("a public https endpoint is accepted");
 
         // The record actually held in the store (== what gets persisted) must
         // NOT be the plaintext secret.

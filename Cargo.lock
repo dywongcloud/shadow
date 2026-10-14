@@ -2017,6 +2017,7 @@ dependencies = [
  "futures",
  "hive-backend",
  "hive-core",
+ "hive-outbound",
  "image",
  "libc",
  "parking_lot",
@@ -2736,6 +2737,7 @@ dependencies = [
  "hive-core",
  "hive-crsql",
  "hive-edge",
+ "hive-outbound",
  "hive-p2p",
  "hive-wg",
  "hive-zkauth",
@@ -2835,6 +2837,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "hive-outbound"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "tokio",
 ]
 
 [[package]]

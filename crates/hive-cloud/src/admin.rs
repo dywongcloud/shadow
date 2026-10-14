@@ -11954,16 +11954,20 @@ async fn webhook_create_team(
     }
     let mut created = Vec::new();
     for p in targets {
-        created.push(c.webhooks.add(crate::webhooks::Webhook {
-            id: String::new(),
-            team: t.clone(),
-            project: p,
-            url: b.url.clone(),
-            events: b.events.clone(),
-            secret: String::new(),
-            enabled: true,
-            created_ms: 0,
-        }));
+        created.push(
+            c.webhooks
+                .add(crate::webhooks::Webhook {
+                    id: String::new(),
+                    team: t.clone(),
+                    project: p,
+                    url: b.url.clone(),
+                    events: b.events.clone(),
+                    secret: String::new(),
+                    enabled: true,
+                    created_ms: 0,
+                })
+                .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?,
+        );
     }
     crate::persist::persist(&c);
     let created: Vec<_> = created.into_iter().map(|w| w.decrypted()).collect();
@@ -12002,21 +12006,24 @@ async fn webhook_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(b): Json<CreateWebhook>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
-        return Err(StatusCode::NOT_FOUND);
+        return Err((StatusCode::NOT_FOUND, "no such project".into()));
     }
-    let wh = c.webhooks.add(crate::webhooks::Webhook {
-        id: String::new(),
-        team: t,
-        project,
-        url: b.url,
-        events: b.events,
-        secret: String::new(),
-        enabled: true,
-        created_ms: 0,
-    });
+    let wh = c
+        .webhooks
+        .add(crate::webhooks::Webhook {
+            id: String::new(),
+            team: t,
+            project,
+            url: b.url,
+            events: b.events,
+            secret: String::new(),
+            enabled: true,
+            created_ms: 0,
+        })
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     crate::persist::persist(&c);
     Ok(Json(json!(wh.decrypted())))
 }
@@ -13601,14 +13608,17 @@ async fn wqueue_enqueue(
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
     }
-    let id = c.world_queue.enqueue(
-        t,
-        b.target_url,
-        b.headers,
-        b.payload,
-        b.delay_seconds,
-        b.max_attempts,
-    );
+    let id = c
+        .world_queue
+        .enqueue(
+            t,
+            b.target_url,
+            b.headers,
+            b.payload,
+            b.delay_seconds,
+            b.max_attempts,
+        )
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     Ok(Json(json!({ "message_id": id })))
 }
 

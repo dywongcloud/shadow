@@ -1,0 +1,10 @@
+[package]
+name = "hive-outbound"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The one guard for HTTP requests the node makes to a URL a tenant influences."
+
+[dependencies]
+reqwest = { workspace = true }
+tokio = { workspace = true }

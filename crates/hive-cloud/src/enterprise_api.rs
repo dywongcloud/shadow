@@ -201,7 +201,8 @@ async fn siem_put(
     }
     let cfg = c
         .enterprise
-        .set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled);
+        .set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled)
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     c.audit.record(
         &t,
         "user",

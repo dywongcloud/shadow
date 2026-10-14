@@ -65,30 +65,41 @@ pub fn has_world(cloud: &Arc<CloudState>, project: &str) -> bool {
     world_config(cloud, project).is_some()
 }
 
-/// One Upstash REST command (`["GET","k"]` style) → its `result` value.
-async fn cmd(cloud: &Arc<CloudState>, url: &str, token: &str, parts: &[&str]) -> Option<Value> {
-    let resp = cloud
-        .http
-        .post(url)
+/// The most the node reads from one world REST reply.
+const WORLD_REPLY_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// One Upstash REST command (`["GET","k"]` style) → its `result` value. The REST URL is the
+/// project's own env value (a tenant URL the node POSTs to), so it goes through `hive_outbound`:
+/// https, public addresses only, a bounded reply.
+async fn cmd(_cloud: &Arc<CloudState>, url: &str, token: &str, parts: &[&str]) -> Option<Value> {
+    let target = hive_outbound::validate_url(url).ok()?;
+    let resp = hive_outbound::client()
+        .post(target)
         .bearer_auth(token)
         .json(&parts.to_vec())
         .timeout(std::time::Duration::from_secs(8))
         .send()
         .await
         .ok()?;
-    resp.json::<Value>().await.ok()?.get("result").cloned()
+    let body = hive_outbound::read_limited(resp, WORLD_REPLY_MAX_BYTES).await?;
+    serde_json::from_slice::<Value>(&body)
+        .ok()?
+        .get("result")
+        .cloned()
 }
 
 /// A pipeline of commands → vector of `result` values (errors map to Null).
 async fn pipeline(
-    cloud: &Arc<CloudState>,
+    _cloud: &Arc<CloudState>,
     url: &str,
     token: &str,
     cmds: Vec<Vec<String>>,
 ) -> Vec<Value> {
-    let resp = cloud
-        .http
-        .post(format!("{url}/pipeline"))
+    let Ok(target) = hive_outbound::validate_url(&format!("{url}/pipeline")) else {
+        return Vec::new();
+    };
+    let resp = hive_outbound::client()
+        .post(target)
         .bearer_auth(token)
         .json(&cmds)
         .timeout(std::time::Duration::from_secs(12))
@@ -97,7 +108,10 @@ async fn pipeline(
     let Some(resp) = resp.ok() else {
         return Vec::new();
     };
-    let Some(v) = resp.json::<Value>().await.ok() else {
+    let Some(body) = hive_outbound::read_limited(resp, WORLD_REPLY_MAX_BYTES).await else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(&body) else {
         return Vec::new();
     };
     v.as_array()

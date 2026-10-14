@@ -1258,7 +1258,7 @@ async fn async_main() -> anyhow::Result<()> {
             std::process::exit(if restart_reason.is_some() { 17 } else { 0 });
         });
     }
-    enterprise::spawn_siem_streamer(cloud.enterprise.clone(), cloud.http.clone());
+    enterprise::spawn_siem_streamer(cloud.enterprise.clone());
     *cloud.peer_iroh.write() = persist::load_peer_iroh();
 
     let self_iroh_id = iroh_ep.as_ref().map(|e| e.id().to_string());

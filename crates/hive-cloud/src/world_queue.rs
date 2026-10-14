@@ -116,7 +116,9 @@ impl WorldQueue {
 
     /// Enqueues locally and kicks off the best-effort, async GuardianDB mirror so every other node
     /// hosting `team` can see the job even if THIS node never becomes primary for it (for example
-    /// because the app's HTTP client happened to resolve here).
+    /// because the app's HTTP client happened to resolve here). The target is tenant-supplied and
+    /// the node makes the request, so it must pass `hive_outbound::validate_url` (https, a public
+    /// host); the delivery loop checks it again.
     pub fn enqueue(
         &self,
         team: String,
@@ -125,7 +127,8 @@ impl WorldQueue {
         payload: Value,
         delay_seconds: u64,
         max_attempts: u32,
-    ) -> String {
+    ) -> Result<String, hive_outbound::Refused> {
+        hive_outbound::validate_url(&target_url)?;
         let id = format!("wq_{}", uuid::Uuid::new_v4().simple());
         let job = QueueJob {
             id: id.clone(),
@@ -142,7 +145,7 @@ impl WorldQueue {
         if let Ok(bytes) = serde_json::to_vec(&job) {
             tokio::spawn(async move { crate::guardian::put(&key, bytes).await });
         }
-        id
+        Ok(id)
     }
 
     /// Every due job THIS node holds, removed from `pending` (the caller re-inserts it on a
@@ -296,7 +299,14 @@ pub async fn run_delivery_loop(cloud: Arc<CloudState>, queue: Arc<WorldQueue>) {
             if !is_primary_for_team(&cloud, &job.team).await {
                 continue;
             }
-            let mut req = cloud.http.post(&job.target_url).json(&job.payload);
+            let Ok(target) = hive_outbound::validate_url(&job.target_url) else {
+                tracing::warn!(job_id = %job.id, target = %job.target_url, "world_queue: target refused by the outbound policy, job dead-lettered");
+                queue.mark_dead(&job.id);
+                let key = guardian_key(&job.team, &job.id);
+                tokio::spawn(async move { crate::guardian::delete(&key).await });
+                continue;
+            };
+            let mut req = hive_outbound::client().post(target).json(&job.payload);
             for (k, v) in &job.headers {
                 req = req.header(k.as_str(), v.as_str());
             }

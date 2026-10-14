@@ -4008,14 +4008,17 @@ async fn serve_optimized_image(
         if !allowed {
             return bad("remote url not allowed by images.remotePatterns/domains");
         }
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
+        // The pattern allow-list is the tenant's own config, so it never decides WHERE the node may
+        // connect: the shared outbound guard refuses non-public addresses at every hop.
+        let Ok(target) = hive_outbound::validate_fetch_url(&url) else {
+            return bad("remote url is not a public address");
         };
-        match client.get(&url).send().await {
+        let fetched = hive_outbound::following_client()
+            .get(target)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await;
+        match fetched {
             Ok(r) if r.status().is_success() => {
                 let svg = r
                     .headers()
@@ -4023,11 +4026,9 @@ async fn serve_optimized_image(
                     .and_then(|v| v.to_str().ok())
                     .map(|t| t.contains("svg"))
                     .unwrap_or(false);
-                match r.bytes().await {
-                    Ok(b) if b.len() <= 16 * 1024 * 1024 => {
-                        (b.to_vec(), svg || url.ends_with(".svg"))
-                    }
-                    _ => return (StatusCode::BAD_GATEWAY, "image too large").into_response(),
+                match hive_outbound::read_limited(r, 16 * 1024 * 1024).await {
+                    Some(b) => (b, svg || url.ends_with(".svg")),
+                    None => return (StatusCode::BAD_GATEWAY, "image too large").into_response(),
                 }
             }
             _ => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
