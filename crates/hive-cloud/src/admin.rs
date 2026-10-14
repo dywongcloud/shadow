@@ -11320,7 +11320,12 @@ async fn team_create(
                 format!("team slug '{slug}' already exists"),
             ))?
     };
-    apply_plan_everywhere(&c, &t.slug, &plan);
+    apply_plan_everywhere(
+        &c,
+        &t.slug,
+        &plan,
+        PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+    )?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -11428,11 +11433,77 @@ async fn team_remove_member(
 /// every tier change goes through here. `teams.set_plan` returning `None` is normal: personal
 /// namespaces (`personal`, `u_<uid>`) have a billing account but no team row. A downgrade drops
 /// Enterprise-only SSO, matching `team_set_plan`.
-pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &str) {
+///
+/// It is also where a tier change is AUTHORIZED: `change` names the authority behind it
+/// ([`PlanChange`]) and a plan that names no plan or a RAISE of the tier (above the higher of the
+/// team record and the billing account, never below Hobby) without the authority to raise it is
+/// refused here, so no route can reach this sink around the rule: a plan is bought (a verified
+/// checkout) or granted (an operator), never self-assigned.
+pub(crate) fn apply_plan_everywhere(
+    c: &Arc<CloudState>,
+    tenant: &str,
+    plan: &str,
+    change: PlanChange<'_>,
+) -> Result<(), (StatusCode, String)> {
+    if crate::billing::known_plan(plan).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown plan '{plan}': the plans are {}",
+                crate::billing::plan_ids()
+            ),
+        ));
+    }
+    let team_rank = c
+        .teams
+        .get(tenant)
+        .map(|t| crate::billing::plan_rank(&t.plan))
+        .unwrap_or(0);
+    let current = team_rank
+        .max(crate::billing::plan_rank(&c.billing.account(tenant).plan))
+        .max(crate::billing::plan_rank("hobby"));
+    if crate::billing::plan_rank(plan) > current && !change.may_raise() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "raising the plan to '{plan}' needs a paid checkout (POST /v1/billing/checkout) or a platform operator"
+            ),
+        ));
+    }
     c.teams.set_plan(tenant, plan);
     c.billing.set_plan(tenant, plan);
     if !crate::billing::plan_allows_sso(plan) {
         c.teams.set_sso(tenant, false);
+    }
+    Ok(())
+}
+
+/// The authority behind a tier change ([`apply_plan_everywhere`] decides from it whether the change
+/// may RAISE the tier): the rule lives at the one function every change funnels through, so a new
+/// route has to name its authority to change a plan at all.
+#[derive(Clone, Copy)]
+pub(crate) enum PlanChange<'a> {
+    /// A request from `claims`: a platform operator (`operator_allowed`: everyone in dev mode) may
+    /// set any tier, anyone else may only keep or LOWER it (`PUT /v1/teams/:slug/plan`, the
+    /// free-plan checkout shortcut, team creation).
+    Request(Option<&'a crate::auth::Claims>),
+    /// A payment was verified: a checkout confirmed with Stripe (`billing_confirm`, the Stripe
+    /// webhook), or the mock checkout of a node with no Stripe configured. The tier that was bought.
+    Paid,
+    /// The billing authority's own downgrade (a cancelled Stripe subscription): never raises.
+    Cancellation,
+    /// The platform operator's own tenant, locked at enterprise when its owner signs in
+    /// ([`apply_admin_enterprise`]).
+    AdminTenant,
+}
+
+impl PlanChange<'_> {
+    fn may_raise(self) -> bool {
+        match self {
+            PlanChange::Request(claims) => operator_allowed(claims, crate::auth::enforced()),
+            PlanChange::Paid | PlanChange::AdminTenant => true,
+            PlanChange::Cancellation => false,
+        }
     }
 }
 
@@ -11442,7 +11513,9 @@ pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &st
 /// `customer.subscription.deleted`) can drop. Called from `mint_token` on the billing writer only,
 /// and idempotent.
 pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
-    apply_plan_everywhere(c, tenant, "enterprise");
+    if let Err((_, why)) = apply_plan_everywhere(c, tenant, "enterprise", PlanChange::AdminTenant) {
+        tracing::error!(tenant, %why, "platform admin tenant could not be set to enterprise");
+    }
     c.billing.set_tier_lock(tenant, Some("enterprise"));
     crate::persist::persist(c);
     tracing::info!(tenant, "platform admin tenant locked to enterprise");
@@ -11454,7 +11527,9 @@ struct SetPlan {
 }
 
 /// Change a team's tier (hobby | pro | enterprise). Keeps the billing account in
-/// sync so the compute allowance + plan label update together.
+/// sync so the compute allowance + plan label update together. An owner or admin may keep or LOWER
+/// the team's plan; raising it is a platform operator's call or a paid checkout
+/// (`apply_plan_everywhere` refuses a raise without that authority: 403).
 async fn team_set_plan(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11476,7 +11551,12 @@ async fn team_set_plan(
     c.teams
         .get(&slug)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
-    apply_plan_everywhere(&c, &slug, &plan);
+    apply_plan_everywhere(
+        &c,
+        &slug,
+        &plan,
+        PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+    )?;
     crate::persist::persist(&c);
     Ok(Json(json!(c.teams.get(&slug))))
 }
@@ -15738,7 +15818,12 @@ async fn billing_checkout(
             }
         };
     if amount == 0 && req.kind != "addon" {
-        apply_plan_everywhere(&c, &t, &plan);
+        apply_plan_everywhere(
+            &c,
+            &t,
+            &plan,
+            PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+        )?;
         let acc = c.billing.account(&t);
         c.audit.record(
             &t,
@@ -15914,7 +15999,8 @@ async fn billing_confirm(
                 addon_error = Some(e);
             }
         }
-        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
+        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan, PlanChange::Paid)
+            .map_err(|(status, _)| status)?,
     }
     if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
         c.billing
@@ -16004,7 +16090,13 @@ async fn billing_webhook(
                                 tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed (stripe webhook path)");
                             }
                         }
-                        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
+                        _ => {
+                            if let Err((_, why)) =
+                                apply_plan_everywhere(&c, &co.tenant, &co.plan, PlanChange::Paid)
+                            {
+                                tracing::error!(checkout = %co.id, tenant = %co.tenant, %why, "stripe webhook: the paid plan could not be applied");
+                            }
+                        }
                     }
                     let customer = obj.get("customer").and_then(|s| s.as_str()).unwrap_or("");
                     let subscription = obj
@@ -16032,7 +16124,11 @@ async fn billing_webhook(
                 .then(|| c.billing.tenant_for_subscription(sub_id))
                 .flatten()
             {
-                apply_plan_everywhere(&c, &tenant, "hobby");
+                if let Err((_, why)) =
+                    apply_plan_everywhere(&c, &tenant, "hobby", PlanChange::Cancellation)
+                {
+                    tracing::error!(tenant = %tenant, %why, "stripe webhook: the cancelled subscription could not be downgraded");
+                }
                 c.audit.record(
                     &tenant,
                     "system",
@@ -16152,8 +16248,9 @@ async fn billing_grant(
     } else {
         req.note.clone()
     };
+    let change = PlanChange::Request(claims.as_ref().map(|e| &e.0));
     if !req.plan.is_empty() {
-        apply_plan_everywhere(&c, t, &req.plan);
+        apply_plan_everywhere(&c, t, &req.plan, change)?;
     }
     if let Some(lock) = req.lock_tier.as_deref() {
         let floor = lock.trim();
@@ -16166,7 +16263,7 @@ async fn billing_grant(
         let floor_opt = if floor.is_empty() { None } else { Some(floor) };
         c.billing.set_tier_lock(t, floor_opt);
         if let Some(f) = floor_opt {
-            apply_plan_everywhere(&c, t, f);
+            apply_plan_everywhere(&c, t, f, change)?;
         }
     }
     let acc = if req.credit_cents > 0 {
