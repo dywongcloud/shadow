@@ -302,6 +302,74 @@ fn free_bytes_on(dir: &std::path::Path) -> Option<u64> {
         .map(|d| d.available_space())
 }
 
+/// Most model downloads this node runs at once (`HIVE_INFERENCE_MODEL_DOWNLOADS_MAX`, default 2,
+/// never under 1): every project's `fluid.json` can name its own multi-GB model, and each running
+/// download holds a connection, a partial file and a claim on the disk.
+fn max_concurrent_downloads() -> usize {
+    std::env::var("HIVE_INFERENCE_MODEL_DOWNLOADS_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// One permit per running download, node-wide ([`max_concurrent_downloads`]). A URL that finds none
+/// is simply tried again on the next reconcile tick ([`model_state`]); nothing queues.
+static DOWNLOAD_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(max_concurrent_downloads())));
+
+/// The bytes every download in flight still EXPECTS to write (its declared length less what has
+/// landed): the disk reserve is shared by all of them, so each admission and each periodic re-check
+/// asks whether the volume can hold ALL of it and still keep the reserve, never just its own file.
+static DISK_CLAIMED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// One download's claim on the disk: dropped on every exit, so the ledger never leaks a claim.
+struct DiskClaim {
+    remaining: u64,
+}
+
+impl DiskClaim {
+    /// Admits a download of `declared` bytes (0 when the server declared no length) when the volume
+    /// at `dir` keeps `reserve` free once everything already in flight and this download have
+    /// written what they still expect. The free space is read INSIDE the ledger lock, so it is
+    /// consistent with the claims it is compared against. A volume that cannot be probed admits.
+    fn admit(dir: &std::path::Path, declared: u64, reserve: u64) -> Option<DiskClaim> {
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        if free_bytes_on(dir)
+            .is_some_and(|free| free < claimed.saturating_add(declared).saturating_add(reserve))
+        {
+            return None;
+        }
+        *claimed = claimed.saturating_add(declared);
+        Some(DiskClaim {
+            remaining: declared,
+        })
+    }
+
+    /// `n` bytes reached the disk: they are no longer expected, they are written (the free space
+    /// already reflects them), so they leave the claim.
+    fn landed(&mut self, n: u64) {
+        let take = n.min(self.remaining);
+        self.remaining -= take;
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        *claimed = claimed.saturating_sub(take);
+    }
+
+    /// Whether the volume still holds everything in flight (this download's remainder included)
+    /// and keeps `reserve`.
+    fn still_fits(&self, dir: &std::path::Path, reserve: u64) -> bool {
+        let claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        !free_bytes_on(dir).is_some_and(|free| free < claimed.saturating_add(reserve))
+    }
+}
+
+impl Drop for DiskClaim {
+    fn drop(&mut self) {
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        *claimed = claimed.saturating_sub(self.remaining);
+    }
+}
+
 /// A partial download that deletes itself on EVERY exit — an error, a timeout, a cap, or the future
 /// being dropped mid-transfer (the load watchdog and a shutdown both cancel it). Only the rename
 /// that publishes the finished blob disarms it.
@@ -398,8 +466,8 @@ async fn cached_model(model: &str) -> Result<Option<(std::path::PathBuf, u64)>, 
 /// redirects legitimately) and a size cap; a failure is one fixed, generic reason, never the
 /// upstream status or body (no oracle for an internal address). The transfer is bounded in TIME
 /// (a stall timeout between chunks and a total timeout) and in DISK (the models volume must keep a
-/// reserve, checked up front against the declared length and again as bytes land), and the partial
-/// file is removed on every outcome. The stored blob is named by the BLAKE3 content hash of its OWN
+/// reserve SHARED by every download in flight — a [`DiskClaim`] — checked up front against the
+/// declared length and again as bytes land), and the partial file is removed on every outcome. The stored blob is named by the BLAKE3 content hash of its OWN
 /// bytes (a NEW content identity, hashed incrementally as it downloads so a multi-GB model is never
 /// held in memory at once) rather than a hash of the URL: the old `fnv(url)` filename let two
 /// different URLs that happened to collide on 64 bits silently share a cache slot. Returns
@@ -435,10 +503,11 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     if declared.is_some_and(|len| len > max_bytes) {
         return Err("model exceeds the maximum download size".to_string());
     }
-    if free_bytes_on(&dir).is_some_and(|free| free < declared.unwrap_or(0).saturating_add(reserve))
-    {
+    // The reserve is shared by every download in flight: this one is admitted only if the volume can
+    // hold what the others still expect to write, this file, and the reserve, all at once.
+    let Some(mut claim) = DiskClaim::admit(&dir, declared.unwrap_or(0), reserve) else {
         return Err("insufficient disk space for the model".to_string());
-    }
+    };
     // Unique per download: two projects naming the same URL must never write one partial file.
     let tmp = dir.join(format!(
         "hive-{:016x}-{}.part",
@@ -470,12 +539,13 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
         }
         if written - disk_checked_at >= 256 * 1024 * 1024 {
             disk_checked_at = written;
-            if free_bytes_on(&dir).is_some_and(|free| free < reserve) {
+            if !claim.still_fits(&dir, reserve) {
                 return Err("insufficient disk space for the model".to_string());
             }
         }
         hasher.update(&chunk);
         f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        claim.landed(chunk.len() as u64);
     }
     f.flush().await.map_err(|e| e.to_string())?;
     drop(f);
@@ -527,8 +597,8 @@ enum ModelState {
 /// returned at once; otherwise the download runs in its own task (bounded by `ensure_model`'s
 /// timeouts) and the loop moves on to every other project, polling again next tick. The loop used
 /// to await the transfer inline, so one slow-drip URL stalled every tenant's endpoint on the
-/// coordinator. A failed URL is remembered for [`model_retry_cooldown_ms`] before it is retried, and
-/// a URL two projects share is fetched once.
+/// coordinator. A failed URL is remembered for [`model_retry_cooldown_ms`] before it is retried, a URL
+/// two projects share is fetched once, and at most [`max_concurrent_downloads`] run at a time.
 async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
     match cached_model(model).await {
         Ok(Some((path, bytes))) => return ModelState::Ready(path, bytes),
@@ -538,7 +608,7 @@ async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
     let Some(url) = model_url(model) else {
         return ModelState::Failed(format!("unresolvable model ref '{model}'"));
     };
-    {
+    let slot = {
         let mut fetches = cloud.inference.fetches.lock();
         let now = hive_core::now_ms();
         match fetches.get(&url) {
@@ -555,10 +625,18 @@ async fn model_state(cloud: &Arc<CloudState>, model: &str) -> ModelState {
             }
             _ => {}
         }
+        // At most `max_concurrent_downloads` run node-wide; a URL that finds no free slot is not
+        // recorded and is simply tried again next tick, so nothing queues and a `Running` entry
+        // always names a transfer that really started.
+        let Ok(slot) = DOWNLOAD_SLOTS.clone().try_acquire_owned() else {
+            return ModelState::Downloading;
+        };
         fetches.insert(url.clone(), Fetch::Running { since_ms: now });
-    }
+        slot
+    };
     let (cloud, model) = (cloud.clone(), model.to_string());
     tokio::spawn(async move {
+        let _slot = slot;
         let outcome = ensure_model(&model).await;
         let mut fetches = cloud.inference.fetches.lock();
         match outcome {
