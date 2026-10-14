@@ -11337,6 +11337,10 @@ fn roster_refusal(refusal: crate::teams::RosterRefusal) -> (StatusCode, String) 
             "a team must keep at least one owner: make someone else an owner first".into(),
         ),
         RosterRefusal::NoTeam => (StatusCode::NOT_FOUND, "team not found".into()),
+        RosterRefusal::BadEmail => (
+            StatusCode::BAD_REQUEST,
+            "email is required: a non-empty address without control characters".into(),
+        ),
     }
 }
 
@@ -11359,6 +11363,9 @@ async fn team_add_member(
         &["owner", "admin"],
     )?;
     let actor = crate::roles::actor(claims.as_ref().map(|e| &e.0));
+    if crate::teams::roster_email(&b.email).is_none() {
+        return Err(roster_refusal(crate::teams::RosterRefusal::BadEmail));
+    }
     let team = c
         .teams
         .get(&slug)
@@ -11394,7 +11401,8 @@ async fn team_add_member(
 /// so remaining members renew from a fresh platform session while the removed member loses service
 /// now), and the revocation's own persisted state is saved again. The roster rule lives in
 /// `TeamStore::remove_member_as`: nobody removes a member above their own role, and the last owner
-/// stays (a refusal returns before anything is purged or revoked).
+/// stays (a refusal, or an email nobody on the roster has, returns before anything is purged or
+/// revoked).
 async fn team_remove_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11415,7 +11423,11 @@ async fn team_remove_member(
             crate::roles::actor(claims.as_ref().map(|e| &e.0)),
             &email,
         )
-        .map_err(roster_refusal)?;
+        .map_err(roster_refusal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "nobody by that email is on this team".into(),
+        ))?;
     if let Some(uid) = c
         .identity
         .users()

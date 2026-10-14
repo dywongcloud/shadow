@@ -55,6 +55,22 @@ pub enum RosterRefusal {
     LastOwner,
     /// No such team.
     NoTeam,
+    /// The email is not one: empty, over-long or carrying a control character ([`roster_email`]).
+    BadEmail,
+}
+
+/// The roster key of an email: trimmed, `None` when nothing usable is left (empty, over 320 bytes,
+/// a control character). Such a string is never a member, whatever the request claims: a leading
+/// space once made a GHOST row beside the real member, and an empty email took a seat.
+pub fn roster_email(raw: &str) -> Option<&str> {
+    let email = raw.trim();
+    (!email.is_empty() && email.len() <= 320 && !email.chars().any(char::is_control))
+        .then_some(email)
+}
+
+/// Whether two roster emails name the same person: trimmed and case-insensitive.
+fn same_person(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
 }
 
 /// The one rule every roster change obeys, whoever makes it: nobody changes or removes a member of
@@ -130,9 +146,13 @@ fn default_plan() -> String {
 }
 
 impl Team {
+    /// The member with this email, matched trimmed and case-insensitively ([`same_person`]); an
+    /// empty email is nobody (a ghost row with an empty email must never answer "is a member").
     pub fn member(&self, email: &str) -> Option<&Member> {
-        let e = email.to_lowercase();
-        self.members.iter().find(|m| m.email.to_lowercase() == e)
+        if email.trim().is_empty() {
+            return None;
+        }
+        self.members.iter().find(|m| same_person(&m.email, email))
     }
 }
 
@@ -505,17 +525,17 @@ impl TeamStore {
         email: &str,
         role: Role,
     ) -> Result<Team, RosterRefusal> {
+        let email = roster_email(email).ok_or(RosterRefusal::BadEmail)?;
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
         let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
         let current = team.member(email).map(|member| member.role);
         check_roster_change(team, actor, current, Some(role))?;
-        let email_lower = email.to_lowercase();
         let mut changed = false;
         if let Some(existing) = team
             .members
             .iter_mut()
-            .find(|member| member.email.to_lowercase() == email_lower)
+            .find(|member| same_person(&member.email, email))
         {
             if existing.role != role {
                 existing.role = role;
@@ -552,6 +572,9 @@ impl TeamStore {
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
         let team = state.teams.get_mut(slug)?;
+        let Some(email) = roster_email(email) else {
+            return Some((team.clone(), false));
+        };
         if team.member(email).is_some() {
             return Some((team.clone(), false));
         }
@@ -568,15 +591,16 @@ impl TeamStore {
 
     /// Removes `email` on behalf of a person acting as `actor`, under one lock and under
     /// [`check_roster_change`] (nobody removes a member above their own role, and the last Owner
-    /// stays). A non-member is a no-op that returns the team unchanged.
+    /// stays). `Ok(None)` when nobody by that email is on the roster: nothing changed, so the caller
+    /// has nothing to purge or revoke.
     pub fn remove_member_as(
         &self,
         slug: &str,
         actor: Role,
         email: &str,
-    ) -> Result<Team, RosterRefusal> {
+    ) -> Result<Option<Team>, RosterRefusal> {
         self.remove_checked(slug, actor, email)
-            .map(|(team, _)| team)
+            .map(|(team, removal)| matches!(removal, Removal::Removed).then_some(team))
     }
 
     /// Removes `email` ONLY when it is a plain member (Member or Viewer): the same rule as
@@ -592,10 +616,15 @@ impl TeamStore {
             Err(RosterRefusal::AboveActor | RosterRefusal::LastOwner) => {
                 Some(MemberRemoval::Privileged)
             }
+            // a removal never validates the email (a legacy ghost row must stay removable)
+            Err(RosterRefusal::BadEmail) => Some(MemberRemoval::Absent),
         }
     }
 
-    /// The one removal path: look the member up, apply [`check_roster_change`], drop the row.
+    /// The one removal path: look the member up, apply [`check_roster_change`], drop the row. The
+    /// email is matched as [`same_person`], except that a row stored under EXACTLY this string (case
+    /// aside) wins: a ghost row an older build stored with a stray space or no email can still be
+    /// removed on its own, without taking the real member beside it.
     fn remove_checked(
         &self,
         slug: &str,
@@ -605,13 +634,31 @@ impl TeamStore {
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
         let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
-        let Some(current) = team.member(email).map(|member| member.role) else {
+        let exact = email.to_lowercase();
+        let blank = email.trim().is_empty();
+        let by_exact = team
+            .members
+            .iter()
+            .any(|member| member.email.to_lowercase() == exact);
+        let is_target = |member: &Member| {
+            if blank {
+                member.email.trim().is_empty()
+            } else if by_exact {
+                member.email.to_lowercase() == exact
+            } else {
+                same_person(&member.email, email)
+            }
+        };
+        let Some(current) = team
+            .members
+            .iter()
+            .find(|member| is_target(member))
+            .map(|member| member.role)
+        else {
             return Ok((team.clone(), Removal::Absent));
         };
         check_roster_change(team, actor, Some(current), None)?;
-        let email_lower = email.to_lowercase();
-        team.members
-            .retain(|member| member.email.to_lowercase() != email_lower);
+        team.members.retain(|member| !is_target(member));
         team.synthetic_seed = false;
         team.updated_ms = next_version(team.updated_ms, tombstone);
         Ok((team.clone(), Removal::Removed))
