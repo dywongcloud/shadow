@@ -2285,11 +2285,8 @@ impl Gateway {
         if restored_state == fluid_core::DeployState::Ready {
             set_alias_if_newer(&mut st, &project, &id);
             insert_deploy_aliases(&mut st, &id);
-            // Records restore OLDEST first. `deploy` and `promote` make the deployment that takes a
-            // project's alias the host-less default, so the default must follow the alias winners
-            // here too (ending on the newest one); `get_or_insert` alone kept the OLDEST record
-            // for good, and a request with no Host answered a different app after every restart.
-            if st.aliases.get(&project) == Some(&id) {
+            let wins_project_alias = st.aliases.get(&project) == Some(&id);
+            if wins_project_alias {
                 st.default = Some(id);
             } else {
                 st.default.get_or_insert(id);
@@ -4042,8 +4039,6 @@ async fn serve_optimized_image(
         if !allowed {
             return bad("remote url not allowed by images.remotePatterns/domains");
         }
-        // The pattern allow-list is the tenant's own config, so it never decides WHERE the node may
-        // connect: the shared outbound guard refuses non-public addresses at every hop.
         let Ok(target) = hive_outbound::validate_fetch_url(&url) else {
             return bad("remote url is not a public address");
         };

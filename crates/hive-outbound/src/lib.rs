@@ -116,11 +116,8 @@ fn public_v6(ip: Ipv6Addr) -> bool {
     if s[0] == 0x0064 && s[1] == 0xff9b {
         return s[2..6] == [0, 0, 0, 0] && public_v4(embedded(s[6], s[7]));
     }
-    // SIIT's `::ffff:0:a.b.c.d` (the 0xffff marker one segment later than the standard v4-mapped
-    // `::ffff:a.b.c.d` form `to_ipv4()` already handles above): `s[0..4]` zero, `s[4]==0xffff`,
-    // `s[5]==0`, v4 in `s[6..8]`. Without this arm the embedded v4 address (which can be loopback
-    // or RFC1918) is invisible to every check below and the whole address reads as public.
-    if s[0..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0 {
+    let is_siit_translated_v4 = s[0..4] == [0, 0, 0, 0] && s[4] == 0xffff && s[5] == 0;
+    if is_siit_translated_v4 {
         return public_v4(embedded(s[6], s[7]));
     }
     if s[0] == 0x2002 {
