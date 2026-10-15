@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMotionPause } from "@/components/landing/motion-pause";
 
 const PHRASE = "Own Your Cloud";
 
@@ -36,13 +36,7 @@ function Track() {
  *  landing's decorative motion (`html.lp-paused` stops the CSS loops and the terminal's typing; SMIL is paused from script), and
  *  `prefers-reduced-motion` stops it outright. */
 export function MarqueeBanner() {
-  const [paused, setPaused] = useState(false);
-  const togglePause = () => {
-    const next = !paused;
-    setPaused(next);
-    document.documentElement.classList.toggle("lp-paused", next);
-    document.querySelectorAll<SVGSVGElement>(".lp svg").forEach((svg) => (next ? svg.pauseAnimations() : svg.unpauseAnimations()));
-  };
+  const [paused, togglePause] = useMotionPause();
   return (
     <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 sm:pt-6">
       <div className="relative h-[52px] w-full sm:h-[68px]">
@@ -60,7 +54,7 @@ export function MarqueeBanner() {
           </div>
         </div>
       </div>
-      <div className="flex justify-end px-3 lg:px-7">
+      <div className="mx-auto flex max-w-[1500px] justify-end px-3 lg:px-10">
         <button
           type="button"
           onClick={togglePause}

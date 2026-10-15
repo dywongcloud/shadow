@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   GitBranch,
@@ -19,26 +20,15 @@ import {
   Check,
 } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Features — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Features",
+  socialTitle: "Features — shadw",
   description:
     "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access.",
-  alternates: { canonical: "/features" },
-  openGraph: {
-    title: "Features — shadw",
-    description:
-      "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access.",
-    url: "/features",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Features — shadw",
-    description:
-      "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics.",
-  },
-};
+  twitterDescription:
+    "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics.",
+  path: "/features",
+});
 
 
 const FEATURES = [

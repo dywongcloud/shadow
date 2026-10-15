@@ -1,28 +1,16 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { Mail, MessageSquare, Building2 } from "lucide-react";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 
-export const metadata: Metadata = {
-  title: "Contact — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Contact",
+  socialTitle: "Contact — shadw",
   description:
     "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email.",
-  alternates: { canonical: "/contact" },
-  openGraph: {
-    title: "Contact — shadw",
-    description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email.",
-    url: "/contact",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Contact — shadw",
-    description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email.",
-  },
-};
+  path: "/contact",
+});
 
 
 export default function ContactPage() {

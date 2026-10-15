@@ -3,7 +3,9 @@ import { Section, SectionHead } from "./section";
 import { delay } from "./lp-utils";
 
 /** The preset catalog the build detects (crates/fluid-build/src/framework.rs: nextjs, nuxtjs, sveltekit, astro, vite, vue, create-react-app,
- *  node, static) plus the Dockerfile lane and the bun toolchain; logos are the dashboard's own (`public/frameworks`). */
+ *  node, static) plus the Dockerfile lane and the bun toolchain; logos are the dashboard's own (`public/frameworks`). The toolchain line names the
+ *  package managers a build installs with, never Go or Python: a repository whose root is a Go or Python project is an "unsupported root marker"
+ *  (`app_discovery.rs`) unless it carries a Dockerfile, a `fluid.json` or a `package.json`. */
 const STACK: { src: string; name: string; w: number; h: number }[] = [
   { src: "/frameworks/nextjs.png", name: "Next.js", w: 512, h: 512 },
   { src: "/frameworks/nuxt.svg", name: "Nuxt", w: 61, h: 40 },
@@ -17,7 +19,7 @@ const STACK: { src: string; name: string; w: number; h: number }[] = [
   { src: "/frameworks/docker.png", name: "Docker", w: 1067, h: 771 },
 ];
 
-const TOOLCHAINS = ["npm", "pnpm", "yarn", "bun", "Go", "Python"];
+const TOOLCHAINS = ["npm", "pnpm", "yarn", "bun"];
 
 export function StackStrip() {
   return (
@@ -40,6 +42,7 @@ export function StackStrip() {
             {i < TOOLCHAINS.length - 1 ? " · " : ""}
           </span>
         ))}
+        , or from a Dockerfile
       </p>
     </Section>
   );

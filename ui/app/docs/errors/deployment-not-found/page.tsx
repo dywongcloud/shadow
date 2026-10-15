@@ -1,28 +1,18 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { ExternalLink } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
 const DESC =
   "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, or an unattached custom domain — and how it differs from 503 DEPLOYMENT_NOT_READY.";
 
-export const metadata: Metadata = {
-  title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
+export const metadata: Metadata = pageMeta({
+  title: "DEPLOYMENT_NOT_FOUND — Docs",
+  socialTitle: "DEPLOYMENT_NOT_FOUND — shadw Docs",
   description: DESC,
-  alternates: { canonical: "/docs/errors/deployment-not-found" },
-  openGraph: {
-    title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
-    description: DESC,
-    url: "/docs/errors/deployment-not-found",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
-    description: DESC,
-  },
-};
+  path: "/docs/errors/deployment-not-found",
+});
 
 function Section({ id, title, children }: { id: string; title: string; children: React.ReactNode }) {
   return (

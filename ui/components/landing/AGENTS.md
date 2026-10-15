@@ -24,6 +24,16 @@ the root `AGENTS.md` still apply.
 - A flag, id, URL or algorithm name that can wrap is a `Tok` (or a `whitespace-nowrap` terminal segment); the code panel keeps a
   token of up to 30 characters whole and breaks a longer URL after its path slashes, never clipping it. Inline content in a flex
   row goes in ONE element, because a fragment becomes one flex item per run.
+- **A list of capabilities is audited item by item**: `BUILD_TOOLCHAINS` names `go` and `python3` (the build image carries them), yet a repository whose
+  root is a Go or Python project is an "unsupported root marker" (`app_discovery.rs`), so the toolchain line names npm, pnpm, yarn and bun and the
+  Dockerfile lane, never Go or Python.
+- A public page declares its metadata with `pageMeta` (`lib/page-meta.ts`): a page's own `openGraph` or `twitter` object REPLACES the root's, images
+  included, so the helper names the share card on every page, and `title` is the page's own name (the root template adds " · shadw").
+- Motion has one state, `html.lp-paused` (`motion-pause.tsx`): `PauseSkip` is the second Tab stop (through `MarketingShell`'s `lead`), the ticker's
+  button is the same control, and `prefers-reduced-motion` starts the SMIL timelines paused (CSS cannot stop SMIL). An open mobile menu is a dialog:
+  focus moves in, the page behind is `inert`, Tab wraps, focus returns to the toggle.
+- A well is a `min-height`, not a `height` (the step-1 graph's is fixed), and a chip row that cannot shrink keeps its padding in px: a reader's larger
+  text grows the well instead of clipping it (probed at root font x1.0, x1.5 and x2.0).
 - Headings, eyebrows and captions are `text-wrap: balance` (`.lp-card-title`, `.lp-eyebrow`, `.lp-caption`): a block's last line is
   never one short word (the orphan census; a single long word such as "infrastructure." at 320 px cannot be balanced).
 - The social card (`app/opengraph-image.tsx`, a route with no file extension) must be listed in BOTH `isPublic` and `isClerkFree` in

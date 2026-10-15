@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import {
   MarketingShell,
   MarketingHero,
@@ -18,26 +19,15 @@ import {
   Radar,
 } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Product — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Product",
+  socialTitle: "Product — shadw",
   description:
     "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
-  alternates: { canonical: "/product" },
-  openGraph: {
-    title: "Product — shadw",
-    description:
-      "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
-    url: "/product",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Product — shadw",
-    description:
-      "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys and rollback to earlier deployments.",
-  },
-};
+  twitterDescription:
+    "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys and rollback to earlier deployments.",
+  path: "/product",
+});
 
 
 const CAPABILITIES = [

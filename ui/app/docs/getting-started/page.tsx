@@ -1,29 +1,19 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { ArrowRight } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
 
-export const metadata: Metadata = {
-  title: "Getting Started — shadw Docs",
+export const metadata: Metadata = pageMeta({
+  title: "Getting Started — Docs",
+  socialTitle: "Getting Started — shadw Docs",
   description:
     "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions, custom domains and TLS, the CLI, and self-hosting your own nodes.",
-  alternates: { canonical: "/docs/getting-started" },
-  openGraph: {
-    title: "Getting Started — shadw Docs",
-    description:
-      "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions, custom domains and TLS, the CLI, and self-hosting your own nodes.",
-    url: "/docs/getting-started",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Getting Started — shadw Docs",
-    description:
-      "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions, custom domains, the CLI, and self-hosting.",
-  },
-};
+  twitterDescription:
+    "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions, custom domains, the CLI, and self-hosting.",
+  path: "/docs/getting-started",
+});
 
 function Section({ id, title, eyebrow, children }: { id: string; title: string; eyebrow?: string; children: React.ReactNode }) {
   return (

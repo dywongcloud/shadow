@@ -11,7 +11,7 @@ export function PullRequests() {
     { n: "#126", t: "Bump packages", s: "Merged", tone: "text-violet-300", kind: "merged" },
   ];
   return (
-    <div className="flex h-full flex-col px-4 pb-4 pt-3" aria-hidden="true">
+    <div className="flex flex-1 flex-col px-4 pb-4 pt-3" aria-hidden="true">
       <SampleTag />
       <div className="flex min-h-0 flex-1 flex-col justify-center gap-2.5">
         {rows.map((r) => (
@@ -92,7 +92,7 @@ const BARS = [6, 6, 6, 34, 52, 30, 8, 6, 6, 6, 6, 6, 6, 44, 60, 38, 12, 6, 6, 6,
 
 export function ScaleToZero() {
   return (
-    <div className="flex h-full flex-col px-5 pb-5 pt-3" aria-hidden="true">
+    <div className="flex flex-1 flex-col px-5 pb-5 pt-3" aria-hidden="true">
       <SampleTag />
       <div className="mt-auto flex flex-col gap-3">
         <div className="flex h-[72px] items-end gap-[5px]">
@@ -120,7 +120,7 @@ export function Dns() {
     ["TXT", "_hive-verify"],
   ];
   return (
-    <div className="flex h-full flex-col px-4 pb-4 pt-3" aria-hidden="true">
+    <div className="flex flex-1 flex-col px-4 pb-4 pt-3" aria-hidden="true">
       <SampleTag />
       <div className="flex min-h-0 flex-1 flex-col justify-center gap-2.5">
         {rows.map(([type, name]) => (
@@ -139,7 +139,7 @@ const ENGINES = ["Postgres", "Redis", "SQLite", "Blob", "Queue", "Vector", "Pub/
 
 export function ManagedData() {
   return (
-    <div className="flex h-full flex-wrap content-center gap-2.5 p-5" aria-hidden="true">
+    <div className="flex flex-1 flex-wrap content-center gap-2.5 p-5" aria-hidden="true">
       {ENGINES.map((e, i) => (
         <span key={e} className={`lp-chip ${i < 2 ? "!border-indigo-400/50 !bg-indigo-400/10" : ""}`}>
           <span className="lp-dot" style={{ color: ["#38bdf8", "#f87171", "#5eead4", "#fbbf24", "#a78bfa", "#f472b6", "#34d399", "#22d3ee"][i] }} />
@@ -157,11 +157,11 @@ export function Promote() {
     { id: "dpl-91c3f0a85e", live: false },
   ];
   return (
-    <div className="flex h-full flex-col px-5 pb-4 pt-3" aria-hidden="true">
+    <div className="flex flex-1 flex-col px-5 pb-4 pt-3" aria-hidden="true">
       <SampleTag />
       <div className="flex min-h-0 flex-1 flex-col justify-center gap-2.5">
         {rows.map((r) => (
-          <div key={r.id} className="flex h-10 items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5">
+          <div key={r.id} className="flex min-h-10 flex-wrap items-center gap-x-2.5 gap-y-1.5 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3 py-1">
             <span className="lp-dot text-emerald-300 max-[359px]:hidden" />
             <span className="lp-mono flex-1 whitespace-nowrap text-[12.5px] text-zinc-100">{r.id}</span>
             {r.live ? (
@@ -184,7 +184,7 @@ export function LogsMetrics() {
     ["ready", "Deployment ready"],
   ];
   return (
-    <div className="flex h-full flex-col px-4 pb-4 pt-3" aria-hidden="true">
+    <div className="flex flex-1 flex-col px-4 pb-4 pt-3" aria-hidden="true">
       <SampleTag />
       <div className="flex min-h-0 flex-1 items-stretch gap-4">
         <div className="lp-mono flex min-w-0 flex-1 flex-col justify-center gap-2 text-[12px]">
@@ -195,7 +195,7 @@ export function LogsMetrics() {
             </div>
           ))}
         </div>
-        <svg viewBox="0 0 160 90" className="hidden h-full w-[40%] shrink-0 self-end sm:block" preserveAspectRatio="none">
+        <svg viewBox="0 0 160 90" className="hidden h-[110px] w-[40%] shrink-0 self-end sm:block" preserveAspectRatio="none">
           <defs>
             <linearGradient id="lp-area" x1="0" y1="0" x2="0" y2="1">
               <stop offset="0" stopColor="#818cf8" stopOpacity=".5" />

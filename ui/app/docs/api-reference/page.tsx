@@ -1,28 +1,18 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { CodeBlock } from "@/components/code-block";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
-export const metadata: Metadata = {
-  title: "REST API Reference — shadw Docs",
+export const metadata: Metadata = pageMeta({
+  title: "REST API Reference — Docs",
+  socialTitle: "REST API Reference — shadw Docs",
   description:
     "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
-  alternates: { canonical: "/docs/api-reference" },
-  openGraph: {
-    title: "REST API Reference — shadw Docs",
-    description:
-      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
-    url: "/docs/api-reference",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "REST API Reference — shadw Docs",
-    description:
-      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
-  },
-};
+  twitterDescription:
+    "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
+  path: "/docs/api-reference",
+});
 
 
 const TOC = [

@@ -1,28 +1,18 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2 } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-export const metadata: Metadata = {
-  title: "Documentation — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Documentation",
+  socialTitle: "Documentation — shadw",
   description:
     "shadw documentation: deploy serverless functions, containers, and static sites from Git, hosted or on machines you operate, with guides for environment & secrets, GitOps, regions, and the REST API.",
-  alternates: { canonical: "/docs" },
-  openGraph: {
-    title: "Documentation — shadw",
-    description:
-      "shadw documentation: deploy serverless functions, containers, and static sites from Git, hosted or on machines you operate, with guides for environment & secrets, GitOps, regions, and the REST API.",
-    url: "/docs",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Documentation — shadw",
-    description:
-      "shadw documentation: deploy serverless functions, containers, and static sites from Git, with guides for GitOps, regions, and the REST API.",
-  },
-};
+  twitterDescription:
+    "shadw documentation: deploy serverless functions, containers, and static sites from Git, with guides for GitOps, regions, and the REST API.",
+  path: "/docs",
+});
 
 const HERO_TABS = [
   {

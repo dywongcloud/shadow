@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Menu, X } from "lucide-react";
 import Image from "next/image";
@@ -72,15 +72,33 @@ function useForcedDarkRoot() {
   }, []);
 }
 
-export function MarketingShell({ children }: { children: React.ReactNode }) {
+/** `lead` is rendered right after the skip link, so a control that must be a first Tab stop (the landing's Pause) is one. */
+export function MarketingShell({ children, lead }: { children: React.ReactNode; lead?: React.ReactNode }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
   useForcedDarkRoot();
 
   const [menuOpen, setMenuOpen] = useState(false);
+  const toggleRef = useRef<HTMLButtonElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
   // eslint-disable-next-line react-hooks/set-state-in-effect -- resets menu-open state whenever the route changes, a derived-reset-on-change sync
   useEffect(() => setMenuOpen(false), [pathname]);
+  // An open menu is a dialog: focus moves into it (it is appended to <body>, 23 Tab stops away otherwise), the page behind is `inert`, Tab wraps
+  // inside it, and focus returns to the toggle when it closes.
+  useEffect(() => {
+    if (!menuOpen) return;
+    closeRef.current?.focus();
+    const toggle = toggleRef.current;
+    return () => toggle?.focus();
+  }, [menuOpen]);
+  const wrapTab = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== "Tab") return;
+    const items = e.currentTarget.querySelectorAll<HTMLElement>("a[href], button");
+    const first = items[0], last = items[items.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  };
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
     window.addEventListener("keydown", onKey);
@@ -97,6 +115,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div
+      inert={menuOpen}
       className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-x-clip bg-[#0c0d10] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
@@ -106,6 +125,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       >
         Skip to content
       </a>
+      {lead}
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0c0d10]/70 backdrop-blur-xl">
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
           <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
@@ -139,6 +159,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               Get started
             </Link>
             <button
+              ref={toggleRef}
               type="button"
               aria-label={menuOpen ? "Close menu" : "Open menu"}
               aria-expanded={menuOpen}
@@ -159,12 +180,20 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       {menuOpen &&
         typeof document !== "undefined" &&
         createPortal(
-          <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Menu"
+            onKeyDown={wrapTab}
+            className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden"
+            style={{ fontFamily: ELECTROLIZE_FONT }}
+          >
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-3.5">
               <Link href="/" onClick={() => setMenuOpen(false)} className="inline-flex min-h-[44px] shrink-0 items-center">
                 <Logo className="h-7" />
               </Link>
               <button
+                ref={closeRef}
                 type="button"
                 aria-label="Close menu"
                 onClick={() => setMenuOpen(false)}

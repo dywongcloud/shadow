@@ -411,6 +411,13 @@
 .lp-card:hover::before {
   opacity: 1;
 }
+/* a touch screen has no hover: the spotlight becomes a static bloom at the card's top, so a stack of cards on a phone is lit like the desktop grid */
+@media (hover: none) {
+  .lp-card::before {
+    opacity: 1;
+    background: radial-gradient(520px circle at 50% 0%, rgba(99, 102, 241, 0.5), rgba(34, 211, 238, 0.12) 52%, transparent 72%);
+  }
+}
 .lp-card-title {
   font-size: 21px;
   line-height: 1.25;

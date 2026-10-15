@@ -1,26 +1,16 @@
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection } from "@/components/marketing-shell";
 
-export const metadata: Metadata = {
-  title: "Privacy Policy — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Privacy Policy",
+  socialTitle: "Privacy Policy — shadw",
   description:
     "shadw's privacy policy: what the hosted dashboard and managed services collect, where your application data is stored, what platform operators can read, our use of first-party cookies, and what happens when you delete a resource.",
-  alternates: { canonical: "/privacy" },
-  openGraph: {
-    title: "Privacy Policy — shadw",
-    description:
-      "shadw's privacy policy: what the hosted dashboard and managed services collect, where your application data is stored, what platform operators can read, our use of first-party cookies, and what happens when you delete a resource.",
-    url: "/privacy",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Privacy Policy — shadw",
-    description:
-      "shadw's privacy policy: what the hosted dashboard collects, where your application data is stored, what platform operators can read, and what happens when you delete a resource.",
-  },
-};
+  twitterDescription:
+    "shadw's privacy policy: what the hosted dashboard collects, where your application data is stored, what platform operators can read, and what happens when you delete a resource.",
+  path: "/privacy",
+});
 
 
 const SECTIONS: { h: string; p: string }[] = [

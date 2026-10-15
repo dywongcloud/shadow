@@ -10,45 +10,45 @@ import { Dns, LogsMetrics, ManagedData, DomeKeystone, Promote, PullRequests, Sca
 const CARDS: { title: string; body: string; visual: React.ReactNode; span: string; well: string }[] = [
   {
     title: "A live URL for every pull request",
-    body: "Each pull request on a connected GitHub repository gets its own preview, separate from production. A preview reaches production only when you promote it.",
+    body: "Each pull request on a connected GitHub repository gets its own preview, kept apart from production until you merge it or promote it.",
     visual: <PullRequests />,
     span: "lg:col-span-7",
-    well: "h-[256px]",
+    well: "min-h-[256px]",
   },
   {
     title: "Previews that sleep",
     body: "Production stays warm. Previews and earlier deployments scale to zero when idle and wake on the next request.",
     visual: <ScaleToZero />,
     span: "lg:col-span-5",
-    well: "h-[256px]",
+    well: "min-h-[256px]",
   },
   {
     title: "Domains, DNS and TLS",
     body: "Attach a custom domain, manage its DNS records and get HTTPS certificates, from the dashboard or the CLI.",
     visual: <Dns />,
     span: "lg:col-span-4",
-    well: "h-[200px]",
+    well: "min-h-[200px]",
   },
   {
     title: "Managed data",
     body: "Provision Postgres, Redis, SQLite, queues, blobs, vectors, pub/sub and realtime channels from the same dashboard.",
     visual: <ManagedData />,
     span: "md:col-span-2 lg:col-span-4",
-    well: "h-[200px]",
+    well: "min-h-[200px]",
   },
   {
     title: "Promote an earlier deployment",
     body: "When a release goes wrong, promote an earlier deployment back to production.",
     visual: <Promote />,
     span: "lg:col-span-4",
-    well: "h-[200px]",
+    well: "min-h-[200px]",
   },
   {
     title: "Logs and metrics",
     body: "Build and runtime logs, and metrics polled from the dashboard, in one place.",
     visual: <LogsMetrics />,
     span: "md:col-span-2 lg:col-span-12",
-    well: "h-[190px]",
+    well: "min-h-[190px]",
   },
 ];
 
@@ -79,7 +79,7 @@ export function Bento() {
         </article>
         {CARDS.map((c, i) => (
           <article key={c.title} className={`lp-card lp-reveal flex flex-col ${c.span}`} style={delay((i % 3) * 90)}>
-            <div className={`lp-well m-3.5 mb-0 shrink-0 overflow-hidden ${c.well}`}>{c.visual}</div>
+            <div className={`lp-well m-[12px] mb-0 flex shrink-0 flex-col overflow-hidden ${c.well}`}>{c.visual}</div>
             <div className="p-6 pt-5">
               <h3 className="lp-card-title">{c.title}</h3>
               <p className="lp-card-copy mt-2.5">{c.body}</p>

@@ -4,6 +4,7 @@ import { useRef } from "react";
 import { MarqueeBanner } from "@/components/marquee-banner";
 import { MarketingShell } from "@/components/marketing-shell";
 import { IntroLoader } from "@/components/landing/intro-loader";
+import { PauseSkip } from "@/components/landing/motion-pause";
 import { Hero } from "@/components/landing/hero";
 import { StackStrip } from "@/components/landing/stack-strip";
 import { HowItWorks } from "@/components/landing/how-it-works";
@@ -20,7 +21,7 @@ export function Landing() {
   const root = useRef<HTMLDivElement>(null);
   useReveal(root);
   return (
-    <MarketingShell>
+    <MarketingShell lead={<PauseSkip />}>
       <IntroLoader />
       <div ref={root} className="lp">
         <Hero />

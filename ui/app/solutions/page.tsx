@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   ArrowRight,
@@ -15,26 +16,15 @@ import {
   Wrench,
 } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Solutions — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Solutions",
+  socialTitle: "Solutions — shadw",
   description:
     "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
-  alternates: { canonical: "/solutions" },
-  openGraph: {
-    title: "Solutions — shadw",
-    description:
-      "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
-    url: "/solutions",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Solutions — shadw",
-    description:
-      "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
-  },
-};
+  twitterDescription:
+    "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
+  path: "/solutions",
+});
 
 
 const audiences = [
