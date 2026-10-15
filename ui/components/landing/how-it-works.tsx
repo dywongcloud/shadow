@@ -92,18 +92,21 @@ export function HowItWorks() {
   return (
     <Section className="pt-28 sm:pt-36" wash="violet">
       <SectionHead eyebrow="How it works" title="From a commit to a live URL." lead="No pipeline to assemble. Connect a repository and the platform builds it, gives it an address and keeps every build." />
-      <ol className="mt-14 grid gap-5 md:grid-cols-3">
-        {STEPS.map((s, i) => (
-          <li key={s.n} className="lp-card lp-reveal flex flex-col" style={delay(i * 110)}>
-            <div className="lp-well m-3.5 mb-0 h-[172px] overflow-hidden">{s.visual}</div>
-            <div className="flex flex-1 flex-col p-6 pt-5">
-              <span className="lp-gradient-text lp-mono w-fit text-[13px] tracking-[0.2em]">{s.n}</span>
-              <h3 className="lp-card-title mt-2">{s.title}</h3>
-              <p className="lp-card-copy mt-2.5">{s.body}</p>
-            </div>
-          </li>
-        ))}
-      </ol>
+      <div className="relative mt-14">
+        <div aria-hidden="true" className="lp-rail hidden md:block" />
+        <ol className="grid gap-5 md:grid-cols-3">
+          {STEPS.map((s, i) => (
+            <li key={s.n} className="lp-card lp-reveal flex flex-col" style={delay(i * 110)}>
+              <div className="lp-well m-3.5 mb-0 h-[172px] overflow-hidden">{s.visual}</div>
+              <div className="flex flex-1 flex-col p-6 pt-5">
+                <span className="lp-gradient-text lp-mono w-fit text-[13px] tracking-[0.2em]">{s.n}</span>
+                <h3 className="lp-card-title mt-2">{s.title}</h3>
+                <p className="lp-card-copy mt-2.5">{s.body}</p>
+              </div>
+            </li>
+          ))}
+        </ol>
+      </div>
     </Section>
   );
 }

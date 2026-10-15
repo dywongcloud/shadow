@@ -5,7 +5,7 @@ import { Section, SectionHead } from "./section";
 import { delay, trackSpotlight } from "./lp-utils";
 import { Dns, LogsMetrics, ManagedData, MeshKeystone, Promote, PullRequests, ScaleToZero } from "./bento-visuals";
 
-/** Every card names a feature the code has (audit-copy.md): pull-request previews, the iroh QUIC mesh with hybrid post-quantum key exchange
+/** Every card names a feature the code has: pull-request previews, the iroh QUIC mesh with hybrid post-quantum key exchange
  *  (CHANGELOG 2026-09-22), scale to zero, DNS + ACME, the `DbKind` engines, promote, logs and metrics. */
 const CARDS: { title: string; body: string; visual: React.ReactNode; span: string; well: string }[] = [
   {
@@ -59,16 +59,21 @@ export function Bento() {
     <Section className="pt-28 sm:pt-36" wash="duo">
       <SectionHead eyebrow="What you get" title="Everything between git push and a live URL." lead="Builds, previews, domains, data and logs in one platform, on one mesh." />
       <div ref={grid} className="mt-14 grid gap-5 md:grid-cols-2 lg:grid-cols-12">
-        <article className="lp-card lp-reveal grid md:col-span-2 lg:col-span-12 lg:grid-cols-12" style={delay(0)}>
+        <article className="lp-card lp-card-keystone lp-reveal grid md:col-span-2 lg:col-span-12 lg:grid-cols-12" style={delay(0)}>
           <div className="flex flex-col justify-center p-7 lg:col-span-4 lg:p-10">
-            <h3 className="lp-card-title !text-[26px]">A peer-to-peer mesh</h3>
+            <h3 className="lp-card-title !text-[28px]">A peer-to-peer mesh</h3>
             <p className="lp-card-copy mt-3 max-w-[400px]">
               Nodes connect to each other over QUIC, and mesh links offer hybrid post-quantum key exchange (X25519 + ML-KEM-768).
             </p>
           </div>
-          <div className="lp-well relative m-3.5 h-[300px] overflow-hidden lg:col-span-8 lg:m-4">
-            <MeshKeystone />
-            <span className="lp-chip lp-mono absolute bottom-3 right-3 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)]">Illustrative</span>
+          <div className="relative h-[230px] sm:h-[290px] lg:col-span-8 lg:h-[400px] lg:[clip-path:inset(-70px_0_0_0)]">
+            <div className="absolute inset-x-3 bottom-0 top-8 lg:hidden">
+              <MeshKeystone compact />
+            </div>
+            <div className="absolute bottom-0 left-0 right-0 hidden h-[470px] lg:block">
+              <MeshKeystone />
+            </div>
+            <span className="lp-chip lp-mono absolute left-4 top-4 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] lg:left-2 lg:top-5">Illustrative</span>
           </div>
         </article>
         {CARDS.map((c, i) => (

@@ -6,7 +6,7 @@
   --lp-mute: #a1a1aa;
   --lp-dim: #9a9aa6;
   --lp-grad: linear-gradient(100deg, #5eead4 0%, #22d3ee 28%, #818cf8 62%, #e879f9 100%);
-  --lp-edge: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(255, 255, 255, 0.07) 42%, rgba(34, 211, 238, 0.5) 100%);
+  --lp-edge: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(34, 211, 238, 0.5) 100%);
   --lp-limb: linear-gradient(90deg, transparent, #8b5cf6 22%, #e0f2fe 50%, #22d3ee 78%, transparent);
 }
 .lp {
@@ -276,7 +276,7 @@
   position: relative;
   margin-left: auto;
   margin-right: auto;
-  max-width: 1152px;
+  max-width: 1208px;
 }
 .lp-dome-mask {
   -webkit-mask-image: linear-gradient(to bottom, #000 56%, transparent 99%);
@@ -381,6 +381,7 @@
   content: "";
   position: absolute;
   inset: 0;
+  border-radius: inherit;
   z-index: -1;
   opacity: 0;
   transition: opacity 0.35s;
@@ -503,4 +504,56 @@
 }
 html:has(.lp-hero) {
   scroll-padding-top: 76px;
+}
+
+/* the mesh keystone: the one card whose outline is the full limb gradient and whose dome may cross its top edge */
+.lp-card-keystone {
+  overflow: visible;
+  border-width: 1.5px;
+  background: linear-gradient(180deg, #11121b, #0b0c12) padding-box, linear-gradient(90deg, #8b5cf6, #e0f2fe 50%, #22d3ee) border-box;
+}
+
+/* the flow's rail: one lit line across the three cards' top edges with a point travelling along it */
+.lp-rail {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  z-index: 3;
+  pointer-events: none;
+  border-radius: 2px;
+  background: linear-gradient(90deg, transparent, #8b5cf6 12%, #e0f2fe 50%, #22d3ee 88%, transparent);
+  opacity: 0.85;
+}
+.lp-rail::after {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: 4%;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e0f2fe;
+  box-shadow: 0 0 14px 4px rgba(94, 234, 212, 0.7);
+  animation: lp-travel 5.5s linear infinite;
+}
+@keyframes lp-travel {
+  0% {
+    left: 4%;
+    opacity: 0;
+  }
+  8%,
+  92% {
+    opacity: 1;
+  }
+  100% {
+    left: 96%;
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .lp-rail::after {
+    display: none;
+  }
 }

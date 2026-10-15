@@ -5,7 +5,7 @@ import { GitMerge, GitPullRequest } from "lucide-react";
 
 export function PullRequests() {
   const rows = [
-    { n: "#128", t: "Add pricing page", s: "Preview ready", tone: "text-emerald-300", kind: "ok" },
+    { n: "#128", t: "Add pricing page", s: "Ready", tone: "text-emerald-300", kind: "ok" },
     { n: "#127", t: "Fix auth redirect", s: "Building", tone: "text-amber-300", kind: "run" },
     { n: "#126", t: "Update dependencies", s: "Merged", tone: "text-violet-300", kind: "merged" },
   ];
@@ -14,8 +14,8 @@ export function PullRequests() {
       {rows.map((r) => (
         <div key={r.n} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5 py-3">
           {r.kind === "merged" ? <GitMerge className="h-4 w-4 shrink-0 text-violet-300" /> : <GitPullRequest className="h-4 w-4 shrink-0 text-emerald-300" />}
-          <span className="lp-mono text-[12px] text-[var(--lp-dim)]">{r.n}</span>
-          <span className="min-w-0 flex-1 truncate text-[14px] text-zinc-100">{r.t}</span>
+          <span className="lp-mono hidden text-[12px] text-[var(--lp-dim)] sm:inline">{r.n}</span>
+          <span className="min-w-0 flex-1 text-[14px] text-zinc-100">{r.t}</span>
           <span className={`lp-chip ${r.tone}`}>
             {r.kind === "run" ? <span className="lp-spinner" /> : <span className="lp-dot" />}
             {r.s}
@@ -27,54 +27,57 @@ export function PullRequests() {
 }
 
 /** The mesh keystone: the hero's planet in miniature (the same limb gradient and halo strokes, a dark body, meridians and parallels clipped to the dome),
- *  nine nodes, ten links and a few pulses. Sample topology: it prints no count of real nodes. */
-const ARC = "M30 320C30 140 190 24 410 24C630 24 790 140 790 320";
-const MESH_NODES: [number, number][] = [[150, 236], [262, 152], [352, 222], [410, 98], [506, 160], [588, 240], [672, 176], [330, 82], [486, 276]];
-const MESH_EDGES = ["M150 236L262 152", "M262 152L352 222", "M262 152L330 82", "M330 82L410 98", "M410 98L506 160", "M506 160L588 240", "M506 160L672 176", "M352 222L486 276", "M352 222L410 98", "M588 240L672 176"];
-const MERIDIANS = ["M410 24V320", "M410 24C330 80 282 170 272 320", "M410 24C490 80 538 170 548 320", "M410 24C262 72 184 182 152 320", "M410 24C558 72 636 182 668 320"];
+ *  nine nodes, ten links and a few pulses. Drawn in the pixel space of the wide card (760 x 400, with 70 px of headroom so the arc can cross the card's top
+ *  edge); `compact` fits the whole dome into a small well. Sample topology: it prints no count of real nodes. */
+const ARC = "M20 400C20 150 180 -30 380 -30C580 -30 740 150 740 400";
+const MESH_NODES: [number, number][] = [[140, 300], [250, 205], [335, 290], [395, 95], [505, 190], [590, 300], [675, 240], [305, 35], [465, 350]];
+const MESH_EDGES = ["M140 300L250 205", "M250 205L335 290", "M250 205L305 35", "M305 35L395 95", "M395 95L505 190", "M505 190L590 300", "M505 190L675 240", "M335 290L465 350", "M335 290L395 95", "M590 300L675 240"];
+const MERIDIANS = ["M380 -30V400", "M380 -30C300 40 250 200 240 400", "M380 -30C460 40 510 200 520 400", "M380 -30C230 30 130 210 100 400", "M380 -30C530 30 630 210 660 400"];
 
-export function MeshKeystone() {
+export function MeshKeystone({ compact = false }: { compact?: boolean }) {
+  const id = compact ? "lp-mk-s" : "lp-mk-l";
   return (
-    <svg viewBox="0 0 820 320" className="h-full w-full" preserveAspectRatio="xMidYMax slice" aria-hidden="true">
+    <svg viewBox="0 -70 760 470" className="h-full w-full overflow-visible" preserveAspectRatio={compact ? "xMidYMax meet" : "xMidYMax slice"} aria-hidden="true">
       <defs>
-        <linearGradient id="lp-mk-limb" gradientUnits="userSpaceOnUse" x1="30" y1="0" x2="790" y2="0">
-          <stop offset="0" stopColor="#8b5cf6" stopOpacity="0.6" />
+        <linearGradient id={`${id}-limb`} gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="740" y2="0">
+          <stop offset="0" stopColor="#8b5cf6" stopOpacity="0.7" />
           <stop offset="0.3" stopColor="#60a5fa" />
           <stop offset="0.5" stopColor="#e0f2fe" />
           <stop offset="0.7" stopColor="#38bdf8" />
-          <stop offset="1" stopColor="#22d3ee" stopOpacity="0.6" />
+          <stop offset="1" stopColor="#22d3ee" stopOpacity="0.7" />
         </linearGradient>
-        <clipPath id="lp-mk-clip">
-          <path d={`${ARC}V320H30Z`} />
+        <clipPath id={`${id}-clip`}>
+          <path d={`${ARC}V400H20Z`} />
         </clipPath>
       </defs>
-      <path d={`${ARC}V320H30Z`} fill="#07090f" fillOpacity="0.92" />
-      <g clipPath="url(#lp-mk-clip)" fill="none" stroke="rgba(255,255,255,.13)" strokeWidth="1.2">
-        {[118, 190, 262].map((y) => (
-          <path key={y} d={`M0 ${y}H820`} />
+      <path d={`${ARC}V400H20Z`} fill="#07090f" fillOpacity="0.94" />
+      <g clipPath={`url(#${id}-clip)`} fill="none" stroke="rgba(255,255,255,.13)" strokeWidth="1.2">
+        {[150, 250, 340].map((y) => (
+          <path key={y} d={`M0 ${y}H760`} />
         ))}
         {MERIDIANS.map((d) => (
           <path key={d} d={d} />
         ))}
         {MESH_EDGES.map((d) => (
-          <path key={d} d={d} stroke="rgba(147,197,253,.38)" />
+          <path key={d} d={d} stroke="rgba(147,197,253,.4)" />
         ))}
       </g>
-      <g fill="none" stroke="url(#lp-mk-limb)" strokeLinecap="round">
-        <path d={ARC} strokeWidth="34" strokeOpacity="0.05" />
-        <path d={ARC} strokeWidth="18" strokeOpacity="0.09" />
-        <path d={ARC} strokeWidth="9" strokeOpacity="0.2" />
-        <path d={ARC} strokeWidth="2.6" strokeOpacity="0.95" />
+      <g fill="none" stroke={`url(#${id}-limb)`} strokeLinecap="round">
+        <path d={ARC} strokeWidth="44" strokeOpacity="0.04" />
+        <path d={ARC} strokeWidth="26" strokeOpacity="0.07" />
+        <path d={ARC} strokeWidth="14" strokeOpacity="0.13" />
+        <path d={ARC} strokeWidth="7" strokeOpacity="0.26" />
+        <path d={ARC} strokeWidth="3" strokeOpacity="1" />
       </g>
       {[0, 3, 5, 8].map((i) => (
-        <circle key={i} r="3.4" fill="#60a5fa" className="lp-pulse">
+        <circle key={i} r="3.6" fill="#60a5fa" className="lp-pulse">
           <animateMotion path={MESH_EDGES[i]} dur={`${2.4 + i * 0.3}s`} begin={`${i * 0.5}s`} repeatCount="indefinite" />
         </circle>
       ))}
       {MESH_NODES.map(([x, y], i) => (
-        <g key={i} transform={`translate(${x - 11} ${y - 11})`}>
-          <rect width="22" height="22" rx="5" fill="#000" stroke={i === 3 ? "#5eead4" : "#2f6bff"} strokeWidth="1.6" />
-          <rect x="6" y="6" width="10" height="10" rx="2" fill="none" stroke="#e5e7eb" strokeWidth="1.3" />
+        <g key={i} transform={`translate(${x - 12} ${y - 12})`}>
+          <rect width="24" height="24" rx="5.5" fill="#000" stroke={i === 3 ? "#5eead4" : "#2f6bff"} strokeWidth="1.7" />
+          <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="#e5e7eb" strokeWidth="1.4" />
         </g>
       ))}
     </svg>
@@ -85,7 +88,8 @@ const BARS = [6, 6, 6, 34, 52, 30, 8, 6, 6, 6, 6, 6, 6, 44, 60, 38, 12, 6, 6, 6,
 
 export function ScaleToZero() {
   return (
-    <div className="flex h-full flex-col justify-end gap-3 p-5" aria-hidden="true">
+    <div className="relative flex h-full flex-col justify-end gap-3 p-5" aria-hidden="true">
+      <span className="lp-chip absolute right-3 top-3 !text-[11px] uppercase tracking-[0.12em] text-[var(--lp-dim)]">Sample</span>
       <div className="flex h-[72px] items-end gap-[5px]">
         {BARS.map((h, i) => (
           <span
@@ -144,7 +148,7 @@ export function Promote() {
     { id: "dpl-91c3f0a85e", live: false },
   ];
   return (
-    <div className="flex h-full flex-col justify-center gap-2.5 p-4" aria-hidden="true">
+    <div className="flex h-full flex-col justify-center gap-2.5 px-5 py-4" aria-hidden="true">
       {rows.map((r) => (
         <div key={r.id} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5 py-3">
           <span className="lp-dot text-emerald-300" />

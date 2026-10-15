@@ -57,12 +57,12 @@ export function ProductShowcase() {
           </div>
           <Crop src={PROJECTS} alt={PROJECTS_ALT} box={{ x: 0, y: 0, w: 2880, h: 1050 }} sizes="(max-width: 1200px) 100vw, 1152px" />
         </figure>
-        <figure className="lp-glass lp-float absolute -bottom-2 -right-3 z-10 w-[58%] overflow-hidden">
+        <figure className="lp-glass lp-limb-top lp-float absolute bottom-0 right-0 z-10 w-[58%] overflow-hidden">
           <Crop
             src={DEPLOYMENTS}
             alt="A project's Deployments tab: one production build and two previews, all ready, with Redeploy and Instant Rollback."
-            box={{ x: 70, y: 216, w: 1670, h: 540 }}
-            sizes="1152px"
+            box={{ x: 70, y: 216, w: 1330, h: 560 }}
+            sizes="1330px"
           />
         </figure>
       </div>

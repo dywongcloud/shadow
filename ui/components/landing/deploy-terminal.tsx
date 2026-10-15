@@ -101,12 +101,18 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
 
   const shown = LINES.map((l, i) => (l.typed ? Math.max(0, Math.min(LENGTHS[i], Math.floor((ms - l.at) / TYPE_MS))) : ms >= l.at ? LENGTHS[i] : 0));
   const lastShown = shown.reduce((last, n, i) => (n > 0 ? i : last), 0);
+  const row = (l: Line, i: number, chars: number, cursor: boolean) => (
+    <div key={i} className={l.gap ? "mt-2" : undefined} style={l.hang ? { paddingLeft: "2ch", textIndent: "-2ch" } : undefined}>
+      {clip(l.segs, chars)}
+      {cursor && <span className="lp-cursor" />}
+    </div>
+  );
 
   return (
     <div
       ref={box}
       role="img"
-      aria-label="Terminal transcript: deploying a repository with the shadw CLI. The build clones the repository, detects Next.js, uploads the outputs and finishes ready."
+      aria-label="Illustrative terminal transcript: deploying a repository with the shadw CLI. The build clones the repository, detects Next.js, uploads the outputs and finishes ready."
       className={`lp-glass ${className}`}
     >
       <div className="lp-glass-bar" aria-hidden="true">
@@ -115,15 +121,9 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
         <i />
         <em>Illustrative</em>
       </div>
-      <div className="lp-term-body lp-mono" aria-hidden="true" data-live={live ? "1" : "0"} style={{ minHeight: "15.2em" }}>
-        {LINES.map((l, i) =>
-          shown[i] > 0 ? (
-            <div key={i} className={l.gap ? "mt-2" : undefined} style={l.hang ? { paddingLeft: "2ch", textIndent: "-2ch" } : undefined}>
-              {clip(l.segs, shown[i])}
-              {i === lastShown && <span className="lp-cursor" />}
-            </div>
-          ) : null,
-        )}
+      <div className="lp-term-body lp-mono relative" aria-hidden="true" data-live={live ? "1" : "0"}>
+        <div className="invisible">{LINES.map((l, i) => row(l, i, LENGTHS[i], false))}</div>
+        <div className="absolute inset-x-0 top-0" style={{ padding: "14px 16px 0" }}>{LINES.map((l, i) => (shown[i] > 0 ? row(l, i, shown[i], i === lastShown) : null))}</div>
       </div>
     </div>
   );

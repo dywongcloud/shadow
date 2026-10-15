@@ -54,7 +54,7 @@ function tint(line: string): React.ReactNode[] {
     const t = m[0];
     const cls = /^(#|\/\/)/.test(t) ? "lp-dim" : /^(["'`]|https?:|<)/.test(t) ? "lp-str" : "lp-key";
     out.push(
-      <span key={at} className={cls}>
+      <span key={at} className={cls === "lp-dim" ? cls : `${cls} whitespace-nowrap`}>
         {t}
       </span>,
     );
@@ -124,7 +124,7 @@ export function Developer() {
                     aria-controls="lp-dev-panel"
                     tabIndex={i === tab ? 0 : -1}
                     onClick={() => setTab(i)}
-                    className={`lp-mono relative inline-flex h-[44px] items-center whitespace-nowrap px-3.5 text-[12px] uppercase tracking-[0.14em] transition-colors ${i === tab ? "text-white" : "text-[var(--lp-dim)] hover:text-zinc-200"}`}
+                    className={`lp-mono relative inline-flex h-[44px] items-center whitespace-nowrap px-3.5 text-[12px] uppercase tracking-[0.14em] transition-colors ${i === tab ? "text-white underline decoration-2 underline-offset-[10px]" : "text-[var(--lp-dim)] hover:text-zinc-200"}`}
                   >
                     {t.label}
                     {i === tab && <span aria-hidden className="absolute inset-x-2.5 -bottom-px h-px bg-gradient-to-r from-teal-300 via-indigo-300 to-fuchsia-300" />}
