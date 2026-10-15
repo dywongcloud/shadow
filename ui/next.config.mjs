@@ -72,6 +72,8 @@ const nextConfig = {
       { source: "/login", destination: "/sign-in", permanent: true },
       { source: "/signup", destination: "/sign-up", permanent: true },
       { source: "/team", destination: "/teams", permanent: true },
+      { source: "/blog", destination: "/docs", permanent: true },
+      { source: "/case-studies", destination: "/solutions", permanent: true },
       { source: "/marketplace", destination: "/integrations", permanent: false },
       { source: "/workflows/runs/:id", destination: "/workflows/run/:id", permanent: false },
     ];

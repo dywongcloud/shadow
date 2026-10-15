@@ -6,12 +6,12 @@ import { Check } from "lucide-react";
 export const metadata: Metadata = {
   title: "Pricing — shadw",
   description:
-    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read answers to common pricing questions.",
   alternates: { canonical: "/pricing" },
   openGraph: {
     title: "Pricing — shadw",
     description:
-      "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+      "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read answers to common pricing questions.",
     url: "/pricing",
     type: "website",
     siteName: "shadw",
@@ -20,7 +20,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Pricing — shadw",
     description:
-      "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
+      "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read pricing FAQs.",
   },
 };
 
@@ -45,9 +45,12 @@ const TIERS: Tier[] = [
     features: [
       "1 concurrent build",
       "Community support",
-      "100GB bandwidth",
+      "$5 of included compute / month",
       "Preview deployments",
       "Automatic HTTPS",
+      "Custom domains & DNS",
+      "Build cache",
+      "Cron & workflows",
     ],
     cta: { label: "Start free", href: "/sign-up" },
     variant: "outline",
@@ -60,13 +63,12 @@ const TIERS: Tier[] = [
     features: [
       "Everything in Hobby",
       "Unlimited concurrent builds",
-      "Custom domains & DNS",
+      "$20 of included compute / month",
+      "Pay-as-you-go beyond included compute",
       "Team members & roles",
-      "Build cache",
-      "Cron & workflows",
       "Email support",
     ],
-    cta: { label: "Start Pro trial", href: "/sign-up" },
+    cta: { label: "Start Pro", href: "/sign-up" },
     variant: "primary",
     featured: true,
   },
@@ -74,15 +76,13 @@ const TIERS: Tier[] = [
     name: "Enterprise",
     price: "$1,000",
     period: "/month",
-    tagline: "Self-host across your own global mesh.",
+    tagline: "For organizations with large compute needs.",
     features: [
       "Everything in Pro",
       "$1,000 of included compute / month",
-      "Self-hosted nodes",
-      "Data residency & leases",
-      "SSO/SAML",
+      "Region pinning for compute & leases",
       "Audit logs",
-      "Dedicated support & SLA",
+      "Priority support",
     ],
     cta: { label: "Start Enterprise", href: "/sign-up" },
     variant: "outline",
@@ -92,7 +92,7 @@ const TIERS: Tier[] = [
 const FAQS: { q: string; a: string }[] = [
   {
     q: "Can I self-host?",
-    a: "Yes. The Enterprise tier lets you run shadw across your own global mesh of self-hosted nodes, with full control over data residency and leases.",
+    a: "Yes. shadw can run on nodes you operate. Self-hosting is not a plan feature: Hobby, Pro and Enterprise differ in included compute, limits and support.",
   },
   {
     q: "What counts as a build?",
@@ -100,11 +100,11 @@ const FAQS: { q: string; a: string }[] = [
   },
   {
     q: "Do you offer a free tier?",
-    a: "The Hobby plan is free forever and includes everything you need for personal projects and experiments, including preview deployments and automatic HTTPS.",
+    a: "Yes. The Hobby plan costs $0 and includes $5 of compute per month, preview deployments and automatic HTTPS. It has no pay-as-you-go overage: once the $5 is used and you have no prepaid credits, new deployments are blocked until the next monthly period, unless you add credits or upgrade to Pro.",
   },
   {
     q: "Can I bring my own domain?",
-    a: "Absolutely. Custom domains and DNS are included on the Pro plan and above, with automatic HTTPS provisioned for every domain you connect.",
+    a: "Yes. Custom domains and DNS are available on every plan, with automatic HTTPS for every verified domain once its DNS points at shadw.",
   },
 ];
 
