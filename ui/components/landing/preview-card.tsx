@@ -29,7 +29,6 @@ export function PreviewCard({ className = "" }: { className?: string }) {
           <span className="lp-chip lp-deploy-building text-amber-300">
             <span className="lp-spinner" /> Building
           </span>
-          <span className="lp-mono text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)]">Illustrative</span>
         </div>
       </div>
     </div>

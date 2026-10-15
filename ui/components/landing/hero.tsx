@@ -10,8 +10,8 @@ import { delay } from "./lp-utils";
  *  less the 54 % of the globe's height it overlaps, fitted as a line in the dome's width because a padding percentage is a share of the width. */
 const CARDS_OVERHANG = "max(0px, calc(725px - 55.6%))";
 
-/** The hero: one dominant luminous object (the globe dome under its tracers) with the product shown doing its job in two glass panels. Every
- *  claim is one the code backs; the dome prints no count and names no region, and says so. */
+/** The hero: one dominant luminous object (the globe dome under its tracers) with the product shown doing its job in two glass panels. The dome is
+ *  art: it prints no count and names no region. */
 export function Hero() {
   return (
     <section className="lp-hero pb-14 lg:pb-24">
@@ -23,12 +23,6 @@ export function Hero() {
       </div>
 
       <div className="relative z-10 mx-auto max-w-[1100px] px-6 pt-12 sm:pt-[60px]">
-        <p className="lp-rise" style={delay(0)}>
-          <span className="lp-pill">
-            <b>Free</b>
-            Start on the Hobby plan
-          </span>
-        </p>
         <h1 className="lp-h1 lp-rise mt-7" style={delay(90)}>
           Push to Git.
           <br />
@@ -63,12 +57,8 @@ export function Hero() {
           </GlobeWireframe>
           <DeployTerminal className="relative z-10 mx-auto -mt-12 w-[min(560px,calc(100%-32px))] lg:absolute lg:left-0 lg:top-[46%] lg:mx-0 lg:mt-0 lg:w-[min(540px,45%)]" />
           <PreviewCard className="absolute right-0 top-[30%] z-10 hidden w-[320px] lg:block" />
-          <span className="lp-chip lp-mono absolute -top-[46px] right-0 z-10 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] sm:top-0">Illustrative</span>
         </div>
         <div aria-hidden="true" className="hidden lg:block" style={{ paddingBottom: CARDS_OVERHANG }} />
-        <p className="lp-caption lp-mono mx-auto mt-7 max-w-[420px] px-6 text-center text-[12px] uppercase leading-[1.7] tracking-[0.16em] text-[var(--lp-dim)] lg:mt-8">
-          Illustrative. Not a map of our machines.
-        </p>
       </div>
     </section>
   );

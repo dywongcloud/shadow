@@ -7,10 +7,11 @@ the root `AGENTS.md` still apply.
 - **The copy sells outcomes, not architecture**: Git to a live URL, a preview per pull request, free to start, hosted or on your own
   machines. Peer-to-peer, mesh, QUIC and post-quantum belong to the docs, never to a hero, title, pill, card title, description or
   social card (the person's rule: "people dont care about peer to peer"). The globe is art, and its caption says so.
-- **Every sentence is one the code backs.** An illustration is marked (`Illustrative` on the dome, terminal, preview card and
-  keystone; `Sample` on every vignette that shows states, as `SampleTag`, the FIRST ROW of the vignette in the flow, so it can
-  never lie on the content; one footnote per section) and names states, never counts, durations or prices.
-  `public/product/dashboard-*.png` are real 2x captures of a seeded local node: recapture them when the dashboard changes, never
+- **Every sentence is one the code backs.** No illustration carries an annotation label: the owner asked for the `Illustrative` and `Sample`
+  chips, the provenance captions and the "Free / Start on the Hobby plan" pill to be removed, and the battery asserts they stay gone
+  (`annotations.js`; the same rule made the motion controls icon-only, with their name in `aria-label` or `sr-only` text). What the rule
+  leaves is the older one: an illustration names states, never counts, durations or prices, and the dome prints no count and names no
+  region. `public/product/dashboard-*.png` are real 2x captures of a seeded local node: recapture them when the dashboard changes, never
   retouch a frame.
 - **Light is gradients, masks and stroke stacks, never a blur filter**; the sticky nav's backdrop blur is the page's only
   filter once the intro overlay (`intro-loader.tsx`: a blurred ring, 2.2 s, removed from the DOM) has ended; the headline paints at

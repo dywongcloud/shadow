@@ -71,9 +71,6 @@ export function ProductShowcase() {
         <Crop src={PROJECTS} alt={PROJECTS_ALT} box={{ x: 690, y: 360, w: 810, h: 340 }} sizes="(max-width: 600px) 1280px, 1990px" />
       </figure>
 
-      <p className="lp-caption lp-mono mt-8 text-center text-[12px] uppercase leading-[1.7] tracking-[0.16em] text-[var(--lp-dim)] lg:mt-6">
-        Screens from a local shadw install with sample projects.
-      </p>
     </Section>
   );
 }

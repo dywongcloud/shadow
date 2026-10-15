@@ -1,7 +1,6 @@
 import { Check, Lock } from "lucide-react";
 import { Section, SectionHead } from "./section";
 import { delay } from "./lp-utils";
-import { SampleTag } from "./sample-tag";
 
 /** Illustrations only: sample names, no counts, no durations. Each is hidden from assistive technology and tagged Sample; the card text carries the
  *  meaning. A well is a minimum height, not a height, so a reader's larger text grows it instead of clipping it (the graph's well is fixed: it scales
@@ -13,7 +12,6 @@ const BRANCH_LABEL = "lp-mono absolute whitespace-nowrap text-[11px] tracking-[0
 function CommitGraph() {
   return (
     <div className="flex min-h-0 flex-1 flex-col px-3 pb-3 pt-3" aria-hidden="true">
-      <SampleTag />
       <div className="min-h-0 flex-1 [container-type:size]">
         <div className="relative mx-auto" style={{ width: "min(100cqw, calc(100cqh * 320 / 130))", aspectRatio: "320 / 130", marginTop: "max(0px, calc((100cqh - 100cqw * 130 / 320) / 2))" }}>
           <svg viewBox="0 0 320 130" className="absolute inset-0 h-full w-full">
@@ -58,7 +56,6 @@ function BuildLines() {
   ] as const;
   return (
     <div className="lp-mono flex flex-1 flex-col px-4 pb-3 pt-3 text-[12.5px] text-zinc-200" aria-hidden="true">
-      <SampleTag />
       <div className="flex min-h-0 flex-1 flex-col justify-center gap-3">
         {rows.map(([text, done]) => (
           <div key={text} className="flex items-center gap-2.5">
@@ -74,7 +71,6 @@ function BuildLines() {
 function LiveAddress() {
   return (
     <div className="flex flex-1 flex-col px-[14px] pb-3 pt-3" aria-hidden="true">
-      <SampleTag />
       <div className="flex min-h-0 flex-1 flex-col justify-center gap-4">
         <div className="lp-chip lp-mono w-full justify-start gap-2 !px-[11px] !py-[9px] !text-[12.5px]">
           <Lock className="h-[14px] w-[14px] shrink-0 text-emerald-300" /> my-app.shadw.app

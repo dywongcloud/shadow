@@ -123,7 +123,6 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
         <i />
         <i />
         <i />
-        <em>Illustrative</em>
       </div>
       <div className="lp-term-body lp-mono relative" aria-hidden="true" data-live={live ? "1" : "0"}>
         <div className="invisible">{LINES.map((l, i) => row(l, i, LENGTHS[i], false))}</div>

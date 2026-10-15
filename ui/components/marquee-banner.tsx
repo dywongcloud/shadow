@@ -1,5 +1,6 @@
 "use client";
 
+import { Pause, Play } from "lucide-react";
 import { useMotionPause } from "@/components/landing/motion-pause";
 
 const PHRASE = "Own Your Cloud";
@@ -41,7 +42,7 @@ export function MarqueeBanner() {
     <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 sm:pt-6">
       <div className="relative h-[52px] w-full sm:h-[68px]">
         <svg viewBox="0 0 2048 69" className="absolute inset-0 h-full w-full" preserveAspectRatio="none" aria-hidden="true">
-          <path d={SHAPE} fill="#131316" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+          <path d={SHAPE} fill="#0a0a0a" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         </svg>
 
         <div className="absolute inset-x-0 overflow-hidden" style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(11px, 0.9vw, 14px)" }}>
@@ -58,9 +59,11 @@ export function MarqueeBanner() {
         <button
           type="button"
           onClick={togglePause}
-          className="inline-flex min-h-[44px] items-center px-3 text-[12px] text-zinc-300 underline-offset-4 transition-colors hover:text-white hover:underline"
+          aria-label={paused ? "Play animations" : "Pause animations"}
+          aria-pressed={paused}
+          className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md px-3 text-zinc-300 transition-colors hover:text-white"
         >
-          {paused ? "Play animations" : "Pause animations"}
+          {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
         </button>
       </div>
     </section>

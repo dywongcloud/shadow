@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { Pause as PauseIcon, Play as PlayIcon } from "lucide-react";
 
 const CHANGED = "lp-motion-pause";
 const PAUSED = "lp-paused";
@@ -66,7 +67,8 @@ export function PauseSkip() {
       onClick={toggle}
       className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[300] focus:inline-flex focus:min-h-[44px] focus:items-center focus:rounded-md focus:bg-white focus:px-4 focus:text-[14px] focus:text-black"
     >
-      {paused ? "Play animations" : "Pause animations"}
+      <span aria-hidden="true">{paused ? <PlayIcon className="h-4 w-4" /> : <PauseIcon className="h-4 w-4" />}</span>
+      <span className="sr-only">{paused ? "Play animations" : "Pause animations"}</span>
     </button>
   );
 }

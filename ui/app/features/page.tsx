@@ -174,7 +174,6 @@ export default function FeaturesPage() {
               <span className="h-3 w-3 rounded-full bg-red-400/80" />
               <span className="h-3 w-3 rounded-full bg-yellow-400/80" />
               <span className="h-3 w-3 rounded-full bg-emerald-400/80" />
-              <span className="ml-auto font-mono text-[11px] uppercase tracking-[0.12em] text-zinc-400">Illustrative</span>
             </div>
             <div className="mt-4 space-y-1.5 font-mono text-sm">
               <div className="text-zinc-200">$ git push</div>

@@ -58,7 +58,6 @@ export function Bento() {
   return (
     <Section className="pt-28 sm:pt-36" wash="duo">
       <SectionHead eyebrow="What you get" title={"Everything between git\u00a0push and a live URL."} lead="Builds, previews, domains, data and logs in one platform." />
-      <p className="lp-mono mt-6 text-[12px] uppercase tracking-[0.16em] text-[var(--lp-dim)]">Illustrations use sample data.</p>
       <div ref={grid} className="mt-10 grid gap-5 md:grid-cols-2 lg:grid-cols-12">
         <article className="lp-card lp-card-keystone lp-reveal grid md:col-span-2 lg:col-span-12 lg:grid-cols-12" style={delay(0)}>
           <div className="flex flex-col justify-center p-7 lg:col-span-4 lg:p-10">
@@ -67,14 +66,13 @@ export function Bento() {
               Use the hosted platform, or run shadw on machines you operate.
             </p>
           </div>
-          <div className="relative h-[230px] sm:h-[290px] lg:col-span-8 lg:h-[400px] lg:[clip-path:inset(-70px_0_0_0)]">
+          <div className="relative h-[230px] sm:h-[290px] lg:col-span-8 lg:h-[400px]">
             <div className="absolute inset-x-3 bottom-0 top-8 lg:hidden">
               <DomeKeystone compact />
             </div>
-            <div className="absolute bottom-0 left-0 right-0 hidden h-[470px] lg:block">
+            <div className="absolute inset-0 hidden lg:block">
               <DomeKeystone />
             </div>
-            <span className="lp-chip lp-mono absolute left-4 top-4 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] lg:left-1 lg:top-1.5">Illustrative</span>
           </div>
         </article>
         {CARDS.map((c, i) => (
