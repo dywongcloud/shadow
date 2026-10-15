@@ -43,13 +43,13 @@ export function ProductShowcase() {
         lead="Projects, deployments, logs, domains and usage, in the same dashboard you deploy from."
       />
 
-      <div className="lp-reveal relative mx-auto mt-14 hidden w-full pb-14 lg:block" style={delay(100)}>
+      <div className="lp-reveal relative mx-auto mt-14 hidden w-full pb-24 lg:block" style={delay(100)}>
         <div
           aria-hidden="true"
           className="pointer-events-none absolute -inset-x-[10%] -inset-y-[14%] -z-10"
           style={{ background: "radial-gradient(60% 56% at 50% 46%, rgba(99,102,241,0.4), rgba(34,211,238,0.16) 56%, transparent 76%)" }}
         />
-        <figure className="lp-glass lp-limb-top overflow-hidden">
+        <figure className="lp-glass lp-limb-top relative overflow-hidden">
           <div className="lp-glass-bar" aria-hidden="true">
             <i />
             <i />
@@ -57,17 +57,17 @@ export function ProductShowcase() {
           </div>
           <Crop src={PROJECTS} alt={PROJECTS_ALT} box={{ x: 0, y: 0, w: 2880, h: 1050 }} sizes="(max-width: 1200px) 100vw, 1152px" />
         </figure>
-        <figure className="lp-glass lp-limb-top lp-float absolute bottom-0 right-0 z-10 w-[58%] overflow-hidden">
+        <figure className="lp-glass lp-limb-top lp-float absolute bottom-0 right-0 z-10 w-[54%] overflow-hidden">
           <Crop
             src={DEPLOYMENTS}
             alt="A project's Deployments tab: one production build and two previews, all ready, with Redeploy and Instant Rollback."
-            box={{ x: 70, y: 216, w: 1330, h: 560 }}
-            sizes="1330px"
+            box={{ x: 70, y: 216, w: 1110, h: 520 }}
+            sizes="1624px"
           />
         </figure>
       </div>
 
-      <figure className="lp-reveal lp-glass lp-limb-top mx-auto mt-12 max-w-[560px] overflow-hidden lg:hidden" style={delay(100)}>
+      <figure className="lp-reveal lp-glass lp-limb-top relative mx-auto mt-12 max-w-[560px] overflow-hidden lg:hidden" style={delay(100)}>
         <Crop src={PROJECTS} alt={PROJECTS_ALT} box={{ x: 690, y: 360, w: 810, h: 340 }} sizes="(max-width: 600px) 1280px, 1990px" />
       </figure>
 

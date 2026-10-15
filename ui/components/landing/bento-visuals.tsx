@@ -109,15 +109,15 @@ export function ScaleToZero() {
 
 export function Dns() {
   const rows = [
-    ["A", "example.com"],
-    ["CNAME", "www.example.com"],
-    ["TXT", "_hive-verify.example.com"],
+    ["A", "@"],
+    ["CNAME", "www"],
+    ["TXT", "_hive-verify"],
   ];
   return (
     <div className="flex h-full flex-col justify-center gap-2.5 p-4" aria-hidden="true">
       {rows.map(([type, name]) => (
         <div key={name} className="lp-mono flex items-center gap-2.5 rounded-lg border border-white/[0.08] bg-white/[0.035] px-3 py-2.5 text-[12px]">
-          <span className="w-[52px] shrink-0 text-[var(--lp-dim)]">{type}</span>
+          <span className="w-[44px] shrink-0 text-[var(--lp-dim)]">{type}</span>
           <span className="min-w-0 flex-1 truncate text-zinc-100">{name}</span>
           <span className="text-emerald-300">✓</span>
         </div>
@@ -150,9 +150,9 @@ export function Promote() {
   return (
     <div className="flex h-full flex-col justify-center gap-2.5 px-5 py-4" aria-hidden="true">
       {rows.map((r) => (
-        <div key={r.id} className="flex items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5 py-3">
-          <span className="lp-dot text-emerald-300" />
-          <span className="lp-mono flex-1 text-[12.5px] text-zinc-100">{r.id}</span>
+        <div key={r.id} className="flex h-10 items-center gap-3 rounded-xl border border-white/[0.08] bg-white/[0.035] px-3.5">
+          <span className="lp-dot text-emerald-300 max-[359px]:hidden" />
+          <span className="lp-mono flex-1 whitespace-nowrap text-[12.5px] text-zinc-100">{r.id}</span>
           {r.live ? (
             <span className="lp-chip !border-emerald-300/40 !bg-emerald-300/10 text-emerald-200">Production</span>
           ) : (
@@ -167,7 +167,7 @@ export function Promote() {
 export function LogsMetrics() {
   const lines = [
     ["info", "Build started"],
-    ["info", "Detected framework: Next.js"],
+    ["info", "Detected Next.js"],
     ["info", "Uploading build outputs…"],
     ["ready", "Deployment ready"],
   ];

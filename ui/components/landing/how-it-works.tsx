@@ -34,12 +34,12 @@ function CommitGraph() {
 
 function BuildLines() {
   const rows = [
-    ["Cloning github.com/you/my-app", true],
-    ["Detected framework: Next.js", true],
-    ["Uploading build outputs…", false],
+    ["Cloning repository", true],
+    ["Detected Next.js", true],
+    ["Uploading outputs…", false],
   ] as const;
   return (
-    <div className="lp-mono flex h-full flex-col justify-center gap-3 px-5 text-[12.5px] text-zinc-200" aria-hidden="true">
+    <div className="lp-mono flex h-full flex-col justify-center gap-3 px-4 text-[12.5px] text-zinc-200" aria-hidden="true">
       {rows.map(([text, done]) => (
         <div key={text} className="flex items-center gap-2.5">
           {done ? <Check className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> : <span className="lp-spinner shrink-0" />}
@@ -52,9 +52,9 @@ function BuildLines() {
 
 function LiveAddress() {
   return (
-    <div className="flex h-full flex-col justify-center gap-4 px-5" aria-hidden="true">
-      <div className="lp-chip lp-mono w-full justify-start gap-2.5 !px-3.5 !py-2.5 !text-[13px]">
-        <Lock className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> https://my-app.shadw.app
+    <div className="flex h-full flex-col justify-center gap-4 px-4" aria-hidden="true">
+      <div className="lp-chip lp-mono w-full justify-start gap-2 !px-3 !py-2.5 !text-[12.5px]">
+        <Lock className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> my-app.shadw.app
       </div>
       <div className="flex items-center gap-2.5">
         <span className="lp-chip text-emerald-300">
@@ -94,6 +94,7 @@ export function HowItWorks() {
       <SectionHead eyebrow="How it works" title="From a commit to a live URL." lead="No pipeline to assemble. Connect a repository and the platform builds it, gives it an address and keeps every build." />
       <div className="relative mt-14">
         <div aria-hidden="true" className="lp-rail hidden md:block" />
+        <div aria-hidden="true" className="lp-rail-v md:hidden" />
         <ol className="grid gap-5 md:grid-cols-3">
           {STEPS.map((s, i) => (
             <li key={s.n} className="lp-card lp-reveal flex flex-col" style={delay(i * 110)}>

@@ -56,14 +56,14 @@ export function Hero() {
         </div>
       </div>
 
-      <div className="lp-dome lp-rise mt-16 px-6 sm:mt-[76px]" style={delay(360)}>
+      <div className="lp-dome lp-rise mt-[76px] px-6" style={delay(360)}>
         <div className="relative">
           <GlobeWireframe className="relative -ml-[34vw] w-[168vw] sm:ml-0 sm:w-full" boxClassName="lp-dome-mask">
             <DomeLight />
           </GlobeWireframe>
           <DeployTerminal className="relative z-10 mx-auto -mt-12 w-[min(560px,calc(100%-32px))] lg:absolute lg:left-0 lg:top-[46%] lg:mx-0 lg:mt-0 lg:w-[min(540px,45%)]" />
           <PreviewCard className="absolute right-0 top-[30%] z-10 hidden w-[320px] lg:block" />
-          <span className="lp-chip lp-mono absolute right-0 top-0 z-10 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)]">Illustrative</span>
+          <span className="lp-chip lp-mono absolute -top-[46px] right-0 z-10 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] sm:top-0">Illustrative</span>
         </div>
         <div aria-hidden="true" className="hidden lg:block" style={{ paddingBottom: CARDS_OVERHANG }} />
         <p className="lp-mono mx-auto mt-7 max-w-[420px] px-6 text-center text-[12px] uppercase leading-[1.7] tracking-[0.16em] text-[var(--lp-dim)] lg:mt-8">

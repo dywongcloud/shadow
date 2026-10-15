@@ -108,7 +108,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       </a>
       <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0c0d10]/70 backdrop-blur-xl">
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
-          <Link href="/" className="shrink-0 justify-self-start">
+          <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
             <Logo className="h-7 sm:h-8" />
           </Link>
           <nav aria-label="Primary" className="col-start-2 hidden items-center gap-10 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex">
@@ -161,7 +161,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
         createPortal(
           <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-3.5">
-              <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
+              <Link href="/" onClick={() => setMenuOpen(false)} className="inline-flex min-h-[44px] shrink-0 items-center">
                 <Logo className="h-7" />
               </Link>
               <button
@@ -250,10 +250,10 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
             {FOOTER_COLS.map((col) => (
               <div key={col.title} className={col.title === "Company" ? "col-span-2 md:col-span-1" : ""}>
                 <div className="text-sm font-semibold text-white">{col.title}</div>
-                <ul className="mt-3 space-y-0.5">
+                <ul className="mt-3 lg:space-y-0.5">
                   {col.links.map((l) => (
                     <li key={l.label}>
-                      <Link href={l.href} className="inline-block py-1.5 text-sm text-zinc-400 transition-colors hover:text-white">
+                      <Link href={l.href} className="inline-flex min-h-[44px] min-w-[44px] items-center text-sm text-zinc-400 transition-colors hover:text-white lg:min-h-0 lg:min-w-0 lg:py-1.5">
                         {l.label}
                       </Link>
                     </li>

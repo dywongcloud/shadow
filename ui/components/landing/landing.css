@@ -276,7 +276,7 @@
   position: relative;
   margin-left: auto;
   margin-right: auto;
-  max-width: 1208px;
+  max-width: 1200px;
 }
 .lp-dome-mask {
   -webkit-mask-image: linear-gradient(to bottom, #000 56%, transparent 99%);
@@ -387,6 +387,7 @@
   transition: opacity 0.35s;
   background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 0%), rgba(129, 140, 248, 0.2), transparent 62%);
 }
+/* the lit top edge; `.lp-limb-top` sets no `position` (this sheet loads after Tailwind's utilities, so a rule here would beat `absolute`): its element carries `relative` or `absolute` itself */
 .lp-card::after,
 .lp-limb-top::after {
   content: "";
@@ -398,9 +399,6 @@
   background: var(--lp-limb);
   opacity: 0.6;
   pointer-events: none;
-}
-.lp-limb-top {
-  position: relative;
 }
 .lp-card:hover {
   transform: translateY(-3px);
@@ -556,4 +554,16 @@ html:has(.lp-hero) {
   .lp-rail::after {
     display: none;
   }
+}
+/* the same rail when the three cards stack: behind them, so it shows only in the gaps and chains one card to the next */
+.lp-rail-v {
+  position: absolute;
+  left: 50%;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  margin-left: -1px;
+  pointer-events: none;
+  background: linear-gradient(180deg, #8b5cf6, #e0f2fe 50%, #22d3ee);
+  opacity: 0.85;
 }

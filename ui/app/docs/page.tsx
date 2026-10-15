@@ -101,7 +101,7 @@ export default function DocsIndex() {
           </h1>
           <p className="mt-6 max-w-md text-lg leading-relaxed text-secondary">
             Deploy serverless functions, containers and static sites to a peer-to-peer cloud of your own
-            machines. Push from git, served from anywhere — in three steps.
+            machines. Push from git, served from anywhere.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link href="/docs/getting-started" className="inline-flex items-center gap-2 rounded-md bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
@@ -118,7 +118,7 @@ export default function DocsIndex() {
         Connect your{" "}
         <Link href="/docs/getting-started#gitops" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">Git repository</Link>{" "}
         to deploy on every push, with{" "}
-        <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">instant preview deployments</Link>{" "}
+        <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">preview deployments</Link>{" "}
         for testing changes before production.
       </p>
 

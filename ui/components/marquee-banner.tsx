@@ -56,7 +56,6 @@ export function MarqueeBanner() {
       <div className="flex justify-end px-3 lg:px-7">
         <button
           type="button"
-          aria-pressed={paused}
           onClick={() => setPaused((p) => !p)}
           className="inline-flex min-h-[44px] items-center px-3 text-[12px] text-zinc-300 underline-offset-4 transition-colors hover:text-white hover:underline"
         >

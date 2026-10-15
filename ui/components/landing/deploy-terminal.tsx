@@ -8,21 +8,20 @@ type Line = { at: number; segs: Seg[]; typed?: boolean; gap?: boolean; hang?: bo
 /** The transcript is the shape `shadw deploy --follow` prints (crates/shadw-cli/src/main.rs `deploy`/`follow_build`) around real build-log
  *  lines (crates/hive-cloud/src/git.rs); the repository, project and deployment id are samples and no duration is printed. */
 const ID = "dpl-3f9a21c07b";
+const KEEP = "whitespace-nowrap";
 const LINES: Line[] = [
-  { at: 0, typed: true, segs: [{ t: "$ ", c: "lp-prompt" }, { t: "shadw deploy https://github.com/you/my-app \\" }] },
-  { at: 1750, typed: true, segs: [{ t: "    --project my-app --follow" }] },
-  { at: 2900, hang: true, segs: [{ t: `Deploy started: build ${ID} (project my-app)` }] },
-  { at: 3200, hang: true, segs: [{ t: `Stream logs:  shadw build logs ${ID} --follow`, c: "lp-dim" }] },
-  { at: 3900, gap: true, hang: true, segs: [{ t: "Cloning github.com/you/my-app (Branch: main, Commit: HEAD)" }] },
+  { at: 0, typed: true, segs: [{ t: "$ ", c: "lp-prompt" }, { t: "shadw deploy " }, { t: "https://github.com/you/my-app", c: KEEP }, { t: " \\" }] },
+  { at: 1750, typed: true, segs: [{ t: "    " }, { t: "--project", c: KEEP }, { t: " my-app " }, { t: "--follow", c: KEEP }] },
+  { at: 2900, hang: true, segs: [{ t: "Deploy started: build " }, { t: ID, c: KEEP }, { t: " (project my-app)" }] },
+  { at: 3200, hang: true, segs: [{ t: "Stream logs:  shadw build logs ", c: "lp-dim" }, { t: ID, c: `lp-dim ${KEEP}` }, { t: " ", c: "lp-dim" }, { t: "--follow", c: `lp-dim ${KEEP}` }] },
+  { at: 3900, gap: true, hang: true, segs: [{ t: "Cloning " }, { t: "github.com/you/my-app", c: KEEP }, { t: " (Branch: main, Commit: HEAD)" }] },
   { at: 4600, hang: true, segs: [{ t: "Detected framework: Next.js — primitive: Hybrid, package manager: npm (NpmLock)" }] },
   { at: 5300, hang: true, segs: [{ t: "…", c: "lp-dim" }] },
   { at: 5900, hang: true, segs: [{ t: "Uploading build outputs…" }] },
-  { at: 6700, gap: true, hang: true, segs: [{ t: `Build ${ID} → ` }, { t: "ready", c: "lp-ok" }] },
+  { at: 6700, gap: true, hang: true, segs: [{ t: "Build " }, { t: ID, c: KEEP }, { t: " → " }, { t: "ready", c: "lp-ok" }] },
 ];
 const TYPE_MS = 30;
-const HOLD_MS = 6500;
 const FINAL_MS = LINES[LINES.length - 1].at + 1;
-const TOTAL_MS = FINAL_MS + HOLD_MS;
 const LENGTHS = LINES.map((l) => l.segs.reduce((n, s) => n + s.t.length, 0));
 
 function clip(segs: Seg[], chars: number) {
@@ -39,8 +38,8 @@ function clip(segs: Seg[], chars: number) {
   });
 }
 
-/** A hero terminal that types one deploy, then holds and loops. It runs only while on screen, visible and past the intro overlay; the server render
- *  and prefers-reduced-motion show the whole transcript at once. */
+/** A hero terminal that types one deploy once and holds the finished transcript. It types only while on screen, visible and past the intro overlay; the
+ *  server render and prefers-reduced-motion show the whole transcript at once. */
 export function DeployTerminal({ className = "" }: { className?: string }) {
   const [ms, setMs] = useState(FINAL_MS);
   const [live, setLive] = useState(false);
@@ -57,27 +56,25 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
     let ready = html.classList.contains("lp-ready");
     let clock = 0;
     let elapsed = 0;
-    const tick = () => {
-      const now = performance.now();
-      elapsed = now - clock;
-      if (elapsed > TOTAL_MS) {
-        clock = now;
-        elapsed = 0;
-      }
-      setMs(elapsed);
-    };
     let timer = 0;
+    const stop = () => {
+      window.clearInterval(timer);
+      timer = 0;
+    };
+    const tick = () => {
+      elapsed = Math.min(FINAL_MS, performance.now() - clock);
+      setMs(elapsed);
+      if (elapsed >= FINAL_MS) stop();
+    };
     const sync = () => {
-      const run = inView && ready && document.visibilityState === "visible";
+      const run = inView && ready && document.visibilityState === "visible" && elapsed < FINAL_MS;
       if (run && !timer) {
         clock = performance.now() - elapsed;
         timer = window.setInterval(tick, 40);
       } else if (!run && timer) {
-        window.clearInterval(timer);
-        timer = 0;
+        stop();
       }
     };
-    elapsed = 0;
     setMs(0);
     const io = new IntersectionObserver(([e]) => {
       inView = e.isIntersecting;

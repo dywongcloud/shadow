@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { Section, SectionHead } from "./section";
 import { delay, trackSpotlight } from "./lp-utils";
+import { Tok } from "./tok";
 import { Dns, LogsMetrics, ManagedData, MeshKeystone, Promote, PullRequests, ScaleToZero } from "./bento-visuals";
 
 /** Every card names a feature the code has: pull-request previews, the iroh QUIC mesh with hybrid post-quantum key exchange
@@ -63,7 +64,7 @@ export function Bento() {
           <div className="flex flex-col justify-center p-7 lg:col-span-4 lg:p-10">
             <h3 className="lp-card-title !text-[28px]">A peer-to-peer mesh</h3>
             <p className="lp-card-copy mt-3 max-w-[400px]">
-              Nodes connect to each other over QUIC, and mesh links offer hybrid post-quantum key exchange (X25519 + ML-KEM-768).
+              Nodes connect to each other over QUIC, and mesh links offer hybrid post-quantum key exchange (X25519 + <Tok>ML-KEM-768</Tok>).
             </p>
           </div>
           <div className="relative h-[230px] sm:h-[290px] lg:col-span-8 lg:h-[400px] lg:[clip-path:inset(-70px_0_0_0)]">
@@ -73,7 +74,7 @@ export function Bento() {
             <div className="absolute bottom-0 left-0 right-0 hidden h-[470px] lg:block">
               <MeshKeystone />
             </div>
-            <span className="lp-chip lp-mono absolute left-4 top-4 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] lg:left-2 lg:top-5">Illustrative</span>
+            <span className="lp-chip lp-mono absolute left-4 top-4 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] lg:left-1 lg:top-1.5">Illustrative</span>
           </div>
         </article>
         {CARDS.map((c, i) => (
@@ -86,7 +87,7 @@ export function Bento() {
           </article>
         ))}
       </div>
-      <p className="lp-mono mt-5 text-right text-[11px] uppercase tracking-[0.16em] text-[var(--lp-dim)]">Illustrations use sample data.</p>
+      <p className="lp-mono mt-5 text-right text-[12px] uppercase tracking-[0.16em] text-[var(--lp-dim)]">Illustrations use sample data.</p>
     </Section>
   );
 }
