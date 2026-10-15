@@ -64,7 +64,7 @@ export const API_CATEGORIES: ApiCategory[] = [
         name: "Get a build",
         method: "GET",
         path: "/v1/builds/{id}",
-        summary: "Poll a build's status and streamed logs. State is one of building, ready or error.",
+        summary: "Poll a build's status and streamed logs. State is one of queued, building, ready, error or cancelled.",
         pathParams: [{ name: "id", type: "string", required: true, desc: "The build id returned by Create a deployment." }],
         response: `{
   "id": "dpl-9f2a1c7b04",
@@ -139,27 +139,36 @@ export const API_CATEGORIES: ApiCategory[] = [
         name: "Set an environment variable",
         method: "POST",
         path: "/v1/projects/{project}/env",
-        summary: "Add or update an environment variable. Sensitive values are encrypted at rest (ChaCha20-Poly1305).",
+        summary: "Add or update an environment variable. Sensitive values are encrypted at rest (ChaCha20-Poly1305). Returns the project's settings, with sensitive values returned empty.",
         pathParams: [{ name: "project", type: "string", required: true, desc: "The project name." }],
         bodyParams: [
           { name: "key", type: "string", required: true, desc: "Variable name." },
           { name: "value", type: "string", required: true, desc: "Value (sealed at rest when sensitive)." },
           { name: "target", type: '"production" | "preview" | "all"', desc: "Which environments it applies to." },
+          { name: "scope", type: '"runtime" | "build" | "all"', desc: 'Where the variable is available: at runtime only, during the build only, or both (default "runtime").' },
           { name: "sensitive", type: "boolean", desc: "Encrypt at rest and mask in the UI." },
         ],
-        response: `{ "key": "DATABASE_URL", "target": "all", "sensitive": true }`,
+        response: `{
+  "env": [
+    { "key": "DATABASE_URL", "value": "", "target": "all", "scope": "runtime", "sensitive": true, "updated_ms": 1781906630000 }
+  ]
+  /* …the project's other settings, as in Get project settings */
+}`,
       },
       {
         slug: "delete-an-environment-variable",
         name: "Delete an environment variable",
         method: "DELETE",
         path: "/v1/projects/{project}/env/{key}",
-        summary: "Remove an environment variable from a project.",
+        summary: "Remove an environment variable from a project. Returns the project's remaining settings.",
         pathParams: [
           { name: "project", type: "string", required: true, desc: "The project name." },
           { name: "key", type: "string", required: true, desc: "The variable name to delete." },
         ],
-        response: `{ "deleted": true }`,
+        response: `{
+  "env": []
+  /* …the project's other settings, as in Get project settings */
+}`,
       },
       {
         slug: "delete-a-project",
@@ -191,10 +200,26 @@ export const API_CATEGORIES: ApiCategory[] = [
         name: "Attach a domain to a project",
         method: "POST",
         path: "/v1/projects/{project}/domains",
-        summary: "Attach a custom domain to a project. The domain's root label is aliased to the project's current deployment.",
+        summary: "Attach a custom domain to a project. Attaching starts an ownership check: add the returned TXT record (verify.txt_name and verify.txt_value) at your DNS provider and verification completes automatically; domain.verify.status in the Get a domain response becomes verified. Once verified, the full hostname and its www. variant are aliased to the project's current production deployment.",
         pathParams: [{ name: "project", type: "string", required: true, desc: "The project name." }],
         bodyParams: [{ name: "domain", type: "string", required: true, desc: "The fully-qualified domain to attach." }],
-        response: `{ "domain": "acme.com", "project": "acme-app", "attached": true }`,
+        response: `{
+  "domain": "acme.com",
+  "project": "acme-app",
+  "attached": false,
+  "status": "pending",
+  "verify": {
+    "status": "pending",
+    "txt_name": "_hive-verify.acme.com",
+    "txt_value": "hive-verify=3f9c2db1e77a41b0",
+    "project": "acme-app",
+    "created_ms": 1781906630000,
+    "checked_ms": 0,
+    "verified_ms": 0,
+    "last_probe": ""
+  },
+  "instructions": "Add a TXT record named _hive-verify.acme.com with the value hive-verify=3f9c2db1e77a41b0 at your DNS provider, then verification completes automatically (usually within a few minutes)."
+}`,
       },
       {
         slug: "get-a-domain",
@@ -204,11 +229,22 @@ export const API_CATEGORIES: ApiCategory[] = [
         summary: "Get a domain with its DNS records, nameservers, SSL certificate and connected projects.",
         pathParams: [{ name: "domain", type: "string", required: true, desc: "The domain name." }],
         response: `{
-  "domain": "acme.com",
-  "nameservers": ["ns1.shadw.cloud", "ns2.shadw.cloud"],
-  "records": [
-    { "id": "rec_a1", "type": "A", "name": "@", "value": "76.76.21.21", "ttl": 3600 }
-  ]
+  "domain": {
+    "domain": "acme.com",
+    "tenant": "acme",
+    "registrar": "",
+    "renewal_price": "",
+    "auto_renew": false,
+    "cdn_active": true,
+    "created_ms": 1781906630000,
+    "expires_ms": 0,
+    "nameservers": ["ns1.shadw.cloud", "ns2.shadw.cloud"],
+    "ssl": { "id": "", "cns": [], "renewal": "pending", "issued_ms": 0, "expires_ms": 0, "provider": "OpenEdge (Let's Encrypt)" },
+    "records": [
+      { "id": "rec_3f9c2db1e77a41b0", "name": "", "type": "CAA", "value": "0 issue \\"letsencrypt.org\\"", "ttl": 60, "priority": null, "comment": "Managed SSL issuer", "created_ms": 1781906630000, "system": true }
+    ]
+  },
+  "connected": []
 }`,
       },
       {
@@ -216,19 +252,33 @@ export const API_CATEGORIES: ApiCategory[] = [
         name: "Set nameservers",
         method: "PUT",
         path: "/v1/domains/{domain}/nameservers",
-        summary: "Set the domain's nameservers (when delegating the whole zone to shadw).",
+        summary: "Set the domain's nameservers (when delegating the whole zone to shadw). Returns the full domain record.",
         pathParams: [{ name: "domain", type: "string", required: true, desc: "The domain name." }],
         bodyParams: [{ name: "nameservers", type: "string[]", required: true, desc: "Nameservers to delegate the zone to." }],
-        response: `{ "domain": "acme.com", "nameservers": ["ns1.shadw.cloud", "ns2.shadw.cloud"] }`,
+        response: `{
+  "domain": "acme.com",
+  "tenant": "acme",
+  "registrar": "",
+  "renewal_price": "",
+  "auto_renew": false,
+  "cdn_active": true,
+  "created_ms": 1781906630000,
+  "expires_ms": 0,
+  "nameservers": ["ns1.shadw.cloud", "ns2.shadw.cloud"],
+  "ssl": { "id": "", "cns": [], "renewal": "pending", "issued_ms": 0, "expires_ms": 0, "provider": "OpenEdge (Let's Encrypt)" },
+  "records": [
+    { "id": "rec_3f9c2db1e77a41b0", "name": "", "type": "CAA", "value": "0 issue \\"letsencrypt.org\\"", "ttl": 60, "priority": null, "comment": "Managed SSL issuer", "created_ms": 1781906630000, "system": true }
+  ]
+}`,
       },
       {
         slug: "renew-ssl",
         name: "Renew the SSL certificate",
         method: "POST",
         path: "/v1/domains/{domain}/ssl/renew",
-        summary: "Reissue the free managed (Let's Encrypt-style) certificate for the domain.",
+        summary: "Request reissue of the domain's free managed Let's Encrypt certificate. Issuance runs in the background; the response is the domain's current certificate block (renewal is pending until a certificate is installed, then auto).",
         pathParams: [{ name: "domain", type: "string", required: true, desc: "The domain name." }],
-        response: `{ "id": "cert_…", "provider": "shadw (Let's Encrypt)", "renewal": "auto" }`,
+        response: `{ "id": "", "cns": [], "renewal": "pending", "issued_ms": 0, "expires_ms": 0, "provider": "OpenEdge (Let's Encrypt)" }`,
       },
     ],
   },
@@ -245,12 +295,12 @@ export const API_CATEGORIES: ApiCategory[] = [
         pathParams: [{ name: "domain", type: "string", required: true, desc: "The domain name." }],
         bodyParams: [
           { name: "type", type: '"A" | "AAAA" | "CNAME" | "TXT" | "MX" | "NS"', required: true, desc: "Record type." },
-          { name: "name", type: "string", required: true, desc: 'Subdomain (e.g. "www") or "@" for the apex.' },
+          { name: "name", type: "string", required: true, desc: 'Subdomain (e.g. "www"), or an empty string for the apex.' },
           { name: "value", type: "string", required: true, desc: "Record value (IP, hostname, text…)." },
-          { name: "ttl", type: "number", desc: "Time-to-live in seconds (default 3600)." },
+          { name: "ttl", type: "number", desc: "Time-to-live in seconds (default 60)." },
           { name: "priority", type: "number", desc: "Priority (MX records)." },
         ],
-        response: `{ "id": "rec_a1", "type": "A", "name": "@", "value": "76.76.21.21", "ttl": 3600 }`,
+        response: `{ "id": "rec_a1", "type": "A", "name": "", "value": "76.76.21.21", "ttl": 3600 }`,
       },
       {
         slug: "update-a-dns-record",
@@ -264,11 +314,11 @@ export const API_CATEGORIES: ApiCategory[] = [
         ],
         bodyParams: [
           { name: "type", type: "string", required: true, desc: "Record type." },
-          { name: "name", type: "string", required: true, desc: "Subdomain or @ for the apex." },
+          { name: "name", type: "string", required: true, desc: "Subdomain, or an empty string for the apex." },
           { name: "value", type: "string", required: true, desc: "Record value." },
           { name: "ttl", type: "number", desc: "Time-to-live in seconds." },
         ],
-        response: `{ "id": "rec_a1", "type": "A", "name": "@", "value": "76.76.21.22", "ttl": 120 }`,
+        response: `{ "id": "rec_a1", "type": "A", "name": "", "value": "76.76.21.22", "ttl": 120 }`,
       },
       {
         slug: "delete-a-dns-record",
@@ -333,10 +383,31 @@ export const API_CATEGORIES: ApiCategory[] = [
         summary: "List the event types a webhook can subscribe to.",
         response: `[
   "deployment.created",
+  "deployment.building",
   "deployment.ready",
-  "deployment.promoted",
+  "deployment.succeeded",
   "deployment.error",
-  "domain.added"
+  "deployment.canceled",
+  "deployment.promoted",
+  "deployment.rollback",
+  "deployment.checks.failed",
+  "deployment.checks.succeeded",
+  "project.created",
+  "project.removed",
+  "project.renamed",
+  "project.env-variable.created",
+  "project.env-variable.updated",
+  "project.env-variable.deleted",
+  "domain.added",
+  "domain.created",
+  "domain.dns.records.changed",
+  "project.domain.verified",
+  "database.created",
+  "database.ready",
+  "alerts.triggered",
+  "firewall.attack",
+  "incident.opened",
+  "incident.resolved"
 ]`,
       },
       {
@@ -360,7 +431,7 @@ export const API_CATEGORIES: ApiCategory[] = [
         path: "/v1/webhooks/{id}",
         summary: "Delete an outbound webhook.",
         pathParams: [{ name: "id", type: "string", required: true, desc: "The webhook id." }],
-        response: `{ "deleted": true }`,
+        response: `{ "removed": "wh_1" }`,
       },
     ],
   },
@@ -390,25 +461,45 @@ export const API_CATEGORIES: ApiCategory[] = [
         name: "Add a team member",
         method: "POST",
         path: "/v1/teams/{slug}/members",
-        summary: "Invite a member to a team.",
+        summary: "Add a member to a team, or change an existing member's role. Returns the updated team.",
         pathParams: [{ name: "slug", type: "string", required: true, desc: "The team slug." }],
         bodyParams: [
           { name: "email", type: "string", required: true, desc: "The member's email." },
-          { name: "role", type: '"owner" | "member"', desc: "Role to assign (default member)." },
+          { name: "role", type: '"owner" | "admin" | "member" | "viewer"', desc: "Role to assign (default member)." },
         ],
-        response: `{ "team": "acme", "email": "dev@acme.com", "role": "member" }`,
+        response: `{
+  "slug": "acme",
+  "name": "Acme",
+  "plan": "pro",
+  "created_ms": 1781906630000,
+  "members": [
+    { "email": "dev@acme.com", "role": "member", "name": "", "added_ms": 1781906630000 }
+  ],
+  "sso_enabled": false,
+  "updated_ms": 1781906630000
+}`,
       },
       {
         slug: "remove-a-team-member",
         name: "Remove a team member",
         method: "DELETE",
         path: "/v1/teams/{slug}/members/{email}",
-        summary: "Remove a member from a team.",
+        summary: "Remove a member from a team. Returns the updated team.",
         pathParams: [
           { name: "slug", type: "string", required: true, desc: "The team slug." },
           { name: "email", type: "string", required: true, desc: "The member's email." },
         ],
-        response: `{ "removed": "dev@acme.com" }`,
+        response: `{
+  "slug": "acme",
+  "name": "Acme",
+  "plan": "pro",
+  "created_ms": 1781906630000,
+  "members": [
+    { "email": "owner@acme.com", "role": "owner", "name": "", "added_ms": 1781906630000 }
+  ],
+  "sso_enabled": false,
+  "updated_ms": 1781906630000
+}`,
       },
     ],
   },
@@ -425,7 +516,7 @@ export const API_CATEGORIES: ApiCategory[] = [
           "Create a long-lived platform API key (hive_…) bound to the active team. The plaintext token is returned exactly once — only its SHA-256 hash is stored. Present it as `Authorization: Bearer hive_…` to scope requests to the key's team.",
         bodyParams: [
           { name: "name", type: "string", required: true, desc: 'A label for the key (e.g. "ci").' },
-          { name: "role", type: '"owner" | "member"', desc: 'Role bound to the key (default "member").' },
+          { name: "role", type: '"owner" | "admin" | "member" | "viewer"', desc: 'Role bound to the key (default "member").' },
         ],
         response: `{
   "id": "key_9f2a1c7b04d14e3e",
@@ -472,13 +563,13 @@ export const API_CATEGORIES: ApiCategory[] = [
         method: "POST",
         path: "/v1/token",
         summary:
-          "Mint a short-lived (8 h) JWT bearer token scoped to a team + role. Requires HIVE_JWT_SECRET to be configured on the node (returns 400 otherwise). When JWT auth is enforced, mutating requests must present a JWT.",
+          "Mint a JWT bearer token scoped to a team + role, valid for at most 1 hour. Requires HIVE_JWT_SECRET to be configured on the node (returns 400 otherwise); once it is set, minting is server-only (the request must carry the x-hive-internal header, else 403). When HIVE_JWT_SECRET is set, mutating requests must present a JWT or an API key.",
         bodyParams: [
           { name: "sub", type: "string", desc: 'Subject / user id embedded in the token (default "user").' },
           { name: "tenant", type: "string", desc: 'Team slug the token is scoped to (default "default").' },
-          { name: "role", type: '"owner" | "member" | "service"', desc: 'Role embedded in the token (default "owner").' },
+          { name: "role", type: '"owner" | "admin" | "member" | "viewer"', desc: "Role embedded in the token. No default: a mint carries only the role you name, and a token without one acts as a viewer (read-only)." },
         ],
-        response: `{ "token": "eyJhbGciOiJIUzI1NiJ9…", "expires_in": 28800 }`,
+        response: `{ "token": "eyJhbGciOiJIUzI1NiJ9…", "expires_in": 3600 }`,
       },
     ],
   },

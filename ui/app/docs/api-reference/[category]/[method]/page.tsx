@@ -80,9 +80,10 @@ export default async function MethodPage(props: { params: Promise<{ category: st
           </div>
           <p className="mt-1.5 text-sm text-secondary">
             A platform API key (<code className="font-mono text-xs">hive_…</code>, created under
-            Settings → API Keys) or a short-lived JWT minted with{" "}
-            <code className="font-mono text-xs">POST /v1/token</code>. An API key scopes the request
-            to the team it was created under.
+            Settings → API Keys) or a JWT of at most 1 hour from{" "}
+            <code className="font-mono text-xs">POST /v1/token</code>, which is server-only once{" "}
+            <code className="font-mono text-xs">HIVE_JWT_SECRET</code> is set. An API key scopes the
+            request to the team it was created under.
           </p>
         </Section>
 

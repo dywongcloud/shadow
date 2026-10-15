@@ -6,12 +6,12 @@ import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/ap
 export const metadata: Metadata = {
   title: "REST API Reference — shadw Docs",
   description:
-    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
   alternates: { canonical: "/docs/api-reference" },
   openGraph: {
     title: "REST API Reference — shadw Docs",
     description:
-      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
     url: "/docs/api-reference",
     type: "website",
     siteName: "shadw",
@@ -20,7 +20,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "REST API Reference — shadw Docs",
     description:
-      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse every endpoint for deploys, projects, domains, and nodes.",
+      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
   },
 };
 
@@ -84,10 +84,11 @@ export default function ApiReferencePage() {
           <CodeBlock tabs={[{ label: "Authorization", lang: "bash", code: "Authorization: Bearer hive_…" }]} />
         </div>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
-          Alternatively, mint a short-lived (8&nbsp;hour) JWT with <Code>POST /v1/token</Code> and
-          present it in the same header. Minting requires <Code>HIVE_JWT_SECRET</Code> to be
-          configured on the node; when JWT auth is enforced, mutating requests (POST/PUT/DELETE)
-          must present a JWT.
+          Alternatively, present a short-lived JWT (1&nbsp;hour at most) in the same header.{" "}
+          <Code>POST /v1/token</Code> mints one; it requires <Code>HIVE_JWT_SECRET</Code> to be
+          configured on the node, and once that is set it is server-only (the request must carry
+          the <Code>x-hive-internal</Code> header). When <Code>HIVE_JWT_SECRET</Code> is set,
+          mutating requests (POST/PUT/PATCH/DELETE) must present a JWT or an API key.
         </p>
 
         <H2 id="accessing-team-resources">Accessing team resources</H2>
@@ -106,9 +107,10 @@ export default function ApiReferencePage() {
 
         <H2 id="rate-limits">Rate limits</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          API requests are rate-limited per team. When you exceed the limit the API responds with{" "}
-          <Code>429 Too Many Requests</Code>; back off and retry after the window resets. Burst limits
-          are higher on Pro and Enterprise plans.
+          API requests are limited per client IP address to 600 requests per minute (a sliding
+          window). When you exceed the limit the API responds with{" "}
+          <Code>429 Too Many Requests</Code>; back off and retry, since each request stops counting
+          after one minute.
         </p>
 
         <H2 id="errors">Errors</H2>
@@ -136,7 +138,7 @@ export default function ApiReferencePage() {
 
         <H2 id="endpoints">Endpoints</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          Browse all {totalEndpoints()} available REST API endpoints grouped by category.
+          Browse the {totalEndpoints()} documented REST API endpoints grouped by category.
         </p>
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
           {API_CATEGORIES.map((cat) => (

@@ -81,12 +81,12 @@ build_id = res.json()["build_id"]`,
 ];
 
 const CARDS = [
-  { icon: Boxes, title: "Deploying apps", desc: "Git import, framework detection, Dockerfile containers and instant rollback.", href: "/docs/getting-started#deploying" },
-  { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars into build + runtime; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
+  { icon: Boxes, title: "Deploying apps", desc: "Git import, framework detection, Dockerfile containers and rollback.", href: "/docs/getting-started#deploying" },
+  { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars at runtime or into the build; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
   { icon: GitBranch, title: "GitOps", desc: "Connect GitHub once — push to deploy, config-as-code, two-way sync.", href: "/docs/getting-started#gitops" },
   { icon: Globe2, title: "Regions & the mesh", desc: "Real geo regions over Iroh QUIC with anycast routing and failover.", href: "/docs/getting-started#regions" },
   { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that scale to zero and pack concurrent requests.", href: "/docs/getting-started#deploying" },
-  { icon: Code2, title: "API reference", desc: "Every admin endpoint for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
+  { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
 ];
 
 export default function DocsIndex() {

@@ -4,7 +4,7 @@ import { ExternalLink } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
 const DESC =
-  "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, unattached custom domain, or a region that does not host the deployment.";
+  "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, or an unattached custom domain — and how it differs from 503 DEPLOYMENT_NOT_READY.";
 
 export const metadata: Metadata = {
   title: "DEPLOYMENT_NOT_FOUND — shadw Docs",
@@ -50,7 +50,8 @@ export default function DeploymentNotFoundPage() {
         <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">DEPLOYMENT_NOT_FOUND</h1>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           A request was made for a deployment that does not exist. The hostname resolved and reached
-          a shadw edge node, but that node found no deployment to serve for it. The response is{" "}
+          a shadw edge node, but neither that node nor the peers it knows of have a deployment or
+          project for that host. The response is{" "}
           <code className="font-mono text-sm">404</code> with the header{" "}
           <code className="font-mono text-sm">x-hive-error: DEPLOYMENT_NOT_FOUND</code>.
         </p>
@@ -69,7 +70,7 @@ export default function DeploymentNotFoundPage() {
             {
               label: "404 response",
               lang: "bash",
-              code: "Code: DEPLOYMENT_NOT_FOUND\nID:   sfo1::a1b2c-1785527146044-3f9c2db1e77a",
+              code: "Code: `DEPLOYMENT_NOT_FOUND`\nID: `sfo1::a1b2c-1785527146044-3f9c2db1e77a`",
             },
           ]}
         />
@@ -104,13 +105,16 @@ export default function DeploymentNotFoundPage() {
               re-request. Until it is attached, every request for that host returns this error.
             </p>
           </Cause>
-          <Cause title="The deployment exists but not where the request landed">
+          <Cause title="The fleet knows the host but nothing is ready to serve it">
             <p>
-              A deployment is placed on specific nodes. If a request reaches a node that neither
-              hosts it nor can route to its host, you get this error rather than a hang. Persistent,
-              region-correlated 404s on a deployment you can see in the dashboard are worth reporting
-              with the error ID — that pattern is a platform-side routing problem, not a mistake in
-              your project.
+              This case returns <code className="font-mono text-sm">503</code>, not this 404. When a
+              deployment record or a project claims the host but this node has nothing ready to
+              serve for it (a build in progress, a failed or cancelled build, no completed build
+              yet, or no healthy route to the node that hosts it), the response carries the header{" "}
+              <code className="font-mono text-sm">x-hive-error: DEPLOYMENT_NOT_READY</code>, a{" "}
+              <code className="font-mono text-sm">retry-after</code> of 30 seconds and a page that
+              names the project and the reason. A 404 means neither this node nor its peers know
+              the host.
             </p>
           </Cause>
         </div>
