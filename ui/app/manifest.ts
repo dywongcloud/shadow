@@ -22,10 +22,10 @@ export default function manifest(): MetadataRoute.Manifest {
     ],
     shortcuts: [
       {
-        name: "Run a node",
-        short_name: "Run a node",
-        description: "Donate spare browser capacity to serve one of your deployed functions.",
-        url: "/run-node",
+        name: "New project",
+        short_name: "New project",
+        description: "Import a Git repository and deploy it.",
+        url: "/new",
         icons: [{ src: "/web-app-manifest-192x192.png", sizes: "192x192", type: "image/png" }],
       },
     ],

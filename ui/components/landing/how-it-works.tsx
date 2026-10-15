@@ -1,34 +1,38 @@
 import { Check, Lock } from "lucide-react";
 import { Section, SectionHead } from "./section";
 import { delay } from "./lp-utils";
+import { SampleTag } from "./sample-tag";
 
-/** Illustrations only: sample names, no counts, no durations. Each is hidden from assistive technology; the card text carries the meaning. */
+/** Illustrations only: sample names, no counts, no durations. Each is hidden from assistive technology and tagged Sample; the card text carries the meaning. */
 function CommitGraph() {
   return (
-    <svg viewBox="0 0 320 130" className="h-full w-full" aria-hidden="true">
-      <defs>
-        <linearGradient id="lp-main" x1="0" x2="1">
-          <stop offset="0" stopColor="#5eead4" stopOpacity=".15" />
-          <stop offset=".5" stopColor="#22d3ee" />
-          <stop offset="1" stopColor="#818cf8" />
-        </linearGradient>
-      </defs>
-      <path d="M16 36H304" stroke="url(#lp-main)" strokeWidth="2" fill="none" />
-      <path d="M100 36C100 66 120 92 150 92H220C250 92 270 66 280 36" stroke="#818cf8" strokeOpacity=".7" strokeWidth="2" fill="none" />
-      {[40, 100, 160, 220].map((x) => (
-        <circle key={x} cx={x} cy="36" r="5" fill="#0c0d10" stroke="#22d3ee" strokeWidth="2" />
-      ))}
-      {[170, 212].map((x) => (
-        <circle key={x} cx={x} cy="92" r="5" fill="#0c0d10" stroke="#818cf8" strokeWidth="2" />
-      ))}
-      <circle cx="280" cy="36" r="6" fill="#5eead4" />
-      <circle cx="280" cy="36" r="6" fill="#5eead4" className="lp-pulse">
-        <animate attributeName="r" values="6;16;6" dur="2.8s" repeatCount="indefinite" />
-        <animate attributeName="opacity" values=".55;0;.55" dur="2.8s" repeatCount="indefinite" />
-      </circle>
-      <text x="16" y="22" className="lp-mono" fontSize="10" fill="#9a9aa6" letterSpacing="1">main</text>
-      <text x="150" y="116" className="lp-mono" fontSize="10" fill="#9a9aa6" letterSpacing="1">feature/pricing</text>
-    </svg>
+    <div className="flex h-full flex-col px-3 pb-3 pt-3" aria-hidden="true">
+      <SampleTag />
+      <svg viewBox="0 0 320 130" className="min-h-0 w-full flex-1">
+        <defs>
+          <linearGradient id="lp-main" x1="0" x2="1">
+            <stop offset="0" stopColor="#5eead4" stopOpacity=".15" />
+            <stop offset=".5" stopColor="#22d3ee" />
+            <stop offset="1" stopColor="#818cf8" />
+          </linearGradient>
+        </defs>
+        <path d="M16 36H304" stroke="url(#lp-main)" strokeWidth="2" fill="none" />
+        <path d="M100 36C100 66 120 92 150 92H220C250 92 270 66 280 36" stroke="#818cf8" strokeOpacity=".7" strokeWidth="2" fill="none" />
+        {[40, 100, 160, 220].map((x) => (
+          <circle key={x} cx={x} cy="36" r="5" fill="#0c0d10" stroke="#22d3ee" strokeWidth="2" />
+        ))}
+        {[170, 212].map((x) => (
+          <circle key={x} cx={x} cy="92" r="5" fill="#0c0d10" stroke="#818cf8" strokeWidth="2" />
+        ))}
+        <circle cx="280" cy="36" r="6" fill="#5eead4" />
+        <circle cx="280" cy="36" r="6" fill="#5eead4" className="lp-pulse">
+          <animate attributeName="r" values="6;16;6" dur="2.8s" repeatCount="indefinite" />
+          <animate attributeName="opacity" values=".55;0;.55" dur="2.8s" repeatCount="indefinite" />
+        </circle>
+        <text x="16" y="24" className="lp-mono" fontSize="17" fill="#aeaeba" letterSpacing="1">main</text>
+        <text x="136" y="121" className="lp-mono" fontSize="17" fill="#aeaeba" letterSpacing="1">feature/pricing</text>
+      </svg>
+    </div>
   );
 }
 
@@ -39,29 +43,35 @@ function BuildLines() {
     ["Uploading outputs…", false],
   ] as const;
   return (
-    <div className="lp-mono flex h-full flex-col justify-center gap-3 px-4 text-[12.5px] text-zinc-200" aria-hidden="true">
-      {rows.map(([text, done]) => (
-        <div key={text} className="flex items-center gap-2.5">
-          {done ? <Check className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> : <span className="lp-spinner shrink-0" />}
-          <span className={done ? "" : "text-[var(--lp-mute)]"}>{text}</span>
-        </div>
-      ))}
+    <div className="lp-mono flex h-full flex-col px-4 pb-3 pt-3 text-[12.5px] text-zinc-200" aria-hidden="true">
+      <SampleTag />
+      <div className="flex min-h-0 flex-1 flex-col justify-center gap-3">
+        {rows.map(([text, done]) => (
+          <div key={text} className="flex items-center gap-2.5">
+            {done ? <Check className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> : <span className="lp-spinner shrink-0" />}
+            <span className={done ? "" : "text-[var(--lp-mute)]"}>{text}</span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
 function LiveAddress() {
   return (
-    <div className="flex h-full flex-col justify-center gap-4 px-4" aria-hidden="true">
-      <div className="lp-chip lp-mono w-full justify-start gap-2 !px-3 !py-2.5 !text-[12.5px]">
-        <Lock className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> my-app.shadw.app
-      </div>
-      <div className="flex items-center gap-2.5">
-        <span className="lp-chip text-emerald-300">
-          <span className="lp-dot" /> Ready
-        </span>
-        <span className="h-2.5 w-2/5 rounded bg-white/12" />
-        <span className="h-2.5 w-1/4 rounded bg-white/8" />
+    <div className="flex h-full flex-col px-4 pb-3 pt-3" aria-hidden="true">
+      <SampleTag />
+      <div className="flex min-h-0 flex-1 flex-col justify-center gap-4">
+        <div className="lp-chip lp-mono w-full justify-start gap-2 !px-3 !py-2.5 !text-[12.5px]">
+          <Lock className="h-3.5 w-3.5 shrink-0 text-emerald-300" /> my-app.shadw.app
+        </div>
+        <div className="flex items-center gap-2.5">
+          <span className="lp-chip text-emerald-300">
+            <span className="lp-dot" /> Ready
+          </span>
+          <span className="h-2.5 w-2/5 rounded bg-white/12" />
+          <span className="h-2.5 w-1/4 rounded bg-white/8" />
+        </div>
       </div>
     </div>
   );

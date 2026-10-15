@@ -354,6 +354,11 @@
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: #8fa3ff;
+  text-wrap: balance;
+}
+/* a short line under a picture or a row: its last line is never one word */
+.lp-caption {
+  text-wrap: balance;
 }
 .lp-h2 {
   font-size: clamp(30px, 4.1vw, 54px);
@@ -410,6 +415,7 @@
   font-size: 21px;
   line-height: 1.25;
   letter-spacing: -0.005em;
+  text-wrap: balance;
 }
 .lp-card-copy {
   font-size: 15px;
@@ -569,8 +575,8 @@ html:has(.lp-hero) {
   opacity: 0.85;
 }
 
-/* a touch pointer gets the 44 px target at any width; the width-based `min-h-[44px]` utilities cover phones, this covers tablets and touch laptops */
-@media (pointer: coarse) {
+/* a touch pointer gets the 44 px target at any width; the width-based `min-h-[44px]` utilities cover phones, this covers tablets and touch laptops (whose primary pointer is a mouse: `any-pointer`) */
+@media (pointer: coarse), (any-pointer: coarse) {
   .lp-tap {
     min-height: 44px;
     min-width: 44px;

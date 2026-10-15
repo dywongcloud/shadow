@@ -51,7 +51,7 @@ export function Hero() {
             rel="noopener noreferrer"
             className="inline-flex h-[44px] items-center gap-2 rounded-full px-4 text-[15px] text-zinc-300 transition-colors hover:text-white"
           >
-            <Play className="h-4 w-4 fill-current" /> Watch the demo
+            <Play className="h-4 w-4 fill-current" /> Watch the demo<span className="sr-only"> (opens YouTube in a new tab)</span>
           </a>
         </div>
       </div>
@@ -66,8 +66,8 @@ export function Hero() {
           <span className="lp-chip lp-mono absolute -top-[46px] right-0 z-10 !text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)] sm:top-0">Illustrative</span>
         </div>
         <div aria-hidden="true" className="hidden lg:block" style={{ paddingBottom: CARDS_OVERHANG }} />
-        <p className="lp-mono mx-auto mt-7 max-w-[420px] px-6 text-center text-[12px] uppercase leading-[1.7] tracking-[0.16em] text-[var(--lp-dim)] lg:mt-8">
-          Illustrative. Not a map of our nodes.
+        <p className="lp-caption lp-mono mx-auto mt-7 max-w-[420px] px-6 text-center text-[12px] uppercase leading-[1.7] tracking-[0.16em] text-[var(--lp-dim)] lg:mt-8">
+          Illustrative. Not a map of our machines.
         </p>
       </div>
     </section>

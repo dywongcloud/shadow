@@ -10,14 +10,14 @@
 - **Managed databases**: Postgres, Redis and SQLite databases with per-database connection URLs. Each database runs on a single host node.
 - **GitOps**: Your platform config is mirrored to a Git repo as `openedge.yaml`; a push to a linked project's repo rebuilds and redeploys it.
 - **Observability**: Real-user Core Web Vitals (Speed Insights), build and request logs, a service graph, and workflow run timelines.
-- **Security**: Team-scoped data and roles, signed gossip between nodes, preview protection, and SCIM and SIEM log streaming on the Enterprise plan. Workloads run on each node's probed isolation backend.
+- **Security**: Team-scoped data and roles, signed deployments, encrypted secrets, preview protection, and SCIM and SIEM log streaming on the Enterprise plan. Workloads run on each node's probed isolation backend.
 
 ## Key concepts
 
 - **Project**: A deployable unit (from Git, an image, or an upload) with environment variables, domains, and settings.
 - **Deployment**: One immutable build of a project, addressable by a unique URL; production is an alias that points at one deployment.
 - **Team / tenant**: Ownership and access boundary; personal and organization scopes are supported.
-- **Node**: A machine (a Linux host or a Mac) running the shadw node software. Nodes connect to each other over Iroh QUIC, and one active owner coordinates them, with standby failover.
+- **Node**: A machine (a Linux host or a Mac) running the shadw node software. One active owner coordinates the nodes, with standby failover.
 
 ## Docs
 

@@ -12,6 +12,7 @@ const isPublic = createRouteMatcher([
   "/case-studies(.*)",
   "/contact(.*)",
   "/privacy(.*)",
+  "/opengraph-image(.*)",
   "/offline.html",
   "/sw.js",
   "/sign-in(.*)",
@@ -35,6 +36,7 @@ const isClerkFree = createRouteMatcher([
   "/contact(.*)",
   "/privacy(.*)",
   "/status(.*)",
+  "/opengraph-image(.*)",
   "/offline.html",
   "/sw.js",
 ]);

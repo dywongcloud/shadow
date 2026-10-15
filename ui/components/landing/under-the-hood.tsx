@@ -8,7 +8,7 @@ import { Tok } from "./tok";
  *  viewer roles (`teams.rs`, `roles.rs`). */
 const FACTS = [
   { icon: EyeOff, title: "Private previews", body: "Previews are reachable only by your team by default." },
-  { icon: ShieldCheck, title: "Signed deployments", body: "Each deployment carries an integrity chain signed with a node's ed25519 key." },
+  { icon: ShieldCheck, title: "Signed deployments", body: "Each deployment carries an integrity chain signed with an ed25519 key." },
   { icon: Lock, title: "Encrypted secrets", body: <>Sensitive variables are sealed with <Tok>ChaCha20-Poly1305</Tok> before they touch disk.</> },
   { icon: Users, title: "Team roles", body: "Teams have owner, admin, member and viewer roles." },
 ];

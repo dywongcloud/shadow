@@ -33,7 +33,7 @@ export function StackStrip() {
           </li>
         ))}
       </ul>
-      <p className="lp-reveal lp-mono mt-10 text-[13px] tracking-[0.04em] text-[var(--lp-dim)]" style={delay(200)}>
+      <p className="lp-reveal lp-caption lp-mono mt-10 text-[13px] tracking-[0.04em] text-[var(--lp-dim)]" style={delay(200)}>
         Builds with {TOOLCHAINS.map((t, i) => (
           <span key={t}>
             <span className="text-zinc-300">{t}</span>

@@ -68,7 +68,7 @@ export const metadata: Metadata = {
     title: "shadw — Push to Git. Get a live URL.",
     description: DESCRIPTION,
   },
-  twitter: { card: "summary_large_image", title: "shadw", description: DESCRIPTION },
+  twitter: { card: "summary_large_image", title: "shadw — Push to Git. Get a live URL.", description: DESCRIPTION },
   appleWebApp: {
     capable: true,
     title: "shadw",

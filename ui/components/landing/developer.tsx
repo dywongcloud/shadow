@@ -42,11 +42,13 @@ const POINTS: { key: string; icon: LucideIcon; text: React.ReactNode }[] = [
   { key: "logs", icon: ScrollText, text: <>{"Follow a build's logs from the terminal with "}<Tok>--follow</Tok></> },
 ];
 
-/** Strings, URLs, placeholders, flags, comments and a few keywords; a comment starts at line start or after a space, so `https://` is a URL. */
-const TOKEN = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|(?<=^|\s)(?:#|\/\/).*$|https?:\/\/[^\s\\]+|<[a-z-]+>|(?<![\w-])--?[a-zA-Z][\w-]*|dpl-[0-9a-f]+|\bmy-app\b|\b(?:const|await|import|True|true)\b/g;
+/** Strings, URLs, placeholders, flags, comments and a few keywords; a comment starts at line start or after a space, so `https://` is a URL. An index
+ *  expression such as `res.json()["build_id"]` is one token, so it never splits at its bracket. */
+const TOKEN = /[\w.]+(?:\(\))?\["[^"\\]*"\]|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|(?<=^|\s)(?:#|\/\/).*$|https?:\/\/[^\s\\]+|<[a-z-]+>|(?<![\w-])--?[a-zA-Z][\w-]*|dpl-[0-9a-f]+|\bmy-app\b|\b(?:const|await|import|True|true)\b/g;
 
 /** A token this short never splits across lines; a longer one (the API URL, a header string) may wrap, and a URL breaks after its slashes. */
 const LONG_TOKEN = 30;
+const INDEX_EXPR = /^([\w.]+(?:\(\))?\[)("[^"]*")(\])$/;
 
 /** A URL breaks after the slashes of its path, never inside `://` or a name. */
 function breakAfterSlashes(url: string): React.ReactNode[] {
@@ -69,9 +71,10 @@ function tint(line: string): React.ReactNode[] {
     const at = m.index ?? 0;
     if (at > last) out.push(line.slice(last, at));
     const t = m[0];
-    const cls = /^(#|\/\/)/.test(t) ? "lp-dim" : /^(["'`]|https?:|<)/.test(t) ? "lp-str" : /^(dpl-|my-app)/.test(t) ? "" : "lp-key";
+    const cls = /^(#|\/\/)/.test(t) ? "lp-dim" : /^(["'`]|https?:|<)/.test(t) ? "lp-str" : /^(dpl-|my-app|[\w.]+(?:\(\))?\[)/.test(t) ? "" : "lp-key";
     const keep = t.length <= LONG_TOKEN && !/\s/.test(t);
-    const body = !keep && t.includes("://") ? breakAfterSlashes(t) : t;
+    const index = INDEX_EXPR.exec(t);
+    const body = index ? [index[1], <span key="s" className="lp-str">{index[2]}</span>, index[3]] : !keep && t.includes("://") ? breakAfterSlashes(t) : t;
     out.push(
       <span key={at} className={cls === "lp-dim" ? cls : `${cls}${keep ? " whitespace-nowrap" : ""}`}>
         {body}
