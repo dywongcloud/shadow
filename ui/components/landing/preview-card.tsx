@@ -17,7 +17,7 @@ export function PreviewCard({ className = "" }: { className?: string }) {
       <div className="p-4">
         <div
           className="h-[104px] rounded-lg"
-          style={{ background: "linear-gradient(135deg, rgba(94,234,212,.3), rgba(129,140,248,.34) 55%, rgba(232,121,249,.3))" }}
+          style={{ background: "linear-gradient(135deg, rgba(233, 42, 103,.3), rgba(168, 83, 186,.34) 55%, rgba(232,121,249,.3))" }}
         />
         <div className="mt-3.5 h-3 w-3/5 rounded bg-white/15" />
         <div className="mt-2 h-3 w-4/5 rounded bg-white/10" />

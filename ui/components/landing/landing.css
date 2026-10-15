@@ -2,12 +2,12 @@
    Sizes are px: the dashboard root scales rem to 83.125%, which would shrink every marketing type size. */
 
 :root {
-  --lp-bg: #0c0d10;
+  --lp-bg: #000000;
   --lp-mute: #b8b8c2;
   --lp-dim: #aeaeba;
-  --lp-grad: linear-gradient(100deg, #5eead4 0%, #22d3ee 28%, #818cf8 62%, #e879f9 100%);
-  --lp-edge: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(34, 211, 238, 0.5) 100%);
-  --lp-limb: linear-gradient(90deg, transparent, #8b5cf6 22%, #e0f2fe 50%, #22d3ee 78%, transparent);
+  --lp-grad: linear-gradient(100deg, #e92a67 0%, #a853ba 52%, #2a8af6 100%);
+  --lp-edge: linear-gradient(135deg, rgba(168, 83, 186, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(42, 138, 246, 0.5) 100%);
+  --lp-limb: linear-gradient(90deg, transparent, #a853ba 22%, #ffe3ec 50%, #2a8af6 78%, transparent);
 }
 /* the dark brand surface from the first paint: the shell also forces it from an effect, which left a light-scheme visitor a flash of the light canvas */
 html:has(#lp-content),
@@ -164,13 +164,13 @@ html:has(#lp-content) {
   will-change: transform;
 }
 .lp-aurora-a {
-  background: radial-gradient(760px 560px at 6% 22%, rgba(168, 85, 247, 0.4), transparent 64%),
-    radial-gradient(420px 340px at 0% 34%, rgba(236, 72, 153, 0.3), transparent 66%);
+  background: radial-gradient(456px 336px at 6% 22%, rgba(168, 83, 186, 0.4), transparent 64%),
+    radial-gradient(252px 204px at 0% 34%, rgba(233, 42, 103, 0.3), transparent 66%);
   animation: lp-drift-a 24s ease-in-out infinite alternate;
 }
 .lp-aurora-b {
-  background: radial-gradient(760px 560px at 96% 30%, rgba(34, 211, 238, 0.26), transparent 64%),
-    radial-gradient(460px 360px at 100% 42%, rgba(56, 189, 248, 0.26), transparent 66%);
+  background: radial-gradient(456px 336px at 96% 30%, rgba(42, 138, 246, 0.26), transparent 64%),
+    radial-gradient(276px 216px at 100% 42%, rgba(42, 138, 246, 0.26), transparent 66%);
   animation: lp-drift-b 30s ease-in-out infinite alternate;
 }
 .lp-grid {
@@ -207,7 +207,7 @@ html:has(#lp-content) {
   padding: 3px 10px;
   border-radius: 999px;
   background: var(--lp-grad);
-  color: #0c0d10;
+  color: #000000;
   font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -218,7 +218,7 @@ html:has(#lp-content) {
   letter-spacing: -0.02em;
   font-weight: 400;
   text-wrap: balance;
-  text-shadow: 0 2px 40px rgba(12, 13, 16, 0.8);
+  text-shadow: 0 2px 40px rgba(0, 0, 0, 0.8);
 }
 .lp-h1-page {
   font-size: clamp(34px, 5.4vw, 70px);
@@ -244,15 +244,15 @@ html:has(#lp-content) {
 }
 .lp-btn {
   background: #fff;
-  color: #0c0d10;
+  color: #000000;
   font-weight: 600;
   /* forced-colors mode drops the background and the ring below; a transparent border is painted in a system colour, so the primary keeps an edge */
   border: 1px solid transparent;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 12px 44px -10px rgba(129, 140, 248, 0.7), 0 0 70px -14px rgba(34, 211, 238, 0.5);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 12px 44px -10px rgba(168, 83, 186, 0.7), 0 0 70px -14px rgba(42, 138, 246, 0.5);
 }
 .lp-btn:hover {
   transform: translateY(-2px);
-  box-shadow: 0 0 0 1px #fff, 0 18px 54px -8px rgba(129, 140, 248, 0.85), 0 0 90px -10px rgba(34, 211, 238, 0.65);
+  box-shadow: 0 0 0 1px #fff, 0 18px 54px -8px rgba(168, 83, 186, 0.85), 0 0 90px -10px rgba(42, 138, 246, 0.65);
 }
 .lp-btn-ghost {
   color: #fff;
@@ -300,8 +300,8 @@ html:has(#lp-content) {
 .lp-glass {
   border-radius: 16px;
   border: 1px solid rgba(255, 255, 255, 0.13);
-  background: linear-gradient(180deg, rgba(22, 24, 33, 0.985), rgba(10, 11, 16, 0.985));
-  box-shadow: 0 50px 120px -34px rgba(0, 0, 0, 0.95), 0 0 90px -26px rgba(99, 102, 241, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  background: linear-gradient(180deg, rgba(8, 8, 10, 0.985), rgba(0, 0, 0, 0.985));
+  box-shadow: 0 50px 120px -34px rgba(0, 0, 0, 0.95), 0 0 90px -26px rgba(168, 83, 186, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.07);
   text-align: left;
 }
 .lp-glass-bar {
@@ -334,7 +334,7 @@ html:has(#lp-content) {
   word-break: break-word;
 }
 .lp-prompt {
-  color: #5eead4;
+  color: #e92a67;
 }
 .lp-ok {
   color: #4ade80;
@@ -392,7 +392,7 @@ html:has(#lp-content) {
   overflow: hidden;
   border-radius: 24px;
   border: 1px solid transparent;
-  background: linear-gradient(180deg, #121319, #0d0e13) padding-box, var(--lp-edge) border-box;
+  background: linear-gradient(180deg, #121319, #050505) padding-box, var(--lp-edge) border-box;
   transition: transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 .lp-card::before {
@@ -403,7 +403,7 @@ html:has(#lp-content) {
   z-index: -1;
   opacity: 0;
   transition: opacity 0.35s;
-  background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 0%), rgba(129, 140, 248, 0.2), transparent 62%);
+  background: radial-gradient(252px circle at var(--mx, 50%) var(--my, 0%), rgba(168, 83, 186, 0.2), transparent 62%);
 }
 /* the lit top edge; `.lp-limb-top` sets no `position` (this sheet loads after Tailwind's utilities, so a rule here would beat `absolute`): its element carries `relative` or `absolute` itself */
 .lp-card::after,
@@ -428,14 +428,14 @@ html:has(#lp-content) {
 @media (hover: none) {
   .lp-card::before {
     opacity: 1;
-    background: radial-gradient(520px circle at 50% 0%, rgba(99, 102, 241, 0.5), rgba(34, 211, 238, 0.12) 52%, transparent 72%);
+    background: radial-gradient(312px circle at 50% 0%, rgba(168, 83, 186, 0.5), rgba(42, 138, 246, 0.12) 52%, transparent 72%);
   }
   /* the same light on the two surfaces that are not cards (the code panel, the facts tiles), so no slice of a phone is a valley */
   .lp-glass.lp-bloom {
-    background: radial-gradient(520px circle at 50% 0%, rgba(99, 102, 241, 0.42), rgba(34, 211, 238, 0.1) 55%, transparent 74%), linear-gradient(180deg, rgba(22, 24, 33, 0.985), rgba(10, 11, 16, 0.985));
+    background: radial-gradient(312px circle at 50% 0%, rgba(168, 83, 186, 0.42), rgba(42, 138, 246, 0.1) 55%, transparent 74%), linear-gradient(180deg, rgba(8, 8, 10, 0.985), rgba(0, 0, 0, 0.985));
   }
   .lp-fact {
-    background: radial-gradient(260px circle at 50% 0%, rgba(99, 102, 241, 0.34), transparent 70%), #0d0e13;
+    background: radial-gradient(156px circle at 50% 0%, rgba(168, 83, 186, 0.34), transparent 70%), #050505;
   }
 }
 .lp-card-title {
@@ -500,7 +500,7 @@ html:has(#lp-content) {
 }
 .lp-line {
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(129, 140, 248, 0.6), rgba(34, 211, 238, 0.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(168, 83, 186, 0.6), rgba(42, 138, 246, 0.5), transparent);
 }
 .lp-cta-panel {
   position: relative;
@@ -525,14 +525,14 @@ html:has(#lp-content) {
   mask-image: linear-gradient(to bottom, transparent, #000 22%, #000 78%, transparent);
 }
 .lp-wash[data-tone="violet"] {
-  background: radial-gradient(560px 420px at 16% 34%, rgba(139, 92, 246, 0.46), transparent 70%);
+  background: radial-gradient(336px 252px at 16% 34%, rgba(168, 83, 186, 0.46), transparent 70%);
 }
 .lp-wash[data-tone="cyan"] {
-  background: radial-gradient(600px 420px at 84% 40%, rgba(34, 211, 238, 0.38), transparent 70%);
+  background: radial-gradient(360px 252px at 84% 40%, rgba(42, 138, 246, 0.38), transparent 70%);
 }
 .lp-wash[data-tone="duo"] {
-  background: radial-gradient(560px 420px at 10% 22%, rgba(139, 92, 246, 0.44), transparent 70%),
-    radial-gradient(560px 420px at 92% 76%, rgba(34, 211, 238, 0.36), transparent 70%);
+  background: radial-gradient(336px 252px at 10% 22%, rgba(168, 83, 186, 0.44), transparent 70%),
+    radial-gradient(336px 252px at 92% 76%, rgba(42, 138, 246, 0.36), transparent 70%);
 }
 html:has(.lp-hero) {
   scroll-padding-top: 76px;
@@ -542,7 +542,7 @@ html:has(.lp-hero) {
 .lp-card-keystone {
   overflow: visible;
   border-width: 1.5px;
-  background: linear-gradient(180deg, #11121b, #0b0c12) padding-box, linear-gradient(90deg, #8b5cf6, #e0f2fe 50%, #22d3ee) border-box;
+  background: linear-gradient(180deg, #11121b, #0b0c12) padding-box, linear-gradient(90deg, #a853ba, #ffe3ec 50%, #2a8af6) border-box;
 }
 
 /* the flow's rail: one lit line across the three cards' top edges with a point travelling along it */
@@ -555,7 +555,7 @@ html:has(.lp-hero) {
   z-index: 3;
   pointer-events: none;
   border-radius: 2px;
-  background: linear-gradient(90deg, transparent, #8b5cf6 12%, #e0f2fe 50%, #22d3ee 88%, transparent);
+  background: linear-gradient(90deg, transparent, #a853ba 12%, #ffe3ec 50%, #2a8af6 88%, transparent);
   opacity: 0.85;
 }
 .lp-rail::after {
@@ -566,8 +566,8 @@ html:has(.lp-hero) {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: #e0f2fe;
-  box-shadow: 0 0 14px 4px rgba(94, 234, 212, 0.7);
+  background: #ffe3ec;
+  box-shadow: 0 0 14px 4px rgba(233, 42, 103, 0.7);
   animation: lp-travel 5.5s linear infinite;
 }
 @keyframes lp-travel {
@@ -598,7 +598,7 @@ html:has(.lp-hero) {
   width: 2px;
   margin-left: -1px;
   pointer-events: none;
-  background: linear-gradient(180deg, #8b5cf6, #e0f2fe 50%, #22d3ee);
+  background: linear-gradient(180deg, #a853ba, #ffe3ec 50%, #2a8af6);
   opacity: 0.85;
 }
 

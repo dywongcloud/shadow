@@ -49,7 +49,7 @@ function Logo({ className = "h-7" }: { className?: string }) {
   return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto select-none`} />;
 }
 
-const MARKETING_SURFACE_COLOR = "#0c0d10";
+const MARKETING_SURFACE_COLOR = "#000000";
 
 /** Forces the dark brand surface on the document root while mounted (overscroll, gutters and native scrollbars match). The full-bleed `w-screen` shell is
  *  100vw, wider than a window that carries a classic scrollbar: `html:has(#lp-content)` (landing.css) clips the root from the first byte, which hides the horizontal
@@ -123,7 +123,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
   return (
     <div
       inert={menuOpen}
-      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-x-clip bg-[#0c0d10] text-white"
+      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-x-clip bg-[#000000] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
       <a
@@ -133,7 +133,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         Skip to content
       </a>
       {lead}
-      <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0c0d10]/70 backdrop-blur-xl">
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-[#000000]/70 backdrop-blur-xl">
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
           <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
             <Logo className="h-7 sm:h-8" />
@@ -161,7 +161,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
             </Link>
             <Link
               href="/sign-up"
-              className="hidden rounded-full border border-transparent bg-white px-5 py-[11px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(129,140,248,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
+              className="hidden rounded-full border border-transparent bg-white px-5 py-[11px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(168, 83, 186,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
             >
               Get started
             </Link>
@@ -180,7 +180,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-x-0 -bottom-px h-px"
-          style={{ background: "linear-gradient(90deg, transparent, rgba(129,140,248,0.6) 28%, rgba(34,211,238,0.5) 72%, transparent)" }}
+          style={{ background: "linear-gradient(90deg, transparent, rgba(168, 83, 186,0.6) 28%, rgba(42, 138, 246,0.5) 72%, transparent)" }}
         />
       </header>
 
@@ -192,7 +192,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
             aria-modal="true"
             aria-label="Menu"
             onKeyDown={wrapTab}
-            className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden"
+            className="fixed inset-0 z-[200] flex flex-col bg-[#000000] text-white lg:hidden"
             style={{ fontFamily: ELECTROLIZE_FONT }}
           >
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-3.5">
@@ -251,13 +251,13 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         {children}
       </div>
 
-      <footer className="relative overflow-hidden bg-[#0c0d10]">
+      <footer className="relative overflow-hidden bg-[#000000]">
         <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]"
           style={{
             background:
-              "radial-gradient(420px 420px at 14% 100%, rgba(45,212,191,0.28), transparent 70%), radial-gradient(540px 540px at 42% 106%, rgba(79,70,229,0.4), transparent 70%), radial-gradient(420px 420px at 66% 100%, rgba(192,38,211,0.26), transparent 70%), radial-gradient(450px 450px at 92% 100%, rgba(34,211,238,0.24), transparent 70%)",
+              "radial-gradient(252px 252px at 14% 100%, rgba(233, 42, 103,0.28), transparent 70%), radial-gradient(324px 324px at 42% 106%, rgba(168, 83, 186,0.4), transparent 70%), radial-gradient(252px 252px at 66% 100%, rgba(233, 42, 103,0.26), transparent 70%), radial-gradient(270px 270px at 92% 100%, rgba(42, 138, 246,0.24), transparent 70%)",
           }}
         />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center overflow-hidden">
@@ -268,7 +268,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
               fontSize: "clamp(7rem, 30vw, 28rem)",
               opacity: 0.16,
               transform: "translateY(12%)",
-              backgroundImage: "linear-gradient(100deg, #5eead4 0%, #22d3ee 30%, #818cf8 60%, #e879f9 100%)",
+              backgroundImage: "linear-gradient(100deg, #e92a67 0%, #2a8af6 30%, #a853ba 60%, #e92a67 100%)",
               maskImage: "linear-gradient(to top, black 30%, transparent 95%)",
               WebkitMaskImage: "linear-gradient(to top, black 30%, transparent 95%)",
             }}

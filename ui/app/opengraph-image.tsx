@@ -13,7 +13,7 @@ const MERIDIANS = ["M380 -30V400", "M380 -30C300 40 250 200 240 400", "M380 -30C
 
 const DOME_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -70 760 470" width="760" height="470">
 <defs>
-<linearGradient id="l" gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="740" y2="0"><stop offset="0" stop-color="#8b5cf6" stop-opacity=".7"/><stop offset=".3" stop-color="#60a5fa"/><stop offset=".5" stop-color="#e0f2fe"/><stop offset=".7" stop-color="#38bdf8"/><stop offset="1" stop-color="#22d3ee" stop-opacity=".7"/></linearGradient>
+<linearGradient id="l" gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="740" y2="0"><stop offset="0" stop-color="#a853ba" stop-opacity=".7"/><stop offset=".3" stop-color="#60a5fa"/><stop offset=".5" stop-color="#ffe3ec"/><stop offset=".7" stop-color="#38bdf8"/><stop offset="1" stop-color="#2a8af6" stop-opacity=".7"/></linearGradient>
 <clipPath id="c"><path d="${ARC}V400H20Z"/></clipPath>
 </defs>
 <path d="${ARC}V400H20Z" fill="#07090f" fill-opacity=".94"/>
@@ -22,7 +22,7 @@ const DOME_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -70 760 470
 <g fill="none" stroke="url(#l)" stroke-linecap="round">
 <path d="${ARC}" stroke-width="44" stroke-opacity=".04"/><path d="${ARC}" stroke-width="26" stroke-opacity=".07"/><path d="${ARC}" stroke-width="14" stroke-opacity=".13"/><path d="${ARC}" stroke-width="7" stroke-opacity=".26"/><path d="${ARC}" stroke-width="3"/>
 </g>
-${NODES.map(([x, y], i) => `<g transform="translate(${x - 12} ${y - 12})"><rect width="24" height="24" rx="5.5" fill="#000" stroke="${i === 3 ? "#5eead4" : "#2f6bff"}" stroke-width="1.7"/><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="#e5e7eb" stroke-width="1.4"/></g>`).join("")}
+${NODES.map(([x, y], i) => `<g transform="translate(${x - 12} ${y - 12})"><rect width="24" height="24" rx="5.5" fill="#000" stroke="${i === 3 ? "#e92a67" : "#2f6bff"}" stroke-width="1.7"/><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="#e5e7eb" stroke-width="1.4"/></g>`).join("")}
 </svg>`;
 const DOME_URI = `data:image/svg+xml;base64,${Buffer.from(DOME_SVG).toString("base64")}`;
 
@@ -36,7 +36,7 @@ export default function OpengraphImage() {
           height: "100%",
           display: "flex",
           position: "relative",
-          background: "#0c0d10",
+          background: "#000000",
           color: "#ffffff",
           fontFamily: "sans-serif",
         }}
@@ -50,7 +50,7 @@ export default function OpengraphImage() {
             height: "100%",
             display: "flex",
             backgroundImage:
-              "radial-gradient(circle at 12% 0%, rgba(99,102,241,0.5) 0%, rgba(99,102,241,0) 46%), radial-gradient(circle at 86% 100%, rgba(34,211,238,0.3) 0%, rgba(34,211,238,0) 44%)",
+              "radial-gradient(circle at 12% 0%, rgba(168, 83, 186,0.5) 0%, rgba(168, 83, 186,0) 46%), radial-gradient(circle at 86% 100%, rgba(42, 138, 246,0.3) 0%, rgba(42, 138, 246,0) 44%)",
           }}
         />
         <img src={DOME_URI} width={660} height={408} alt="" style={{ position: "absolute", right: -30, bottom: 0 }} />
@@ -73,7 +73,7 @@ export default function OpengraphImage() {
           Illustrative
         </div>
         <div style={{ position: "absolute", top: 0, left: 0, width: 640, height: "100%", display: "flex", flexDirection: "column", justifyContent: "center", padding: "0 0 0 84px" }}>
-          <div style={{ fontSize: 58, fontWeight: 700, letterSpacing: "-0.03em", color: "#e0f2fe" }}>shadw</div>
+          <div style={{ fontSize: 58, fontWeight: 700, letterSpacing: "-0.03em", color: "#ffe3ec" }}>shadw</div>
           <div style={{ display: "flex", flexDirection: "column", marginTop: 26, fontSize: 70, lineHeight: 1.04, fontWeight: 700, letterSpacing: "-0.03em" }}>
             <div>Push to Git.</div>
             <div>Get a live URL.</div>

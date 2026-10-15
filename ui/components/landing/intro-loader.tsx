@@ -102,7 +102,7 @@ export function IntroLoader() {
         right: 0,
         height: "100vh",
         zIndex: 100,
-        background: "#0c0d10",
+        background: "#000000",
         display: "flex",
         alignItems: "center",
         justifyContent: "center",

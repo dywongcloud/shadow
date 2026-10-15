@@ -44,11 +44,11 @@ export function DomeKeystone({ compact = false }: { compact?: boolean }) {
     <svg viewBox="0 -70 760 470" className="h-full w-full overflow-visible" preserveAspectRatio={compact ? "xMidYMax meet" : "xMidYMax slice"} aria-hidden="true">
       <defs>
         <linearGradient id={`${id}-limb`} gradientUnits="userSpaceOnUse" x1="20" y1="0" x2="740" y2="0">
-          <stop offset="0" stopColor="#8b5cf6" stopOpacity="0.7" />
+          <stop offset="0" stopColor="#a853ba" stopOpacity="0.7" />
           <stop offset="0.3" stopColor="#60a5fa" />
-          <stop offset="0.5" stopColor="#e0f2fe" />
+          <stop offset="0.5" stopColor="#ffe3ec" />
           <stop offset="0.7" stopColor="#38bdf8" />
-          <stop offset="1" stopColor="#22d3ee" stopOpacity="0.7" />
+          <stop offset="1" stopColor="#2a8af6" stopOpacity="0.7" />
         </linearGradient>
         <clipPath id={`${id}-clip`}>
           <path d={`${ARC}V400H20Z`} />
@@ -80,7 +80,7 @@ export function DomeKeystone({ compact = false }: { compact?: boolean }) {
       ))}
       {DOME_NODES.map(([x, y], i) => (
         <g key={i} transform={`translate(${x - 12} ${y - 12})`}>
-          <rect width="24" height="24" rx="5.5" fill="#000" stroke={i === 3 ? "#5eead4" : "#2f6bff"} strokeWidth="1.7" />
+          <rect width="24" height="24" rx="5.5" fill="#000" stroke={i === 3 ? "#e92a67" : "#2f6bff"} strokeWidth="1.7" />
           <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="#e5e7eb" strokeWidth="1.4" />
         </g>
       ))}
@@ -100,7 +100,7 @@ export function ScaleToZero() {
             <span
               key={i}
               className="w-[6px] flex-1 rounded-full"
-              style={{ height: h, background: h > 10 ? "linear-gradient(to top, #22d3ee, #818cf8)" : "rgba(255,255,255,.16)" }}
+              style={{ height: h, background: h > 10 ? "linear-gradient(to top, #2a8af6, #a853ba)" : "rgba(255,255,255,.16)" }}
             />
           ))}
         </div>
@@ -142,7 +142,7 @@ export function ManagedData() {
     <div className="flex flex-1 flex-wrap content-center gap-2.5 p-5" aria-hidden="true">
       {ENGINES.map((e, i) => (
         <span key={e} className={`lp-chip ${i < 2 ? "!border-indigo-400/50 !bg-indigo-400/10" : ""}`}>
-          <span className="lp-dot" style={{ color: ["#38bdf8", "#f87171", "#5eead4", "#fbbf24", "#a78bfa", "#f472b6", "#34d399", "#22d3ee"][i] }} />
+          <span className="lp-dot" style={{ color: ["#38bdf8", "#f87171", "#e92a67", "#fbbf24", "#a78bfa", "#f472b6", "#34d399", "#2a8af6"][i] }} />
           {e}
         </span>
       ))}
@@ -198,8 +198,8 @@ export function LogsMetrics() {
         <svg viewBox="0 0 160 90" className="hidden h-[110px] w-[40%] shrink-0 self-end sm:block" preserveAspectRatio="none">
           <defs>
             <linearGradient id="lp-area" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stopColor="#818cf8" stopOpacity=".5" />
-              <stop offset="1" stopColor="#818cf8" stopOpacity="0.1" />
+              <stop offset="0" stopColor="#a853ba" stopOpacity=".5" />
+              <stop offset="1" stopColor="#a853ba" stopOpacity="0.1" />
             </linearGradient>
           </defs>
           <path d="M0 70C14 66 20 50 34 52S56 72 70 56 92 22 108 30 130 58 144 40L160 24V90H0Z" fill="url(#lp-area)" />

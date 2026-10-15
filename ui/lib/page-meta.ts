@@ -20,5 +20,5 @@ export function pageMeta({ title, socialTitle, description, twitterDescription, 
 
 /** The pages that sit in `MarketingShell` are dark whatever the visitor's scheme: the browser bar and the default canvas say so from the first byte,
  *  not after hydration (`/` is a static shell shared with the dashboard, so the shell sets its own bar from an effect). */
-export const darkViewport: Viewport = { themeColor: "#0c0d10", colorScheme: "dark" };
+export const darkViewport: Viewport = { themeColor: "#000000", colorScheme: "dark" };
 

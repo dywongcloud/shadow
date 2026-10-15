@@ -19,21 +19,21 @@ function CommitGraph() {
           <svg viewBox="0 0 320 130" className="absolute inset-0 h-full w-full">
             <defs>
               <linearGradient id="lp-main" gradientUnits="userSpaceOnUse" x1="16" y1="36" x2="304" y2="36">
-                <stop offset="0" stopColor="#5eead4" stopOpacity=".15" />
-                <stop offset=".5" stopColor="#22d3ee" />
-                <stop offset="1" stopColor="#818cf8" />
+                <stop offset="0" stopColor="#e92a67" stopOpacity=".15" />
+                <stop offset=".5" stopColor="#2a8af6" />
+                <stop offset="1" stopColor="#a853ba" />
               </linearGradient>
             </defs>
             <path d="M16 36H304" stroke="url(#lp-main)" strokeWidth="2" fill="none" />
-            <path d="M100 36C100 66 120 92 150 92H220C250 92 270 66 280 36" stroke="#818cf8" strokeOpacity=".7" strokeWidth="2" fill="none" />
+            <path d="M100 36C100 66 120 92 150 92H220C250 92 270 66 280 36" stroke="#a853ba" strokeOpacity=".7" strokeWidth="2" fill="none" />
             {[40, 100, 160, 220].map((x) => (
-              <circle key={x} cx={x} cy="36" r="5" fill="#0c0d10" stroke="#22d3ee" strokeWidth="2" />
+              <circle key={x} cx={x} cy="36" r="5" fill="#000000" stroke="#2a8af6" strokeWidth="2" />
             ))}
             {[170, 212].map((x) => (
-              <circle key={x} cx={x} cy="92" r="5" fill="#0c0d10" stroke="#818cf8" strokeWidth="2" />
+              <circle key={x} cx={x} cy="92" r="5" fill="#000000" stroke="#a853ba" strokeWidth="2" />
             ))}
-            <circle cx="280" cy="36" r="6" fill="#5eead4" />
-            <circle cx="280" cy="36" r="6" fill="#5eead4" className="lp-pulse">
+            <circle cx="280" cy="36" r="6" fill="#e92a67" />
+            <circle cx="280" cy="36" r="6" fill="#e92a67" className="lp-pulse">
               <animate attributeName="r" values="6;16;6" dur="2.8s" repeatCount="indefinite" />
               <animate attributeName="opacity" values=".55;0;.55" dur="2.8s" repeatCount="indefinite" />
             </circle>

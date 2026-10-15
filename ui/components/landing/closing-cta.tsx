@@ -12,7 +12,7 @@ export function ClosingCta() {
           className="pointer-events-none absolute inset-0 -z-10"
           style={{
             background:
-              "radial-gradient(620px 340px at 12% 0%, rgba(168,85,247,.32), transparent 66%), radial-gradient(620px 340px at 88% 100%, rgba(34,211,238,.26), transparent 66%), radial-gradient(700px 260px at 50% 120%, rgba(37,99,235,.34), transparent 70%)",
+              "radial-gradient(372px 204px at 12% 0%, rgba(168,83,186,.32), transparent 66%), radial-gradient(372px 204px at 88% 100%, rgba(42, 138, 246,.26), transparent 66%), radial-gradient(420px 156px at 50% 120%, rgba(37,99,235,.34), transparent 70%)",
           }}
         />
         <div aria-hidden="true" className="lp-grid -z-10 opacity-50" />

@@ -24,7 +24,7 @@ const TOOLCHAINS = ["npm", "pnpm", "yarn", "bun"];
 export function StackStrip() {
   return (
     <Section className="pt-24 text-center sm:pt-28" wash="duo">
-      <SectionHead center eyebrow="Bring what you already build" title="Detects your framework. Runs your container." />
+      <SectionHead center eyebrow="Bring what you already build" title="Detects your framework. Runs a litebox isolate." />
       <ul className="mx-auto mt-12 flex max-w-[1000px] flex-wrap items-start justify-center gap-x-3 gap-y-7 sm:gap-x-5">
         {STACK.map((s, i) => (
           <li key={s.name} className="lp-reveal flex w-[88px] flex-col items-center gap-2.5" style={delay(i * 45)}>

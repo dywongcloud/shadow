@@ -16,16 +16,16 @@ export function DomeLight() {
     >
       <defs>
         <linearGradient id="lp-limb" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="2048" y2="0">
-          <stop offset="0" stopColor="#8b5cf6" stopOpacity="0.55" />
+          <stop offset="0" stopColor="#a853ba" stopOpacity="0.55" />
           <stop offset="0.3" stopColor="#60a5fa" />
-          <stop offset="0.5" stopColor="#e0f2fe" />
+          <stop offset="0.5" stopColor="#ffe3ec" />
           <stop offset="0.7" stopColor="#38bdf8" />
-          <stop offset="1" stopColor="#22d3ee" stopOpacity="0.55" />
+          <stop offset="1" stopColor="#2a8af6" stopOpacity="0.55" />
         </linearGradient>
         <linearGradient id="lp-body" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="0" y2="762">
           <stop offset="0" stopColor="#070911" stopOpacity="0.96" />
           <stop offset="0.6" stopColor="#090b12" stopOpacity="0.9" />
-          <stop offset="1" stopColor="#0c0d10" stopOpacity="0.7" />
+          <stop offset="1" stopColor="#000000" stopOpacity="0.7" />
         </linearGradient>
         <linearGradient id="lp-dome-fade" gradientUnits="userSpaceOnUse" x1="0" y1="-200" x2="0" y2="762">
           <stop offset="0" stopColor="#fff" />

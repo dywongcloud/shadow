@@ -47,7 +47,7 @@ export function ProductShowcase() {
         <div
           aria-hidden="true"
           className="pointer-events-none absolute -inset-x-[10%] -inset-y-[14%] -z-10"
-          style={{ background: "radial-gradient(60% 56% at 50% 46%, rgba(99,102,241,0.4), rgba(34,211,238,0.16) 56%, transparent 76%)" }}
+          style={{ background: "radial-gradient(40% 36% at 50% 46%, rgba(168, 83, 186,0.4), rgba(42, 138, 246,0.16) 56%, transparent 76%)" }}
         />
         <figure className="lp-glass lp-limb-top relative overflow-hidden">
           <div className="lp-glass-bar" aria-hidden="true">
