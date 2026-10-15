@@ -4,19 +4,17 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
-import { Twitter, Github, Linkedin, Dribbble, Menu, X } from "lucide-react";
+import { Menu, X } from "lucide-react";
 import Image from "next/image";
+import "@/components/landing/landing.css";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
 
 export const MARKETING_NAV: { label: string; href: string }[] = [
   { label: "Product", href: "/product" },
   { label: "Solutions", href: "/solutions" },
-  { label: "Features", href: "/features" },
   { label: "Docs", href: "/docs" },
   { label: "Pricing", href: "/pricing" },
-  { label: "Blog", href: "/blog" },
-  { label: "Case Studies", href: "/case-studies" },
 ];
 
 const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[] = [
@@ -25,24 +23,22 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
     links: [
       { label: "Overview", href: "/product" },
       { label: "Features", href: "/features" },
+      { label: "Solutions", href: "/solutions" },
       { label: "Pricing", href: "/pricing" },
-      { label: "Changelog", href: "/blog" },
     ],
   },
   {
     title: "Resources",
     links: [
       { label: "Documentation", href: "/docs" },
-      { label: "API Reference", href: "/docs/api-reference" },
-      { label: "Guides", href: "/docs/getting-started" },
-      { label: "Blog", href: "/blog" },
+      { label: "API reference", href: "/docs/api-reference" },
+      { label: "Getting started", href: "/docs/getting-started" },
+      { label: "Status", href: "/status" },
     ],
   },
   {
     title: "Company",
     links: [
-      { label: "Solutions", href: "/solutions" },
-      { label: "Case Studies", href: "/case-studies" },
       { label: "Contact", href: "/contact" },
       { label: "Privacy", href: "/privacy" },
     ],
@@ -101,49 +97,70 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div
-      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-[#0c0d10] text-white"
+      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-x-clip bg-[#0c0d10] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
-      <header className="relative z-30 border-b border-[#218cff]/50 bg-[#0c0d10]/80 backdrop-blur">
-        <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
-          <Link href="/" className="shrink-0"><Logo className="h-7 sm:h-8" /></Link>
-          <nav className="hidden items-center gap-8 font-semibold uppercase text-[18px] text-zinc-300 lg:flex">
+      <a
+        href="#lp-content"
+        className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[300] focus:rounded-md focus:bg-white focus:px-4 focus:py-2 focus:text-[14px] focus:text-black"
+      >
+        Skip to content
+      </a>
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-[#0c0d10]/70 backdrop-blur-xl">
+        <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
+          <Link href="/" className="shrink-0 justify-self-start">
+            <Logo className="h-7 sm:h-8" />
+          </Link>
+          <nav aria-label="Primary" className="col-start-2 hidden items-center gap-10 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex">
             {MARKETING_NAV.map((n) => (
               <Link
                 key={n.href}
                 href={n.href}
-                className={`transition-colors hover:text-white ${active(n.href) ? "text-white" : ""}`}
+                aria-current={active(n.href) ? "page" : undefined}
+                className={`relative py-[13px] transition-colors hover:text-white after:absolute after:inset-x-0 after:bottom-[5px] after:h-px after:bg-gradient-to-r after:from-transparent after:via-indigo-300 after:to-transparent after:transition-opacity ${
+                  active(n.href) ? "text-white after:opacity-100" : "after:opacity-0 hover:after:opacity-60"
+                }`}
               >
                 {n.label}
               </Link>
             ))}
           </nav>
-          <div className="flex items-center gap-3">
+          <div className="col-start-3 flex items-center gap-2 justify-self-end sm:gap-3">
             <Link
               href="/sign-in"
-              className="hidden rounded-full border border-white/30 px-5 py-2 font-semibold uppercase text-[16.8px] text-white transition-colors hover:bg-white/10 lg:inline-flex"
+              className="hidden rounded-full px-4 py-[13px] text-[13px] uppercase tracking-[0.18em] text-zinc-300 transition-colors hover:text-white lg:inline-flex"
             >
-              Login
+              Sign in
+            </Link>
+            <Link
+              href="/sign-up"
+              className="hidden rounded-full bg-white px-5 py-[12px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(129,140,248,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
+            >
+              Get started
             </Link>
             <button
               type="button"
               aria-label={menuOpen ? "Close menu" : "Open menu"}
               aria-expanded={menuOpen}
               onClick={() => setMenuOpen((o) => !o)}
-              className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10 lg:hidden"
+              className="inline-flex h-[44px] w-[44px] items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10 lg:hidden"
             >
               {menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
             </button>
           </div>
         </div>
-
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 -bottom-px h-px"
+          style={{ background: "linear-gradient(90deg, transparent, rgba(129,140,248,0.6) 28%, rgba(34,211,238,0.5) 72%, transparent)" }}
+        />
       </header>
 
       {menuOpen &&
         typeof document !== "undefined" &&
         createPortal(
           <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
-            <div className="flex items-center justify-between border-b border-[#218cff]/50 px-6 py-4">
+            <div className="flex items-center justify-between border-b border-white/10 px-6 py-3.5">
               <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
                 <Logo className="h-7" />
               </Link>
@@ -151,19 +168,20 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
                 type="button"
                 aria-label="Close menu"
                 onClick={() => setMenuOpen(false)}
-                className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10"
+                className="inline-flex h-[44px] w-[44px] items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10"
               >
                 <X className="h-5 w-5" />
               </button>
             </div>
-            <nav className="flex flex-1 flex-col overflow-y-auto px-6 py-6">
+            <nav aria-label="Primary" className="flex flex-1 flex-col overflow-y-auto px-6 py-6">
               <ul className="flex flex-col">
                 {MARKETING_NAV.map((n) => (
                   <li key={n.href}>
                     <Link
                       href={n.href}
                       onClick={() => setMenuOpen(false)}
-                      className={`block border-b border-white/5 py-4 font-semibold uppercase text-[18px] transition-colors hover:text-white ${
+                      aria-current={active(n.href) ? "page" : undefined}
+                      className={`block border-b border-white/5 py-4 text-[18px] font-medium transition-colors hover:text-white ${
                         active(n.href) ? "text-white" : "text-zinc-300"
                       }`}
                     >
@@ -172,34 +190,47 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
                   </li>
                 ))}
               </ul>
-              <Link
-                href="/sign-in"
-                onClick={() => setMenuOpen(false)}
-                className="mt-8 inline-flex w-full items-center justify-center rounded-full border border-white/30 px-5 py-3 font-semibold uppercase text-[18px] text-white transition-colors hover:bg-white/10"
-              >
-                Login
-              </Link>
+              <div className="mt-8 flex flex-col gap-3">
+                <Link
+                  href="/sign-up"
+                  onClick={() => setMenuOpen(false)}
+                  className="inline-flex w-full items-center justify-center rounded-full bg-white px-5 py-3.5 text-[16px] font-semibold text-black"
+                >
+                  Get started
+                </Link>
+                <Link
+                  href="/sign-in"
+                  onClick={() => setMenuOpen(false)}
+                  className="inline-flex w-full items-center justify-center rounded-full border border-white/30 px-5 py-3.5 text-[16px] font-medium text-white transition-colors hover:bg-white/10"
+                >
+                  Sign in
+                </Link>
+              </div>
             </nav>
           </div>,
           document.body
         )}
 
-      {children}
+      <div id="lp-content" tabIndex={-1} className="outline-none">
+        {children}
+      </div>
 
       <footer className="relative overflow-hidden bg-[#0c0d10]">
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]">
-          <div className="absolute -bottom-44 left-[6%] h-[25.2rem] w-[25.2rem] rounded-full bg-teal-400/36 blur-[126px]" />
-          <div className="absolute -bottom-52 left-[33%] h-[31.5rem] w-[31.5rem] rounded-full bg-indigo-600/45 blur-[137px]" />
-          <div className="absolute -bottom-44 left-[55%] h-[25.2rem] w-[25.2rem] rounded-full bg-fuchsia-600/30 blur-[126px]" />
-          <div className="absolute -bottom-48 right-[6%] h-[27.3rem] w-[27.3rem] rounded-full bg-cyan-400/30 blur-[126px]" />
-        </div>
+        <div
+          aria-hidden="true"
+          className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]"
+          style={{
+            background:
+              "radial-gradient(420px 420px at 14% 100%, rgba(45,212,191,0.28), transparent 70%), radial-gradient(540px 540px at 42% 106%, rgba(79,70,229,0.4), transparent 70%), radial-gradient(420px 420px at 66% 100%, rgba(192,38,211,0.26), transparent 70%), radial-gradient(450px 450px at 92% 100%, rgba(34,211,238,0.24), transparent 70%)",
+          }}
+        />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center overflow-hidden">
           <span
             className="select-none whitespace-nowrap bg-clip-text font-bold leading-[0.78] tracking-tighter text-transparent"
             style={{
               fontSize: "clamp(7rem, 30vw, 28rem)",
               opacity: 0.16,
-              transform: "translateY(26%)",
+              transform: "translateY(12%)",
               backgroundImage: "linear-gradient(100deg, #5eead4 0%, #22d3ee 30%, #818cf8 60%, #e879f9 100%)",
               maskImage: "linear-gradient(to top, black 30%, transparent 95%)",
               WebkitMaskImage: "linear-gradient(to top, black 30%, transparent 95%)",
@@ -209,20 +240,22 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
           </span>
         </div>
         <div className="relative z-10 mx-auto max-w-[1500px] px-6 pt-14 lg:px-10">
-          <div className="grid grid-cols-2 gap-10 md:grid-cols-5">
-            <div className="col-span-2 md:col-span-2">
+          <div className="grid grid-cols-2 gap-10 md:grid-cols-4">
+            <div className="col-span-2 md:col-span-1">
               <Logo className="h-7" />
-              <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-500">
-                Unleash the Power of Peer-to-Peer: Seamlessly Connect, Collaborate, and Conquer.
+              <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-400">
+                Serverless functions, containers and data on a peer-to-peer cloud.
               </p>
             </div>
             {FOOTER_COLS.map((col) => (
-              <div key={col.title}>
+              <div key={col.title} className={col.title === "Company" ? "col-span-2 md:col-span-1" : ""}>
                 <div className="text-sm font-semibold text-white">{col.title}</div>
-                <ul className="mt-4 space-y-3">
+                <ul className="mt-3 space-y-0.5">
                   {col.links.map((l) => (
                     <li key={l.label}>
-                      <Link href={l.href} className="text-sm text-zinc-500 transition-colors hover:text-zinc-200">{l.label}</Link>
+                      <Link href={l.href} className="inline-block py-1.5 text-sm text-zinc-400 transition-colors hover:text-white">
+                        {l.label}
+                      </Link>
                     </li>
                   ))}
                 </ul>
@@ -230,14 +263,8 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
             ))}
           </div>
 
-          <div className="mt-12 flex flex-col items-center justify-between gap-4 pt-6 sm:flex-row">
-            <span className="text-sm text-zinc-600">2026 Shadw. All rights reserved.</span>
-            <div className="flex items-center gap-5 text-zinc-500">
-              <a href="#" aria-label="Twitter" className="transition-colors hover:text-white"><Twitter className="h-4 w-4" /></a>
-              <a href="#" aria-label="GitHub" className="transition-colors hover:text-white"><Github className="h-4 w-4" /></a>
-              <a href="#" aria-label="LinkedIn" className="transition-colors hover:text-white"><Linkedin className="h-4 w-4" /></a>
-              <a href="#" aria-label="Dribbble" className="transition-colors hover:text-white"><Dribbble className="h-4 w-4" /></a>
-            </div>
+          <div className="mt-12 flex flex-col items-center justify-between gap-4 border-t border-white/10 pt-6 sm:flex-row">
+            <span className="text-sm text-zinc-400">© 2026 shadw. All rights reserved.</span>
           </div>
           <div className="h-40 sm:h-56" />
         </div>
@@ -248,22 +275,18 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
 export function MarketingHero({ eyebrow, title, subtitle, children }: { eyebrow?: string; title: React.ReactNode; subtitle?: string; children?: React.ReactNode }) {
   return (
-    <section className="relative">
-      <div className="pointer-events-none absolute inset-0">
-        <div className="absolute -left-40 top-0 h-[40rem] w-[40rem] rounded-full bg-violet-700/25 blur-[140px]" />
-        <div className="absolute -left-20 top-16 h-[22rem] w-[22rem] rounded-full bg-pink-500/30 blur-[110px]" />
-        <div className="absolute -right-40 top-40 h-[34rem] w-[34rem] rounded-full bg-cyan-500/15 blur-[140px]" />
-        <div className="absolute -right-16 top-52 h-[20rem] w-[20rem] rounded-full bg-sky-400/30 blur-[110px]" />
+    <section className="lp lp-hero">
+      <div className="lp-bg" aria-hidden="true">
+        <div className="lp-aurora-a" />
+        <div className="lp-aurora-b" />
+        <div className="lp-grid" />
+        <div className="lp-grain" />
       </div>
-      <div className="relative mx-auto max-w-4xl px-6 pb-12 pt-24 text-center sm:pt-28">
-        {eyebrow && (
-          <div className="mb-5 inline-flex items-center rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs font-medium uppercase tracking-wider text-zinc-300">
-            {eyebrow}
-          </div>
-        )}
-        <h1 className="text-balance text-4xl font-bold leading-[1.08] tracking-tight sm:text-6xl">{title}</h1>
-        {subtitle && <p className="mx-auto mt-6 max-w-2xl text-lg leading-relaxed text-zinc-400">{subtitle}</p>}
-        {children && <div className="mt-10 flex flex-wrap items-center justify-center gap-4">{children}</div>}
+      <div className="relative z-10 mx-auto max-w-[920px] px-6 pb-16 pt-16 sm:pt-24">
+        {eyebrow && <span className="lp-pill !px-4 !py-1.5 uppercase !tracking-[0.18em] !text-[12px]">{eyebrow}</span>}
+        <h1 className="lp-h1 lp-h1-page mt-6">{title}</h1>
+        {subtitle && <p className="lp-sub mx-auto mt-6 max-w-[680px]">{subtitle}</p>}
+        {children && <div className="mt-9 flex flex-wrap items-center justify-center gap-4">{children}</div>}
       </div>
     </section>
   );
@@ -273,9 +296,15 @@ export function MarketingSection({ className = "", children }: { className?: str
   return <section className={`relative mx-auto max-w-6xl px-6 ${className}`}>{children}</section>;
 }
 
+/** A marketing card: gradient hairline, a spotlight that follows the pointer (`--mx`/`--my` read by `.lp-card::before`). */
 export function GlowCard({ className = "", children }: { className?: string; children: React.ReactNode }) {
+  const spot = (e: React.PointerEvent<HTMLDivElement>) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    e.currentTarget.style.setProperty("--mx", `${e.clientX - r.left}px`);
+    e.currentTarget.style.setProperty("--my", `${e.clientY - r.top}px`);
+  };
   return (
-    <div className={`rounded-2xl border border-white/10 bg-white/[0.03] p-6 transition-colors hover:border-white/20 ${className}`}>
+    <div onPointerMove={spot} className={`lp-card p-6 ${className}`}>
       {children}
     </div>
   );
