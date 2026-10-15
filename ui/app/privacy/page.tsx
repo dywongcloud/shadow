@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { pageMeta } from "@/lib/page-meta";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection } from "@/components/marketing-shell";
 
 export const metadata: Metadata = pageMeta({
@@ -11,6 +11,7 @@ export const metadata: Metadata = pageMeta({
     "shadw's privacy policy: what the hosted dashboard collects, where your application data is stored, what platform operators can read, and what happens when you delete a resource.",
   path: "/privacy",
 });
+export const viewport = darkViewport;
 
 
 const SECTIONS: { h: string; p: string }[] = [

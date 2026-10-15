@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
-import { pageMeta } from "@/lib/page-meta";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   GitBranch,
@@ -29,6 +29,7 @@ export const metadata: Metadata = pageMeta({
     "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics.",
   path: "/features",
 });
+export const viewport = darkViewport;
 
 
 const FEATURES = [

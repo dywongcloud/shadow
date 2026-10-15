@@ -57,7 +57,7 @@ export function Bento() {
   useEffect(() => (grid.current ? trackSpotlight(grid.current) : undefined), []);
   return (
     <Section className="pt-28 sm:pt-36" wash="duo">
-      <SectionHead eyebrow="What you get" title="Everything between git push and a live URL." lead="Builds, previews, domains, data and logs in one platform." />
+      <SectionHead eyebrow="What you get" title="Everything between git\u00a0push and a live URL." lead="Builds, previews, domains, data and logs in one platform." />
       <p className="lp-mono mt-6 text-[12px] uppercase tracking-[0.16em] text-[var(--lp-dim)]">Illustrations use sample data.</p>
       <div ref={grid} className="mt-10 grid gap-5 md:grid-cols-2 lg:grid-cols-12">
         <article className="lp-card lp-card-keystone lp-reveal grid md:col-span-2 lg:col-span-12 lg:grid-cols-12" style={delay(0)}>

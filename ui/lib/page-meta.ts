@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 
 /** The share card of every public page (`app/opengraph-image.tsx`). A page's own `openGraph` or `twitter` object REPLACES the root layout's, images
  *  included, so each page names the card itself; `metadataBase` makes the URL absolute. */
@@ -14,6 +14,11 @@ export function pageMeta({ title, socialTitle, description, twitterDescription, 
     description,
     alternates: { canonical: path },
     openGraph: { title: socialTitle, description, url: path, type: "website", siteName: "shadw", images: [CARD] },
-    twitter: { card: "summary_large_image", title: socialTitle, description: twitterDescription ?? description, images: [CARD.url] },
+    twitter: { card: "summary_large_image", title: socialTitle, description: twitterDescription ?? description, images: [{ url: CARD.url, alt: CARD.alt }] },
   };
 }
+
+/** The pages that sit in `MarketingShell` are dark whatever the visitor's scheme: the browser bar and the default canvas say so from the first byte,
+ *  not after hydration (`/` is a static shell shared with the dashboard, so the shell sets its own bar from an effect). */
+export const darkViewport: Viewport = { themeColor: "#0c0d10", colorScheme: "dark" };
+

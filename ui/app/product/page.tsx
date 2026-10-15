@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
-import { pageMeta } from "@/lib/page-meta";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import {
   MarketingShell,
   MarketingHero,
@@ -28,6 +28,7 @@ export const metadata: Metadata = pageMeta({
     "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys and rollback to earlier deployments.",
   path: "/product",
 });
+export const viewport = darkViewport;
 
 
 const CAPABILITIES = [

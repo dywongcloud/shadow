@@ -39,7 +39,7 @@ function clip(segs: Seg[], chars: number) {
 }
 
 /** A hero terminal that types one deploy once and holds the finished transcript. It types only while on screen, visible and past the intro overlay; the
- *  server render and prefers-reduced-motion show the whole transcript at once. */
+ *  server render, prefers-reduced-motion and a page that starts paused show the whole transcript at once. */
 export function DeployTerminal({ className = "" }: { className?: string }) {
   const [ms, setMs] = useState(FINAL_MS);
   const [live, setLive] = useState(false);
@@ -48,10 +48,11 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- the server render shows the whole transcript for no-script visitors; scripted visitors see it only once this effect has decided between typing it and showing it
     setLive(true);
-    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    const html = document.documentElement;
+    // a page that starts paused (reduced motion, or a Pause the visitor remembered) shows the whole transcript, as the server render does
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || html.classList.contains("lp-paused")) return;
     const el = box.current;
     if (!el) return;
-    const html = document.documentElement;
     const dome = el.closest<HTMLElement>(".lp-dome");
     dome?.setAttribute("data-deploy", "building");
     let inView = false;

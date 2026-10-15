@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
-import { pageMeta } from "@/lib/page-meta";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   ArrowRight,
@@ -25,6 +25,7 @@ export const metadata: Metadata = pageMeta({
     "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
   path: "/solutions",
 });
+export const viewport = darkViewport;
 
 
 const audiences = [

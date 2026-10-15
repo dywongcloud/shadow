@@ -9,6 +9,12 @@
   --lp-edge: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(34, 211, 238, 0.5) 100%);
   --lp-limb: linear-gradient(90deg, transparent, #8b5cf6 22%, #e0f2fe 50%, #22d3ee 78%, transparent);
 }
+/* the dark brand surface from the first paint: the shell also forces it from an effect, which left a light-scheme visitor a flash of the light canvas */
+html:has(#lp-content),
+html:has(#lp-content) body {
+  background-color: var(--lp-bg);
+  color-scheme: dark;
+}
 .lp {
   font-size: 16px;
   line-height: 1.55;
@@ -602,8 +608,8 @@ html:has(.lp-hero) {
 }
 
 /* the visitor's Pause (`marquee-banner.tsx`) stops every decorative CSS loop on the landing; the terminal and SMIL are stopped from script */
-html.lp-paused .lp *,
-html.lp-paused .lp *::before,
-html.lp-paused .lp *::after {
+html.lp-paused .lp *:not(.lp-rise),
+html.lp-paused .lp *:not(.lp-rise)::before,
+html.lp-paused .lp *:not(.lp-rise)::after {
   animation-play-state: paused !important;
 }

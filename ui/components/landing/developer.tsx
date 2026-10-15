@@ -148,7 +148,7 @@ export function Developer() {
                     aria-controls="lp-dev-panel"
                     tabIndex={i === tab ? 0 : -1}
                     onClick={() => setTab(i)}
-                    className={`lp-mono relative inline-flex h-[44px] min-w-[44px] items-center justify-center whitespace-nowrap px-3.5 text-[12px] uppercase tracking-[0.14em] transition-colors ${i === tab ? "text-white underline decoration-2 underline-offset-[10px]" : "text-[var(--lp-dim)] hover:text-zinc-200"}`}
+                    className={`lp-mono relative inline-flex h-[44px] min-w-[44px] shrink-0 items-center justify-center whitespace-nowrap px-3.5 text-[12px] uppercase tracking-[0.14em] transition-colors ${i === tab ? "text-white underline decoration-2 underline-offset-[10px]" : "text-[var(--lp-dim)] hover:text-zinc-200"}`}
                   >
                     <span className="max-[359px]:hidden">{t.label}</span>
                     <span aria-hidden className="min-[360px]:hidden">

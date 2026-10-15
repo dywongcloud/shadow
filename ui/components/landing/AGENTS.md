@@ -30,8 +30,13 @@ the root `AGENTS.md` still apply.
 - A public page declares its metadata with `pageMeta` (`lib/page-meta.ts`): a page's own `openGraph` or `twitter` object REPLACES the root's, images
   included, so the helper names the share card on every page, and `title` is the page's own name (the root template adds " · shadw").
 - Motion has one state, `html.lp-paused` (`motion-pause.tsx`): `PauseSkip` is the second Tab stop (through `MarketingShell`'s `lead`), the ticker's
-  button is the same control, and `prefers-reduced-motion` starts the SMIL timelines paused (CSS cannot stop SMIL). An open mobile menu is a dialog:
-  focus moves in, the page behind is `inert`, Tab wraps, focus returns to the toggle.
+  button is the same control, `prefers-reduced-motion` and a Pause the visitor remembered (`localStorage`) start the page paused (SMIL stopped, the
+  terminal shows its whole transcript), and the pause rule skips `.lp-rise`, a one-shot entrance that would otherwise freeze invisible. An open mobile
+  menu is a dialog: focus moves in, the page behind is `inert`, Tab wraps, focus returns to the toggle.
+- A page in `MarketingShell` is dark whatever the visitor's scheme: `html:has(#lp-content)` paints the canvas from the first byte, the six marketing
+  pages export `darkViewport` (theme-color and color-scheme), and `/` (a static shell shared with the dashboard) sets the browser bar from the shell's
+  effect. Every public route, a status or auth page included, has its own title, canonical, `og:url` and description (a client page gets a segment
+  `layout.tsx`); a board that reports health says "checking" or "unavailable" until its feed has answered, never "operational" (`/status`).
 - A well is a `min-height`, not a `height` (the step-1 graph's is fixed), and a chip row that cannot shrink keeps its padding in px: a reader's larger
   text grows the well instead of clipping it (probed at root font x1.0, x1.5 and x2.0).
 - Headings, eyebrows and captions are `text-wrap: balance` (`.lp-card-title`, `.lp-eyebrow`, `.lp-caption`): a block's last line is

@@ -63,7 +63,12 @@ function useForcedDarkRoot() {
     body.style.backgroundColor = MARKETING_SURFACE_COLOR;
     html.style.colorScheme = "dark";
     body.style.overflowX = "clip";
+    // the browser's own bar: a light-scheme visitor would otherwise get the layout's white theme-color above a black page
+    const bars = Array.from(document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]'));
+    const barColors = bars.map((m) => m.content);
+    bars.forEach((m) => (m.content = MARKETING_SURFACE_COLOR));
     return () => {
+      bars.forEach((m, i) => (m.content = barColors[i]));
       html.style.backgroundColor = "";
       body.style.backgroundColor = "";
       html.style.colorScheme = prevScheme;
@@ -255,6 +260,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center overflow-hidden">
           <span
+            aria-hidden="true"
             className="select-none whitespace-nowrap bg-clip-text font-bold leading-[0.78] tracking-tighter text-transparent"
             style={{
               fontSize: "clamp(7rem, 30vw, 28rem)",

@@ -1,6 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
-import { pageMeta } from "@/lib/page-meta";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { Check } from "lucide-react";
 
@@ -13,6 +13,7 @@ export const metadata: Metadata = pageMeta({
     "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read pricing FAQs.",
   path: "/pricing",
 });
+export const viewport = darkViewport;
 
 
 type Tier = {

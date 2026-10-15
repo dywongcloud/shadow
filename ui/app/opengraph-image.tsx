@@ -54,6 +54,24 @@ export default function OpengraphImage() {
           }}
         />
         <img src={DOME_URI} width={660} height={408} alt="" style={{ position: "absolute", right: -30, bottom: 0 }} />
+        <div
+          style={{
+            position: "absolute",
+            left: 744,
+            top: 196,
+            display: "flex",
+            padding: "7px 16px",
+            borderRadius: 999,
+            border: "1px solid rgba(255,255,255,0.22)",
+            background: "rgba(12,13,16,0.72)",
+            color: "#aeaeba",
+            fontSize: 17,
+            letterSpacing: "0.16em",
+            textTransform: "uppercase",
+          }}
+        >
+          Illustrative
+        </div>
         <div style={{ position: "absolute", top: 0, left: 0, width: 640, height: "100%", display: "flex", flexDirection: "column", justifyContent: "center", padding: "0 0 0 84px" }}>
           <div style={{ fontSize: 58, fontWeight: 700, letterSpacing: "-0.03em", color: "#e0f2fe" }}>shadw</div>
           <div style={{ display: "flex", flexDirection: "column", marginTop: 26, fontSize: 70, lineHeight: 1.04, fontWeight: 700, letterSpacing: "-0.03em" }}>

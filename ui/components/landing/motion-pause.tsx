@@ -4,10 +4,29 @@ import { useEffect, useState } from "react";
 
 const CHANGED = "lp-motion-pause";
 const PAUSED = "lp-paused";
+const REMEMBERED = "lp-motion-paused";
+
+/** A visitor's own choice survives a reload (storage can be blocked: then it lasts for the page). */
+function remembered(): boolean {
+  try {
+    return window.localStorage.getItem(REMEMBERED) === "1";
+  } catch {
+    return false;
+  }
+}
+function remember(paused: boolean) {
+  try {
+    if (paused) window.localStorage.setItem(REMEMBERED, "1");
+    else window.localStorage.removeItem(REMEMBERED);
+  } catch {
+    // blocked storage: the choice lasts for this page only
+  }
+}
 
 /** Pauses or resumes all of the landing's decorative motion: `html.lp-paused` stops the CSS loops and the terminal's typing, and SMIL (which no CSS
  *  can stop) is paused from script. Every control reads the same state, so two buttons never disagree. */
-export function setMotionPaused(paused: boolean) {
+export function setMotionPaused(paused: boolean, chosen = true) {
+  if (chosen) remember(paused);
   document.documentElement.classList.toggle(PAUSED, paused);
   document.querySelectorAll<SVGSVGElement>(".lp svg").forEach((svg) => (paused ? svg.pauseAnimations() : svg.unpauseAnimations()));
   window.dispatchEvent(new Event(CHANGED));
@@ -26,12 +45,14 @@ export function useMotionPause(): [boolean, () => void] {
 
 /** The second Tab stop on the landing (after "Skip to content"), shown only when focused, as a skip link is: a keyboard visitor reaches Pause before
  *  the navigation and the calls to action, not after them. It also keeps a standing request: with `prefers-reduced-motion: reduce` the SMIL
- *  timelines start paused (the CSS media query already stops the loops), and the state is cleared when the landing unmounts. */
+ *  timelines start paused (the CSS media query already stops the loops), a remembered Pause is honoured, and the state is cleared when the
+ *  landing unmounts. */
 export function PauseSkip() {
   const [paused, toggle] = useMotionPause();
   useEffect(() => {
     const reduce = window.matchMedia("(prefers-reduced-motion: reduce)");
-    const apply = () => reduce.matches && setMotionPaused(true);
+    // the system's request and the visitor's remembered choice start the page paused; neither is stored as a new choice
+    const apply = () => (reduce.matches || remembered()) && setMotionPaused(true, false);
     apply();
     reduce.addEventListener("change", apply);
     return () => {
