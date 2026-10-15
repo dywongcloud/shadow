@@ -94,11 +94,11 @@ export default function DocsIndex() {
             operate.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
-            <Link href="/docs/getting-started" className="inline-flex items-center gap-2 rounded-md bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
+            <Link href="/docs/getting-started" className="tap-44 inline-flex items-center gap-2 rounded-md border border-transparent bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
               Get started guide <ArrowRight className="h-4 w-4" />
             </Link>
-            <Link href="/settings/api-keys" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
-            <Link href="/docs/getting-started#api" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
+            <Link href="/settings/api-keys" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
+            <Link href="/docs/getting-started#api" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
           </div>
         </div>
         <CodeBlock tabs={HERO_TABS} />

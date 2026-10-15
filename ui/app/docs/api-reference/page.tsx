@@ -135,7 +135,7 @@ export default function ApiReferencePage() {
             <Link
               key={cat.slug}
               href={endpointHref(cat.slug, cat.endpoints[0].slug)}
-              className="flex items-center justify-between rounded-lg border border-border px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-subtle/40"
+              className="tap-44 flex items-center justify-between rounded-lg border border-border px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-subtle/40"
             >
               <span className="text-sm font-medium">{cat.name}</span>
               <span className="text-xs text-muted">

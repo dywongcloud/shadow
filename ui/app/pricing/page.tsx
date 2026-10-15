@@ -27,6 +27,8 @@ type Tier = {
   featured?: boolean;
 };
 
+/** Every bullet is a line the plan catalog or a plan gate backs (`crates/hive-cloud/src/billing.rs`: `PLANS`, `plan_allows_*`, `plan_max_*`; the
+ *  Enterprise suite is gated in `enterprise_api.rs`): a feature every plan has (preview deployments, HTTPS, domains) is listed once, under Hobby. */
 const TIERS: Tier[] = [
   {
     name: "Hobby",
@@ -56,7 +58,9 @@ const TIERS: Tier[] = [
       "Unlimited concurrent builds",
       "$20 of included compute / month",
       "Pay-as-you-go beyond included compute",
-      "Team members & roles",
+      "Up to 25 team members",
+      "Deployment protection and microfrontends",
+      "30 days of log history",
       "Email support",
     ],
     cta: { label: "Start Pro", href: "/sign-up" },
@@ -71,8 +75,10 @@ const TIERS: Tier[] = [
     features: [
       "Everything in Pro",
       "$1,000 of included compute / month",
-      "Region pinning for compute & leases",
-      "Audit logs",
+      "Multi-region fail-over",
+      "SAML SSO, SCIM and SIEM audit-log streaming",
+      "IP blocking",
+      "Functions that run up to an hour",
       "Priority support",
     ],
     cta: { label: "Start Enterprise", href: "/sign-up" },
@@ -100,9 +106,9 @@ const FAQS: { q: string; a: string }[] = [
 ];
 
 const PRIMARY_BTN =
-  "inline-flex w-full items-center justify-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black transition-transform hover:scale-[1.02]";
+  "tap-44 inline-flex w-full items-center justify-center gap-2 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black transition-transform hover:scale-[1.02]";
 const OUTLINE_BTN =
-  "inline-flex w-full items-center justify-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10";
+  "tap-44 inline-flex w-full items-center justify-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10";
 
 export default function PricingPage() {
   return (

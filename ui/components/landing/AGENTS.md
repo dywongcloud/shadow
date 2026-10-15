@@ -39,14 +39,22 @@ the root `AGENTS.md` still apply.
   `layout.tsx`); a board that reports health says "checking" or "unavailable" until its feed has answered, never "operational" (`/status`).
 - A well is a `min-height`, not a `height` (the step-1 graph's is fixed), and a chip row that cannot shrink keeps its padding in px: a reader's larger
   text grows the well instead of clipping it (probed at root font x1.0, x1.5 and x2.0).
+- A JSX attribute STRING decodes no escape (`title="git\u00a0push"` prints the backslash): a no-break space or any escape goes in an expression
+  (`title={"git\u00a0push"}`) or is the literal character. A pricing or feature bullet is a line `billing.rs` (`PLANS`, `plan_allows_*`,
+  `plan_max_*`) or the plan gates in `enterprise_api.rs` back, never a feature every plan has listed as a paid one. `/status` polls its public feed with
+  a plain `fetch` (`usePoll` waits for a tenant, an anonymous visitor has none, and the page used to print "operational" without ever asking).
 - Headings, eyebrows and captions are `text-wrap: balance` (`.lp-card-title`, `.lp-eyebrow`, `.lp-caption`): a block's last line is
   never one short word (the orphan census; a single long word such as "infrastructure." at 320 px cannot be balanced).
 - The social card (`app/opengraph-image.tsx`, a route with no file extension) must be listed in BOTH `isPublic` and `isClerkFree` in
   `ui/proxy.ts`, or every signed-out crawler is redirected to sign-in and no link preview ever shows; `next dev` caches the image,
   so restart it before judging an edit.
-- Targets are 44 px (`min-h-[44px]`; a touch laptop reports `pointer: fine`, so `.lp-tap` also answers `any-pointer: coarse`).
-  Motion respects `prefers-reduced-motion` and the Pause button (`html.lp-paused` stops the CSS loops, SMIL and the terminal's
-  typing), and nothing waits on the intro (`html.lp-ready` has a 3 s failsafe).
+- **Every public page** (landing, marketing, docs, status) has 44 px targets: `min-h-[44px]` where the design is phone-first, else `tap-44`
+  (`globals.css`: a 44 px minimum under `(pointer: coarse), (any-pointer: coarse)`, because a touch laptop reports `pointer: fine`);
+  `min-height` needs a `flex`/`inline-flex` link, and a link INSIDE a sentence is exempt (WCAG 2.5.8). `app/docs/layout.tsx` owns no
+  `<main>` (the root layout's is the only one; the docs column `#docs-content` is the skip target), starts with a skip link and names its
+  landmarks and search; a page whose first heading under the h1 is an h3 gets an `sr-only` h2. Motion respects `prefers-reduced-motion` and
+  the Pause button (`html.lp-paused` stops the CSS loops, SMIL and the terminal's typing), and nothing waits on the intro (`html.lp-ready`
+  has a 3 s failsafe).
 - Witness a change at 320, 360, 390, 768, 1024 and 1440 px on a PRODUCTION build of a scratch copy (`ui/AGENTS.md`: never
   `next build` in `ui/`): text past its well (measure the text range), tokens torn across lines, targets under 44 px, a chip's
   distance to the limb, caption gaps and the first viewport's colour energy are measured, not eyeballed.

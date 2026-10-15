@@ -51,9 +51,11 @@ function Logo({ className = "h-7" }: { className?: string }) {
 
 const MARKETING_SURFACE_COLOR = "#0c0d10";
 
-/** Forces the dark brand surface on the document root while mounted (overscroll, gutters and native scrollbars match, and `overflow-x: clip`
- *  removes the horizontal scrollbar the full-bleed `w-screen` shell induces). Background and overflow revert to "" rather than a snapshot, because a
- *  fast logout-login remount would capture the forced values; only the color-scheme next-themes owns is handed back. */
+/** Forces the dark brand surface on the document root while mounted (overscroll, gutters and native scrollbars match). The full-bleed `w-screen` shell is
+ *  100vw, wider than a window that carries a classic scrollbar: `html:has(#lp-content)` (landing.css) clips the root from the first byte, which hides the horizontal
+ *  scrollbar, and the `body` clip set here then clips for itself (a `body` clip alone propagates to the viewport and leaves the document 5 px wider than the window,
+ *  and wide children such as the ticker track widen it further once the root is clipped). Background reverts to "" rather than a snapshot, because a fast
+ *  logout-login remount would capture the forced values; only the color-scheme next-themes owns is handed back. */
 function useForcedDarkRoot() {
   useEffect(() => {
     const html = document.documentElement;
@@ -159,7 +161,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
             </Link>
             <Link
               href="/sign-up"
-              className="hidden rounded-full bg-white px-5 py-[12px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(129,140,248,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
+              className="hidden rounded-full border border-transparent bg-white px-5 py-[11px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(129,140,248,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
             >
               Get started
             </Link>
@@ -228,7 +230,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
                 <Link
                   href="/sign-up"
                   onClick={() => setMenuOpen(false)}
-                  className="inline-flex w-full items-center justify-center rounded-full bg-white px-5 py-3.5 text-[16px] font-semibold text-black"
+                  className="inline-flex w-full items-center justify-center rounded-full border border-transparent bg-white px-5 py-3.5 text-[16px] font-semibold text-black"
                 >
                   Get started
                 </Link>
@@ -288,7 +290,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
                 <ul className="mt-3 lg:space-y-0.5">
                   {col.links.map((l) => (
                     <li key={l.label}>
-                      <Link href={l.href} className="lp-tap inline-flex min-h-[44px] min-w-[44px] items-center text-sm text-zinc-400 transition-colors hover:text-white lg:min-h-0 lg:min-w-0 lg:py-1.5">
+                      <Link href={l.href} className="tap-44 inline-flex min-h-[44px] min-w-[44px] items-center text-sm text-zinc-400 transition-colors hover:text-white lg:min-h-0 lg:min-w-0 lg:py-1.5">
                         {l.label}
                       </Link>
                     </li>

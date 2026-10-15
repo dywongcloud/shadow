@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -38,7 +39,7 @@ export function AuthShell({
           }}
         />
         <div className="relative flex items-center">
-          <Logo className="h-7 w-auto" />
+          <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center"><Logo className="h-7 w-auto" /></Link>
         </div>
         <div className="relative">
           <h1 className="max-w-md text-3xl font-semibold leading-tight tracking-tight">
@@ -64,7 +65,7 @@ export function AuthShell({
       <div className="relative flex flex-col items-center justify-center px-4 py-10">
         <div className="absolute right-4 top-4"><ThemeToggle /></div>
         <div className="mb-6 flex items-center lg:hidden">
-          <Logo className="h-6 w-auto" />
+          <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center"><Logo className="h-6 w-auto" /></Link>
         </div>
         <div className="w-full max-w-[400px]">
           {mounted && render(clerkAppearance(dark))}

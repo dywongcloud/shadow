@@ -1,8 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { CheckCircle2, AlertTriangle, AlertOctagon, Activity, Clock, ChevronDown } from "lucide-react";
-import { usePoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
+import type { Incident, Severity, IncidentStatus } from "@/lib/api";
 
 const SEV_RANK: Record<Severity, number> = { minor: 1, major: 2, critical: 3 };
 
@@ -19,7 +20,8 @@ const SEV_STYLE: Record<Severity, { dot: string; text: string; chip: string }> =
   critical: { dot: "bg-red-500", text: "text-red-500", chip: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" },
 };
 
-const PUBLIC_INCIDENTS_PATH = "/v1/status/incidents";
+/** The public incident feed, through the dashboard's `/cloud` rewrite (public in `proxy.ts`). */
+const PUBLIC_INCIDENTS_URL = "/cloud/v1/status/incidents";
 const INCIDENTS_POLL_MS = 10_000;
 
 const COMPONENTS = ["Edge Network", "Builds & Deployments", "Fluid Compute", "Dashboard", "Admin API", "Storage"];
@@ -37,10 +39,43 @@ function fmtAgo(ms: number) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
+/** Polls the public feed. It is NOT `usePoll`: that hook waits for a tenant, and an anonymous visitor (everyone this page is for) never has one, so the
+ *  page asked for nothing and printed "operational" forever. `data` stays `null` until the feed has answered once; `error` says the latest read failed. */
+function useIncidentFeed() {
+  const [data, setData] = useState<Incident[] | null>(null);
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch(PUBLIC_INCIDENTS_URL, { cache: "no-store" });
+        if (!r.ok) throw new Error(String(r.status));
+        const d: unknown = await r.json();
+        if (alive) {
+          setData(Array.isArray(d) ? (d as Incident[]) : []);
+          setError(false);
+        }
+      } catch {
+        if (alive) setError(true);
+      }
+    };
+    load();
+    const id = setInterval(() => document.visibilityState !== "hidden" && load(), INCIDENTS_POLL_MS);
+    const onVisible = () => document.visibilityState === "visible" && load();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+  return { data, error };
+}
+
 /** Public statuspage-style board over the operator-declared incident feed: no dashboard chrome (the nav and footer hide on /status). It reports what the
  *  feed says and nothing else: until the feed has answered (or when it cannot) it says so, never "operational". */
 export default function StatusPage() {
-  const { data, error } = usePoll<Incident[]>(PUBLIC_INCIDENTS_PATH, INCIDENTS_POLL_MS);
+  const { data, error } = useIncidentFeed();
   const [updated, setUpdated] = useState(0);
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -72,9 +107,11 @@ export default function StatusPage() {
       <div className="mx-auto max-w-3xl px-5 py-10 sm:py-14">
         <div className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-fg text-bg">
-              <svg width="13" height="11" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
-            </span>
+            <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center justify-center">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-fg text-bg">
+                <svg width="13" height="11" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
+              </span>
+            </Link>
             <div>
               <h1 className="text-base font-semibold leading-tight">shadw Status</h1>
               <div className="text-xs text-muted">Incidents declared by shadw</div>
@@ -85,7 +122,11 @@ export default function StatusPage() {
               {known && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green opacity-60" />}
               <span className={`relative inline-flex h-2 w-2 rounded-full ${known ? "bg-green" : "bg-border-strong"}`} />
             </span>
-            {known ? `Updated${updated ? ` ${new Date(updated).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}` : ""}` : error ? "Unavailable" : "Checking"}
+            {known
+              ? `Updated${updated ? ` ${new Date(updated).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}` : ""}${error ? " · refresh failing" : ""}`
+              : error
+                ? "Unavailable"
+                : "Checking"}
           </div>
         </div>
 

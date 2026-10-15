@@ -15,6 +15,11 @@ html:has(#lp-content) body {
   background-color: var(--lp-bg);
   color-scheme: dark;
 }
+/* the full-bleed shell is `w-screen` (100vw), which INCLUDES a classic scrollbar's width, so on Windows, Linux and a Mac set to always show scrollbars the
+   page scrolled sideways by half a scrollbar: only the root's value reaches the viewport (a clip on `body` does not) */
+html:has(#lp-content) {
+  overflow-x: clip;
+}
 .lp {
   font-size: 16px;
   line-height: 1.55;
@@ -241,6 +246,8 @@ html:has(#lp-content) body {
   background: #fff;
   color: #0c0d10;
   font-weight: 600;
+  /* forced-colors mode drops the background and the ring below; a transparent border is painted in a system colour, so the primary keeps an edge */
+  border: 1px solid transparent;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7), 0 12px 44px -10px rgba(129, 140, 248, 0.7), 0 0 70px -14px rgba(34, 211, 238, 0.5);
 }
 .lp-btn:hover {
@@ -423,6 +430,13 @@ html:has(#lp-content) body {
     opacity: 1;
     background: radial-gradient(520px circle at 50% 0%, rgba(99, 102, 241, 0.5), rgba(34, 211, 238, 0.12) 52%, transparent 72%);
   }
+  /* the same light on the two surfaces that are not cards (the code panel, the facts tiles), so no slice of a phone is a valley */
+  .lp-glass.lp-bloom {
+    background: radial-gradient(520px circle at 50% 0%, rgba(99, 102, 241, 0.42), rgba(34, 211, 238, 0.1) 55%, transparent 74%), linear-gradient(180deg, rgba(22, 24, 33, 0.985), rgba(10, 11, 16, 0.985));
+  }
+  .lp-fact {
+    background: radial-gradient(260px circle at 50% 0%, rgba(99, 102, 241, 0.34), transparent 70%), #0d0e13;
+  }
 }
 .lp-card-title {
   font-size: 21px;
@@ -586,14 +600,6 @@ html:has(.lp-hero) {
   pointer-events: none;
   background: linear-gradient(180deg, #8b5cf6, #e0f2fe 50%, #22d3ee);
   opacity: 0.85;
-}
-
-/* a touch pointer gets the 44 px target at any width; the width-based `min-h-[44px]` utilities cover phones, this covers tablets and touch laptops (whose primary pointer is a mouse: `any-pointer`) */
-@media (pointer: coarse), (any-pointer: coarse) {
-  .lp-tap {
-    min-height: 44px;
-    min-width: 44px;
-  }
 }
 
 /* the preview card's state chip follows the hero terminal: Building while it types, Ready once it finishes, and always Ready without scripts or with reduced motion */

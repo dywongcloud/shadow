@@ -208,3 +208,18 @@ a[aria-label="Clerk logo"][target="_blank"] {
     transform: translateY(0) scale(1);
   }
 }
+
+/* the docs layout is full-bleed `w-screen` too: see `html:has(#lp-content)` in landing.css */
+html:has(#docs-content) {
+  overflow-x: clip;
+}
+
+/* a touch pointer gets a 44 px target on anything marked `tap-44` (a link or a button), at any width: width-based utilities cover phones, this covers tablets
+   and touch laptops (whose primary pointer is a mouse: `any-pointer`) */
+@media (pointer: coarse), (any-pointer: coarse) {
+  .tap-44 {
+    /* a floor: a responsive `lg:min-h-0` utility sits after this rule in the built sheet and would otherwise lower it at 1024 px and up */
+    min-height: 44px !important;
+    min-width: 44px !important;
+  }
+}

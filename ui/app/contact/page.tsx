@@ -39,7 +39,7 @@ export default function ContactPage() {
             </div>
             <div className="mt-4 text-lg font-semibold text-white">{c.title}</div>
             <p className="mt-2 text-sm text-zinc-400">{c.desc}</p>
-            <a href={`mailto:${c.cta}`} className="mt-4 inline-block text-sm font-medium text-emerald-300 hover:underline">
+            <a href={`mailto:${c.cta}`} className="tap-44 mt-4 inline-flex items-center text-sm font-medium text-emerald-300 hover:underline">
               {c.cta}
             </a>
           </GlowCard>
@@ -47,7 +47,7 @@ export default function ContactPage() {
       </MarketingSection>
 
       <MarketingSection className="pb-24">
-        <Link href="/" className="text-sm text-zinc-500 hover:text-zinc-300">← Back to home</Link>
+        <Link href="/" className="tap-44 inline-flex items-center text-sm text-zinc-500 hover:text-zinc-300">← Back to home</Link>
       </MarketingSection>
     </MarketingShell>
   );

@@ -79,7 +79,7 @@ export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: s
             <button
               key={t.label}
               onClick={() => setActive(i)}
-              className={`relative rounded-md px-3 py-1.5 text-[13px] transition-colors ${
+              className={`tap-44 relative inline-flex items-center rounded-md px-3 py-1.5 text-[13px] transition-colors ${
                 i === active ? "text-fg" : "text-secondary hover:text-fg"
               }`}
             >
@@ -96,7 +96,7 @@ export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: s
           )}
           {tab.filename ?? tab.lang}
         </span>
-        <button onClick={copy} className="text-muted transition-colors hover:text-fg" aria-label="Copy code">
+        <button onClick={copy} className="tap-44 -m-1.5 inline-flex items-center justify-center p-1.5 text-muted transition-colors hover:text-fg" aria-label="Copy code">
           {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
         </button>
       </div>

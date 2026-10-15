@@ -25,13 +25,13 @@ export function StackStrip() {
   return (
     <Section className="pt-24 text-center sm:pt-28" wash="duo">
       <SectionHead center eyebrow="Bring what you already build" title="Detects your framework. Runs your container." />
-      <ul className="mx-auto mt-12 flex max-w-[980px] flex-wrap items-start justify-center gap-x-3 gap-y-7 sm:gap-x-7">
+      <ul className="mx-auto mt-12 flex max-w-[1000px] flex-wrap items-start justify-center gap-x-3 gap-y-7 sm:gap-x-5">
         {STACK.map((s, i) => (
-          <li key={s.name} className="lp-reveal flex min-w-[74px] max-w-[112px] flex-col items-center gap-2.5" style={delay(i * 45)}>
+          <li key={s.name} className="lp-reveal flex w-[88px] flex-col items-center gap-2.5" style={delay(i * 45)}>
             <span className="flex h-[68px] w-[68px] items-center justify-center rounded-[18px] border border-white/10 bg-white/[0.045] transition-all duration-300 hover:-translate-y-1 hover:border-white/25 hover:bg-white/[0.08]">
               <Image src={s.src} alt="" width={s.w} height={s.h} sizes="64px" className="h-[32px] w-auto max-w-[44px] object-contain" />
             </span>
-            <span className="lp-mono text-center text-[11px] uppercase tracking-[0.12em] text-[var(--lp-dim)] [text-wrap:balance]">{s.name}</span>
+            <span className="lp-mono text-center text-[11px] uppercase tracking-[0.12em] text-[var(--lp-mute)] [overflow-wrap:anywhere] [text-wrap:balance]">{s.name}</span>
           </li>
         ))}
       </ul>

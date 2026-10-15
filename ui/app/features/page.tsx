@@ -117,20 +117,21 @@ export default function FeaturesPage() {
       >
         <Link
           href="/sign-up"
-          className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+          className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
         >
           Start free
           <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
         </Link>
         <Link
           href="/pricing"
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
+          className="inline-flex items-center gap-2 tap-44 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
         >
           See pricing
         </Link>
       </MarketingHero>
 
       <MarketingSection className="py-16">
+        <h2 className="sr-only">Platform features</h2>
         <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map(({ icon: Icon, title, desc }) => (
             <GlowCard key={title}>
@@ -195,7 +196,7 @@ export default function FeaturesPage() {
           <div className="mt-8 flex justify-center">
             <Link
               href="/sign-up"
-              className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+              className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
             >
               Start free
               <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

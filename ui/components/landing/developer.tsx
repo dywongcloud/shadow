@@ -131,7 +131,7 @@ export function Developer() {
         </div>
 
         <div className="lp-reveal min-w-0 lg:col-span-7" style={delay(100)}>
-          <div className="lp-glass lp-limb-top relative overflow-hidden">
+          <div className="lp-glass lp-bloom lp-limb-top relative overflow-hidden">
             <div className="lp-glass-bar !gap-0 !py-0 !pl-2 !pr-3">
               <div role="tablist" aria-label="Deploy with" onKeyDown={onTabKey} className="no-scrollbar flex overflow-x-auto">
                 {TABS.map((t, i) => (

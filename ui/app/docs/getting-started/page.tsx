@@ -146,14 +146,14 @@ HIVE_DATA=~/.hive-cloud-b HIVE_DNS_ADDR=127.0.0.1:5355 HIVE_TLS_ADDR=127.0.0.1:8
             <li><In>HIVE_SECRET_KEY</In> — at-rest encryption key for secrets</li>
           </ul>
           <p className="flex items-center gap-1.5">
-            <Link href="/" className="inline-flex items-center gap-1 text-link hover:underline">Open the dashboard <ArrowRight className="h-3.5 w-3.5" /></Link>
+            <Link href="/" className="tap-44 inline-flex items-center gap-1 text-link hover:underline">Open the dashboard <ArrowRight className="h-3.5 w-3.5" /></Link>
           </p>
         </Section>
       </div>
 
       <footer className="mt-16 flex items-center justify-between border-t border-border pt-6 text-sm text-muted">
         <span>© 2026 shadw.cloud</span>
-        <Link href="/docs" className="hover:text-fg">← Back to docs</Link>
+        <Link href="/docs" className="tap-44 inline-flex items-center hover:text-fg">← Back to docs</Link>
       </footer>
     </div>
   );

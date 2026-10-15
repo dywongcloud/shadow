@@ -140,7 +140,7 @@ export default function DeploymentNotFoundPage() {
             href="https://vercel.com/docs/errors/deployment_not_found"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 text-link underline decoration-border underline-offset-4 hover:decoration-current"
+            className="tap-44 inline-flex items-center gap-1.5 text-link underline decoration-border underline-offset-4 hover:decoration-current"
           >
             Vercel — DEPLOYMENT_NOT_FOUND <ExternalLink className="h-3.5 w-3.5" />
           </a>

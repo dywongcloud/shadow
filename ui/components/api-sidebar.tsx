@@ -36,11 +36,11 @@ export function ApiSidebar() {
       return n;
     });
 
-  const topLink = "flex items-center justify-between rounded-md px-3 py-1.5 text-sm transition-colors";
+  const topLink = "tap-44 flex items-center justify-between rounded-md px-3 py-1.5 text-sm transition-colors";
 
   return (
-    <nav>
-      <Link href="/docs" className="mb-4 flex items-center gap-1.5 px-3 text-sm text-secondary hover:text-fg">
+    <nav aria-label="API reference">
+      <Link href="/docs" className="tap-44 mb-4 flex items-center gap-1.5 px-3 text-sm text-secondary hover:text-fg">
         <ChevronLeft className="h-4 w-4" /> shadw REST API
       </Link>
 
@@ -61,7 +61,8 @@ export function ApiSidebar() {
             <div key={cat.slug}>
               <button
                 onClick={() => toggle(cat.slug)}
-                className="flex w-full items-center justify-between rounded-md px-3 py-1.5 text-sm text-secondary transition-colors hover:bg-subtle/60 hover:text-fg"
+                aria-expanded={expanded}
+                className="tap-44 flex w-full items-center justify-between rounded-md px-3 py-1.5 text-sm text-secondary transition-colors hover:bg-subtle/60 hover:text-fg"
               >
                 <span className={activeCat === cat.slug ? "font-medium text-fg" : ""}>{cat.name}</span>
                 <ChevronDown className={`h-4 w-4 text-muted transition-transform ${expanded ? "" : "-rotate-90"}`} />
@@ -75,7 +76,7 @@ export function ApiSidebar() {
                       <li key={ep.slug}>
                         <Link
                           href={href}
-                          className={`flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors ${
+                          className={`tap-44 flex items-start gap-2 rounded-md px-2 py-1.5 text-sm transition-colors ${
                             active ? "bg-subtle font-medium text-fg" : "text-secondary hover:bg-subtle/60 hover:text-fg"
                           }`}
                         >

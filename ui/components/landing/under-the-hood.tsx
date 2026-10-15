@@ -19,7 +19,7 @@ export function UnderTheHood() {
       <SectionHead eyebrow="Under the hood" title="Built like infrastructure." lead="How deployments are signed, secrets are sealed and access is gated." />
       <ul className="lp-limb-top relative mt-14 grid gap-px overflow-hidden rounded-3xl border border-white/10 bg-white/10 sm:grid-cols-2 lg:grid-cols-4">
         {FACTS.map(({ icon: Icon, title, body }, i) => (
-          <li key={title} className="lp-reveal bg-[#0d0e13] p-7 transition-colors duration-300 hover:bg-[#12131a]" style={delay(i * 80)}>
+          <li key={title} className="lp-reveal lp-fact bg-[#0d0e13] p-7 transition-colors duration-300 hover:bg-[#12131a]" style={delay(i * 80)}>
             <span className="flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-gradient-to-br from-indigo-400/20 to-cyan-300/10">
               <Icon className="h-5 w-5 text-indigo-200" />
             </span>
