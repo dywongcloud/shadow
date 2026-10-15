@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Link2 } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
@@ -7,12 +8,30 @@ import {
   METHOD_TONE,
   type ApiParam,
   codeExamples,
+  endpointHref,
   endpointUrl,
   findEndpoint,
 } from "@/lib/api-catalog";
+import { pageMeta } from "@/lib/page-meta";
 
 export function generateStaticParams() {
   return API_CATEGORIES.flatMap((c) => c.endpoints.map((e) => ({ category: c.slug, method: e.slug })));
+}
+
+/** Every generated endpoint page names itself: without this the page inherits the root layout's title, description and canonical (the landing's), and a crawler
+ *  folds all of them into `/`. */
+export async function generateMetadata(props: { params: Promise<{ category: string; method: string }> }): Promise<Metadata> {
+  const { category, method } = await props.params;
+  const found = findEndpoint(category, method);
+  if (!found) return {};
+  const { endpoint: ep } = found;
+  const description = `${ep.method} ${ep.path}: ${ep.summary}`;
+  return pageMeta({
+    title: `${ep.name} — API Reference`,
+    socialTitle: `${ep.name} — shadw API Reference`,
+    description: description.length > 158 ? `${description.slice(0, 155).trimEnd()}...` : description,
+    path: endpointHref(category, method),
+  });
 }
 
 function Section({ id, title, children }: { id?: string; title: string; children: React.ReactNode }) {

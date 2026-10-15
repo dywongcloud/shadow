@@ -27,6 +27,10 @@ the root `AGENTS.md` still apply.
 - **A list of capabilities is audited item by item**: `BUILD_TOOLCHAINS` names `go` and `python3` (the build image carries them), yet a repository whose
   root is a Go or Python project is an "unsupported root marker" (`app_discovery.rs`), so the toolchain line names npm, pnpm, yarn and bun and the
   Dockerfile lane, never Go or Python.
+- A GENERATED route names itself too: `app/docs/api-reference/[category]/[method]` has `generateMetadata`, because a page without metadata inherits the root
+  layout's title, description and canonical (the landing's) and a crawler folds it into `/`; the battery finds routes by CRAWLING the links the pages print, never
+  from a hand-kept list. Print is a surface: the landing is light on dark, which prints as pale text on white paper with every below-the-fold section at opacity 0,
+  so `@media print` in `landing.css` makes it black on white and reveals everything. A probe's predicate must fail on an emptied page (`mutants.py`).
 - A public page declares its metadata with `pageMeta` (`lib/page-meta.ts`): a page's own `openGraph` or `twitter` object REPLACES the root's, images
   included, so the helper names the share card on every page, and `title` is the page's own name (the root template adds " · shadw").
 - Motion has one state, `html.lp-paused` (`motion-pause.tsx`): `PauseSkip` is the second Tab stop (through `MarketingShell`'s `lead`), the ticker's

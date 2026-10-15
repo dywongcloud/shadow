@@ -50,7 +50,7 @@ const CAPABILITIES = [
   {
     icon: Network,
     title: "Request Routing",
-    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment. One active owner coordinates the nodes with standby failover, and shared state is eventually consistent.",
+    desc: "Requests reach the node that runs your deployment: platform DNS favours it, and a request that lands on another node is forwarded. If the coordinating node is lost, a standby takes over, and shared state is eventually consistent.",
   },
   {
     icon: GitBranch,

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect } from "react";
 import { SignIn } from "@clerk/nextjs";
 import { AuthShell } from "@/components/auth-shell";
@@ -13,7 +14,7 @@ export default function Page() {
   return (
     <AuthShell
       render={(appearance) => <SignIn appearance={appearance} signUpUrl="/sign-up" />}
-      footer={<>By continuing you agree to the Terms &amp; Privacy Policy.</>}
+      footer={<>By continuing you agree to the <Link href="/privacy" className="underline underline-offset-2 hover:text-fg">Privacy Policy</Link>.</>}
     />
   );
 }

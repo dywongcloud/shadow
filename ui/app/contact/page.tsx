@@ -31,7 +31,7 @@ export default function ContactPage() {
         {[
           { icon: MessageSquare, title: "Sales", desc: "Talk through your use case and self-hosting plan.", cta: "sales@shadw.cloud" },
           { icon: Mail, title: "Support", desc: "Email support for Pro and Enterprise; Hobby has community support.", cta: "support@shadw.cloud" },
-          { icon: Building2, title: "Enterprise", desc: "Region pinning, audit logs and priority support.", cta: "enterprise@shadw.cloud" },
+          { icon: Building2, title: "Enterprise", desc: "Multi-region fail-over, SAML SSO and priority support.", cta: "enterprise@shadw.cloud" },
         ].map((c) => (
           <GlowCard key={c.title}>
             <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5">

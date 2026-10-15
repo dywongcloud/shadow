@@ -619,3 +619,33 @@ html.lp-paused .lp *:not(.lp-rise)::before,
 html.lp-paused .lp *:not(.lp-rise)::after {
   animation-play-state: paused !important;
 }
+
+/* print and PDF: browsers drop backgrounds, so the light-on-dark page printed as pale text on white paper (the white wordmark, the gradient headline and the CTAs
+   all vanished), and the sections that wait for a scroll that never comes stayed at opacity 0 (pages 2 and 3 of a printed landing were blank). Black on white,
+   everything revealed, the decorative layers and the hero's typed windows (their text is typed by script) gone. */
+@media print {
+  html:has(#lp-content),
+  html:has(#lp-content) body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+  html:has(#lp-content) .lp-rise,
+  html:has(#lp-content) .lp-reveal {
+    opacity: 1 !important;
+    transform: none !important;
+    animation: none !important;
+    transition: none !important;
+  }
+  html:has(#lp-content) :is(.lp-aurora-a, .lp-aurora-b, .lp-grain, .lp-grid, .lp-wash, .lp-dome .lp-glass, footer [aria-hidden="true"]) {
+    display: none !important;
+  }
+  html:has(#lp-content) :is(header, #lp-content, footer) * {
+    color: #000 !important;
+    -webkit-text-fill-color: #000 !important;
+    text-shadow: none !important;
+    box-shadow: none !important;
+  }
+  html:has(#lp-content) :is(header, footer) img {
+    filter: invert(1);
+  }
+}

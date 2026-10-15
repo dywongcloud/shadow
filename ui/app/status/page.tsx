@@ -26,6 +26,15 @@ const INCIDENTS_POLL_MS = 10_000;
 
 const COMPONENTS = ["Edge Network", "Builds & Deployments", "Fluid Compute", "Dashboard", "Admin API", "Storage"];
 
+/** A component row reads like the banner: the worst active incident that names it decides, and a feed that has not answered says "Unknown". */
+const COMPONENT_LEVEL: Record<Severity, { label: string; dot: string; text: string }> = {
+  minor: { label: "Degraded", dot: "bg-amber-400", text: "text-amber-500" },
+  major: { label: "Partial outage", dot: "bg-orange-400", text: "text-orange-500" },
+  critical: { label: "Major outage", dot: "bg-red-500", text: "text-red-500" },
+};
+const COMPONENT_CLEAR = { label: "No incident", dot: "bg-green", text: "text-green" };
+const COMPONENT_UNKNOWN = { label: "Unknown", dot: "bg-border-strong", text: "text-muted" };
+
 function fmtAbs(ms: number) {
   return new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }
@@ -88,7 +97,8 @@ export default function StatusPage() {
   const past = incidents.filter((i) => i.status === "resolved").sort((a, b) => b.updated_ms - a.updated_ms);
 
   const worst = active.reduce<Severity | null>((acc, i) => (!acc || SEV_RANK[i.severity] > SEV_RANK[acc] ? i.severity : acc), null);
-  const affectedComponents = new Set(active.flatMap((i) => i.affected));
+  const levelOf = (component: string) =>
+    active.filter((i) => i.affected.includes(component)).reduce<Severity | null>((acc, i) => (!acc || SEV_RANK[i.severity] > SEV_RANK[acc] ? i.severity : acc), null);
 
   const banner = !known
     ? error
@@ -141,13 +151,14 @@ export default function StatusPage() {
         <div className="mb-10 overflow-hidden rounded-xl border border-border bg-card">
           <div className="border-b border-border px-4 py-2.5 text-sm font-medium">Components</div>
           {COMPONENTS.map((c) => {
-            const down = affectedComponents.has(c);
+            const level = levelOf(c);
+            const look = !known ? COMPONENT_UNKNOWN : level ? COMPONENT_LEVEL[level] : COMPONENT_CLEAR;
             return (
               <div key={c} className="flex items-center justify-between border-b border-border px-4 py-3 text-sm last:border-0">
                 <span>{c}</span>
-                <span className={`flex items-center gap-1.5 text-xs font-medium ${!known ? "text-muted" : down ? "text-amber-500" : "text-green"}`}>
-                  <span className={`h-2 w-2 rounded-full ${!known ? "bg-border-strong" : down ? "bg-amber-400" : "bg-green"}`} />
-                  {!known ? "Unknown" : down ? "Degraded" : "No incident"}
+                <span className={`flex items-center gap-1.5 text-xs font-medium ${look.text}`}>
+                  <span className={`h-2 w-2 rounded-full ${look.dot}`} />
+                  {look.label}
                 </span>
               </div>
             );
@@ -195,7 +206,7 @@ function IncidentCard({ incident, active }: { incident: Incident; active?: boole
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card">
-      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-start justify-between gap-3 px-4 py-3.5 text-left">
+      <button onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex w-full items-start justify-between gap-3 px-4 py-3.5 text-left">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <span className={`h-2 w-2 shrink-0 rounded-full ${sev.dot}`} />

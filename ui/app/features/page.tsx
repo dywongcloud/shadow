@@ -96,7 +96,7 @@ const FEATURES = [
   {
     icon: Share2,
     title: "Request Routing",
-    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment. One active owner coordinates the nodes, with standby failover.",
+    desc: "Requests reach the node that runs your deployment: platform DNS favours it, and a request that lands on another node is forwarded. If the coordinating node is lost, a standby takes over.",
   },
 ];
 
@@ -174,13 +174,14 @@ export default function FeaturesPage() {
               <span className="h-3 w-3 rounded-full bg-red-400/80" />
               <span className="h-3 w-3 rounded-full bg-yellow-400/80" />
               <span className="h-3 w-3 rounded-full bg-emerald-400/80" />
+              <span className="ml-auto font-mono text-[11px] uppercase tracking-[0.12em] text-zinc-400">Illustrative</span>
             </div>
             <div className="mt-4 space-y-1.5 font-mono text-sm">
               <div className="text-zinc-200">$ git push</div>
               <div className="text-zinc-400">→ Cloning…</div>
               <div className="text-zinc-400">→ Building (Next.js detected)</div>
               <div className="text-zinc-400">→ Deploying…</div>
-              <div className="text-emerald-400">✓ Deployed to app.localhost</div>
+              <div className="text-emerald-400">✓ Deployed to my-app.shadw.app</div>
             </div>
           </GlowCard>
         </div>

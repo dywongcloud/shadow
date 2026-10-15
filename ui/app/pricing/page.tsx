@@ -139,7 +139,7 @@ export default function PricingPage() {
               {tier.featured && (
                 <div className="absolute -top-3 left-1/2 -translate-x-1/2">
                   <span className="rounded-full bg-emerald-400 px-3 py-1 text-xs font-semibold text-black">
-                    Most popular
+                    For teams
                   </span>
                 </div>
               )}
