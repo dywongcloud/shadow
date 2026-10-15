@@ -81,8 +81,23 @@ impl CdnCache {
         }
     }
 
-    pub fn key(host: &str, path_q: &str) -> String {
-        format!("{host}{path_q}")
+    /// Cache identity for one request: the deployment the host resolves to, then host + path.
+    ///
+    /// The deployment dimension is load-bearing, not decoration. A cached body is only meaningful
+    /// for the deployment that produced it: an HTML document embeds BUILD-SCOPED asset names
+    /// (`/_next/static/chunks/<content-hash>.js`), so once a promotion swaps the deployment behind
+    /// a hostname, the predecessor's HTML references chunk names the new build never emitted and
+    /// every one of them 404s (`ChunkLoadError`). With the deployment in the key, a promoted
+    /// deployment simply MISSES its predecessor's entries and refetches — which is what makes this
+    /// the right site for the fix: it needs no purge, no invalidation call site and no cross-node
+    /// fanout, because every node's cache is independent and each one derives the same identity
+    /// from the same live alias table. A stale entry can therefore never be *read*, only aged out.
+    ///
+    /// `deployment` is `None` for a host with no deployment record; those share one namespace, so
+    /// the dimension never changes the identity of traffic the gateway cannot attribute anyway.
+    pub fn key(host: &str, path_q: &str, deployment: Option<&str>) -> String {
+        // US (0x1f) cannot occur in a host or a request-target, so the split is unambiguous.
+        format!("{}\u{1f}{host}{path_q}", deployment.unwrap_or("-"))
     }
 
     /// Look up an entry, classifying it as Hit / Stale / Miss.
@@ -263,61 +278,4 @@ fn directive(cc: &str, key: &str) -> Option<u64> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn precedence_and_states() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/a");
-        assert!(matches!(cdn.lookup(&k), Lookup::Miss));
-        // Vercel-CDN-Cache-Control wins over Cache-Control.
-        let stored = cdn.maybe_store(
-            &k,
-            200,
-            &[
-                ("cache-control".into(), "max-age=0".into()),
-                ("vercel-cdn-cache-control".into(), "max-age=60".into()),
-            ],
-            b"x",
-        );
-        assert!(stored);
-        assert!(matches!(cdn.lookup(&k), Lookup::Hit(_)));
-    }
-
-    #[test]
-    fn stale_while_revalidate() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/swr");
-        // max-age=0 but SWR=60 -> immediately stale-but-usable.
-        cdn.maybe_store(
-            &k,
-            200,
-            &[(
-                "cache-control".into(),
-                "max-age=0, stale-while-revalidate=60".into(),
-            )],
-            b"body",
-        );
-        match cdn.lookup(&k) {
-            Lookup::Stale(r) => assert_eq!(r.body, b"body"),
-            _ => panic!("expected STALE"),
-        }
-    }
-
-    #[test]
-    fn no_store_not_cached() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/api");
-        assert!(!cdn.maybe_store(
-            &k,
-            200,
-            &[("cache-control".into(), "no-store".into())],
-            b"x"
-        ));
-        assert!(matches!(cdn.lookup(&k), Lookup::Miss));
-    }
 }

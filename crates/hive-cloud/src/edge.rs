@@ -1048,7 +1048,11 @@ async fn edge_pipeline_inner(
         hive_edge::bot::BotVerdict::Allow => {}
     }
 
-    let cache_key = CdnCache::key(&host, &path_q);
+    // The deployment the host resolves to is part of the cache identity (see `CdnCache::key`), so a
+    // promotion can never serve the previous deployment's HTML — and therefore never its dead
+    // chunk URLs. Derived here from the same alias table the gateway serves from.
+    let deployment = cloud.gw.host_deployment_id(&host);
+    let cache_key = CdnCache::key(&host, &path_q, deployment.as_deref());
     let protection = protection_for_host(&cloud, &host);
     if let Some(resp) = preview_gate(
         &cloud,
