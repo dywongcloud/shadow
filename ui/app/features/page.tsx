@@ -22,12 +22,12 @@ import {
 export const metadata: Metadata = {
   title: "Features — shadw",
   description:
-    "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access over a peer-to-peer mesh.",
+    "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access.",
   alternates: { canonical: "/features" },
   openGraph: {
     title: "Features — shadw",
     description:
-      "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access over a peer-to-peer mesh.",
+      "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access.",
     url: "/features",
     type: "website",
     siteName: "shadw",
@@ -36,7 +36,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Features — shadw",
     description:
-      "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics over a peer-to-peer mesh.",
+      "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics.",
   },
 };
 
@@ -60,7 +60,7 @@ const FEATURES = [
   {
     icon: Eye,
     title: "Preview Deployments",
-    desc: "Every branch and pull request gets its own live URL, so you can review real running code before you merge.",
+    desc: "Every pull request on a connected GitHub repository gets its own live URL, so you can review real running code before you merge.",
   },
   {
     icon: Globe,
@@ -75,7 +75,7 @@ const FEATURES = [
   {
     icon: Zap,
     title: "Serverless Functions",
-    desc: "Fluid compute scales to zero when idle. Request handlers run on mesh nodes with no servers to manage.",
+    desc: "Production stays warm and previews scale to zero when idle, with no servers to manage.",
   },
   {
     icon: Container,
@@ -104,8 +104,8 @@ const FEATURES = [
   },
   {
     icon: Share2,
-    title: "P2P Mesh Routing",
-    desc: "Requests are forwarded between nodes over Iroh QUIC, with NAT traversal and relay fallback. One active owner coordinates the mesh, with standby failover.",
+    title: "Request Routing",
+    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment. One active owner coordinates the nodes, with standby failover.",
   },
 ];
 
@@ -122,7 +122,7 @@ export default function FeaturesPage() {
             </span>
           </>
         }
-        subtitle="A self-hostable, peer-to-peer cloud with the developer experience you already love — Git deploys, rollback, previews, managed databases, and logs and metrics over a mesh of nodes."
+        subtitle="The developer experience you already love — Git deploys, rollback, previews, managed databases, and logs and metrics — on a cloud you can self-host."
       >
         <Link
           href="/sign-up"
@@ -159,12 +159,12 @@ export default function FeaturesPage() {
             <h2 className="text-3xl font-bold tracking-tight text-white">Deploy with a git push</h2>
             <p className="mt-3 text-zinc-400">
               Connect a repository and push. shadw detects supported frameworks, builds an immutable deployment,
-              and serves it from mesh nodes — no servers to provision.
+              and serves it — no servers to provision.
             </p>
             <ul className="mt-6 space-y-3">
               {[
                 "Automatic framework detection; a monorepo with several apps needs a root directory",
-                "A unique preview URL for every push and pull request",
+                "A unique deployment URL for every push, and a preview for every pull request on a connected GitHub repository",
                 "Promote or roll back to any earlier deployment",
               ].map((item) => (
                 <li key={item} className="flex items-start gap-3 text-sm text-zinc-300">
@@ -187,7 +187,7 @@ export default function FeaturesPage() {
               <div className="text-zinc-200">$ git push</div>
               <div className="text-zinc-400">→ Cloning…</div>
               <div className="text-zinc-400">→ Building (Next.js detected)</div>
-              <div className="text-zinc-400">→ Distributing to mesh peers…</div>
+              <div className="text-zinc-400">→ Deploying…</div>
               <div className="text-emerald-400">✓ Deployed to app.localhost</div>
             </div>
           </GlowCard>
@@ -196,9 +196,9 @@ export default function FeaturesPage() {
 
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
-          <h2 className="text-3xl font-bold tracking-tight text-white">Ship on your own cloud today</h2>
+          <h2 className="text-3xl font-bold tracking-tight text-white">Ship on shadw today</h2>
           <p className="mx-auto mt-3 max-w-xl text-zinc-400">
-            Get the deploy experience you love on a self-hostable peer-to-peer mesh. The hosted service uses Clerk,
+            Get the deploy experience you love on a cloud you can self-host. The hosted service uses Clerk,
             Stripe and Vercel DNS.
           </p>
           <div className="mt-8 flex justify-center">

@@ -23,7 +23,7 @@ const STRUCTURED_DATA = {
       name: "shadw",
       url: "https://shadw.cloud",
       description:
-        "shadw is a peer-to-peer cloud for serverless functions, containers and managed databases over an Iroh QUIC mesh.",
+        "shadw is a cloud for serverless functions, containers and static sites deployed from Git, with managed databases.",
     },
     {
       "@type": "WebSite",
@@ -39,7 +39,7 @@ const STRUCTURED_DATA = {
       operatingSystem: "Web",
       offers: { "@type": "AggregateOffer", lowPrice: "0", priceCurrency: "USD" },
       description:
-        "Deploy serverless functions, containers, and static sites to a peer-to-peer mesh of nodes, with rollback to earlier deployments, preview deploys, GitOps, and managed databases.",
+        "Deploy serverless functions, containers, and static sites from Git, with rollback to earlier deployments, a preview for every pull request on a connected GitHub repository, GitOps, and managed databases.",
     },
   ],
 };
@@ -49,12 +49,12 @@ const electrolize = Electrolize({ subsets: ["latin"], weight: "400", variable: "
 
 const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://shadw.cloud").replace(/\/$/, "");
 const DESCRIPTION =
-  "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers and managed databases over a P2P mesh (Iroh QUIC).";
+  "Push to Git, get a live URL: serverless functions, containers and static sites, plus managed databases, with a preview per GitHub pull request. Free to start.";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "shadw — The serverless cloud, peer-to-peer",
+    default: "shadw — Push to Git. Get a live URL.",
     template: "%s · shadw",
   },
   description: DESCRIPTION,
@@ -65,7 +65,7 @@ export const metadata: Metadata = {
     type: "website",
     siteName: "shadw",
     url: SITE_URL,
-    title: "shadw — The serverless cloud, peer-to-peer",
+    title: "shadw — Push to Git. Get a live URL.",
     description: DESCRIPTION,
   },
   twitter: { card: "summary_large_image", title: "shadw", description: DESCRIPTION },

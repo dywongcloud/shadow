@@ -21,12 +21,12 @@ import {
 export const metadata: Metadata = {
   title: "Product — shadw",
   description:
-    "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
+    "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
   alternates: { canonical: "/product" },
   openGraph: {
     title: "Product — shadw",
     description:
-      "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
+      "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
     url: "/product",
     type: "website",
     siteName: "shadw",
@@ -35,7 +35,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Product — shadw",
     description:
-      "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys and rollback to earlier deployments.",
+      "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys and rollback to earlier deployments.",
   },
 };
 
@@ -44,12 +44,12 @@ const CAPABILITIES = [
   {
     icon: Zap,
     title: "Serverless Functions",
-    desc: "Ship request-driven functions that scale to zero when idle and run on mesh nodes picked by the scheduler — no servers to manage.",
+    desc: "Ship request-driven functions that stay warm in production, scale previews to zero when idle, and run on nodes picked by the scheduler — no servers to manage.",
   },
   {
     icon: Box,
     title: "Containers (Dockerfile)",
-    desc: "Bring your own Dockerfile. Run any language or runtime as a long-lived container, scheduled onto healthy peers.",
+    desc: "Bring your own Dockerfile. Run any language or runtime as a long-lived container, scheduled onto healthy nodes.",
   },
   {
     icon: Database,
@@ -58,8 +58,8 @@ const CAPABILITIES = [
   },
   {
     icon: Network,
-    title: "P2P Mesh (Iroh QUIC)",
-    desc: "Nodes discover and connect directly over QUIC, forming an encrypted, NAT-traversing peer-to-peer fabric. One active owner coordinates the mesh with standby failover, and shared state is eventually consistent.",
+    title: "Request Routing",
+    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment. One active owner coordinates the nodes with standby failover, and shared state is eventually consistent.",
   },
   {
     icon: GitBranch,
@@ -81,8 +81,8 @@ const STEPS = [
   },
   {
     icon: Radar,
-    title: "Serve from nearby nodes",
-    desc: "Platform DNS favours nodes near the requester, and the mesh forwards a request to the node that runs the deployment when it arrives elsewhere.",
+    title: "Route to the right node",
+    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment.",
   },
 ];
 
@@ -93,13 +93,13 @@ export default function ProductPage() {
         eyebrow="Platform"
         title={
           <>
-            The cloud,{" "}
+            One cloud for{" "}
             <span className="bg-gradient-to-r from-fuchsia-400 via-cyan-300 to-blue-500 bg-clip-text text-transparent">
-              peer-to-peer
+              what you ship
             </span>
           </>
         }
-        subtitle="A self-hostable, peer-to-peer cloud platform. Serverless functions, containers, and managed databases running over an encrypted P2P mesh — with Vercel-style deploys straight from Git."
+        subtitle="Serverless functions, containers, and managed databases on one platform — with Vercel-style deploys straight from Git. Hosted, or self-hosted on machines you operate."
       >
         <Link
           href="/sign-up"
@@ -119,11 +119,11 @@ export default function ProductPage() {
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight text-white">
-            Everything you ship, in one mesh
+            Everything you ship, in one place
           </h2>
           <p className="mt-3 text-zinc-400">
-            Compute, storage, and networking primitives that run on a mesh of
-            nodes you can operate yourself.
+            Compute, storage, and networking primitives on one platform, hosted or
+            on nodes you can operate yourself.
           </p>
         </div>
 
@@ -172,10 +172,10 @@ export default function ProductPage() {
         <GlowCard className="text-center">
           <div className="mx-auto max-w-2xl py-8">
             <h2 className="text-3xl font-bold tracking-tight text-white">
-              Deploy your first node today
+              Deploy your first project today
             </h2>
             <p className="mt-3 text-zinc-400">
-              Spin up the mesh, connect a repo, and push to deploy.
+              Connect a repo and push to deploy.
             </p>
             <div className="mt-8 flex justify-center">
               <Link

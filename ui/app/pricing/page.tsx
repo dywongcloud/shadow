@@ -127,7 +127,7 @@ export default function PricingPage() {
             pricing
           </>
         }
-        subtitle="Start free. Scale on your own mesh. No surprises."
+        subtitle="Start free. Scale as you grow. Hobby never bills overage."
       />
 
       <MarketingSection className="pb-20">

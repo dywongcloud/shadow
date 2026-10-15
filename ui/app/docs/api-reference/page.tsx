@@ -59,8 +59,8 @@ export default function ApiReferencePage() {
         <h1 className="text-4xl font-bold tracking-tight">Using the REST API</h1>
         <p className="mt-6 text-[15px] leading-relaxed text-secondary">
           Interact programmatically with your shadw cloud using direct HTTP requests. You can create
-          deployments, manage custom domains and DNS, configure projects, and wire up webhooks — all
-          over the mesh.
+          deployments, manage custom domains and DNS, configure projects, and wire up webhooks, all
+          over HTTPS.
         </p>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           The API supports any programming language or framework that can send HTTP requests.

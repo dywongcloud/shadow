@@ -25,18 +25,18 @@ export function Hero() {
       <div className="relative z-10 mx-auto max-w-[1100px] px-6 pt-12 sm:pt-[60px]">
         <p className="lp-rise" style={delay(0)}>
           <span className="lp-pill">
-            <b>Mesh</b>
-            Nodes connect peer to peer over QUIC
+            <b>Free</b>
+            Start on the Hobby plan
           </span>
         </p>
         <h1 className="lp-h1 lp-rise mt-7" style={delay(90)}>
-          The serverless cloud,
+          Push to Git.
           <br />
-          <span className="lp-gradient-text">peer-to-peer.</span>
+          <span className="lp-gradient-text">Get a live URL.</span>
         </h1>
         <p className="lp-sub lp-rise mx-auto mt-6 max-w-[640px]" style={delay(180)}>
-          Deploy functions, containers, static sites and databases from Git, a zip upload or a container image. Every pull request gets a live
-          preview.
+          Deploy functions, containers and static sites from Git, a zip upload or a container image, with managed databases beside them. Every
+          pull request on a connected GitHub repository gets a live preview.
         </p>
         <div className="lp-rise mt-9 flex flex-wrap items-center justify-center gap-x-3.5 gap-y-4" style={delay(270)}>
           <Link href="/sign-up" className="lp-btn">

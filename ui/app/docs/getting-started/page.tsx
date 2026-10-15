@@ -7,12 +7,12 @@ import { CodeBlock } from "@/components/code-block";
 export const metadata: Metadata = {
   title: "Getting Started — shadw Docs",
   description:
-    "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+    "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions, custom domains and TLS, the CLI, and self-hosting your own nodes.",
   alternates: { canonical: "/docs/getting-started" },
   openGraph: {
     title: "Getting Started — shadw Docs",
     description:
-      "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+      "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions, custom domains and TLS, the CLI, and self-hosting your own nodes.",
     url: "/docs/getting-started",
     type: "website",
     siteName: "shadw",
@@ -21,7 +21,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Getting Started — shadw Docs",
     description:
-      "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions over the Iroh QUIC mesh, custom domains, the CLI, and self-hosting.",
+      "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions, custom domains, the CLI, and self-hosting.",
   },
 };
 
@@ -57,21 +57,19 @@ export default function GettingStarted() {
         <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">Documentation</div>
         <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">Getting started</h1>
         <p className="mt-4 text-lg text-secondary">
-          Everything you need to deploy and run apps on <strong className="text-fg">shadw</strong> — the
-          self-hosted, peer-to-peer cloud.
+          Guides for deploying apps on <strong className="text-fg">shadw</strong>, from your first push to your own nodes.
         </p>
       </div>
 
       <div className="space-y-2">
         <Section id="introduction" eyebrow="Overview" title="Introduction">
           <p>
-            shadw turns any machine you run into a region. Nodes find each other over a real peer-to-peer mesh
-            (Iroh QUIC, with NAT traversal + relay fallback) and serve your deployments by anycast — no data
-            center, no public IPs. The platform is two layers over one isolation backend:
+            shadw places regions wherever your nodes are, and a request to any node reaches your deployment. The
+            platform is two layers over one isolation backend:
           </p>
           <ul className="list-disc space-y-1.5 pl-5">
             <li><strong className="text-fg">Builds</strong> — turn a git repo into build output (framework detection or a Dockerfile).</li>
-            <li><strong className="text-fg">Fluid compute</strong> — serve functions on long-lived instances that handle many concurrent requests, autoscale, and scale to zero.</li>
+            <li><strong className="text-fg">Fluid compute</strong> — serve functions on long-lived instances that handle many concurrent requests and autoscale; production keeps at least one instance warm and other deployments scale to zero.</li>
           </ul>
           <p>Everything below talks to the platform <strong className="text-fg">API</strong> at <In>https://api.shadw.cloud</In>. (Self-hosting? The same endpoints live on your node&apos;s admin API — default <In>127.0.0.1:8786</In>.)</p>
         </Section>

@@ -2,10 +2,10 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "shadw — the peer-to-peer cloud",
+    name: "shadw — the serverless cloud",
     short_name: "shadw",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: deploy serverless functions, containers and static sites to a mesh of your own machines over Iroh QUIC.",
+      "Deploy serverless functions, containers and static sites from Git, with a preview for every pull request on a connected GitHub repository.",
     id: "/",
     start_url: "/",
     scope: "/",

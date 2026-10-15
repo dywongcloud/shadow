@@ -1,6 +1,6 @@
 import { ImageResponse } from "next/og";
 
-export const alt = "shadw — a peer-to-peer cloud";
+export const alt = "shadw — push to Git, get a live URL";
 export const size = { width: 1200, height: 630 };
 export const contentType = "image/png";
 
@@ -25,7 +25,7 @@ export default function OpengraphImage() {
         <div style={{ fontSize: 128, fontWeight: 700, letterSpacing: "-0.04em" }}>shadw</div>
         <div style={{ fontSize: 42, color: "#9ba1a6", marginTop: 20 }}>Beyond the Edge are Shadows</div>
         <div style={{ fontSize: 28, color: "#6b7075", marginTop: 44, maxWidth: 900 }}>
-          A peer-to-peer cloud — serverless functions, containers &amp; managed databases over an Iroh QUIC mesh.
+          Push to Git, get a live URL — serverless functions, containers &amp; static sites.
         </div>
       </div>
     ),

@@ -167,7 +167,7 @@ export default function DeploymentNotFoundPage() {
             href="/docs/getting-started#regions"
             className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg"
           >
-            Regions &amp; the mesh
+            Regions
           </Link>{" "}
           explains how a request finds the node hosting your deployment.
         </p>

@@ -9,7 +9,7 @@ export default function FunctionsPage() {
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", FUNCTIONS_POLL_MS);
   return (
     <div>
-      <PageHeader title="Functions" desc="Fluid compute — instances multiplex concurrent requests, scale to zero, and bill Active CPU + memory (not idle wall-time)" />
+      <PageHeader title="Functions" desc="Fluid compute — instances multiplex concurrent requests, non-production deployments scale to zero, and bill Active CPU + memory (not idle wall-time)" />
       <Table>
         <thead>
           <tr><Th>Function</Th><Th>Instances</Th><Th>In-flight</Th><Th>Concurrency</Th><Th>Scale-outs</Th><Th>NACKs</Th><Th>Recycled</Th><Th>Requests</Th><Th>Active CPU</Th><Th>Memory</Th><Th>Fluid savings</Th><Th>Active-CPU savings</Th></tr>

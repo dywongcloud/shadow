@@ -18,12 +18,12 @@ import {
 export const metadata: Metadata = {
   title: "Solutions — shadw",
   description:
-    "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+    "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
   alternates: { canonical: "/solutions" },
   openGraph: {
     title: "Solutions — shadw",
     description:
-      "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+      "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
     url: "/solutions",
     type: "website",
     siteName: "shadw",
@@ -32,7 +32,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Solutions — shadw",
     description:
-      "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
+      "See how startups, agencies, and enterprises ship on shadw — a cloud you can self-host for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
   },
 };
 
@@ -41,8 +41,8 @@ const audiences = [
   {
     icon: Rocket,
     title: "Startups",
-    desc: "Ship fast and scale on a budget. Deploy from Git, pay for what you use, and let the mesh handle the rest.",
-    bullets: ["Git deploys with framework detection", "Generous free tier", "Scale to zero when idle"],
+    desc: "Ship fast and scale on a budget. Deploy from Git, start free, and upgrade when you outgrow the included compute.",
+    bullets: ["Git deploys with framework detection", "Generous free tier", "Previews scale to zero when idle"],
   },
   {
     icon: Users,
@@ -53,8 +53,8 @@ const audiences = [
   {
     icon: Building2,
     title: "Enterprises",
-    desc: "Self-host on your own mesh with full control. Choose the regions your workloads run in and govern compute with leases.",
-    bullets: ["Region-targeted compute placement", "Lease-based capacity", "Run on your own nodes"],
+    desc: "Self-host on your own machines with full control. Choose the regions your workloads run in and whether they fail over.",
+    bullets: ["Region-targeted compute placement", "Per-project region failover", "Run on your own nodes"],
   },
 ];
 
@@ -67,12 +67,12 @@ const useCases = [
   {
     icon: Server,
     title: "APIs & microservices",
-    desc: "Containers and functions wired into the mesh with built-in routing.",
+    desc: "Containers and functions with built-in routing.",
   },
   {
     icon: FileText,
     title: "Static sites & docs",
-    desc: "Static output served from mesh nodes, with long-lived caching for content-hashed assets.",
+    desc: "Static output served from nodes, with long-lived caching for content-hashed assets.",
   },
   {
     icon: Clock,
@@ -104,7 +104,7 @@ export default function SolutionsPage() {
             </span>
           </>
         }
-        subtitle="shadw is a self-hostable, peer-to-peer cloud — serverless functions, containers, and managed databases over a P2P mesh, with Vercel-style Git deploys. One platform that adapts to your team and your workloads."
+        subtitle="Serverless functions, containers, and managed databases with Vercel-style Git deploys: one platform that adapts to your team and your workloads, hosted or on machines you operate."
       >
         <Link
           href="/sign-up"
@@ -125,7 +125,7 @@ export default function SolutionsPage() {
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">Solutions for every team</h2>
           <p className="mt-3 text-zinc-400">
-            From your first deploy to a mesh you run yourself, shadw meets you where you are.
+            From your first deploy to machines you run yourself, shadw meets you where you are.
           </p>
         </div>
 
@@ -154,7 +154,7 @@ export default function SolutionsPage() {
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">By use case</h2>
           <p className="mt-3 text-zinc-400">
-            Whatever you&apos;re building, the mesh has a primitive for it.
+            For each of these, the platform has a primitive built in.
           </p>
         </div>
 
@@ -174,11 +174,11 @@ export default function SolutionsPage() {
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
           <h2 className="text-3xl font-bold tracking-tight text-white">
-            Ship your first deploy on the mesh
+            Ship your first deploy
           </h2>
           <p className="mx-auto mt-3 max-w-xl text-zinc-400">
             Connect a repo and push to deploy — serverless, containers, and managed databases, all
-            on a peer-to-peer cloud you can self-host.
+            on a cloud you can self-host.
           </p>
           <div className="mt-8 flex justify-center">
             <Link

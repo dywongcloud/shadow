@@ -6,12 +6,12 @@ import { CodeBlock } from "@/components/code-block";
 export const metadata: Metadata = {
   title: "Documentation — shadw",
   description:
-    "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
+    "shadw documentation: deploy serverless functions, containers, and static sites from Git, hosted or on machines you operate, with guides for environment & secrets, GitOps, regions, and the REST API.",
   alternates: { canonical: "/docs" },
   openGraph: {
     title: "Documentation — shadw",
     description:
-      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
+      "shadw documentation: deploy serverless functions, containers, and static sites from Git, hosted or on machines you operate, with guides for environment & secrets, GitOps, regions, and the REST API.",
     url: "/docs",
     type: "website",
     siteName: "shadw",
@@ -20,7 +20,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Documentation — shadw",
     description:
-      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines, with guides for GitOps, regions, and the REST API.",
+      "shadw documentation: deploy serverless functions, containers, and static sites from Git, with guides for GitOps, regions, and the REST API.",
   },
 };
 
@@ -84,8 +84,8 @@ const CARDS = [
   { icon: Boxes, title: "Deploying apps", desc: "Git import, framework detection, Dockerfile containers and rollback.", href: "/docs/getting-started#deploying" },
   { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars at runtime or into the build; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
   { icon: GitBranch, title: "GitOps", desc: "Connect GitHub once — push to deploy, config-as-code, two-way sync.", href: "/docs/getting-started#gitops" },
-  { icon: Globe2, title: "Regions & the mesh", desc: "Real geo regions over Iroh QUIC with anycast routing and failover.", href: "/docs/getting-started#regions" },
-  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that scale to zero and pack concurrent requests.", href: "/docs/getting-started#deploying" },
+  { icon: Globe2, title: "Regions", desc: "Regions follow where your nodes are; requests go to a healthy node in their own region first.", href: "/docs/getting-started#regions" },
+  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that pack concurrent requests; production stays warm, previews scale to zero.", href: "/docs/getting-started#deploying" },
   { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
 ];
 
@@ -95,13 +95,13 @@ export default function DocsIndex() {
       <div className="grid gap-10 pb-8 lg:grid-cols-[1.05fr_1fr] lg:items-center">
         <div>
           <h1 className="text-5xl font-bold leading-[1.05] tracking-tight sm:text-6xl">
-            Ship anything,
+            Push to Git,
             <br />
-            on your own mesh
+            get a live URL
           </h1>
           <p className="mt-6 max-w-md text-lg leading-relaxed text-secondary">
-            Deploy serverless functions, containers and static sites to a peer-to-peer cloud of your own
-            machines. Push from git, served from anywhere.
+            Deploy serverless functions, containers and static sites from Git, hosted or on machines you
+            operate.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Link href="/docs/getting-started" className="inline-flex items-center gap-2 rounded-md bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">

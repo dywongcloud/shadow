@@ -24,7 +24,7 @@ export const metadata: Metadata = {
 
 
 const SECTIONS: { h: string; p: string }[] = [
-  { h: "Overview", p: "shadw is a peer-to-peer cloud you can self-host. When you self-host, your application data, deployments, and durable storage live on nodes you operate. On the hosted service they live on nodes run by the shadw operators. This policy describes what the hosted dashboard and managed services collect." },
+  { h: "Overview", p: "shadw is a cloud you can self-host. When you self-host, your application data, deployments, and durable storage live on nodes you operate. On the hosted service they live on nodes run by the shadw operators. This policy describes what the hosted dashboard and managed services collect." },
   { h: "Data we collect", p: "Account details (name, email, organization) for authentication; project and deployment metadata to run the dashboard; and page-load performance measurements (Core Web Vitals) that a first-party beacon sends together with the URL of the page. Environment variables marked sensitive, and values that look like credentials, are encrypted at rest." },
   { h: "Your application data", p: "Deployments, databases, and durable data are stored on the nodes that run them. On the hosted service, platform operators can read platform records across all tenants through operator-only admin routes, including projects, deployments, databases, domains, workflow runs, request events, billing, and audit entries." },
   { h: "DNS & domains", p: "When you bring a domain into the DNS console, we store the records you configure to answer DNS queries and to attach domains to deployments. You can import and delete these records at any time." },

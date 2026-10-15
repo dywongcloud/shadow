@@ -244,7 +244,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
             <div className="col-span-2 md:col-span-1">
               <Logo className="h-7" />
               <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-400">
-                Serverless functions, containers and data on a peer-to-peer cloud.
+                Serverless functions and containers deployed from Git, plus managed data.
               </p>
             </div>
             {FOOTER_COLS.map((col) => (
@@ -253,7 +253,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
                 <ul className="mt-3 lg:space-y-0.5">
                   {col.links.map((l) => (
                     <li key={l.label}>
-                      <Link href={l.href} className="inline-flex min-h-[44px] min-w-[44px] items-center text-sm text-zinc-400 transition-colors hover:text-white lg:min-h-0 lg:min-w-0 lg:py-1.5">
+                      <Link href={l.href} className="lp-tap inline-flex min-h-[44px] min-w-[44px] items-center text-sm text-zinc-400 transition-colors hover:text-white lg:min-h-0 lg:min-w-0 lg:py-1.5">
                         {l.label}
                       </Link>
                     </li>

@@ -31,7 +31,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
   {
     group: "Platform",
     items: [
-      { label: "Regions & the mesh", href: "/docs/getting-started#regions" },
+      { label: "Regions", href: "/docs/getting-started#regions" },
       { label: "CLI", href: "/docs/getting-started#cli" },
       { label: "API reference", href: "/docs/api-reference" },
       { label: "Self-hosting", href: "/docs/getting-started#self-hosting", badge: "Ops" },

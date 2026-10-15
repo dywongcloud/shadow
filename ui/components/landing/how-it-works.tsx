@@ -71,19 +71,19 @@ const STEPS = [
   {
     n: "01",
     title: "Connect your code",
-    body: "Push to Git, upload a zip or point at a container image. Each push starts a build.",
+    body: "Push to Git, upload a zip or point at a container image. A push starts a build.",
     visual: <CommitGraph />,
   },
   {
     n: "02",
-    title: "Build on a node",
-    body: "A build runs on a node that has the toolchain it needs. A failed build keeps its project and its logs, so you can fix it and redeploy.",
+    title: "Build it",
+    body: "A build runs on a machine that has the toolchain it needs. A failed build keeps its project and its logs, so you can fix it and redeploy.",
     visual: <BuildLines />,
   },
   {
     n: "03",
-    title: "Serve from the mesh",
-    body: "Every deployment gets its own HTTPS address. Pull requests get previews, and any earlier build can be promoted to production.",
+    title: "Go live",
+    body: "Every deployment gets its own HTTPS address. Pull requests on a connected GitHub repository get previews, and an earlier deployment can be promoted to production.",
     visual: <LiveAddress />,
   },
 ];
@@ -91,7 +91,7 @@ const STEPS = [
 export function HowItWorks() {
   return (
     <Section className="pt-28 sm:pt-36" wash="violet">
-      <SectionHead eyebrow="How it works" title="From a commit to a live URL." lead="No pipeline to assemble. Connect a repository and the platform builds it, gives it an address and keeps every build." />
+      <SectionHead eyebrow="How it works" title="No pipeline to assemble." lead="Connect a repository and the platform builds it, gives it an address and lets you roll back to an earlier deployment." />
       <div className="relative mt-14">
         <div aria-hidden="true" className="lp-rail hidden md:block" />
         <div aria-hidden="true" className="lp-rail-v md:hidden" />

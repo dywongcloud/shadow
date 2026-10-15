@@ -26,15 +26,15 @@ export function PullRequests() {
   );
 }
 
-/** The mesh keystone: the hero's planet in miniature (the same limb gradient and halo strokes, a dark body, meridians and parallels clipped to the dome),
+/** The dome keystone: the hero's planet in miniature (the same limb gradient and halo strokes, a dark body, meridians and parallels clipped to the dome),
  *  nine nodes, ten links and a few pulses. Drawn in the pixel space of the wide card (760 x 400, with 70 px of headroom so the arc can cross the card's top
  *  edge); `compact` fits the whole dome into a small well. Sample topology: it prints no count of real nodes. */
 const ARC = "M20 400C20 150 180 -30 380 -30C580 -30 740 150 740 400";
-const MESH_NODES: [number, number][] = [[140, 300], [250, 205], [335, 290], [395, 95], [505, 190], [590, 300], [675, 240], [305, 35], [465, 350]];
-const MESH_EDGES = ["M140 300L250 205", "M250 205L335 290", "M250 205L305 35", "M305 35L395 95", "M395 95L505 190", "M505 190L590 300", "M505 190L675 240", "M335 290L465 350", "M335 290L395 95", "M590 300L675 240"];
+const DOME_NODES: [number, number][] = [[140, 300], [250, 205], [335, 290], [395, 95], [505, 190], [590, 300], [675, 240], [305, 35], [465, 350]];
+const DOME_EDGES = ["M140 300L250 205", "M250 205L335 290", "M250 205L305 35", "M305 35L395 95", "M395 95L505 190", "M505 190L590 300", "M505 190L675 240", "M335 290L465 350", "M335 290L395 95", "M590 300L675 240"];
 const MERIDIANS = ["M380 -30V400", "M380 -30C300 40 250 200 240 400", "M380 -30C460 40 510 200 520 400", "M380 -30C230 30 130 210 100 400", "M380 -30C530 30 630 210 660 400"];
 
-export function MeshKeystone({ compact = false }: { compact?: boolean }) {
+export function DomeKeystone({ compact = false }: { compact?: boolean }) {
   const id = compact ? "lp-mk-s" : "lp-mk-l";
   return (
     <svg viewBox="0 -70 760 470" className="h-full w-full overflow-visible" preserveAspectRatio={compact ? "xMidYMax meet" : "xMidYMax slice"} aria-hidden="true">
@@ -58,7 +58,7 @@ export function MeshKeystone({ compact = false }: { compact?: boolean }) {
         {MERIDIANS.map((d) => (
           <path key={d} d={d} />
         ))}
-        {MESH_EDGES.map((d) => (
+        {DOME_EDGES.map((d) => (
           <path key={d} d={d} stroke="rgba(147,197,253,.4)" />
         ))}
       </g>
@@ -71,10 +71,10 @@ export function MeshKeystone({ compact = false }: { compact?: boolean }) {
       </g>
       {[0, 3, 5, 8].map((i) => (
         <circle key={i} r="3.6" fill="#60a5fa" className="lp-pulse">
-          <animateMotion path={MESH_EDGES[i]} dur={`${2.4 + i * 0.3}s`} begin={`${i * 0.5}s`} repeatCount="indefinite" />
+          <animateMotion path={DOME_EDGES[i]} dur={`${2.4 + i * 0.3}s`} begin={`${i * 0.5}s`} repeatCount="indefinite" />
         </circle>
       ))}
-      {MESH_NODES.map(([x, y], i) => (
+      {DOME_NODES.map(([x, y], i) => (
         <g key={i} transform={`translate(${x - 12} ${y - 12})`}>
           <rect width="24" height="24" rx="5.5" fill="#000" stroke={i === 3 ? "#5eead4" : "#2f6bff"} strokeWidth="1.7" />
           <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="none" stroke="#e5e7eb" strokeWidth="1.4" />

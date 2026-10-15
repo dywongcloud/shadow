@@ -7,10 +7,10 @@ import { clerkAppearance } from "@/lib/clerk-appearance";
 import { Logo } from "@/components/logo";
 
 const FEATURES = [
-  "Global edge network across every region",
-  "Fluid compute that scales to zero",
-  "Built-in WAF, CDN & DDoS protection",
-  "Multi-tenant teams with strict isolation",
+  "An edge on every node: routing, firewall and cache",
+  "Fluid compute; previews scale to zero when idle",
+  "Built-in WAF, edge caching and per-IP rate limiting",
+  "Multi-tenant teams with owner, admin, member and viewer roles",
 ];
 
 /** Split-screen auth layout shared by sign-in and sign-up: brand and value props on a subtle gradient on the left, the Clerk widget on the right; works in light and dark. */
@@ -42,10 +42,10 @@ export function AuthShell({
         </div>
         <div className="relative">
           <h1 className="max-w-md text-3xl font-semibold leading-tight tracking-tight">
-            Your unified, self-hosted cloud.
+            Push to Git. Get a live URL.
           </h1>
           <p className="mt-3 max-w-sm text-sm text-secondary">
-            Builds, Fluid compute, edge and regions — meshed across your own machines.
+            Serverless functions and containers deployed from Git, plus managed databases.
           </p>
           <ul className="mt-8 flex flex-col gap-3">
             {FEATURES.map((f) => (
@@ -58,7 +58,7 @@ export function AuthShell({
             ))}
           </ul>
         </div>
-        <div className="relative text-xs text-muted">© {2026} shadw · The peer-to-peer cloud.</div>
+        <div className="relative text-xs text-muted">© {2026} shadw</div>
       </div>
 
       <div className="relative flex flex-col items-center justify-center px-4 py-10">
