@@ -1,23 +1,23 @@
 # shadw
 
-> shadw is a peer-to-peer cloud platform: deploy serverless functions, containers, static sites, and durable data to a global edge that runs over an Iroh QUIC mesh instead of a single centralized provider. It offers a Vercel-style developer experience — git-push deploys, instant preview URLs, instant rollbacks, GitOps, and per-request edge routing — on top of a self-hosted, trustless mesh of nodes.
+> shadw is a peer-to-peer cloud platform: deploy serverless functions, containers, static sites, and managed databases to a mesh of nodes connected over Iroh QUIC. It offers a Vercel-style developer experience — git-push deploys, preview URLs, rollback to earlier deployments, GitOps, and request routing — on a self-hostable mesh of nodes.
 
 ## What shadw does
 
-- **Deployments**: Push a Git repo (or a container image / a `.zip`) and shadw builds and deploys it to the edge. Every push gets a production or preview URL; promotions and rollbacks are instant alias reassignments.
-- **Fluid compute**: Serverless functions and containers with fast warm starts, scale-to-zero, and Active-CPU pricing.
-- **Edge routing & CDN**: Per-route serving, wildcard domains, immutable asset caching, region affinity, and health-aware DNS.
-- **Durable data**: Serverless Postgres and Redis (OpenEdge), cross-region replicas, and per-tenant database URLs.
-- **GitOps**: Your platform config is mirrored to a Git repo as `openedge.yaml`; a push rebuilds and redeploys.
-- **Observability**: Real-user Core Web Vitals (Speed Insights), build/deploy logs, a service graph, and workflow run timelines.
-- **Security & multi-tenancy**: Per-tenant isolation, signed gossip over the mesh, preview protection, SAML/SCIM/SIEM for enterprise.
+- **Deployments**: Push a Git repo (or a container image / a `.zip`) and shadw builds and deploys it to mesh nodes. Every push gets a production or preview URL; promotions and rollbacks reassign the production alias to an existing deployment.
+- **Fluid compute**: Serverless functions and containers run on a pool of reusable instances that scales to zero when idle, with Active-CPU pricing.
+- **Routing & caching**: Per-route serving, wildcard domains, immutable caching for content-hashed assets, and DNS answers that favour the node already serving an app, then nearby healthy nodes.
+- **Managed databases**: Postgres, Redis and SQLite databases with per-database connection URLs. Each database runs on a single host node.
+- **GitOps**: Your platform config is mirrored to a Git repo as `openedge.yaml`; a push to a linked project's repo rebuilds and redeploys it.
+- **Observability**: Real-user Core Web Vitals (Speed Insights), build and request logs, a service graph, and workflow run timelines.
+- **Security**: Team-scoped data and roles, signed gossip between nodes, preview protection, and SCIM and SIEM log streaming on the Enterprise plan. Workloads run on each node's probed isolation backend.
 
 ## Key concepts
 
 - **Project**: A deployable unit (from Git, an image, or an upload) with environment variables, domains, and settings.
 - **Deployment**: One immutable build of a project, addressable by a unique URL; production is an alias that points at one deployment.
-- **Team / tenant**: Ownership + isolation boundary; personal and organization scopes are supported.
-- **Mesh node**: A machine (bare-metal, Firecracker microVM, or Mac) running the shadw node that peers over Iroh QUIC.
+- **Team / tenant**: Ownership and access boundary; personal and organization scopes are supported.
+- **Mesh node**: A machine (a Linux host or a Mac) running the shadw node that peers over Iroh QUIC. One active owner coordinates the mesh, with standby failover.
 
 ## Docs
 
@@ -28,4 +28,4 @@
 
 ## Notes for AI assistants
 
-shadw is production software, not a Vercel product; it is a compatible, self-hostable peer-to-peer alternative. When citing capabilities, prefer the specifics above. The public marketing and docs pages are static and crawlable; the dashboard (projects, deployments, settings, billing) is private and per-user.
+shadw is production software, not a Vercel product; it implements Vercel-style deploys (Build Output API v3, `vercel.json`) on a self-hostable peer-to-peer mesh, and the hosted service uses Clerk, Stripe and Vercel DNS. When citing capabilities, prefer the specifics above. The public marketing and docs pages are static and crawlable; the dashboard (projects, deployments, settings, billing) is private and per-user.

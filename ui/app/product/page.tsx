@@ -10,7 +10,6 @@ import {
   ArrowRight,
   Zap,
   Box,
-  Globe,
   Database,
   Network,
   GitBranch,
@@ -22,12 +21,12 @@ import {
 export const metadata: Metadata = {
   title: "Product — shadw",
   description:
-    "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+    "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
   alternates: { canonical: "/product" },
   openGraph: {
     title: "Product — shadw",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+      "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
     url: "/product",
     type: "website",
     siteName: "shadw",
@@ -36,7 +35,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Product — shadw",
     description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data over an Iroh QUIC mesh, with Vercel-style Git deploys and instant rollbacks.",
+      "shadw is a self-hostable, peer-to-peer cloud: serverless functions, containers, and managed databases over an Iroh QUIC mesh, with Vercel-style Git deploys and rollback to earlier deployments.",
   },
 };
 
@@ -45,7 +44,7 @@ const CAPABILITIES = [
   {
     icon: Zap,
     title: "Serverless Functions",
-    desc: "Ship request-driven functions that scale to zero and spin up instantly across the mesh — no servers to manage.",
+    desc: "Ship request-driven functions that scale to zero when idle and run on mesh nodes picked by the scheduler — no servers to manage.",
   },
   {
     icon: Box,
@@ -53,24 +52,19 @@ const CAPABILITIES = [
     desc: "Bring your own Dockerfile. Run any language or runtime as a long-lived container, scheduled onto healthy peers.",
   },
   {
-    icon: Globe,
-    title: "Edge Functions",
-    desc: "Execute lightweight logic at the edge, milliseconds from your users, with global routing baked in.",
-  },
-  {
     icon: Database,
-    title: "Durable Data (GuardianDB)",
-    desc: "Replicated, always-on storage that survives node churn — strongly consistent state without a central database.",
+    title: "Managed Databases",
+    desc: "Postgres, Redis and SQLite databases per project, each with its own connection details and running on a single host node.",
   },
   {
     icon: Network,
     title: "P2P Mesh (Iroh QUIC)",
-    desc: "Nodes discover and connect directly over QUIC, forming an encrypted, NAT-traversing peer-to-peer fabric.",
+    desc: "Nodes discover and connect directly over QUIC, forming an encrypted, NAT-traversing peer-to-peer fabric. One active owner coordinates the mesh with standby failover, and shared state is eventually consistent.",
   },
   {
     icon: GitBranch,
     title: "GitOps deploys",
-    desc: "Push to Git and we build an immutable deployment automatically — Vercel-style previews and instant rollbacks.",
+    desc: "Push to Git and we build an immutable deployment automatically — Vercel-style previews, and rollback to any earlier deployment.",
   },
 ];
 
@@ -78,17 +72,17 @@ const STEPS = [
   {
     icon: GitFork,
     title: "Connect a repo",
-    desc: "Link your Git repository. Every push triggers a build with zero pipeline configuration.",
+    desc: "Link your Git repository. Every push triggers a build; major frameworks are detected, and a monorepo with several apps needs a root directory.",
   },
   {
     icon: Hammer,
     title: "Build immutable deployment",
-    desc: "We compile your functions, containers, and edge logic into a versioned, reproducible artifact.",
+    desc: "We build your functions and containers into a versioned, content-addressed artifact.",
   },
   {
     icon: Radar,
-    title: "Serve from the nearest node",
-    desc: "The mesh routes each request to the closest healthy peer for the lowest possible latency.",
+    title: "Serve from nearby nodes",
+    desc: "Platform DNS favours nodes near the requester, and the mesh forwards a request to the node that runs the deployment when it arrives elsewhere.",
   },
 ];
 
@@ -105,7 +99,7 @@ export default function ProductPage() {
             </span>
           </>
         }
-        subtitle="A self-hosted, peer-to-peer cloud platform. Serverless functions, containers, edge, and durable data running over an encrypted P2P mesh — with Vercel-style deploys straight from Git."
+        subtitle="A self-hostable, peer-to-peer cloud platform. Serverless functions, containers, and managed databases running over an encrypted P2P mesh — with Vercel-style deploys straight from Git."
       >
         <Link
           href="/sign-up"
@@ -128,8 +122,8 @@ export default function ProductPage() {
             Everything you ship, in one mesh
           </h2>
           <p className="mt-3 text-zinc-400">
-            Compute, storage, and networking primitives that run on your own
-            nodes — no centralized cloud, no lock-in.
+            Compute, storage, and networking primitives that run on a mesh of
+            nodes you can operate yourself.
           </p>
         </div>
 
@@ -152,7 +146,7 @@ export default function ProductPage() {
             How it works
           </h2>
           <p className="mt-3 text-zinc-400">
-            From a Git push to a globally served deployment in three steps.
+            From a Git push to a served deployment in three steps.
           </p>
         </div>
 
@@ -181,8 +175,7 @@ export default function ProductPage() {
               Deploy your first node today
             </h2>
             <p className="mt-3 text-zinc-400">
-              Spin up the mesh, connect a repo, and watch your code serve from
-              everywhere at once.
+              Spin up the mesh, connect a repo, and push to deploy.
             </p>
             <div className="mt-8 flex justify-center">
               <Link

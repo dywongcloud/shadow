@@ -7,7 +7,6 @@ import {
   Rocket,
   Users,
   Building2,
-  Brain,
   Globe,
   Server,
   FileText,
@@ -19,12 +18,12 @@ import {
 export const metadata: Metadata = {
   title: "Solutions — shadw",
   description:
-    "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+    "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
   alternates: { canonical: "/solutions" },
   openGraph: {
     title: "Solutions — shadw",
     description:
-      "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
+      "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron jobs, realtime, and internal tools, with Vercel-style Git deploys.",
     url: "/solutions",
     type: "website",
     siteName: "shadw",
@@ -33,7 +32,7 @@ export const metadata: Metadata = {
     card: "summary_large_image",
     title: "Solutions — shadw",
     description:
-      "See how startups, agencies, enterprises, and AI teams ship on shadw — a self-hosted, peer-to-peer cloud for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
+      "See how startups, agencies, and enterprises ship on shadw — a self-hostable, peer-to-peer cloud for full-stack apps, APIs, static sites, cron, realtime, and internal tools.",
   },
 };
 
@@ -43,25 +42,19 @@ const audiences = [
     icon: Rocket,
     title: "Startups",
     desc: "Ship fast and scale on a budget. Deploy from Git, pay for what you use, and let the mesh handle the rest.",
-    bullets: ["Zero-config Git deploys", "Generous free tier", "Scale to zero when idle"],
+    bullets: ["Git deploys with framework detection", "Generous free tier", "Scale to zero when idle"],
   },
   {
     icon: Users,
     title: "Agencies",
-    desc: "Run multi-tenant teams with clean isolation. Spin up preview deploys for every client and every branch.",
-    bullets: ["Preview deploys per client", "Team & project roles", "White-label friendly"],
+    desc: "Keep each client in its own team; workloads run on each node's probed isolation backend. Spin up preview deploys for every client and every branch.",
+    bullets: ["Preview deploys per client", "Team & project roles"],
   },
   {
     icon: Building2,
     title: "Enterprises",
-    desc: "Self-host on your own mesh with full control. Keep data where it belongs and govern compute with leases.",
-    bullets: ["Data residency by region", "Lease-based capacity", "Run on your own nodes"],
-  },
-  {
-    icon: Brain,
-    title: "AI apps",
-    desc: "Fluid compute for inference workloads, durable data for state, and edge delivery for low-latency UX.",
-    bullets: ["Burstable inference compute", "Durable, replicated data", "Edge-served responses"],
+    desc: "Self-host on your own mesh with full control. Choose the regions your workloads run in and govern compute with leases.",
+    bullets: ["Region-targeted compute placement", "Lease-based capacity", "Run on your own nodes"],
   },
 ];
 
@@ -79,17 +72,17 @@ const useCases = [
   {
     icon: FileText,
     title: "Static sites & docs",
-    desc: "Globally cached pages served from the nearest peer in the network.",
+    desc: "Static output served from mesh nodes, with long-lived caching for content-hashed assets.",
   },
   {
     icon: Clock,
     title: "Background jobs / cron",
-    desc: "Scheduled and queued work that runs reliably across the mesh.",
+    desc: "Cron jobs and managed queues. Each cron job runs on a single node.",
   },
   {
     icon: Radio,
-    title: "Realtime & edge",
-    desc: "Low-latency sockets and edge functions close to your users.",
+    title: "Realtime",
+    desc: "Managed pub/sub topics and WebSocket rooms for realtime apps.",
   },
   {
     icon: Wrench,
@@ -111,7 +104,7 @@ export default function SolutionsPage() {
             </span>
           </>
         }
-        subtitle="shadw is a self-hosted, peer-to-peer cloud — serverless functions, containers, edge, and durable data over a P2P mesh, with Vercel-style Git deploys. One platform that adapts to your team and your workloads."
+        subtitle="shadw is a self-hostable, peer-to-peer cloud — serverless functions, containers, and managed databases over a P2P mesh, with Vercel-style Git deploys. One platform that adapts to your team and your workloads."
       >
         <Link
           href="/sign-up"
@@ -132,7 +125,7 @@ export default function SolutionsPage() {
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight">Solutions for every team</h2>
           <p className="mt-3 text-zinc-400">
-            From your first deploy to a self-hosted global mesh, shadw meets you where you are.
+            From your first deploy to a mesh you run yourself, shadw meets you where you are.
           </p>
         </div>
 
@@ -184,8 +177,8 @@ export default function SolutionsPage() {
             Ship your first deploy on the mesh
           </h2>
           <p className="mx-auto mt-3 max-w-xl text-zinc-400">
-            Connect a repo and push to deploy — serverless, containers, edge, and durable data, all
-            on a peer-to-peer cloud you control.
+            Connect a repo and push to deploy — serverless, containers, and managed databases, all
+            on a peer-to-peer cloud you can self-host.
           </p>
           <div className="mt-8 flex justify-center">
             <Link

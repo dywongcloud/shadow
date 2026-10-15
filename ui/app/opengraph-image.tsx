@@ -25,7 +25,7 @@ export default function OpengraphImage() {
         <div style={{ fontSize: 128, fontWeight: 700, letterSpacing: "-0.04em" }}>shadw</div>
         <div style={{ fontSize: 42, color: "#9ba1a6", marginTop: 20 }}>Beyond the Edge are Shadows</div>
         <div style={{ fontSize: 28, color: "#6b7075", marginTop: 44, maxWidth: 900 }}>
-          A peer-to-peer cloud — serverless functions, containers, edge routing &amp; durable data over an Iroh QUIC mesh.
+          A peer-to-peer cloud — serverless functions, containers &amp; managed databases over an Iroh QUIC mesh.
         </div>
       </div>
     ),

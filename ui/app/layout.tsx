@@ -23,7 +23,7 @@ const STRUCTURED_DATA = {
       name: "shadw",
       url: "https://shadw.cloud",
       description:
-        "shadw is a peer-to-peer cloud for serverless functions, containers, edge routing and durable data over an Iroh QUIC mesh.",
+        "shadw is a peer-to-peer cloud for serverless functions, containers and managed databases over an Iroh QUIC mesh.",
     },
     {
       "@type": "WebSite",
@@ -37,9 +37,9 @@ const STRUCTURED_DATA = {
       name: "shadw",
       applicationCategory: "DeveloperApplication",
       operatingSystem: "Web",
-      offers: { "@type": "Offer", price: "0", priceCurrency: "USD" },
+      offers: { "@type": "AggregateOffer", lowPrice: "0", priceCurrency: "USD" },
       description:
-        "Deploy serverless functions, containers, and static sites to a global peer-to-peer edge with instant rollbacks, preview deploys, GitOps, and durable data.",
+        "Deploy serverless functions, containers, and static sites to a peer-to-peer mesh of nodes, with rollback to earlier deployments, preview deploys, GitOps, and managed databases.",
     },
   ],
 };
@@ -49,12 +49,12 @@ const electrolize = Electrolize({ subsets: ["latin"], weight: "400", variable: "
 
 const SITE_URL = (process.env.NEXT_PUBLIC_SITE_URL || "https://shadw.cloud").replace(/\/$/, "");
 const DESCRIPTION =
-  "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers, edge & durable data over a P2P mesh (Iroh QUIC).";
+  "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers and managed databases over a P2P mesh (Iroh QUIC).";
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),
   title: {
-    default: "shadw — Beyond the Edge are Shadows",
+    default: "shadw — The serverless cloud, peer-to-peer",
     template: "%s · shadw",
   },
   description: DESCRIPTION,
@@ -65,7 +65,7 @@ export const metadata: Metadata = {
     type: "website",
     siteName: "shadw",
     url: SITE_URL,
-    title: "shadw — Beyond the Edge are Shadows",
+    title: "shadw — The serverless cloud, peer-to-peer",
     description: DESCRIPTION,
   },
   twitter: { card: "summary_large_image", title: "shadw", description: DESCRIPTION },
