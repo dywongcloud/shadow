@@ -32,10 +32,17 @@ function Track() {
   );
 }
 
-/** The brand ticker. Its height is fixed, not proportional to the width, so the text keeps a readable size on a phone; the visitor can pause the
- *  motion, and `prefers-reduced-motion` stops it outright. */
+/** The brand ticker. Its height is fixed, not proportional to the width, so the text keeps a readable size on a phone. Its button pauses ALL the
+ *  landing's decorative motion (`html.lp-paused` stops the CSS loops and the terminal's typing; SMIL is paused from script), and
+ *  `prefers-reduced-motion` stops it outright. */
 export function MarqueeBanner() {
   const [paused, setPaused] = useState(false);
+  const togglePause = () => {
+    const next = !paused;
+    setPaused(next);
+    document.documentElement.classList.toggle("lp-paused", next);
+    document.querySelectorAll<SVGSVGElement>(".lp svg").forEach((svg) => (next ? svg.pauseAnimations() : svg.unpauseAnimations()));
+  };
   return (
     <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 sm:pt-6">
       <div className="relative h-[52px] w-full sm:h-[68px]">
@@ -56,10 +63,10 @@ export function MarqueeBanner() {
       <div className="flex justify-end px-3 lg:px-7">
         <button
           type="button"
-          onClick={() => setPaused((p) => !p)}
+          onClick={togglePause}
           className="inline-flex min-h-[44px] items-center px-3 text-[12px] text-zinc-300 underline-offset-4 transition-colors hover:text-white hover:underline"
         >
-          {paused ? "Resume ticker" : "Pause ticker"}
+          {paused ? "Play animations" : "Pause animations"}
         </button>
       </div>
     </section>

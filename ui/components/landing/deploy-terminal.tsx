@@ -11,8 +11,8 @@ const ID = "dpl-3f9a21c07b";
 const KEEP = "whitespace-nowrap";
 const LINES: Line[] = [
   { at: 0, typed: true, segs: [{ t: "$ ", c: "lp-prompt" }, { t: "shadw deploy " }, { t: "https://github.com/you/my-app", c: KEEP }, { t: " \\" }] },
-  { at: 1750, typed: true, segs: [{ t: "    " }, { t: "--project", c: KEEP }, { t: " my-app " }, { t: "--follow", c: KEEP }] },
-  { at: 2900, hang: true, segs: [{ t: "Deploy started: build " }, { t: ID, c: KEEP }, { t: " (project my-app)" }] },
+  { at: 1750, typed: true, segs: [{ t: "    " }, { t: "--project", c: KEEP }, { t: " " }, { t: "my-app", c: KEEP }, { t: " " }, { t: "--follow", c: KEEP }] },
+  { at: 2900, hang: true, segs: [{ t: "Deploy started: build " }, { t: ID, c: KEEP }, { t: " (project " }, { t: "my-app", c: KEEP }, { t: ")" }] },
   { at: 3200, hang: true, segs: [{ t: "Stream logs:  shadw build logs ", c: "lp-dim" }, { t: ID, c: `lp-dim ${KEEP}` }, { t: " ", c: "lp-dim" }, { t: "--follow", c: `lp-dim ${KEEP}` }] },
   { at: 3900, gap: true, hang: true, segs: [{ t: "Cloning " }, { t: "github.com/you/my-app", c: KEEP }, { t: " (Branch: main, Commit: HEAD)" }] },
   { at: 4600, hang: true, segs: [{ t: "Detected framework: Next.js — primitive: Hybrid, package manager: npm (NpmLock)" }] },
@@ -52,6 +52,8 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
     const el = box.current;
     if (!el) return;
     const html = document.documentElement;
+    const dome = el.closest<HTMLElement>(".lp-dome");
+    dome?.setAttribute("data-deploy", "building");
     let inView = false;
     let ready = html.classList.contains("lp-ready");
     let clock = 0;
@@ -64,10 +66,13 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
     const tick = () => {
       elapsed = Math.min(FINAL_MS, performance.now() - clock);
       setMs(elapsed);
-      if (elapsed >= FINAL_MS) stop();
+      if (elapsed >= FINAL_MS) {
+        dome?.setAttribute("data-deploy", "ready");
+        stop();
+      }
     };
     const sync = () => {
-      const run = inView && ready && document.visibilityState === "visible" && elapsed < FINAL_MS;
+      const run = inView && ready && !html.classList.contains("lp-paused") && document.visibilityState === "visible" && elapsed < FINAL_MS;
       if (run && !timer) {
         clock = performance.now() - elapsed;
         timer = window.setInterval(tick, 40);
@@ -89,6 +94,7 @@ export function DeployTerminal({ className = "" }: { className?: string }) {
     document.addEventListener("visibilitychange", sync);
     sync();
     return () => {
+      dome?.removeAttribute("data-deploy");
       window.clearInterval(timer);
       io.disconnect();
       mo.disconnect();

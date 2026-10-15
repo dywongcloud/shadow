@@ -3,7 +3,7 @@
 Present-tense conventions: what must be true of the code now; history lives in `CHANGELOG.md`. Stay under ~30 KB
 (`wc -c AGENTS.md`); past it, recompile from the code, the git log and the memory files, keep what is still true and
 load-bearing, delete the memories it absorbs. Nested files load where you work: `ui/AGENTS.md` (dashboard),
-`ansible/AGENTS.md` (ansible, `scripts/`).
+`ui/components/landing/AGENTS.md` (the landing), `ansible/AGENTS.md` (ansible, `scripts/`).
 
 ## Process & verification
 

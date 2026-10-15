@@ -43,7 +43,16 @@ const POINTS: { key: string; icon: LucideIcon; text: React.ReactNode }[] = [
 ];
 
 /** Strings, URLs, placeholders, flags, comments and a few keywords; a comment starts at line start or after a space, so `https://` is a URL. */
-const TOKEN = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|(?<=^|\s)(?:#|\/\/).*$|https?:\/\/[^\s\\]+|<[a-z-]+>|(?<![\w-])--?[a-zA-Z][\w-]*|dpl-[0-9a-f]+|\b(?:const|await|import|True|true)\b/g;
+const TOKEN = /"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|(?<=^|\s)(?:#|\/\/).*$|https?:\/\/[^\s\\]+|<[a-z-]+>|(?<![\w-])--?[a-zA-Z][\w-]*|dpl-[0-9a-f]+|\bmy-app\b|\b(?:const|await|import|True|true)\b/g;
+
+/** A token this short never splits across lines; a longer one (the API URL, a header string) may wrap, and a URL breaks after its slashes. */
+const LONG_TOKEN = 30;
+
+/** A URL breaks after the slashes of its path, never inside `://` or a name. */
+function breakAfterSlashes(url: string): React.ReactNode[] {
+  const at = url.indexOf("://") + 3;
+  return [url.slice(0, at), ...url.slice(at).split("/").flatMap((part, i, all) => (i < all.length - 1 ? [part, "/", <wbr key={i} />] : [part]))];
+}
 
 function tint(line: string): React.ReactNode[] {
   if (line.startsWith("$ ")) {
@@ -60,10 +69,12 @@ function tint(line: string): React.ReactNode[] {
     const at = m.index ?? 0;
     if (at > last) out.push(line.slice(last, at));
     const t = m[0];
-    const cls = /^(#|\/\/)/.test(t) ? "lp-dim" : /^(["'`]|https?:|<)/.test(t) ? "lp-str" : t.startsWith("dpl-") ? "" : "lp-key";
+    const cls = /^(#|\/\/)/.test(t) ? "lp-dim" : /^(["'`]|https?:|<)/.test(t) ? "lp-str" : /^(dpl-|my-app)/.test(t) ? "" : "lp-key";
+    const keep = t.length <= LONG_TOKEN && !/\s/.test(t);
+    const body = !keep && t.includes("://") ? breakAfterSlashes(t) : t;
     out.push(
-      <span key={at} className={cls === "lp-dim" ? cls : `${cls} whitespace-nowrap`}>
-        {t}
+      <span key={at} className={cls === "lp-dim" ? cls : `${cls}${keep ? " whitespace-nowrap" : ""}`}>
+        {body}
       </span>,
     );
     last = at + t.length;
@@ -106,7 +117,7 @@ export function Developer() {
                 <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05]">
                   <Icon className="h-4 w-4 text-indigo-300" />
                 </span>
-                <span>{text}</span>
+                <span className="[text-wrap:pretty]">{text}</span>
               </li>
             ))}
           </ul>
@@ -130,7 +141,7 @@ export function Developer() {
                     role="tab"
                     type="button"
                     aria-selected={i === tab}
-                    aria-label={t.label}
+                    aria-label={t.short === t.label ? t.label : `${t.label} (${t.short})`}
                     aria-controls="lp-dev-panel"
                     tabIndex={i === tab ? 0 : -1}
                     onClick={() => setTab(i)}

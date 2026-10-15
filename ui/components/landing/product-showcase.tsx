@@ -60,8 +60,8 @@ export function ProductShowcase() {
         <figure className="lp-glass lp-limb-top lp-float absolute bottom-0 right-0 z-10 w-[54%] overflow-hidden">
           <Crop
             src={DEPLOYMENTS}
-            alt="A project's Deployments tab: one production build and two previews, all ready, with Redeploy and Instant Rollback."
-            box={{ x: 70, y: 216, w: 1110, h: 520 }}
+            alt="A project's Deployments tab: one production deployment and two previews, all ready."
+            box={{ x: 40, y: 216, w: 1110, h: 520 }}
             sizes="1624px"
           />
         </figure>

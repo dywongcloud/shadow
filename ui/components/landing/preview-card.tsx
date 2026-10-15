@@ -1,7 +1,8 @@
 import { Lock } from "lucide-react";
 
 /** A deployed site in a browser frame: an illustration of "every deployment gets its own HTTPS address". Decorative, so hidden from assistive
- *  technology; the sample address follows the `<project>.shadw.app` form the docs use. */
+ *  technology; the sample address follows the `<project>.shadw.app` form the docs use. Its state chip follows the hero terminal (`data-deploy` on
+ *  `.lp-dome`): Building while the transcript types, Ready once it says so, and Ready when nothing types. */
 export function PreviewCard({ className = "" }: { className?: string }) {
   return (
     <div className={`lp-glass lp-float ${className}`} aria-hidden="true">
@@ -22,8 +23,11 @@ export function PreviewCard({ className = "" }: { className?: string }) {
         <div className="mt-2 h-3 w-4/5 rounded bg-white/10" />
         <div className="mt-2 h-3 w-2/5 rounded bg-white/10" />
         <div className="mt-4 flex items-center justify-between">
-          <span className="lp-chip text-emerald-300">
+          <span className="lp-chip lp-deploy-ready text-emerald-300">
             <span className="lp-dot" /> Ready
+          </span>
+          <span className="lp-chip lp-deploy-building text-amber-300">
+            <span className="lp-spinner" /> Building
           </span>
           <span className="lp-mono text-[11px] uppercase tracking-[0.14em] text-[var(--lp-dim)]">Illustrative</span>
         </div>

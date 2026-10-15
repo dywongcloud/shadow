@@ -3,8 +3,8 @@
 
 :root {
   --lp-bg: #0c0d10;
-  --lp-mute: #a1a1aa;
-  --lp-dim: #9a9aa6;
+  --lp-mute: #b8b8c2;
+  --lp-dim: #aeaeba;
   --lp-grad: linear-gradient(100deg, #5eead4 0%, #22d3ee 28%, #818cf8 62%, #e879f9 100%);
   --lp-edge: linear-gradient(135deg, rgba(139, 92, 246, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(34, 211, 238, 0.5) 100%);
   --lp-limb: linear-gradient(90deg, transparent, #8b5cf6 22%, #e0f2fe 50%, #22d3ee 78%, transparent);
@@ -415,6 +415,7 @@
   font-size: 15px;
   line-height: 1.6;
   color: var(--lp-mute);
+  text-wrap: pretty;
 }
 .lp-well {
   border-radius: 14px;
@@ -491,20 +492,20 @@
   mask-image: linear-gradient(to bottom, transparent, #000 22%, #000 78%, transparent);
 }
 .lp-wash[data-tone="violet"] {
-  background: radial-gradient(560px 420px at 16% 34%, rgba(139, 92, 246, 0.34), transparent 70%);
+  background: radial-gradient(560px 420px at 16% 34%, rgba(139, 92, 246, 0.46), transparent 70%);
 }
 .lp-wash[data-tone="cyan"] {
-  background: radial-gradient(600px 420px at 84% 40%, rgba(34, 211, 238, 0.28), transparent 70%);
+  background: radial-gradient(600px 420px at 84% 40%, rgba(34, 211, 238, 0.38), transparent 70%);
 }
 .lp-wash[data-tone="duo"] {
-  background: radial-gradient(560px 420px at 10% 22%, rgba(139, 92, 246, 0.32), transparent 70%),
-    radial-gradient(560px 420px at 92% 76%, rgba(34, 211, 238, 0.26), transparent 70%);
+  background: radial-gradient(560px 420px at 10% 22%, rgba(139, 92, 246, 0.44), transparent 70%),
+    radial-gradient(560px 420px at 92% 76%, rgba(34, 211, 238, 0.36), transparent 70%);
 }
 html:has(.lp-hero) {
   scroll-padding-top: 76px;
 }
 
-/* the mesh keystone: the one card whose outline is the full limb gradient and whose dome may cross its top edge */
+/* the dome keystone: the one card whose outline is the full limb gradient and whose dome may cross its top edge */
 .lp-card-keystone {
   overflow: visible;
   border-width: 1.5px;
@@ -566,4 +567,30 @@ html:has(.lp-hero) {
   pointer-events: none;
   background: linear-gradient(180deg, #8b5cf6, #e0f2fe 50%, #22d3ee);
   opacity: 0.85;
+}
+
+/* a touch pointer gets the 44 px target at any width; the width-based `min-h-[44px]` utilities cover phones, this covers tablets and touch laptops */
+@media (pointer: coarse) {
+  .lp-tap {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
+/* the preview card's state chip follows the hero terminal: Building while it types, Ready once it finishes, and always Ready without scripts or with reduced motion */
+.lp-deploy-building {
+  display: none;
+}
+.lp-dome[data-deploy="building"] .lp-deploy-ready {
+  display: none;
+}
+.lp-dome[data-deploy="building"] .lp-deploy-building {
+  display: inline-flex;
+}
+
+/* the visitor's Pause (`marquee-banner.tsx`) stops every decorative CSS loop on the landing; the terminal and SMIL are stopped from script */
+html.lp-paused .lp *,
+html.lp-paused .lp *::before,
+html.lp-paused .lp *::after {
+  animation-play-state: paused !important;
 }
