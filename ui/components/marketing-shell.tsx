@@ -133,7 +133,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         Skip to content
       </a>
       {lead}
-      <header className="sticky top-0 z-40 border-b border-white/10 bg-[#000000]/70 backdrop-blur-xl">
+      <header className="sticky top-0 z-40 border-b border-white/10 bg-black/85 backdrop-blur-xl">
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
           <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
             <Logo className="h-7 sm:h-8" />
@@ -144,7 +144,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
                 key={n.href}
                 href={n.href}
                 aria-current={active(n.href) ? "page" : undefined}
-                className={`relative py-[13px] transition-colors hover:text-white after:absolute after:inset-x-0 after:bottom-[5px] after:h-px after:bg-gradient-to-r after:from-transparent after:via-indigo-300 after:to-transparent after:transition-opacity ${
+                className={`relative py-[13px] transition-colors hover:text-white after:absolute after:inset-x-0 after:bottom-[5px] after:h-px after:bg-gradient-to-r after:from-transparent after:via-[#a853ba] after:to-transparent after:transition-opacity ${
                   active(n.href) ? "text-white after:opacity-100" : "after:opacity-0 hover:after:opacity-60"
                 }`}
               >

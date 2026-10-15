@@ -6,8 +6,8 @@
   --lp-mute: #b8b8c2;
   --lp-dim: #aeaeba;
   --lp-grad: linear-gradient(100deg, #e92a67 0%, #a853ba 52%, #2a8af6 100%);
-  --lp-edge: linear-gradient(135deg, rgba(168, 83, 186, 0.6), rgba(255, 255, 255, 0.13) 42%, rgba(42, 138, 246, 0.5) 100%);
-  --lp-limb: linear-gradient(90deg, transparent, #a853ba 22%, #ffe3ec 50%, #2a8af6 78%, transparent);
+  --lp-edge: linear-gradient(135deg, rgba(233, 42, 103, 0.5), rgba(168, 83, 186, 0.34) 22%, rgba(255, 255, 255, 0.12) 50%, rgba(42, 138, 246, 0.5) 100%);
+  --lp-limb: linear-gradient(90deg, transparent, #e92a67 14%, #a853ba 34%, #ffe3ec 50%, #2a8af6 72%, transparent);
 }
 /* the dark brand surface from the first paint: the shell also forces it from an effect, which left a light-scheme visitor a flash of the light canvas */
 html:has(#lp-content),
@@ -343,10 +343,10 @@ html:has(#lp-content) {
   color: var(--lp-dim);
 }
 .lp-key {
-  color: #c4b5fd;
+  color: #e3b8ee;
 }
 .lp-str {
-  color: #7dd3fc;
+  color: #8fc2fb;
 }
 .lp-cursor {
   display: inline-block;
@@ -366,7 +366,7 @@ html:has(#lp-content) {
   font-size: 12px;
   letter-spacing: 0.24em;
   text-transform: uppercase;
-  color: #8fa3ff;
+  color: #7db4fa;
   text-wrap: balance;
 }
 /* a short line under a picture or a row: its last line is never one word */
@@ -392,7 +392,7 @@ html:has(#lp-content) {
   overflow: hidden;
   border-radius: 24px;
   border: 1px solid transparent;
-  background: linear-gradient(180deg, #121319, #050505) padding-box, var(--lp-edge) border-box;
+  background: linear-gradient(180deg, #080808, #000000) padding-box, var(--lp-edge) border-box;
   transition: transform 0.35s cubic-bezier(0.2, 0.7, 0.2, 1);
 }
 .lp-card::before {
@@ -508,7 +508,7 @@ html:has(#lp-content) {
   overflow: hidden;
   border-radius: 32px;
   border: 1px solid transparent;
-  background: linear-gradient(180deg, #11121a, #0b0c11) padding-box, var(--lp-edge) border-box;
+  background: linear-gradient(180deg, #060606, #000000) padding-box, var(--lp-edge) border-box;
 }
 
 /* ───── section light ───── */
@@ -525,24 +525,24 @@ html:has(#lp-content) {
   mask-image: linear-gradient(to bottom, transparent, #000 22%, #000 78%, transparent);
 }
 .lp-wash[data-tone="violet"] {
-  background: radial-gradient(336px 252px at 16% 34%, rgba(168, 83, 186, 0.46), transparent 70%);
+  background: radial-gradient(300px 220px at 0% 34%, rgba(168, 83, 186, 0.34), transparent 70%);
 }
 .lp-wash[data-tone="cyan"] {
-  background: radial-gradient(360px 252px at 84% 40%, rgba(42, 138, 246, 0.38), transparent 70%);
+  background: radial-gradient(300px 220px at 100% 40%, rgba(42, 138, 246, 0.3), transparent 70%);
 }
 .lp-wash[data-tone="duo"] {
-  background: radial-gradient(336px 252px at 10% 22%, rgba(168, 83, 186, 0.44), transparent 70%),
-    radial-gradient(336px 252px at 92% 76%, rgba(42, 138, 246, 0.36), transparent 70%);
+  background: radial-gradient(300px 220px at 0% 22%, rgba(168, 83, 186, 0.32), transparent 70%),
+    radial-gradient(300px 220px at 100% 76%, rgba(42, 138, 246, 0.28), transparent 70%);
 }
 html:has(.lp-hero) {
   scroll-padding-top: 76px;
 }
 
-/* the dome keystone: the one card whose outline is the full limb gradient and whose dome may cross its top edge */
+/* the dome keystone: the one card whose outline is the full Turbo Flow ramp; its dome sits wholly inside the frame (it used to cross the top edge, where the
+   border ran through the arc and the halo was cut) */
 .lp-card-keystone {
-  overflow: visible;
   border-width: 1.5px;
-  background: linear-gradient(180deg, #11121b, #0b0c12) padding-box, linear-gradient(90deg, #a853ba, #ffe3ec 50%, #2a8af6) border-box;
+  background: linear-gradient(180deg, #060606, #000000) padding-box, linear-gradient(100deg, #e92a67, #a853ba 46%, #2a8af6) border-box;
 }
 
 /* the flow's rail: one lit line across the three cards' top edges with a point travelling along it */

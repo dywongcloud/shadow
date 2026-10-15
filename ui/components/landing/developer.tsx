@@ -118,7 +118,7 @@ export function Developer() {
             {POINTS.map(({ key, icon: Icon, text }) => (
               <li key={key} className="flex items-start gap-3.5 text-[15px] leading-relaxed text-zinc-300">
                 <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05]">
-                  <Icon className="h-4 w-4 text-indigo-300" />
+                  <Icon className="h-4 w-4 text-[#d79be6]" />
                 </span>
                 <span className="[text-wrap:pretty]">{text}</span>
               </li>
@@ -154,7 +154,7 @@ export function Developer() {
                     <span aria-hidden className="min-[360px]:hidden">
                       {t.short}
                     </span>
-                    {i === tab && <span aria-hidden className="absolute inset-x-2.5 -bottom-px h-px bg-gradient-to-r from-teal-300 via-indigo-300 to-fuchsia-300" />}
+                    {i === tab && <span aria-hidden className="absolute inset-x-2.5 -bottom-px h-px bg-gradient-to-r from-[#e92a67] via-[#a853ba] to-[#2a8af6]" />}
                   </button>
                 ))}
               </div>
