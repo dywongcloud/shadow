@@ -4733,6 +4733,9 @@ async fn proxy_function(
     const MAX_REROUTES: usize = 3;
     let mut last_err = String::from("unknown");
     let mut upstream_silent = false;
+    // Attempts that reached a live instance which reported itself at capacity. Distinct from
+    // `upstream_silent`, because a nack is an ANSWER: it must never be published as a timeout.
+    let mut nacks = 0usize;
     for attempt in 0..MAX_REROUTES {
         let lease = match gw.fluid.lease(&key).await {
             Ok(l) => l,
@@ -4784,6 +4787,16 @@ async fn proxy_function(
                     upstream_silent = false;
                     gw.fluid.mark_dead(&key, &cell).await;
                     gw.drop_tunnel(&cell).await;
+                } else if fluid_tunnel::is_nack_error(&e) {
+                    // A nack is the instance ANSWERING "I am at max_concurrency" — it is alive and
+                    // healthy, so this is neither a silent upstream nor grounds to reap it.
+                    // Retrying instantly just collects another nack: give the in-flight requests
+                    // a moment to drain and let the next lease pick whichever instance frees up.
+                    nacks += 1;
+                    upstream_silent = false;
+                    tracing::debug!(cell = %cell, attempt, nacks, "instance at capacity; backing off");
+                    tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
+                    continue;
                 } else {
                     upstream_silent = true;
                     if method != Method::GET && method != Method::HEAD {
@@ -4795,12 +4808,18 @@ async fn proxy_function(
     }
     let class = if upstream_silent {
         fluid_core::FailureClass::FunctionNoResponse
+    } else if nacks > 0 {
+        // Every attempt reached a live instance that said "at capacity". That is genuine
+        // saturation, which the client and the edge may retry — publishing it as a 504 timeout
+        // both misreports it and reads to the operator as a dead function.
+        fluid_core::FailureClass::CapacityExhausted
     } else {
         fluid_core::FailureClass::RuntimeTunnelFailed
     };
     warn!(
         func = %key,
         error = %last_err,
+        nacks,
         code = class.code(),
         "upstream failed after reroute budget"
     );

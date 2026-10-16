@@ -43,6 +43,51 @@ pub struct TunnelResponse {
     pub body: mpsc::UnboundedReceiver<Bytes>,
 }
 
+/// The error [`TunnelClient::request`] returns when the instance rejected the request because it is
+/// already serving `max_concurrency` of them. A live, honest capacity answer — not a broken
+/// instance, and not a missed response.
+pub const NACK_ERROR: &str = "instance nack (overloaded)";
+
+/// True when `e` is the instance's own "at capacity" rejection. The router must treat this
+/// differently from a silent upstream: retrying it instantly against the same instance just
+/// collects three more nacks and publishes a timeout to the client.
+pub fn is_nack_error(e: &anyhow::Error) -> bool {
+    e.to_string() == NACK_ERROR
+}
+
+/// Sends `Cancel` for a request the gateway stops waiting for.
+///
+/// Fires on drop — the caller's future was abandoned (client disconnect, or an outer timeout
+/// fired) — and on head timeout. Without it the instance keeps working the request and holds its
+/// `InflightSlot` for as long as the local hop takes (up to `LOCAL_RESPONSE_DEADLINE` per
+/// attempt), so abandoned requests ratchet `inflight` up to `max_concurrency` and every later
+/// request is nacked even though nothing is actually busy. That is the geniee.site outage.
+///
+/// Disarmed once the response head arrives: from then on the response is the caller's to stream,
+/// and a `Nack` never took a slot in the first place.
+struct CancelOnDrop {
+    out: mpsc::UnboundedSender<Frame>,
+    id: u64,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .out
+                .send(Frame::new(self.id, FrameKind::Cancel, Bytes::new()));
+        }
+    }
+}
+
+
 impl TunnelClient {
     pub fn new<S>(stream: S) -> TunnelClient
     where
@@ -95,7 +140,7 @@ impl TunnelClient {
                     FrameKind::Nack => {
                         if let Some(mut p) = s.pending.lock().remove(&frame.stream_id) {
                             if let Some(h) = p.head.take() {
-                                let _ = h.send(Err(anyhow::anyhow!("instance nack (overloaded)")));
+                                let _ = h.send(Err(anyhow::anyhow!(NACK_ERROR)));
                             }
                         }
                     }
@@ -140,6 +185,9 @@ impl TunnelClient {
         *self.shared.health.lock()
     }
 
+    /// Abandoning this future (or timing it out) cancels the request at the instance, so the work
+    /// stops and its in-flight slot is released immediately.
+    ///
     /// Send a request and await its response head; the body streams via the returned receiver.
     /// `head_timeout` is the caller's own per-invocation budget (the deployment's
     /// `max_duration_secs`): a shorter fixed value misreads a slow-but-running invocation as
@@ -181,8 +229,19 @@ impl TunnelClient {
             .send(Frame::new(id, FrameKind::Request, payload))
             .map_err(|_| anyhow::anyhow!("tunnel writer gone"))?;
 
+        let mut cancel = CancelOnDrop {
+            out: self.out.clone(),
+            id,
+            armed: true,
+        };
+
         let meta = match tokio::time::timeout(head_timeout, head_rx).await {
-            Ok(Ok(r)) => r?,
+            Ok(Ok(r)) => {
+                // The instance answered (a Nack included, and a nack never took a slot), so there
+                // is nothing left to release.
+                cancel.disarm();
+                r?
+            }
             Ok(Err(_)) => {
                 self.shared.pending.lock().remove(&id);
                 anyhow::bail!("tunnel closed before response");

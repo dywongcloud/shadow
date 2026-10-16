@@ -7,7 +7,7 @@ mod client;
 mod codec;
 mod server;
 
-pub use client::{TunnelClient, TunnelResponse};
+pub use client::{is_nack_error, TunnelClient, TunnelResponse, NACK_ERROR};
 pub use codec::{Frame, FrameKind};
 pub use server::{set_local_connect_permits, TunnelServer};
 

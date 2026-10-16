@@ -57,6 +57,68 @@ impl Drop for InflightSlot {
     }
 }
 
+/// Per-request cancellation, set by [`FrameKind::Cancel`] when the gateway's caller goes away.
+///
+/// A `Notify` alone is wrong: `notify_waiters` only wakes waiters already parked, so a cancel that
+/// arrives in the window between dispatch and the first await is lost and the request runs to
+/// completion anyway. The flag closes that window — set it first, then wake, and check it again
+/// after registering interest.
+#[derive(Clone, Default)]
+struct CancelSignal {
+    flag: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+}
+
+impl CancelSignal {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves as soon as the request is cancelled; safe to use as a `select!` branch.
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.wake.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Live cancel signals for this connection's in-flight requests, keyed by `stream_id`.
+type CancelMap = Arc<std::sync::Mutex<std::collections::HashMap<u64, CancelSignal>>>;
+
+/// Withdraws a request's cancel entry when its task finishes, however it finishes, so the map is
+/// bounded by live concurrency rather than by requests ever seen.
+struct CancelEntry {
+    map: CancelMap,
+    id: u64,
+}
+
+impl Drop for CancelEntry {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
+
+/// What one dispatched request produced. `Cancelled` is its own arm because it is NOT evidence
+/// about the function: the caller abandoned the request, so it must neither reset nor advance the
+/// [`UNHEALTHY_FAILURE_STREAK`] that decides whether this instance gets reaped.
+enum Outcome {
+    Answered,
+    Failed,
+    Cancelled,
+}
+
 /// Per-upstream-address connect gates keyed by the literal `local_http`; cleared if the map grows
 /// past a bound so ephemeral-port churn cannot leak.
 fn connect_gate(local_http: &str) -> Arc<tokio::sync::Semaphore> {
@@ -176,6 +238,9 @@ impl TunnelServer {
         let failures = Arc::new(AtomicU32::new(0));
         let stuck = Arc::new(AtomicBool::new(false));
         let stuck_notify = Arc::new(Notify::new());
+        let cancels: CancelMap = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
         loop {
             let notified = stuck_notify.notified();
             let frame = match tokio::select! {
@@ -203,6 +268,17 @@ impl TunnelServer {
                 FrameKind::Ping => {
                     let _ = out_tx.send(Frame::new(0, FrameKind::Pong, Bytes::new()));
                 }
+                FrameKind::Cancel => {
+                    // The caller abandoned this request: stop the work and hand its slot back now
+                    // instead of holding it for as long as the local hop takes.
+                    let signal = cancels
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&frame.stream_id);
+                    if let Some(signal) = signal {
+                        signal.cancel();
+                    }
+                }
                 FrameKind::Request => {
                     let id = frame.stream_id;
                     if inflight.load(Ordering::Relaxed) >= max_concurrency {
@@ -216,16 +292,33 @@ impl TunnelServer {
                     let failures = failures.clone();
                     let stuck = stuck.clone();
                     let stuck_notify = stuck_notify.clone();
+                    let cancel = CancelSignal::default();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(id, cancel.clone());
+                    let entry = CancelEntry {
+                        map: cancels.clone(),
+                        id,
+                    };
                     tokio::spawn(async move {
                         let _slot = slot;
-                        if handle_request(id, frame.payload, &local, &out).await {
-                            failures.store(0, Ordering::Relaxed);
-                        } else {
-                            let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
-                            if n >= UNHEALTHY_FAILURE_STREAK && !stuck.swap(true, Ordering::Relaxed)
-                            {
-                                stuck_notify.notify_one();
+                        let _entry = entry;
+                        match handle_request(id, frame.payload, &local, &out, &cancel).await {
+                            Outcome::Answered => {
+                                failures.store(0, Ordering::Relaxed);
                             }
+                            Outcome::Failed => {
+                                let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n >= UNHEALTHY_FAILURE_STREAK
+                                    && !stuck.swap(true, Ordering::Relaxed)
+                                {
+                                    stuck_notify.notify_one();
+                                }
+                            }
+                            // The caller left, not the function: neither reset nor advance the
+                            // streak, so client disconnects can never reap a healthy instance.
+                            Outcome::Cancelled => {}
                         }
                     });
                 }
@@ -296,7 +389,13 @@ impl TunnelServer {
 /// Returns whether a response head reached the caller — the progress signal
 /// [`UNHEALTHY_FAILURE_STREAK`] counts; a 502 the function sent is an answer, only "no response
 /// at all" is a failure.
-async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) -> bool {
+async fn handle_request(
+    id: u64,
+    payload: Bytes,
+    local_http: &str,
+    out: &MeteredSender,
+    cancel: &CancelSignal,
+) -> Outcome {
     let idempotent = payload
         .get(0..4)
         .and_then(|len| Some(u32::from_be_bytes(len.try_into().ok()?) as usize))
@@ -307,10 +406,20 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
+        // The caller is gone: stop before spending another attempt — and up to another
+        // [`LOCAL_RESPONSE_DEADLINE`] of this slot — on a response nobody will read.
+        if cancel.is_cancelled() {
+            return Outcome::Cancelled;
+        }
         let mut head_sent = false;
-        match proxy_local(id, &payload, local_http, out, &mut head_sent).await {
-            Ok(()) => return true,
+        match proxy_local(id, &payload, local_http, out, &mut head_sent, cancel).await {
+            Ok(()) => return Outcome::Answered,
             Err(error) => {
+                // Distinguish "the caller left" from "the function failed" by the flag, not by
+                // the error text: only the flag is set exactly when we abandoned our own work.
+                if cancel.is_cancelled() {
+                    return Outcome::Cancelled;
+                }
                 if head_sent || !idempotent || attempt + 1 == MAX_ATTEMPTS {
                     if head_sent {
                         tracing::warn!(
@@ -319,7 +428,7 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
                             error = %error,
                             "tunnel: upstream request failed after response head was already sent — truncating stream"
                         );
-                        return true;
+                        return Outcome::Answered;
                     }
                     last_error = Some(error);
                     break;
@@ -360,7 +469,7 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         ));
         let _ = out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()));
     }
-    false
+    Outcome::Failed
 }
 
 /// Relay one framed request to the local hop over a fresh connection as a `RespHead` frame then
@@ -372,6 +481,7 @@ async fn proxy_local(
     local_http: &str,
     out: &MeteredSender,
     head_sent: &mut bool,
+    cancel: &CancelSignal,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(payload.len() >= 4, "short request payload");
     let meta_len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
@@ -379,23 +489,29 @@ async fn proxy_local(
     let meta: ReqMeta = serde_json::from_slice(&payload[4..4 + meta_len])?;
     let body = &payload[4 + meta_len..];
 
-    let _connect_permit = tokio::time::timeout(
+    let permit_wait = tokio::time::timeout(
         LOCAL_RESPONSE_DEADLINE,
         connect_gate(local_http).acquire_owned(),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "timed out after {LOCAL_RESPONSE_DEADLINE:?} waiting for a local connect permit to {local_http}"
-        )
-    })??;
-    let mut conn = tokio::time::timeout(LOCAL_CONNECT_DEADLINE, TcpStream::connect(local_http))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
+    );
+    let _connect_permit = tokio::select! {
+        r = permit_wait => r
+            .map_err(|_| anyhow::anyhow!(
+                "timed out after {LOCAL_RESPONSE_DEADLINE:?} waiting for a local connect permit to {local_http}"
+            ))??,
+        _ = cancel.cancelled() => {
+            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
+        },
+    };
+    let connecting = tokio::time::timeout(LOCAL_CONNECT_DEADLINE, TcpStream::connect(local_http));
+    let mut conn = tokio::select! {
+        r = connecting => r
+            .map_err(|_| anyhow::anyhow!(
                 "local connect to {local_http} timed out after {LOCAL_CONNECT_DEADLINE:?}"
-            )
-        })??;
+            ))??,
+        _ = cancel.cancelled() => {
+            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
+        },
+    };
 
     let fwd_host = meta
         .headers
@@ -443,13 +559,16 @@ async fn proxy_local(
             split = pos;
             break;
         }
-        let n = tokio::time::timeout(LOCAL_RESPONSE_DEADLINE, conn.read(&mut tmp))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        let read = tokio::time::timeout(LOCAL_RESPONSE_DEADLINE, conn.read(&mut tmp));
+        let n = tokio::select! {
+            r = read => r
+                .map_err(|_| anyhow::anyhow!(
                     "function accepted the request but sent no response head within {LOCAL_RESPONSE_DEADLINE:?}"
-                )
-            })??;
+                ))??,
+            _ = cancel.cancelled() => {
+            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
+        },
+        };
         anyhow::ensure!(n > 0, "function closed before headers");
         raw.extend_from_slice(&tmp[..n]);
         anyhow::ensure!(raw.len() < 1024 * 1024, "function headers too large");
