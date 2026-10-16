@@ -2,35 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Image from "next/image";
-
-/** The rotating aurora glow ring: a conic pink-purple-blue (Turbo Flow) gradient masked into a soft ring and heavily blurred; rotating the element
- *  cycles the visible arc's color (~2 s). */
-function GlowRing({
-  className = "",
-  duration = 2.2,
-  style,
-}: {
-  className?: string;
-  duration?: number;
-  style?: React.CSSProperties;
-}) {
-  const ring = "radial-gradient(closest-side, transparent 48%, rgba(0,0,0,0.55) 62%, black 72%, rgba(0,0,0,0.55) 84%, transparent 96%)";
-  return (
-    <div
-      aria-hidden
-      className={`pointer-events-none rounded-full ${className}`}
-      style={{
-        background:
-          "conic-gradient(from -160deg, rgba(233,42,103,0.6), rgba(168,83,186,0.6) 33%, rgba(42,138,246,0.62) 66%, rgba(233,42,103,0.6))",
-        WebkitMaskImage: ring,
-        maskImage: ring,
-        filter: "blur(min(42px,3.3vw))",
-        animation: `glow-ring-spin ${duration}s linear infinite`,
-        ...style,
-      }}
-    />
-  );
-}
+import { GlowRing } from "./glow-ring";
 
 /** Module scope on purpose: `<Landing>` can remount within one page load (an auth flip), and the intro must play once per page load; only
  *  the client effect sets it, so SSR always renders the overlay and hydration agrees. */

@@ -140,6 +140,10 @@ html:has(#lp-content) {
   .lp-pulse {
     display: none;
   }
+  /* the ring is the one blurred loop on the page: it stops, it does not fade out, so the corner still carries its light */
+  .lp-ring {
+    animation: none !important;
+  }
 }
 
 /* ───── hero light ───── */
@@ -172,6 +176,18 @@ html:has(#lp-content) {
   background: radial-gradient(456px 336px at 96% 30%, rgba(42, 138, 246, 0.26), transparent 64%),
     radial-gradient(276px 216px at 100% 42%, rgba(42, 138, 246, 0.26), transparent 66%);
   animation: lp-drift-b 30s ease-in-out infinite alternate;
+}
+/* the right side is the blue half of the palette: ONE field, not two blobs. Three overlapping radial gradients share a long, gradual falloff and a
+   mid-tone between them, so the deep blue at the top and the light blue lower down cross-fade instead of meeting at an edge. Static, because the
+   aurora above it already drifts; it sits behind the content in `.lp-bg`. */
+.lp-glow-blue {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(closest-side at 84% 8%, rgba(42, 138, 246, 0.38), rgba(42, 138, 246, 0.17) 40%, rgba(42, 138, 246, 0.05) 66%, transparent 84%),
+    radial-gradient(closest-side at 97% 40%, rgba(88, 164, 250, 0.3), rgba(88, 164, 250, 0.13) 44%, transparent 82%),
+    radial-gradient(closest-side at 92% 62%, rgba(125, 211, 252, 0.26), rgba(125, 211, 252, 0.1) 46%, transparent 80%);
 }
 .lp-grid {
   position: absolute;

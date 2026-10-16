@@ -4,6 +4,7 @@ import { GlobeWireframe } from "@/components/globe-wireframe";
 import { DeployTerminal } from "./deploy-terminal";
 import { DomeLight } from "./dome-light";
 import { PreviewCard } from "./preview-card";
+import { GlowRing } from "./glow-ring";
 import { delay } from "./lp-utils";
 
 /** What the cards need below the globe from the `lg` breakpoint up: the finished terminal's height (about 375 px in a 974 px dome, 309 px in a 1160 px one)
@@ -16,6 +17,8 @@ export function Hero() {
   return (
     <section className="lp-hero pb-14 lg:pb-24">
       <div className="lp-bg" aria-hidden="true">
+        <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
+        <div className="lp-glow-blue" />
         <div className="lp-aurora-a" />
         <div className="lp-aurora-b" />
         <div className="lp-grid" />
@@ -28,7 +31,8 @@ export function Hero() {
           <br />
           <span className="lp-gradient-text">Get a live URL.</span>
         </h1>
-        <p className="lp-sub lp-rise mx-auto mt-6 max-w-[640px]" style={delay(180)}>
+        {/* the standfirst is desktop-only: on a phone it pushed the headline and the calls to action off the first screen */}
+        <p className="lp-sub lp-rise mx-auto mt-6 max-w-[640px] max-sm:hidden" style={delay(180)}>
           Deploy functions, containers and static sites from Git, a zip upload or a container image, with managed databases beside them. Every
           pull request on a connected GitHub repository gets a live preview.
         </p>
