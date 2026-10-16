@@ -19,9 +19,16 @@ use tokio::sync::{mpsc, Notify};
 /// streaming bursts.
 const BACKPRESSURE_HWM: u64 = 256;
 
-/// Concurrent local connections one upstream address may receive across every tunnel in this
+/// Concurrent local connects one upstream address may receive across every tunnel in this
 /// process; litebox lowers it at init because its guest network stack re-arms a single listener
-/// serially, so requests queue for the microseconds a busy guest needs instead of being accept-closed.
+/// serially, so connects queue for the microseconds a busy guest needs instead of being
+/// accept-closed.
+///
+/// The permit covers the connect and nothing else: it is released the moment the socket exists
+/// ([`proxy_local`]). Held across the request it is a second, hidden concurrency limit on the
+/// instance that the `inflight` nack gate cannot see, and whenever it is the lower of the two
+/// (litebox sets it to 1) the instance admits `max_concurrency` requests, serves one, and nacks
+/// the rest — the whole instance reports "at capacity" while it is actually serializing.
 static LOCAL_CONNECT_PERMITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(64);
 
@@ -34,10 +41,12 @@ pub fn set_local_connect_permits(permits: usize) {
 /// cold start gets to reach a listening state.
 const LOCAL_CONNECT_DEADLINE: Duration = Duration::from_secs(15);
 
-/// Ceiling on the two waits that can hold a guest's connect permit — queueing for it and reading
-/// the response head — so a guest that accepts and never answers costs one retryable failure
-/// instead of pinning the address's permit and an `inflight` slot until the OS gives up (~130 s).
-/// Generous on purpose: shorter than forever, never shorter than real work.
+/// Ceiling on every wait on the local hop — queueing for the connect permit, connecting, writing
+/// the request, and reading each piece of the response. One number, applied to every await in
+/// [`proxy_local`] through [`hop_await`], so no single wait can hold a connect permit and an
+/// `inflight` slot longer than this: a guest that stalls costs one bounded, retryable failure
+/// instead of pinning the instance's capacity until the OS gives up (~130 s). Generous on purpose:
+/// shorter than forever, never shorter than real work.
 const LOCAL_RESPONSE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Consecutive requests that reached this function's address and produced NO response at all,
@@ -472,6 +481,34 @@ async fn handle_request(
     Outcome::Failed
 }
 
+/// One await on the local hop: bounded by `deadline` and abortable through the caller's
+/// [`CancelSignal`].
+///
+/// Every await in [`proxy_local`] goes through this. It is what stops a stalled or wedged guest
+/// from pinning the two resources a dispatched request owns — an `inflight` slot and a connect
+/// permit — for as long as the guest feels like it: the wait ends, both are dropped, and the
+/// gateway sees one bounded retryable failure instead of an instance that nacks every request it
+/// has already admitted until something reaps it.
+async fn hop_await<F, T>(
+    fut: F,
+    cancel: &CancelSignal,
+    deadline: Duration,
+    what: &str,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        v = fut => Ok(v),
+        _ = tokio::time::sleep(deadline) => {
+            Err(anyhow::anyhow!("{what} timed out after {deadline:?}"))
+        }
+        _ = cancel.cancelled() => {
+            Err(anyhow::anyhow!("caller abandoned the request before it was answered"))
+        }
+    }
+}
+
 /// Relay one framed request to the local hop over a fresh connection as a `RespHead` frame then
 /// `RespBody` frames, marking `head_sent` as the head frame is sent. A chunked body is re-framed
 /// chunk by chunk and its trailers are ignored.
@@ -489,28 +526,27 @@ async fn proxy_local(
     let meta: ReqMeta = serde_json::from_slice(&payload[4..4 + meta_len])?;
     let body = &payload[4 + meta_len..];
 
-    let permit_wait = tokio::time::timeout(
-        LOCAL_RESPONSE_DEADLINE,
-        connect_gate(local_http).acquire_owned(),
-    );
-    let _connect_permit = tokio::select! {
-        r = permit_wait => r
-            .map_err(|_| anyhow::anyhow!(
-                "timed out after {LOCAL_RESPONSE_DEADLINE:?} waiting for a local connect permit to {local_http}"
-            ))??,
-        _ = cancel.cancelled() => {
-            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
-        },
-    };
-    let connecting = tokio::time::timeout(LOCAL_CONNECT_DEADLINE, TcpStream::connect(local_http));
-    let mut conn = tokio::select! {
-        r = connecting => r
-            .map_err(|_| anyhow::anyhow!(
-                "local connect to {local_http} timed out after {LOCAL_CONNECT_DEADLINE:?}"
-            ))??,
-        _ = cancel.cancelled() => {
-            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
-        },
+    // The gate bounds CONCURRENT CONNECTS — which is all its name and its callers' intent ever
+    // claimed — so the permit is released the moment the socket exists. Held across the request it
+    // is a second concurrency limit on the instance that the `inflight` nack gate cannot see, and
+    // when it is the lower of the two the instance serves one request at a time while admitting
+    // `max_concurrency` of them: the parked ones hold slots for as long as they queue, `inflight`
+    // pins at the ceiling, and every request after them is nacked.
+    let mut conn = {
+        let _connect_permit = hop_await(
+            connect_gate(local_http).acquire_owned(),
+            cancel,
+            LOCAL_CONNECT_DEADLINE,
+            &format!("waiting for a local connect permit to {local_http}"),
+        )
+        .await??;
+        hop_await(
+            TcpStream::connect(local_http),
+            cancel,
+            LOCAL_CONNECT_DEADLINE,
+            &format!("local connect to {local_http}"),
+        )
+        .await??
     };
 
     let fwd_host = meta
@@ -547,9 +583,17 @@ async fn proxy_local(
     }
     req.push_str(&format!("content-length: {}\r\n", body.len()));
     req.push_str("connection: keep-alive\r\n\r\n");
-    conn.write_all(req.as_bytes()).await?;
-    conn.write_all(body).await?;
-    conn.flush().await?;
+    hop_await(
+        async {
+            conn.write_all(req.as_bytes()).await?;
+            conn.write_all(body).await?;
+            conn.flush().await
+        },
+        cancel,
+        LOCAL_RESPONSE_DEADLINE,
+        "writing the request to the function",
+    )
+    .await??;
 
     let mut raw = Vec::with_capacity(2048);
     let mut tmp = [0u8; 8192];
@@ -559,16 +603,13 @@ async fn proxy_local(
             split = pos;
             break;
         }
-        let read = tokio::time::timeout(LOCAL_RESPONSE_DEADLINE, conn.read(&mut tmp));
-        let n = tokio::select! {
-            r = read => r
-                .map_err(|_| anyhow::anyhow!(
-                    "function accepted the request but sent no response head within {LOCAL_RESPONSE_DEADLINE:?}"
-                ))??,
-            _ = cancel.cancelled() => {
-            return Err(anyhow::anyhow!("caller abandoned the request before it was answered"));
-        },
-        };
+        let n = hop_await(
+            conn.read(&mut tmp),
+            cancel,
+            LOCAL_RESPONSE_DEADLINE,
+            &format!("response head from {local_http}"),
+        )
+        .await??;
         anyhow::ensure!(n > 0, "function closed before headers");
         raw.extend_from_slice(&tmp[..n]);
         anyhow::ensure!(raw.len() < 1024 * 1024, "function headers too large");
@@ -632,7 +673,13 @@ async fn proxy_local(
                 if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
                     break pos;
                 }
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "chunk size line",
+                )
+                .await??;
                 anyhow::ensure!(r > 0, "function closed before chunk size");
                 buf.extend_from_slice(&tmp[..r]);
                 anyhow::ensure!(buf.len() < 64 * 1024, "chunk size line too long");
@@ -646,7 +693,13 @@ async fn proxy_local(
                 break;
             }
             while buf.len() < size + 2 {
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "chunk body",
+                )
+                .await??;
                 anyhow::ensure!(r > 0, "function closed mid-chunk");
                 buf.extend_from_slice(&tmp[..r]);
             }
@@ -672,7 +725,13 @@ async fn proxy_local(
             Some(n) => {
                 while sent < n {
                     let want = (n - sent).min(tmp.len());
-                    let r = conn.read(&mut tmp[..want]).await?;
+                    let r = hop_await(
+                        conn.read(&mut tmp[..want]),
+                        cancel,
+                        LOCAL_RESPONSE_DEADLINE,
+                        "response body",
+                    )
+                    .await??;
                     anyhow::ensure!(r > 0, "function closed mid-body");
                     out.send(Frame::new(
                         id,
@@ -683,7 +742,13 @@ async fn proxy_local(
                 }
             }
             None => loop {
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "response body",
+                )
+                .await??;
                 if r == 0 {
                     break;
                 }
