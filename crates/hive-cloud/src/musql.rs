@@ -26,13 +26,17 @@
 //!
 //! **Measured divergences from SQLite.** `rows_read` is the length of the returned rows array (see
 //! `run`), and a NULL in a REAL-capable column is re-checked against the engine because musqld's
-//! encoder emits `{"type":"null"}` for `Inf`/`-Inf`/`NaN` (see `non_finite_probe`). Two are
+//! encoder emits `{"type":"null"}` for `Inf`/`-Inf`/`NaN` (see `non_finite_probe`). Three are
 //! ACCEPTED: musqld normalises a STORED `-0.0` to `0.0` (`-0.0 = 0.0` in SQL and they sort, compare
 //! and sum identically; only their TEXT rendering differs, which nothing here reads, and closing it
 //! would mean re-encoding every REAL both ways), and error message text differs (`SELECT FROM` is
 //! `near "FROM": syntax error` on SQLite and `no such column: FROM` on musqld; message text is not
 //! part of the wire contract, clients match the code and the envelope, so musqld's more specific
-//! text passes through).
+//! text passes through), and an integer-valued REAL is spelled `3` where SQLite's encoder writes
+//! `3.0` — the same f64 under the same `"type":"float"` tag, so `musql_migrate::row_string` (which
+//! formats the DECODED f64, never the wire text) digests them identically and migration still
+//! verifies; a client that ignores the type tag and branches on the JSON literal instead is the
+//! only thing that can tell them apart (measured on `people.overall_score`, `reviews.overall_score`).
 
 use crate::sqlite_engine::{Budget, Col, DescribeResult, NamedArg, RunResult, SqlEngine, SqlValue};
 use async_trait::async_trait;
