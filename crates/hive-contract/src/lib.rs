@@ -22,6 +22,7 @@ pub mod engine;
 pub mod exec;
 pub mod oplog;
 pub mod reconcile;
+pub mod replicate;
 
 pub use audit::{verify, Breach};
 pub use contract::{
@@ -29,8 +30,11 @@ pub use contract::{
 };
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
 pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
-pub use oplog::{Ack, LogEntry, Op, OpLog, OP_DOMAIN};
+pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, OP_DOMAIN};
 pub use reconcile::{
     reconcile, scope_report, CanonicalDb, Divergence, DivergenceKind, ReconcileReport, ScopeEntry,
     DECLARED_SCOPE,
+};
+pub use replicate::{
+    AdoptSource, MergeError, Replica, ReplicaSnapshot, SyncReport, SNAPSHOT_DOMAIN,
 };
