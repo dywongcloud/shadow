@@ -1,0 +1,46 @@
+name: Shadw deploy action
+
+on:
+  push:
+    paths:
+      - "action.yml"
+      - "scripts/shadw-action/**"
+      - "schemas/shadw.schema.json"
+      - "examples/shadw.yml"
+      - ".github/workflows/shadw-action-ci.yml"
+  pull_request:
+    paths:
+      - "action.yml"
+      - "scripts/shadw-action/**"
+      - "schemas/shadw.schema.json"
+      - "examples/shadw.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests (stdlib parser)
+        run: python3 scripts/shadw-action/test_deploy.py -v
+      - name: Validate example shadw.yml against the JSON schema
+        run: |
+          python3 -m pip install --quiet pyyaml jsonschema
+          python3 - <<'PY'
+          import json, yaml, jsonschema
+          schema = json.load(open("schemas/shadw.schema.json"))
+          jsonschema.Draft202012Validator.check_schema(schema)
+          jsonschema.validate(yaml.safe_load(open("examples/shadw.yml")), schema)
+          print("examples/shadw.yml is valid")
+          PY
+      - name: Action dry run
+        id: dry
+        uses: ./
+        with:
+          token: unused
+          config: examples/shadw.yml
+          dry-run: "true"
+      - run: test "${{ steps.dry.outputs.state }}" = "dry-run"

@@ -3146,7 +3146,34 @@ async fn run_build(
             ));
         }
     }
-    let build_cache_enabled = req.use_cache;
+    let checkout_dir = resolve_checkout_dir(&dir, None).await?;
+    // Standard repository project file (shadw.yml v1, shared with the
+    // "Deploy to Shadw" GitHub Action). Inert data read from the
+    // checkout root; invalid files fail the build like an invalid vercel.json.
+    // Precedence: deploy request > shadw.yml > persisted project settings.
+    let shadw_config = fluid_build::load_shadw_config_checked(&checkout_dir).map_err(|error| {
+        fluid_build::BuildContractError::invalid_metadata("load shadw.yml", error)
+    })?;
+    if let Some(config) = shadw_config.as_ref() {
+        log(format!(
+            "shadw.yml v{} loaded (root_dir: {}, build cache: {}).",
+            config.version,
+            config.root_dir().unwrap_or("."),
+            if config.build_cache_enabled() { "on" } else { "off" },
+        ));
+        if !config.env.is_empty() {
+            let keys: Vec<&str> = config.env.keys().map(String::as_str).collect();
+            log(format!(
+                "shadw.yml env keys ({}) are applied by the Shadw GitHub Action, not read from the repository at build time: {}.",
+                keys.len(),
+                keys.join(", ")
+            ));
+        }
+    }
+    let build_cache_enabled = req.use_cache
+        && shadw_config
+            .as_ref()
+            .map_or(true, fluid_build::ShadwConfig::build_cache_enabled);
 
     let persisted_root = cloud
         .projects
@@ -3160,11 +3187,20 @@ async fn run_build(
         .filter(|root| !root.is_empty())
         .map(str::to_string)
         .or_else(|| {
+            shadw_config
+                .as_ref()
+                .and_then(fluid_build::ShadwConfig::root_dir)
+                .map(str::to_string)
+        })
+        .or_else(|| {
             Some(persisted_root.trim())
                 .filter(|root| !root.is_empty())
                 .map(str::to_string)
         });
-    let checkout_dir = resolve_checkout_dir(&dir, None).await?;
+    let shadw_root = shadw_config
+        .as_ref()
+        .and_then(fluid_build::ShadwConfig::root_dir)
+        .map(str::to_string);
     let root_package_manager = if req.image_ref.is_none() {
         Some(
             fluid_build::detect_package_manager_checked(&checkout_dir).map_err(|error| {
@@ -3209,6 +3245,8 @@ async fn run_build(
             .is_some_and(|value| !value.trim().is_empty())
         {
             "deploy_request"
+        } else if shadw_root.as_deref() == Some(root) {
+            "shadw_yml"
         } else {
             "project_setting"
         };
