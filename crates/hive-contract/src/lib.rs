@@ -21,9 +21,16 @@ pub mod contract;
 pub mod engine;
 pub mod exec;
 pub mod oplog;
+pub mod reconcile;
 
 pub use audit::{verify, Breach};
-pub use contract::{managed_db_contract, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
+pub use contract::{
+    managed_db_contract, record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec,
+};
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
 pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
 pub use oplog::{Ack, LogEntry, Op, OpLog, OP_DOMAIN};
+pub use reconcile::{
+    reconcile, scope_report, CanonicalDb, Divergence, DivergenceKind, ReconcileReport, ScopeEntry,
+    DECLARED_SCOPE,
+};

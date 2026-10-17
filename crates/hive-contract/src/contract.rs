@@ -19,6 +19,19 @@ use std::collections::BTreeSet;
 /// sentinel and never collapses to "personal".
 pub const UNTAGGED_TENANT: &str = "__untagged__";
 
+/// The STORED tenant tag, mirroring `crates/hive-cloud/src/admin.rs:3338` (`record_tenant`): an
+/// empty or missing tag is the fail-closed sentinel, never "personal".
+///
+/// Request-side normalization (`admin.rs:3357` `norm`, empty -> "personal") is deliberately NOT
+/// mirrored here. This crate only ever sees the verdict the platform already bound, so there is no
+/// path through it that invents a tenant from an unauthenticated request.
+pub fn record_tenant(raw: Option<&str>) -> String {
+    match raw.unwrap_or("").trim() {
+        "" => UNTAGGED_TENANT.to_string(),
+        t => t.to_string(),
+    }
+}
+
 pub const CONTRACT_SCHEMA_VERSION: u32 = 1;
 
 /// Who may emit an operation.
