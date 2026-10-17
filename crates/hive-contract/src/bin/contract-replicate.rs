@@ -499,6 +499,25 @@ async fn main() {
         format!("still {} entries, index unchanged", held.log.len()),
     );
 
+    // A replica running an OLDER contract: the same log, replayed against fewer declared ops.
+    let mut older = Contract::new(&contract.id);
+    older
+        .declare(
+            "db.create",
+            hive_contract::contract::AuthPolicy::TenantAuthorized,
+            hive_contract::contract::Effect::StateWrite,
+            &["db_id", "kind", "project"],
+        )
+        .expect("db.create");
+    let mut r = Replica::new(older);
+    let e = r.merge(&owner_log).expect_err("an undeclared op is a breach");
+    probe(
+        &mut failures,
+        matches!(e, MergeError::UndeclaredOp { .. }) && r.log.is_empty(),
+        "a log carrying an op the replica's contract does not declare is refused",
+        format!("{}: {e}", err_label(&e)),
+    );
+
     // A shorter, divergent history: the only way a deleted key could come back.
     let mut truncated = entries.clone();
     truncated.truncate(heights[0]);
