@@ -1,0 +1,14 @@
+[package]
+name = "hive-contract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Contract + execution-transparency layer for managed database operations"
+
+[dependencies]
+fluid-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

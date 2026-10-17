@@ -20,6 +20,7 @@ members = [
     "crates/hive-browser-proto",
     "crates/hive-edge",
     "crates/hive-cloud",
+    "crates/hive-contract",
     "crates/hive-wg",
     "crates/hive-zkauth",
     "crates/hive-crsql",

@@ -2784,6 +2784,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-contract"
+version = "0.1.0"
+dependencies = [
+ "fluid-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "hive-controlplane"
 version = "0.1.0"
 dependencies = [
