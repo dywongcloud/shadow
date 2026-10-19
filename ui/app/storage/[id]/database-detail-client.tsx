@@ -15,6 +15,8 @@ import {
   POOLING_NOTE, REACH_NOTE, type Reach,
 } from "../db-model";
 import { SqliteDatabaseDetail } from "./sqlite-detail";
+import { DbConsole } from "./db-console";
+import { InstanceMetrics } from "./instance-metrics";
 
 type StudioOpenResponse = {
   action: string;
@@ -219,6 +221,12 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)}` : "unknown"} />
       </div>
 
+      {db.status === "ready" && (
+        <div className="mb-4">
+          <InstanceMetrics db={db} />
+        </div>
+      )}
+
       {db.mode === "simulated" && (
         <Card className="mb-4 border-amber-500/40 bg-amber-500/5 text-sm">
           <div className="flex items-center gap-2 font-medium text-amber-500">This database is simulated</div>
@@ -365,6 +373,12 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         </p>
         {db.container && <p className="mt-3 text-xs text-muted">Backed by container <code className="font-mono">{db.container}</code></p>}
       </Card>
+
+      {db.status === "ready" && (
+        <div className="mb-4">
+          <DbConsole db={db} />
+        </div>
+      )}
 
       {db.note && <Card className="mt-4 text-sm text-secondary">{db.note}</Card>}
     </div>

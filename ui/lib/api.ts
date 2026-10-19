@@ -1074,6 +1074,76 @@ export interface Database {
   primary_node?: string;
 }
 
+/** Console capabilities for one kind. Sent with every console reply; the fallback in the UI is only for the first
+ *  render, because the dashboard and the backend deploy independently. */
+export interface DbConsoleCapabilities {
+  read: boolean;
+  write: boolean;
+  destructive: boolean;
+  note?: string;
+}
+/** One console run: a uniform table whatever the dialect (SQL rows, a RESP reply, object listings), plus where it ran
+ *  and what the server decided the command's tier was. `error` is a server refusal (REFUSED); `message` is an engine
+ *  failure reported with `ok: false`. Neither ever carries a credential. */
+export interface DbConsoleResponse {
+  ok: boolean;
+  db_id: string;
+  name?: string;
+  kind: DbKind;
+  kind_label?: string;
+  /** Which engine actually answered: "sqlite" | "musql" | "postgres" | "redis". */
+  engine?: string | null;
+  host_node?: string;
+  node?: string;
+  /** True when the command was executed on the node hosting the engine rather than here. */
+  proxied?: boolean;
+  /** "instance" for the engine kinds, "node-local" for the platform-native stores. */
+  scope?: string;
+  op?: string;
+  /** "read" | "write" | "destructive", decided server-side from the command text. */
+  tier?: string;
+  columns: string[];
+  rows: unknown[][];
+  row_count?: number;
+  truncated?: boolean;
+  duration_ms?: number;
+  measured_at_ms?: number;
+  message?: string | null;
+  error?: string;
+  code?: string;
+  capabilities?: DbConsoleCapabilities;
+  hint?: string;
+}
+/** Per-INSTANCE metrics (never per-project): `stats` is null when nothing could be measured, and `reachability` says
+ *  why, so a stranded database never reads as a healthy zero. */
+export interface DbInstanceMetrics {
+  db_id: string;
+  name?: string;
+  kind: DbKind;
+  kind_label?: string;
+  status?: DbStatus;
+  mode?: string;
+  host_node?: string;
+  node?: string;
+  reachability?: string;
+  measured?: boolean;
+  observed_at_ms?: number;
+  stats?: Record<string, unknown> | null;
+  note?: string;
+  served_by?: string;
+  sources?: string[];
+  counters?: {
+    requests?: number;
+    errors?: number;
+    bytes_in?: number;
+    bytes_out?: number;
+    last_ms?: number;
+    last_latency_ms?: number;
+    last_error?: string;
+    error_rate?: number;
+  };
+}
+
 export type SandboxStatus = "pending" | "running" | "stopping" | "stopped" | "failed";
 export type SandboxRuntime = "node26" | "node24" | "node22" | "python3.13";
 export interface NetworkPolicy {
