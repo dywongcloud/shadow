@@ -1592,6 +1592,56 @@ async fn dispatch_verified(
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
+        // Per-INSTANCE database metrics OWNER PROXY. An engine kind (SQLite/Postgres/Supabase/Redis)
+        // is a file or a loopback container port on ONE node, so the only node that can measure it
+        // is `Database::host_node`; public hosts are round-robin DNS, so without this hop a metrics
+        // read answered empty on every other node. Owner-routed like `/hrana-mesh` and
+        // `/studio-mesh` (same envelope-free GET + signed tenant), and it answers the LOCAL reading
+        // only, never re-proxying.
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/databases/")
+            && p.split('?')
+                .next()
+                .unwrap_or_default()
+                .ends_with("/metrics") =>
+        {
+            let id = p
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("/v1/databases/")
+                .trim_end_matches("/metrics");
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                jb(axum::Json(
+                    crate::db_metrics::mesh_serve(&cloud, id, &tenant).await,
+                ))
+            }
+        }
+        // PER-INSTANCE CONSOLE OWNER PROXY: an engine kind's console can only run where its file
+        // or loopback port is, so every other node forwards the command here. The envelope carries
+        // the caller's signed delegation token, which `db_console::mesh_serve` re-verifies against
+        // THIS node's own replicated record before touching the engine, and it never re-proxies.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/databases/")
+            && p.split('?')
+                .next()
+                .unwrap_or_default()
+                .ends_with("/console-mesh") =>
+        {
+            let id = p
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("/v1/databases/")
+                .trim_end_matches("/console-mesh");
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(env) => jb(axum::Json(crate::db_console::mesh_serve(&cloud, id, &env).await)),
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+            }
+        }
         // Supabase Studio OWNER PROXY: the container lives on one node and per-DB DNS publishes the
         // full healthy node set, so any other edge forwards here rather than answering
         // MISDIRECTED_REQUEST. Same envelope and re-check shape as the `/hrana-mesh` arm above.

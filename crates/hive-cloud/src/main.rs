@@ -27,7 +27,9 @@ mod cluster;
 mod coi;
 mod compose;
 mod databases;
+mod db_console;
 mod db_gateway;
+mod db_metrics;
 mod db_replicate;
 mod db_rest;
 mod dedicated_ipv4_listener;
@@ -112,6 +114,7 @@ mod sqlite_pool;
 mod state;
 mod storage_api;
 mod storage_broker;
+mod storage_plane;
 mod store_follower;
 mod store_sync;
 mod supervise;
@@ -1855,6 +1858,11 @@ async fn async_main() -> anyhow::Result<()> {
 fn owner_routed(path: &str) -> bool {
     path.starts_with("/v1/sqlite/")
         || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
+        // The per-database CONSOLE is addressed to the node holding the engine (a SQLite file or a
+        // loopback container port), not to the leader: bouncing it to the leader first makes an
+        // unreachable leader fail a command whose host is perfectly reachable.
+        || (path.starts_with("/v1/databases/") && path.ends_with("/console"))
+        || (path.starts_with("/v1/databases/") && path.ends_with("/console-mesh"))
         || (path.starts_with("/v1/databases/") && path.ends_with("/studio-mesh"))
         || path.starts_with("/v1/drive/")
         || path.starts_with("/v1/browser-db/")

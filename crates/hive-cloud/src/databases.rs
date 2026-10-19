@@ -372,6 +372,26 @@ impl BlobStore {
         }
         out
     }
+    /// Permanently removes ONE object. `remove_dir_all` is never used on a caller-supplied name:
+    /// the bucket directory is derived by [`Self::bucket_dir`], which whitelists characters, so a
+    /// key cannot become a path.
+    fn delete_object(&self, bucket: &str, key: &str) -> bool {
+        let path = self
+            .bucket_dir(bucket)
+            .join(format!("{}.bin", hex_encode(key.as_bytes())));
+        std::fs::remove_file(path).is_ok()
+    }
+
+    fn object_size(&self, bucket: &str, key: &str) -> Option<u64> {
+        std::fs::metadata(
+            self.bucket_dir(bucket)
+                .join(format!("{}.bin", hex_encode(key.as_bytes()))),
+        )
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+    }
+
     /// Permanently removes every object in `bucket` (the deleting database's own bucket dir);
     /// best-effort, since an I/O error must not fail the caller's delete flow.
     fn delete_bucket(&self, bucket: &str) {
@@ -1018,6 +1038,93 @@ impl DatabaseStore {
         self.blob.list(bucket)
     }
 
+    /// (object count, total bytes) for a bucket's durable objects, read from the directory rather
+    /// than a counter so a restart cannot zero a number the disk still holds.
+    pub fn blob_stats(&self, bucket: &str) -> (usize, u64) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        if let Ok(rd) = std::fs::read_dir(self.blob.bucket_dir(bucket)) {
+            for e in rd.flatten() {
+                let Ok(meta) = e.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let file_name = e.file_name();
+                let Some(name) = file_name.to_str() else {
+                    continue;
+                };
+                if !name.ends_with(".bin") {
+                    continue;
+                }
+                count += 1;
+                bytes += meta.len();
+            }
+        }
+        (count, bytes)
+    }
+
+    /// (vector count, dimension) for an index. The dimension is that of any stored vector (every
+    /// vector in one index shares it); `None` for an empty index, never a guess.
+    pub fn vector_stats(&self, index: &str) -> (usize, Option<usize>) {
+        let items = self.vector.items.read();
+        let Some(idx) = items.get(index) else {
+            return (0, None);
+        };
+        let dim = idx.values().next().map(|(v, _)| v.len());
+        (idx.len(), dim)
+    }
+
+    /// The database RECORD that owns a platform-native payload name (`bucket`/`queue`/`index`/
+    /// `topic`/`room`), so a `/v1/storage/*` request can be attributed to an INSTANCE rather than
+    /// merely to a tenant. The platform-native lanes are addressed by name, not by database id, and
+    /// per-instance metrics need the bridge. `team` is matched normalized and the payload name is
+    /// matched EXACTLY, so one tenant can never resolve another tenant's instance.
+    pub fn native_db_id(&self, kind: DbKind, team: &str, name: &str) -> Option<String> {
+        let key = match kind {
+            DbKind::Blob => "bucket",
+            DbKind::Queue => "queue",
+            DbKind::Vector => "index",
+            DbKind::Pubsub => "topic",
+            DbKind::Realtime => "room",
+            _ => return None,
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let t = crate::admin::norm(team);
+        self.dbs
+            .read()
+            .iter()
+            .find(|d| {
+                d.kind == kind
+                    && crate::admin::norm(&d.team) == t
+                    && d.connection.get(key).map(String::as_str) == Some(name)
+            })
+            .map(|d| d.id.clone())
+    }
+
+    /// Size of ONE object in bytes, so the console's `HEAD` can report a size without reading an
+    /// arbitrarily large value into memory. `None` when the object is not there, which the console
+    /// reports as an empty result, never as a zero-byte object.
+    pub fn blob_object_size(&self, bucket: &str, key: &str) -> Option<u64> {
+        self.blob.object_size(bucket, key)
+    }
+    /// Removes ONE object; `true` when something was removed. There is deliberately no whole-bucket
+    /// delete on this surface (the console cannot be a one-way door on every object at once).
+    pub fn blob_delete(&self, bucket: &str, key: &str) -> bool {
+        self.blob.delete_object(bucket, key)
+    }
+    /// Non-destructive look at the first `n` pending messages: an inspector must not consume, which
+    /// is exactly what `queue_pop` does.
+    pub fn queue_peek(&self, queue: &str, n: usize) -> Vec<String> {
+        self.queue
+            .msgs
+            .read()
+            .get(queue)
+            .map(|q| q.iter().take(n).cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub fn queue_push(&self, queue: &str, msg: String) -> usize {
         let mut m = self.queue.msgs.write();
         let q = m.entry(queue.to_string()).or_default();
@@ -1035,7 +1142,6 @@ impl DatabaseStore {
             .map(|q| q.len())
             .unwrap_or(0)
     }
-
     pub fn vector_upsert(&self, index: &str, id: &str, v: Vec<f32>, meta: serde_json::Value) {
         self.vector
             .items

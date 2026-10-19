@@ -268,7 +268,16 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             get(database_get).delete(database_delete),
         )
         .route("/v1/databases/:id/credentials", get(database_credentials))
+        .route("/v1/databases/:id/metrics", get(database_metrics))
         .route("/v1/databases/:id/studio-open", post(database_studio_open))
+        .route(
+            "/v1/databases/:id/console",
+            post(crate::db_console::database_console),
+        )
+        .route(
+            "/v1/databases/:id/console-mesh",
+            post(crate::db_console::database_console_mesh),
+        )
         .route("/v1/databases/:id/rotate", post(database_rotate))
         .route(
             "/v1/projects/:project/databases",
@@ -12451,7 +12460,7 @@ async fn webhook_deliveries(
 /// requests, `/credentials` (the ONLY way to obtain the connection string) included. This is the
 /// documented owner/leader fallback for that round-robin-reads-vs-leader-writes split; the leader
 /// re-runs its own tenant check before answering, so proxying can never widen access.
-async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
+pub(crate) async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     if c.is_control_plane_leader() {
         return None;
     }
@@ -12562,6 +12571,116 @@ async fn database_credentials(
         return Ok(Json(v));
     }
     Err(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Deserialize)]
+struct DbMetricsQ {
+    /// Set only by the inner hop of the owner proxy / peer fan-out, so a peer answers with ITS OWN
+    /// measurement instead of proxying (or fanning out) again. Never settable by a real client to
+    /// widen access: it only ever narrows the answer to one node's local view.
+    #[serde(default)]
+    local: Option<bool>,
+}
+
+/// Per-INSTANCE metrics for ONE managed database, for every `DbKind` (SQLite files, Postgres/Supabase
+/// `pg_stat_database` counters, Redis `INFO`, blob object counts and bytes, queue depth, vector
+/// counts, pub/sub subscribers). Not per-project and not per-tenant: two databases of the same kind
+/// inside one project report different numbers.
+///
+/// AUTHORIZATION is per-database and happens HERE, inside the handler: `auth::require_auth` proves
+/// only "some valid token" and never refuses a GET, so an anonymous caller (ANON_TENANT) and a
+/// caller authorized for database A both have to be refused for database B. A platform operator is
+/// admitted across tenants but proxies with the DATABASE'S OWN team, which the owner re-verifies,
+/// rather than with a forgeable operator flag. Nothing in the payload carries a connection field.
+///
+/// ROUTING: an engine kind (SQLite/Postgres/Supabase/Redis) is a file or a loopback port on
+/// `Database::host_node`, so a non-hosting node proxies THERE (`fetch_from_host`: HTTP admin, mesh
+/// gossip GET fallback) instead of reporting a locally measured zero — public hosts are round-robin
+/// DNS, so a naive read would answer empty on most nodes. A platform-native kind (Blob/Queue/Vector/
+/// Pubsub/Realtime) has no owning node, so its reading is local MERGED with the healthy peers, the
+/// shape `/v1/metrics` already uses for the same reason.
+async fn database_metrics(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+    Query(q): Query<DbMetricsQ>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let is_op = operator_allowed(claims.as_ref().map(|e| &e.0), crate::auth::enforced());
+    let local = q.local.unwrap_or(false);
+
+    let mut db = c.databases.get_raw(&id);
+    if db.is_none() && !local {
+        // Database records replicate with a lag, and a restarting node misses them entirely, so a
+        // real, ready database 404s here while the leader still has it (the
+        // `databases_from_leader` measurement). The MASKED route: this node needs the routing facts,
+        // and the engine probe runs on the owner against the owner's own unmasked record.
+        if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}"), &t).await {
+            if let Ok(d) = serde_json::from_value::<crate::databases::Database>(v) {
+                db = Some(d);
+            }
+        }
+    }
+    let Some(db) = db else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+
+    let owner = record_tenant(&db.team).to_string();
+    if !is_op && norm(&owner) != norm(&t) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let carry = if is_op { owner } else { t };
+
+    if crate::db_metrics::owner_routed_kind(db.kind) {
+        if !local && !db.host_node.is_empty() && db.host_node != c.node_name {
+            let path = format!("/v1/databases/{id}/metrics?local=true");
+            if let Some(v) = fetch_from_host(&c, &db.host_node, &path, &carry).await {
+                if v.get("error").is_none() && v.get("db_id").is_some() {
+                    return Ok(Json(annotate_owner(v, &db.host_node)));
+                }
+            }
+            // The owner did not answer. Fall through to the LOCAL reading, which reports
+            // `not_hosted_here` and names the owner: an honest absence, never a zero.
+        }
+        return Ok(Json(crate::db_metrics::local_payload(&c, &db).await));
+    }
+
+    let mut v = crate::db_metrics::local_payload(&c, &db).await;
+    if !local {
+        let peers = all_healthy_peers(&c);
+        if !peers.is_empty() {
+            let mut sources: Vec<String> = vec![c.node_name.clone()];
+            let path = format!("/v1/databases/{id}/metrics?local=true");
+            for p in fan_out_peers_polled(&c, &peers, &carry, &path).await {
+                crate::db_metrics::merge_peer(&id, &mut v, &p, &mut sources);
+            }
+            sources.sort();
+            if let Some(o) = v.as_object_mut() {
+                o.insert("reachability".into(), json!("fleet_merged"));
+                o.insert("measured".into(), json!(true));
+                o.insert("sources".into(), json!(sources));
+            }
+        }
+    }
+    Ok(Json(v))
+}
+
+/// Stamps an owner-answered payload with where it came from, so a dashboard can tell a proxied
+/// measurement from a local one (and an operator can see which node actually answered).
+fn annotate_owner(mut v: Value, host_node: &str) -> Value {
+    if let Some(o) = v.as_object_mut() {
+        let measured = o
+            .get("reachability")
+            .and_then(|r| r.as_str())
+            .map(|r| r == "local" || r == "local_unreachable")
+            .unwrap_or(false);
+        if measured {
+            o.insert("reachability".into(), json!("remote_owner"));
+        }
+        o.insert("served_by".into(), json!(host_node));
+    }
+    v
 }
 
 /// One-click "Open Studio" for a managed Supabase database: mints a short-lived, nonce-bearing
@@ -13742,6 +13861,26 @@ fn write_scope(
     }
 }
 
+/// Attributes one `/v1/storage/*` request to the DATABASE INSTANCE that owns the payload name.
+/// Those lanes are addressed by bucket / queue / index / topic / room, never by database id, so
+/// per-instance metrics need this bridge; a name with no owning record (the lane used standalone) is
+/// not counted at all rather than counted against a wrong instance.
+fn native_tally(
+    c: &Arc<CloudState>,
+    kind: crate::databases::DbKind,
+    team: &str,
+    name: &str,
+    ok: bool,
+    bytes_in: u64,
+    bytes_out: u64,
+    latency_ms: u64,
+    err: crate::db_metrics::ErrorClass,
+) {
+    if let Some(id) = c.databases.native_db_id(kind, team, name) {
+        crate::db_metrics::record(&id, ok, bytes_in, bytes_out, latency_ms, err);
+    }
+}
+
 async fn blob_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13749,10 +13888,22 @@ async fn blob_put(
     Path((bucket, key)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsb = format!("{team}::{bucket}");
     let size = body.len();
     c.databases.blob_put(&nsb, &key, body.to_vec());
+    native_tally(
+        &c,
+        crate::databases::DbKind::Blob,
+        &team,
+        &bucket,
+        true,
+        size as u64,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
     crate::db_replicate::on_write(
         &c,
         is_mirror,
@@ -13781,18 +13932,52 @@ async fn blob_get(
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<axum::response::Response, StatusCode> {
     use axum::response::IntoResponse;
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
     match c.databases.blob_get(&nsb, &key) {
-        Some(data) => Ok(data.into_response()),
+        Some(data) => {
+            native_tally(
+                &c,
+                crate::databases::DbKind::Blob,
+                &t,
+                &bucket,
+                true,
+                0,
+                data.len() as u64,
+                started.elapsed().as_millis() as u64,
+                crate::db_metrics::ErrorClass::None,
+            );
+            Ok(data.into_response())
+        }
         None => {
+            let mut remote: Option<axum::response::Response> = None;
             if let Some(leader) = c.leader_forward_target() {
-                let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
                 let path = format!("/v1/storage/blob/{bucket}/{key}");
                 if let Some(b) = fetch_bytes_from_host(&c, &leader, &path, &t).await {
-                    return Ok(b.into_response());
+                    remote = Some(b.into_response());
                 }
             }
-            Err(StatusCode::NOT_FOUND)
+            let hit = remote.is_some();
+            native_tally(
+                &c,
+                crate::databases::DbKind::Blob,
+                &t,
+                &bucket,
+                hit,
+                0,
+                0,
+                started.elapsed().as_millis() as u64,
+                if hit {
+                    crate::db_metrics::ErrorClass::None
+                } else {
+                    crate::db_metrics::ErrorClass::Client
+                },
+            );
+            match remote {
+                Some(resp) => Ok(resp),
+                None => Err(StatusCode::NOT_FOUND),
+            }
         }
     }
 }
@@ -13806,15 +13991,28 @@ async fn blob_list_keys(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(bucket): Path<String>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
     let keys = c.databases.blob_list(&nsb);
-    if let (true, Some(leader)) = (keys.is_empty(), c.leader_forward_target()) {
-        let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        if let Some(v) =
-            fetch_from_host(&c, &leader, &format!("/v1/storage/blob/{bucket}"), &t).await
-        {
-            return Json(v);
-        }
+    let merged = if let (true, Some(leader)) = (keys.is_empty(), c.leader_forward_target()) {
+        fetch_from_host(&c, &leader, &format!("/v1/storage/blob/{bucket}"), &t).await
+    } else {
+        None
+    };
+    native_tally(
+        &c,
+        crate::databases::DbKind::Blob,
+        &t,
+        &bucket,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
+    if let Some(v) = merged {
+        return Json(v);
     }
     Json(json!({ "bucket": bucket, "keys": keys }))
 }
@@ -13831,9 +14029,21 @@ async fn queue_push(
     Path(queue): Path<String>,
     Json(b): Json<QueueMsg>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsq = format!("{team}::{queue}");
     let depth = c.databases.queue_push(&nsq, b.message.to_string());
+    native_tally(
+        &c,
+        crate::databases::DbKind::Queue,
+        &team,
+        &queue,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
     let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
     crate::db_replicate::on_write(
         &c,
@@ -13854,8 +14064,23 @@ async fn queue_pop(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(queue): Path<String>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
     let msg = c.databases.queue_pop(&nsq);
+    // A POP is the one destructive read in this lane (it consumes a message), so it is counted
+    // whether or not a message was there: the request happened, and an empty pop is not an error.
+    native_tally(
+        &c,
+        crate::databases::DbKind::Queue,
+        &t,
+        &queue,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
     let parsed = msg
         .as_ref()
         .and_then(|m| serde_json::from_str::<Value>(m).ok());
@@ -13874,15 +14099,28 @@ async fn queue_depth(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(queue): Path<String>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
     let depth = c.databases.queue_depth(&nsq);
-    if let (0, Some(leader)) = (depth, c.leader_forward_target()) {
-        let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        if let Some(v) =
-            fetch_from_host(&c, &leader, &format!("/v1/storage/queue/{queue}"), &t).await
-        {
-            return Json(v);
-        }
+    let merged = if let (0, Some(leader)) = (depth, c.leader_forward_target()) {
+        fetch_from_host(&c, &leader, &format!("/v1/storage/queue/{queue}"), &t).await
+    } else {
+        None
+    };
+    native_tally(
+        &c,
+        crate::databases::DbKind::Queue,
+        &t,
+        &queue,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
+    if let Some(v) = merged {
+        return Json(v);
     }
     Json(json!({ "queue": queue, "depth": depth }))
 }
@@ -13902,12 +14140,24 @@ async fn vector_upsert(
     Path(index): Path<String>,
     Json(b): Json<VectorUpsert>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsi = format!("{team}::{index}");
     let mirror_body =
         serde_json::to_vec(&json!({ "id": b.id, "vector": b.vector, "metadata": b.metadata }))
             .unwrap_or_default();
     c.databases.vector_upsert(&nsi, &b.id, b.vector, b.metadata);
+    native_tally(
+        &c,
+        crate::databases::DbKind::Vector,
+        &team,
+        &index,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
     crate::db_replicate::on_write(
         &c,
         is_mirror,
@@ -13938,8 +14188,22 @@ async fn vector_query(
     Path(index): Path<String>,
     Json(b): Json<VectorQuery>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsi = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &index);
-    Json(json!({ "index": index, "matches": c.databases.vector_query(&nsi, &b.vector, b.top_k) }))
+    let matches = c.databases.vector_query(&nsi, &b.vector, b.top_k);
+    native_tally(
+        &c,
+        crate::databases::DbKind::Vector,
+        &t,
+        &index,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
+    Json(json!({ "index": index, "matches": matches }))
 }
 
 #[derive(Deserialize)]
@@ -13999,12 +14263,26 @@ async fn pubsub_info(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(topic): Path<String>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nst = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &topic);
-    Json(json!({
+    let out = json!({
         "topic": topic,
         "subscribers": c.databases.subscriber_count(&nst),
         "published": c.databases.published_count(&nst),
-    }))
+    });
+    native_tally(
+        &c,
+        crate::databases::DbKind::Pubsub,
+        &t,
+        &topic,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
+    Json(out)
 }
 
 /// Publishes to the tenant-namespaced topic on the local broker and fans the message out to EVERY
@@ -14018,9 +14296,21 @@ async fn pubsub_publish(
     Path(topic): Path<String>,
     Json(b): Json<QueueMsg>,
 ) -> Json<Value> {
+    let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nst = format!("{team}::{topic}");
     let delivered = c.databases.publish(&nst, b.message.to_string());
+    native_tally(
+        &c,
+        crate::databases::DbKind::Pubsub,
+        &team,
+        &topic,
+        true,
+        0,
+        0,
+        started.elapsed().as_millis() as u64,
+        crate::db_metrics::ErrorClass::None,
+    );
     let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
     crate::db_replicate::fanout_all(
         &c,
@@ -14045,6 +14335,19 @@ async fn ws_pubsub(
     let mut rx = c
         .databases
         .subscribe(&ns(&c, &headers, claims.as_ref().map(|e| &e.0), &topic));
+    // A socket is the pub/sub instance's own unit of load: the broker's `receiver_count` is the
+    // gauge, this is the connection that produced it.
+    native_tally(
+        &c,
+        crate::databases::DbKind::Pubsub,
+        &tenant(&c, &headers, claims.as_ref().map(|e| &e.0)),
+        &topic,
+        true,
+        0,
+        0,
+        0,
+        crate::db_metrics::ErrorClass::None,
+    );
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         let _ = socket
@@ -14084,6 +14387,17 @@ async fn ws_realtime(
     let mut rx = c.databases.subscribe(&room);
     let db = c.databases.clone();
     let cloud = c.clone();
+    native_tally(
+        &c,
+        crate::databases::DbKind::Realtime,
+        &team,
+        &raw_room,
+        true,
+        0,
+        0,
+        0,
+        crate::db_metrics::ErrorClass::None,
+    );
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         let _ = socket

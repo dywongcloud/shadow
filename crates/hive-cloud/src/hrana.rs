@@ -316,23 +316,37 @@ pub async fn serve(
     }
 
     if !is_owner(&cloud, &db) {
+        let why = host_refusal(&cloud, &db);
         return match forward_to_owner(&cloud, &db, &bearer, &path, &body).await {
             Some(r) => r,
-            None => err(
-                StatusCode::MISDIRECTED_REQUEST,
-                "this database is hosted on another node and that node could not be reached",
-                Some("HOST_UNREACHABLE"),
-            ),
+            None => err(StatusCode::MISDIRECTED_REQUEST, &why, Some("HOST_UNREACHABLE")),
         };
     }
     serve_local(&cloud, &db, endpoint, &body).await
 }
 
-/// Whether this node hosts the database file. An empty `host_node` is a pre-sqlite-lane record
-/// shape, and refusing to guess is the only safe answer: it counts as 'not us', so the proxy fails
-/// honestly instead of creating an empty file here.
+/// The 421 text for a database this node does not hold. STRANDED is named separately from
+/// unreachable: the record's storage node has left this node's registry, and per `db:stranded-host`
+/// nothing was re-hosted (re-hosting under the same slug yields an EMPTY database). To a client the
+/// two look identical, so collapsing them into one sentence hides the one an operator must act on.
+fn host_refusal(cloud: &Arc<CloudState>, db: &Database) -> String {
+    match crate::storage_plane::reach(cloud, db) {
+        crate::storage_plane::Reach::Stranded => {
+            "this database's storage node is no longer in the fleet; the database is stranded and \
+             was not re-hosted"
+                .to_string()
+        }
+        _ => "this database is hosted on another node and that node could not be reached".to_string(),
+    }
+}
+
+/// Whether this node holds the database's bytes — the STORAGE side, the only node allowed to open the
+/// engine. Answered by the storage plane, never by `host_node == node_name` directly: `host_node` is
+/// where the DNS/edge currently points and the record's storage can be elsewhere. An empty holder
+/// counts as 'not us', so a record with no storage node fails honestly instead of being answered
+/// from this node's own (possibly empty) copy.
 fn is_owner(cloud: &Arc<CloudState>, db: &Database) -> bool {
-    !db.host_node.is_empty() && db.host_node == cloud.node_name
+    crate::storage_plane::is_storage_node(cloud, db)
 }
 
 async fn serve_local(
@@ -570,14 +584,23 @@ async fn cursor(cloud: &Arc<CloudState>, db: &Database, version: u8, body: &[u8]
     )
 }
 
-/// The internal envelope carried to the owning node. Bodies ride base64 so the
+/// The internal envelope carried to the STORAGE node. Bodies ride base64 so the
 /// same envelope carries a JSON pipeline body and an NDJSON cursor response.
-fn envelope(bearer: &str, path: &str, body: &[u8]) -> Value {
-    json!({
+///
+/// `storage_key` is the per-database attach capability (`storage_plane::attach_capability`), present
+/// whenever this node can mint one. It is a MAC over (database id, tenant, epoch) under a fleet key,
+/// so it is NOT a credential and cannot be replayed at another database or after a storage move; the
+/// storage node recomputes it from its own record and never trusts this node's claim.
+fn envelope(bearer: &str, path: &str, body: &[u8], attach: Option<&str>) -> Value {
+    let mut v = json!({
         "path": path,
         "auth": bearer,
         "body_b64": base64::engine::general_purpose::STANDARD.encode(body),
-    })
+    });
+    if let Some(k) = attach {
+        v[crate::storage_plane::ATTACH_FIELD] = Value::String(k.to_string());
+    }
+    v
 }
 
 /// Proxies a request to the owning node: HTTP admin first (the same two-tier shape as
@@ -592,15 +615,27 @@ async fn forward_to_owner(
     path: &str,
     body: &[u8],
 ) -> Option<Response> {
-    let node = db.host_node.clone();
+    // The hop goes to the STORAGE node (`storage_plane::storage_node`), not to wherever the DNS
+    // currently points: serving is what compute does, holding the bytes is what this target does,
+    // and only the storage node may open the engine.
+    let node = crate::storage_plane::storage_node(db).to_string();
     if node.is_empty() {
         tracing::warn!(
             db = %db.id,
-            "hrana owner proxy: database record carries no host_node; cannot route"
+            "hrana storage proxy: the record names no storage node (no `storage_node` and no \
+             `host_node`); cannot route"
         );
         return None;
     }
-    let env = envelope(bearer, path, body);
+    let attach = crate::storage_plane::attach_capability(db);
+    if attach.is_none() {
+        tracing::warn!(
+            db = %db.id, storage_node = %node,
+            "hrana storage proxy: no attach capability for this database (no fleet-shared \
+             HIVE_SECRET_KEY, or an untagged record); the storage node will refuse the attach"
+        );
+    }
+    let env = envelope(bearer, path, body, attach.as_deref());
     let route = format!("/v1/databases/{}/hrana-mesh", db.id);
 
     let mut why = String::new();
@@ -647,10 +682,11 @@ async fn forward_to_owner(
         .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
     let Some(target) = target else {
         tracing::warn!(
-            db = %db.id, owner = %node,
+            db = %db.id, storage_node = %node,
+            reach = %crate::storage_plane::reach(cloud, db).label(),
             reason = %why,
-            "hrana owner proxy failed: owner has no gossip address (peer_id/iroh_addr) in this \
-             node's registry, so the mesh fallback could not be attempted"
+            "hrana storage proxy failed: the storage node has no gossip address (peer_id/iroh_addr) \
+             in this node's registry, so the mesh fallback could not be attempted"
         );
         return None;
     };
@@ -722,6 +758,22 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value
             StatusCode::UNAUTHORIZED,
             "invalid auth token for this database",
         );
+    }
+    // ATTACH GATE. The bearer proves the CALLER may use this database; the capability proves the
+    // attach itself is current — bound to this database id, to the tenant the STORAGE node's own
+    // record names (never a request header), and to this node's fencing epoch, so a replay at
+    // another database, a cross-tenant attach, or compute left over from before a storage move all
+    // fail here, before a byte is read. `NotApplicable` (this node cannot derive the fleet key)
+    // keeps the mesh gate and the bearer check above and adds no weaker one.
+    match crate::storage_plane::verify_attach(
+        &db,
+        env.get(crate::storage_plane::ATTACH_FIELD)
+            .and_then(|a| a.as_str()),
+    ) {
+        crate::storage_plane::Verdict::Refused => {
+            return refuse(StatusCode::FORBIDDEN, crate::storage_plane::ATTACH_REFUSAL);
+        }
+        crate::storage_plane::Verdict::Ok | crate::storage_plane::Verdict::NotApplicable => {}
     }
     if !is_owner(cloud, &db) {
         return refuse(
@@ -838,6 +890,7 @@ async fn engine_stats(
                 "host_node": d.host_node,
                 "owned_here": d.host_node == c.node_name,
                 "file": d.connection.get("file").cloned().unwrap_or_default(),
+                "storage": crate::storage_plane::storage_json(&c, &d),
             })
         })
         .collect();
@@ -910,6 +963,18 @@ async fn set_engine_route(
         }
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e, Some("SQLITE_ERROR")),
     }
+}
+
+/// Live Hrana stream count for ONE database: the interactive transactions (batons) this node is
+/// holding against that database's file. Every stream pins a pooled connection, so it is the closest
+/// thing a SQLite instance has to a connection count — and like the file it is node-local, read on
+/// the owner.
+pub fn open_streams_for(db_id: &str) -> usize {
+    streams()
+        .lock()
+        .values()
+        .filter(|s| s.db_id == db_id)
+        .count()
 }
 
 /// Operator view of this NODE's live SQLite pools and open streams. Node-local by nature (a pool is

@@ -173,6 +173,14 @@ const RULES: &[Rule] = &[
     ),
     rule(POST, "/v1/databases", Role::Member),
     rule(POST, "/v1/databases/replica", Role::Member),
+    // The console runs commands against one database instance. READ and WRITE are day-to-day
+    // database work; the DESTRUCTIVE tier is gated again inside the handler (team admin or
+    // operator), because one path carries all three tiers and a rule can only name a floor.
+    rule(POST, "/v1/databases/:id/console", Role::Member),
+    // The owner hop: addressed to one node by a peer holding a signed delegation for the
+    // database's own team, which `db_console::mesh_serve` re-verifies. Member floor, like the
+    // console itself — a lower floor here would let a member's request fail only on the far node.
+    rule(POST, "/v1/databases/:id/console-mesh", Role::Member),
     rule(POST, "/v1/databases/:id/sqlite-engine", Role::Member),
     rule(POST, "/v1/databases/:id/studio-open", Role::Member),
     rule(WRITES, "/v1/projects/:project/sandboxes/*", Role::Member),
@@ -247,7 +255,7 @@ pub fn floor(method: &Method, path: &str) -> Role {
 }
 
 /// A role claim as a [`Role`]; anything this table does not know is the lowest.
-fn role_of(claim: &str) -> Role {
+pub(crate) fn role_of(claim: &str) -> Role {
     match claim {
         "owner" => Role::Owner,
         "admin" => Role::Admin,

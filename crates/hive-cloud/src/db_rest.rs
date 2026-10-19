@@ -62,27 +62,48 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
     let Some(db) = cloud.databases.by_db_host(&host) else {
         return with_cors(err(StatusCode::NOT_FOUND, "no database at this hostname"));
     };
+    // Per-INSTANCE accounting: every request this gateway serves belongs to exactly one database
+    // record, whichever arm answers it. Recorded at the single front door so no kind is missed and
+    // no kind is counted twice.
+    let started = std::time::Instant::now();
+    let db_id = db.id.clone();
+    let tally = |status: StatusCode| {
+        crate::db_metrics::record_http(
+            &db_id,
+            status.as_u16(),
+            started.elapsed().as_millis() as u64,
+        );
+    };
 
     if db.kind == DbKind::Supabase {
         if matches!(*req.method(), Method::GET | Method::HEAD) {
             req = match studio_require_empty_body(req).await {
                 Ok(req) => req,
-                Err(response) => return response,
+                Err(response) => {
+                    tally(response.status());
+                    return response;
+                }
             };
         }
         if let Some(kind) = studio_cache_candidate(&req) {
-            return studio_cached_route(&cloud, &db, req, kind).await;
+            let resp = studio_cached_route(&cloud, &db, req, kind).await;
+            tally(resp.status());
+            return resp;
         }
         if !db.host_node.is_empty() && db.host_node != cloud.node_name {
-            return match studio_forward_to_owner(&cloud, &db, req).await {
+            let resp = match studio_forward_to_owner(&cloud, &db, req).await {
                 Some(resp) => resp,
                 None => err(
                     StatusCode::MISDIRECTED_REQUEST,
                     "this Supabase database's owner node is unreachable",
                 ),
             };
+            tally(resp.status());
+            return resp;
         }
-        return supabase_studio_proxy(&cloud, &db, req).await;
+        let resp = supabase_studio_proxy(&cloud, &db, req).await;
+        tally(resp.status());
+        return resp;
     }
 
     let local = db
@@ -101,6 +122,7 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
             header::WWW_AUTHENTICATE,
             header::HeaderValue::from_static("Bearer"),
         );
+        tally(StatusCode::UNAUTHORIZED);
         return with_cors(resp);
     }
 
@@ -109,13 +131,17 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
         let bytes = match axum::body::to_bytes(body, BODY_CAP).await {
             Ok(b) => b,
             Err(_) => {
+                tally(StatusCode::PAYLOAD_TOO_LARGE);
                 return with_cors(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
             }
         };
-        return with_cors(crate::hrana::serve(cloud, db, bearer, method, path, bytes).await);
+        let resp = crate::hrana::serve(cloud, db, bearer, method, path, bytes).await;
+        tally(resp.status());
+        return with_cors(resp);
     }
 
     let Some(local_port) = local else {
+        tally(StatusCode::MISDIRECTED_REQUEST);
         return with_cors(err(
             StatusCode::MISDIRECTED_REQUEST,
             "database is not hosted on this node (stale DNS?) or has no live engine",
@@ -123,6 +149,7 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
     };
 
     let Some(_permit) = rest_conn_permit(&db.id) else {
+        tally(StatusCode::SERVICE_UNAVAILABLE);
         return with_cors(err(
             StatusCode::SERVICE_UNAVAILABLE,
             "database REST concurrency limit reached; retry",
@@ -141,6 +168,7 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
             ),
         ),
     };
+    tally(out.status());
     with_cors(out)
 }
 
@@ -304,6 +332,47 @@ fn maybe_b64(v: Value, on: bool) -> Value {
     enc(v)
 }
 
+/// Redis commands no caller may run through the platform: engine administration, host-state leaks,
+/// server-side scripting and the multi-reply SUBSCRIBE family. ONE list, read by both the REST
+/// gateway (`command_denied`) and the per-database console (`redis_command_denied`), so the two
+/// surfaces can never disagree about what is refused.
+const DENY_REDIS_COMMANDS: &[&str] = &[
+    "shutdown",
+    "config",
+    "debug",
+    "module",
+    "acl",
+    "cluster",
+    "replicaof",
+    "slaveof",
+    "migrate",
+    "save",
+    "bgsave",
+    "bgrewriteaof",
+    "failover",
+    "latency",
+    "monitor",
+    "psync",
+    "sync",
+    "slowlog",
+    "eval",
+    "evalsha",
+    "eval_ro",
+    "evalsha_ro",
+    "fcall",
+    "fcall_ro",
+    "function",
+    "script",
+    "reset",
+    "swapdb",
+    "subscribe",
+    "psubscribe",
+    "ssubscribe",
+    "unsubscribe",
+    "punsubscribe",
+    "sunsubscribe",
+];
+
 async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Response {
     match tokio::time::timeout(
         ENGINE_TIMEOUT,
@@ -318,50 +387,20 @@ async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Re
     }
 }
 
+/// The deny list itself, as a predicate: the console classifies commands with the SAME list rather
+/// than keeping a second copy that could drift out of step with the gateway.
+pub(crate) fn redis_command_denied(cmd: &str) -> bool {
+    DENY_REDIS_COMMANDS.contains(&cmd.to_ascii_lowercase().as_str())
+}
+
 /// Commands that reconfigure/kill the engine or leak host state are refused: the REST bearer proves
 /// access to the DATA, not engine administration (Upstash blocks the same class). Also denied:
 /// server-side scripting (EVAL/FUNCTION LOAD persist and run arbitrary Lua, and EVAL can reach
 /// commands like MIGRATE even though MIGRATE itself is denied: a real bypass of this list) and the
 /// SUBSCRIBE family (RESP2 emits more than one reply frame per command, which desyncs
 /// `run_pipeline`'s one-reply-per-command assumption and misattributes later replies).
-fn command_denied(cmd: &str) -> Option<Response> {
-    const DENY: &[&str] = &[
-        "shutdown",
-        "config",
-        "debug",
-        "module",
-        "acl",
-        "cluster",
-        "replicaof",
-        "slaveof",
-        "migrate",
-        "save",
-        "bgsave",
-        "bgrewriteaof",
-        "failover",
-        "latency",
-        "monitor",
-        "psync",
-        "sync",
-        "slowlog",
-        "eval",
-        "evalsha",
-        "eval_ro",
-        "evalsha_ro",
-        "fcall",
-        "fcall_ro",
-        "function",
-        "script",
-        "reset",
-        "swapdb",
-        "subscribe",
-        "psubscribe",
-        "ssubscribe",
-        "unsubscribe",
-        "punsubscribe",
-        "sunsubscribe",
-    ];
-    if DENY.contains(&cmd.to_ascii_lowercase().as_str()) {
+pub(crate) fn command_denied(cmd: &str) -> Option<Response> {
+    if redis_command_denied(cmd) {
         return Some(err(
             StatusCode::FORBIDDEN,
             &format!(
@@ -386,10 +425,10 @@ fn json_arg(v: Value) -> String {
 }
 
 #[derive(serde::Deserialize)]
-struct SqlReq {
-    query: String,
+pub(crate) struct SqlReq {
+    pub(crate) query: String,
     #[serde(default)]
-    params: Vec<Value>,
+    pub(crate) params: Vec<Value>,
 }
 
 /// SQL over HTTP (`POST /sql`): the caller's own failing query (syntax, constraint, type) surfaces
@@ -479,7 +518,7 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
-async fn run_sql(
+pub(crate) async fn run_sql(
     port: u16,
     user: &str,
     password: &str,
@@ -557,6 +596,146 @@ async fn run_sql(
     drop(client);
     let _ = driver.await;
     Ok(json!({ "fields": fields, "rows": rows_json, "rowCount": affected }))
+}
+
+/// Read-only introspection of ONE managed Postgres/Supabase instance, in the units that mean
+/// something for that engine (not a tenant request count): database size, live backends, table count
+/// and the `pg_stat_database` commit/rollback/tuple counters. Supabase IS Postgres underneath, so
+/// both kinds read the same facts and a Supabase instance is not reduced to "has a Studio URL".
+///
+/// The query is a fixed constant with NO parameters and no caller text, so this surface cannot be
+/// steered into `COPY ... TO PROGRAM` or any other host escape; it runs on the engine's loopback
+/// port with the database's own credentials, the same connection `postgres_rest` uses.
+pub(crate) async fn postgres_engine_stats(
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+) -> anyhow::Result<Value> {
+    const SQL: &str = "SELECT \
+        current_database()::text AS database, \
+        pg_database_size(current_database())::bigint AS bytes, \
+        (SELECT count(*)::bigint FROM pg_stat_activity WHERE datname = current_database()) AS backends, \
+        (SELECT count(*)::bigint FROM information_schema.tables \
+           WHERE table_schema NOT IN ('pg_catalog','information_schema')) AS tables, \
+        (SELECT coalesce(sum(xact_commit),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS xact_commit, \
+        (SELECT coalesce(sum(xact_rollback),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS xact_rollback, \
+        (SELECT coalesce(sum(tup_inserted),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS tup_inserted, \
+        (SELECT coalesce(sum(tup_updated),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS tup_updated, \
+        (SELECT coalesce(sum(tup_deleted),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS tup_deleted, \
+        (SELECT coalesce(sum(tup_returned),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS tup_returned, \
+        (SELECT coalesce(sum(blks_read),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS blks_read, \
+        (SELECT coalesce(sum(blks_hit),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS blks_hit, \
+        (SELECT coalesce(sum(deadlocks),0)::bigint FROM pg_stat_database \
+           WHERE datname = current_database()) AS deadlocks";
+    let rows = run_sql(
+        port,
+        user,
+        password,
+        dbname,
+        &SqlReq {
+            query: SQL.to_string(),
+            params: Vec::new(),
+        },
+    )
+    .await?;
+    let first = rows
+        .get("rows")
+        .and_then(|r| r.as_array())
+        .and_then(|r| r.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    if first.is_null() {
+        anyhow::bail!("engine returned no row");
+    }
+    Ok(first)
+}
+
+/// Read-only introspection of ONE managed Redis instance: `INFO` in the fields that mean something
+/// for a key/value engine (memory, clients, command throughput, hit rate, keyspace) plus `DBSIZE`,
+/// which no single `INFO` field reports for the selected db. This is RESP, not SQL: Redis has no
+/// tables, and forcing a row-shaped box onto it would report nothing useful.
+///
+/// Both commands are fixed constants and are NOT filtered through the REST `command_denied` list,
+/// which exists to stop a TENANT reaching engine administration; this is the platform reading its
+/// own engine with commands (`INFO`, `DBSIZE`) that list allows anyway.
+pub(crate) async fn redis_engine_stats(port: u16, password: &str) -> anyhow::Result<Value> {
+    let info = crate::resp::run_command(port, password, &["INFO".to_string()]).await?;
+    let text = match info {
+        crate::resp::Reply::Text(s) => s,
+        other => anyhow::bail!("unexpected INFO reply: {other:?}"),
+    };
+    let mut out = serde_json::Map::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        // Only the fields an operator reasons about: `INFO` also carries build ids, config paths and
+        // module names, and a metrics payload is smaller and safer for not echoing them.
+        const KEEP: &[&str] = &[
+            "redis_version",
+            "uptime_in_seconds",
+            "connected_clients",
+            "used_memory",
+            "used_memory_peak",
+            "used_memory_rss",
+            "maxmemory",
+            "total_commands_processed",
+            "instantaneous_ops_per_sec",
+            "keyspace_hits",
+            "keyspace_misses",
+            "expired_keys",
+            "evicted_keys",
+            "connected_slaves",
+        ];
+        if KEEP.contains(&k) {
+            let val = match v.trim().parse::<i64>() {
+                Ok(n) => json!(n),
+                Err(_) => json!(v.trim()),
+            };
+            out.insert(k.to_string(), val);
+        }
+        if let Some(rest) = k.strip_prefix("db") {
+            if rest.chars().all(|c| c.is_ascii_digit()) {
+                let mut keys: i64 = 0;
+                let mut expires: i64 = 0;
+                for part in v.split(',') {
+                    if let Some((pk, pv)) = part.split_once('=') {
+                        match pk.trim() {
+                            "keys" => keys = pv.trim().parse().unwrap_or(0),
+                            "expires" => expires = pv.trim().parse().unwrap_or(0),
+                            _ => {}
+                        }
+                    }
+                }
+                out.insert("keys".into(), json!(keys));
+                out.insert("expires".into(), json!(expires));
+            }
+        }
+    }
+    match crate::resp::run_command(port, password, &["DBSIZE".to_string()]).await {
+        Ok(crate::resp::Reply::Int(n)) => {
+            out.insert("dbsize".into(), json!(n));
+        }
+        Ok(_) => {}
+        Err(_) => {}
+    }
+    if out.is_empty() {
+        anyhow::bail!("engine returned no usable INFO fields");
+    }
+    Ok(Value::Object(out))
 }
 
 /// A permissive text decode used ONLY for types whose binary wire format is exactly UTF-8 bytes

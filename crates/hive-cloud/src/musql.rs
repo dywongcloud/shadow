@@ -110,6 +110,15 @@ fn listen_addr() -> String {
     env_str("HIVE_MUSQL_LISTEN", "127.0.0.1:8099")
 }
 
+/// The STORAGE-side attach address of this node's engine: loopback, on the node that holds the
+/// files. Named by `crate::storage_plane` so the storage plane can state where the bytes are without
+/// knowing how the sidecar is configured; no other node dials it directly — a remote compute tier
+/// asks the storage node to run the statement (`hrana::mesh_serve`), which is what keeps one writer
+/// per file when compute and storage are not the same node.
+pub fn local_attach_addr() -> String {
+    format!("http://{}", listen_addr())
+}
+
 /// musqld's stream idle timeout. MUST exceed Hive's own `HIVE_SQLITE_STREAM_IDLE_MS` (up to 600 s),
 /// or the engine kills an interactive transaction mid-stream while Hive still believes the stream
 /// is live.
@@ -193,7 +202,7 @@ pub fn spawn() -> bool {
     }
     let addr = listen_addr();
     let sc = Arc::new(Sidecar {
-        base: format!("http://{addr}"),
+        base: local_attach_addr(),
         ready: AtomicBool::new(false),
         restarts: AtomicU64::new(0),
     });
@@ -362,8 +371,11 @@ pub struct MusqlEngine {
 impl MusqlEngine {
     /// Open a stream, queueing for admission when the database is at its limit.
     pub async fn connect(client: reqwest::Client, db_id: &str) -> Result<MusqlEngine, String> {
+        // Only the node holding the bytes may open the engine: a node that is not the storage node
+        // must attach across the mesh (`hrana::forward_to_owner`), never open the file here, and
+        // musqld is a loopback sidecar precisely so that cannot happen by accident.
         let sc = sidecar().ok_or_else(|| {
-            "musql is not running on this node (no sidecar); this database cannot be served here"
+            "this node runs no musql engine, so it cannot serve a database whose storage lives here"
                 .to_string()
         })?;
         if !sc.ready.load(Ordering::SeqCst) {
