@@ -952,11 +952,19 @@ async fn exec_local(
 /// the easiest credential leak on the platform. Also bounds the length.
 fn scrub(s: &str) -> String {
     let mut out = s.to_string();
-    while let Some(start) = out.find("://") {
+    // A rewrite keeps the `://` it started from, so rescanning from the front lands on the same
+    // offset forever: resume strictly AFTER the span just rewritten, or a single DSN in an engine
+    // error hangs the request that reported it.
+    let mut cursor = 0usize;
+    while let Some(rel) = out[cursor..].find("://") {
+        let start = cursor + rel;
         let after = &out[start + 3..];
         let at = match after.find('@') {
             Some(i) => i,
-            None => break,
+            None => {
+                cursor = start + 3;
+                continue;
+            }
         };
         let host_start = start + 3 + at;
         let end = out[host_start..]
@@ -966,13 +974,19 @@ fn scrub(s: &str) -> String {
         // Keep the scheme and the host, drop everything between them (userinfo).
         let replaced = format!("{}***:***@{}", &out[..start + 3], &out[host_start + 1..end]);
         out = format!("{replaced}{}", &out[end..]);
+        cursor = replaced.len();
         if out.len() > ERR_CAP * 4 {
             break;
         }
     }
     if out.len() > ERR_CAP {
-        out.truncate(ERR_CAP);
-        out.push_str("…");
+        // `truncate` panics off a char boundary, and an engine error is arbitrary UTF-8.
+        let mut end = ERR_CAP;
+        while end > 0 && !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push('…');
     }
     out
 }
@@ -1546,8 +1560,20 @@ mod tests {
             scrub("engine unreachable: postgres://hive:s3cr3t@127.0.0.1:5432/hive"),
             "engine unreachable: postgres://***:***@127.0.0.1:5432/hive"
         );
+        // Two DSNs, and a scheme with no userinfo: every span is scrubbed and the loop terminates.
+        assert_eq!(
+            scrub("redis://u:p@10.0.0.1:6379 then postgres://a:b@10.0.0.2:5432/db"),
+            "redis://***:***@10.0.0.1:6379 then postgres://***:***@10.0.0.2:5432/db"
+        );
+        assert_eq!(scrub("failed: https://example.com/x"), "failed: https://example.com/x");
         let long = "x".repeat(5000);
-        assert!(scrub(&long).len() <= ERR_CAP + 1);
+        let scrubbed = scrub(&long);
+        assert!(scrubbed.len() <= ERR_CAP + "…".len(), "{}", scrubbed.len());
+        assert!(scrubbed.len() < 500, "the cap must actually bite: {}", scrubbed.len());
+        assert!(scrubbed.ends_with('…'));
+        // A multi-byte char straddling the cap must not panic `truncate`.
+        let wide = "é".repeat(500);
+        assert!(scrub(&wide).len() <= ERR_CAP + "…".len());
     }
 
     #[test]
