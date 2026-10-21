@@ -320,21 +320,39 @@ static PROJECT_TEAMS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
 async fn reconcile_project_teams_schema(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
 ) {
+    reconcile_project_teams_schema_by(s, std::time::Instant::now() + SQL_OP_TIMEOUT).await
+}
+
+/// Bounded by `deadline` (a write path passes `SQL_OP_TIMEOUT`; a request path passes its own read
+/// budget). The latch is only reached when BOTH statements succeed, so a partial reconcile is
+/// retried -- but never at the expense of the deadline.
+async fn reconcile_project_teams_schema_by(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    deadline: std::time::Instant,
+) {
     if PROJECT_TEAMS_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
-    if let Err(e) = exec(
+    let Some(budget) = budget_left(deadline) else {
+        return;
+    };
+    if let Err(e) = exec_with_budget(
         s,
         "ALTER TABLE project_teams ADD COLUMN IF NOT EXISTS deleted_ms BIGINT DEFAULT 0",
+        budget,
     )
     .await
     {
         tracing::warn!(error = %e, "relational: ALTER TABLE project_teams add deleted_ms failed");
         return;
     }
-    if let Err(e) = exec(
+    let Some(budget) = budget_left(deadline) else {
+        return;
+    };
+    if let Err(e) = exec_with_budget(
         s,
         "UPDATE project_teams SET deleted_ms = 0 WHERE deleted_ms IS NULL",
+        budget,
     )
     .await
     {
@@ -645,16 +663,36 @@ async fn exec(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     sql: &str,
 ) -> Result<Vec<ExecResult>, String> {
+    exec_with_budget(s, sql, SQL_OP_TIMEOUT).await
+}
+
+/// `exec` at a caller's budget, which MUST be the bound a request path uses: `block_in_place` holds
+/// the serving worker thread inside `block_on` for the whole inner bound, so a
+/// `tokio::time::timeout` wrapped AROUND this call cannot preempt it -- the budget has to be passed
+/// in and applied to `s.execute` itself.
+async fn exec_with_budget(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    sql: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<ExecResult>, String> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::block_in_place(move || {
         handle.block_on(async {
-            match tokio::time::timeout(SQL_OP_TIMEOUT, s.execute(sql)).await {
+            match tokio::time::timeout(budget, s.execute(sql)).await {
                 Ok(Ok(res)) => Ok(res),
                 Ok(Err(e)) => Err(format!("{e}")),
-                Err(_) => Err(format!("guardian sql execute timed out after {SQL_OP_TIMEOUT:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
+                Err(_) => Err(format!("guardian sql execute timed out after {budget:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
             }
         })
     })
+}
+
+/// Time left on a request-path deadline; `None` = spent, so the caller skips the statement instead
+/// of paying a bound the request no longer has. One deadline covers every statement of one read, so
+/// a wedged namespace costs the budget ONCE, never once per statement.
+fn budget_left(deadline: std::time::Instant) -> Option<std::time::Duration> {
+    let left = deadline.checked_duration_since(std::time::Instant::now())?;
+    (!left.is_zero()).then_some(left)
 }
 
 fn project_team_upsert_sql(project: &str, team: &str, root_dir: &str, updated_ms: u64) -> String {
@@ -782,19 +820,72 @@ pub(crate) async fn rename_project(from: &str, to: &str, updated_ms: u64) {
     }
 }
 
+/// Budget for ONE request-path relational mirror read (`HIVE_RELATIONAL_SQL_READ_MS`, default
+/// 1500 ms): far below `SQL_OP_TIMEOUT` because `gitops_projects` and the ownership checks in
+/// `admin`/`gossip` call this while a tenant waits, and every caller already treats an empty
+/// answer as "the mirror could not confirm" -- which is exactly what a wedged namespace yields
+/// today, only 20 s later.
+fn relational_read_budget() -> std::time::Duration {
+    static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("HIVE_RELATIONAL_SQL_READ_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_millis(1500))
+    })
+}
+
+/// Rate-limited (30 s) WARN for a relational mirror read that missed its budget: silent degradation
+/// here is what let a wedged namespace look like a GitOps outage.
+fn warn_relational_read_slow(budget: std::time::Duration, team: &str) {
+    use std::sync::atomic::Ordering;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = wall_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 30_000
+        && LAST
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        tracing::warn!(
+            team,
+            budget_ms = budget.as_millis() as u64,
+            "relational: project mirror read missed its budget -- serving the caller's other \
+             sources instead (the guardian namespace may be wedged; see SQL_OP_TIMEOUT)"
+        );
+    }
+}
+
 /// Every project this node's replica holds for `team`, including projects with no deployment
-/// anywhere (backs `gitops_projects`' fleet-visibility fallback).
+/// anywhere (backs `gitops_projects`' fleet-visibility fallback). Bounded by
+/// [`relational_read_budget`] and empty on a miss: it is a best-effort fallback, so a request path
+/// never waits on a wedged guardian namespace for it and the caller's own sources still answer.
 pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
+    let budget = relational_read_budget();
+    let deadline = std::time::Instant::now() + budget;
+    let miss = || warn_relational_read_slow(budget, team);
     let Ok(db) = crate::guardian::sql_db().await else {
         return Vec::new();
     };
+    // An unbuilt catalog reads empty anyway (and `session()` would wait out SQL_OP_TIMEOUT for it),
+    // so leave the request now rather than pay the wait.
+    if !index_ready() {
+        return Vec::new();
+    }
     let mut s = session(db).await;
-    reconcile_project_teams_schema(&mut s).await;
+    reconcile_project_teams_schema_by(&mut s, deadline).await;
     let query = format!(
         "SELECT project, team FROM project_teams WHERE team = {} AND deleted_ms = 0",
         q(team)
     );
-    let Ok(res) = exec(&mut s, &query).await else {
+    let Some(left) = budget_left(deadline) else {
+        miss();
+        return Vec::new();
+    };
+    let Ok(res) = exec_with_budget(&mut s, &query, left).await else {
+        miss();
         return Vec::new();
     };
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
