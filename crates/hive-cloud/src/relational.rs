@@ -2618,7 +2618,15 @@ pub(crate) enum BillingSnapshot {
 /// (`admin::billing_invoices` appends the draft).
 pub(crate) async fn billing_snapshot(tenant: &str) -> BillingSnapshot {
     let budget = billing_read_budget();
-    match tokio::time::timeout(budget, billing_snapshot_uncapped(tenant)).await {
+    let deadline = std::time::Instant::now() + budget;
+    // Every statement below goes through `exec_with_budget`, which holds the serving worker inside
+    // `block_in_place` for its OWN bound, so a `tokio::time::timeout` wrapped AROUND this call
+    // cannot preempt it (see `exec_with_budget`'s doc): the budget is carried IN as `deadline` and
+    // applied to each `s.execute` itself. Before this, a wedged namespace made
+    // `GET /v1/billing/ledger` pay the full `SQL_OP_TIMEOUT` (10 s) per statement -- measured
+    // 10.68 s with ZERO budget-miss WARNs, i.e. the 1500 ms bound never fired. The outer timeout
+    // stays as a backstop for the non-blocking waits ahead of the first statement.
+    match tokio::time::timeout(budget, billing_snapshot_uncapped(tenant, deadline)).await {
         Ok(v) => v,
         Err(_) => {
             warn_billing_read_slow(budget);
@@ -2627,10 +2635,14 @@ pub(crate) async fn billing_snapshot(tenant: &str) -> BillingSnapshot {
     }
 }
 
-async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
+async fn billing_snapshot_uncapped(tenant: &str, deadline: std::time::Instant) -> BillingSnapshot {
+    let budget = billing_read_budget();
+    let miss = || warn_billing_read_slow(budget);
     let Ok(db) = crate::guardian::sql_db().await else {
         return BillingSnapshot::Unavailable;
     };
+    // An unbuilt catalog reads empty anyway (and `session()` would wait out SQL_OP_TIMEOUT for it),
+    // so leave the request now rather than pay the wait.
     if !index_ready() {
         return BillingSnapshot::Unavailable;
     }
@@ -2642,12 +2654,21 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
          FROM billing_accounts WHERE tenant = {}",
         q(tenant)
     );
-    let account = match exec(&mut s, &acc_q).await {
+    // One deadline covers every statement of this read (`budget_left`), so a wedged namespace
+    // costs the budget ONCE for the whole request, never once per statement.
+    let Some(left) = budget_left(deadline) else {
+        miss();
+        return BillingSnapshot::Unavailable;
+    };
+    let account = match exec_with_budget(&mut s, &acc_q, left).await {
         Ok(r) => rows_to_json_objects(&r)
             .into_iter()
             .next()
             .map(|v| v.to_string()),
-        Err(_) => return BillingSnapshot::Unavailable,
+        Err(_) => {
+            miss();
+            return BillingSnapshot::Unavailable;
+        }
     };
     if account.is_none() {
         return BillingSnapshot::NotMirrored;
@@ -2658,9 +2679,19 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
          FROM billing_ledger WHERE tenant = {} ORDER BY ts_ms DESC",
         q(tenant)
     );
-    let ledger = match exec(&mut s, &ledger_q).await {
-        Ok(r) => Some(serde_json::Value::Array(rows_to_json_objects(&r)).to_string()),
-        Err(_) => None,
+    // A ledger the mirror cannot read is withheld, never served as `[]` for a tenant with history.
+    let ledger = match budget_left(deadline) {
+        Some(left) => match exec_with_budget(&mut s, &ledger_q, left).await {
+            Ok(r) => Some(serde_json::Value::Array(rows_to_json_objects(&r)).to_string()),
+            Err(_) => {
+                miss();
+                None
+            }
+        },
+        None => {
+            miss();
+            None
+        }
     };
 
     let inv_q = format!(
@@ -2669,12 +2700,22 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
          FROM billing_invoices WHERE tenant = {} ORDER BY period_start_ms DESC",
         q(tenant)
     );
-    let invoice_rows = match exec(&mut s, &inv_q).await {
-        Ok(r) => rows_to_json_objects(&r),
-        Err(_) => return BillingSnapshot::Mirrored {
+    let Some(left) = budget_left(deadline) else {
+        miss();
+        return BillingSnapshot::Mirrored {
             ledger,
             invoices: None,
-        },
+        };
+    };
+    let invoice_rows = match exec_with_budget(&mut s, &inv_q, left).await {
+        Ok(r) => rows_to_json_objects(&r),
+        Err(_) => {
+            miss();
+            return BillingSnapshot::Mirrored {
+                ledger,
+                invoices: None,
+            };
+        }
     };
     let mut invoices_out = Vec::with_capacity(invoice_rows.len());
     for mut inv in invoice_rows {
@@ -2687,7 +2728,14 @@ async fn billing_snapshot_uncapped(tenant: &str) -> BillingSnapshot {
             "SELECT description, amount_cents FROM billing_invoice_lines WHERE invoice_id = {} ORDER BY id",
             q(&id)
         );
-        match exec(&mut s, &lines_q).await {
+        let Some(left) = budget_left(deadline) else {
+            miss();
+            return BillingSnapshot::Mirrored {
+                ledger,
+                invoices: None,
+            };
+        };
+        match exec_with_budget(&mut s, &lines_q, left).await {
             Ok(r) => {
                 let lines = rows_to_json_objects(&r);
                 if let Some(obj) = inv.as_object_mut() {
