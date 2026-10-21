@@ -953,6 +953,23 @@ fn studio_safe_asset_path(path: &str) -> bool {
         })
 }
 
+/// `/api/v1/projects/<ref>/functions/deploy`, the Studio Edge Functions deploy mutation answered at
+/// this edge. One project ref per self-hosted stack, and the segment is validated rather than
+/// trusted: a tenant string never becomes a path.
+fn studio_functions_deploy_path(path: &str) -> bool {
+    let Some(project_ref) = path
+        .strip_prefix("/api/v1/projects/")
+        .and_then(|rest| rest.strip_suffix(STUDIO_FUNCTIONS_DEPLOY_SUFFIX))
+    else {
+        return false;
+    };
+    !project_ref.is_empty()
+        && project_ref.len() <= 64
+        && project_ref
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
 /// Positive allowlist derived from the pinned image's Next.js build and public tree: `/api`,
 /// `/_next/data`, the login exchange, mutations and every unknown route never enter this lane and
 /// keep ordinary owner routing. The shell and immutable assets are cached node-locally only after
@@ -1831,6 +1848,18 @@ const STUDIO_TICKET_MAX_BYTES: usize = 320;
 const STUDIO_SESSION_MAX_BYTES: usize = 96;
 const STUDIO_LOGIN_BODY_CAP: usize = STUDIO_TICKET_MAX_BYTES + "ticket=".len();
 
+/// Studio's Edge Functions deploy mutation (`POST /api/v1/projects/<ref>/functions/deploy`). The
+/// pinned Studio ships the UI *and* the `post('/v1/projects/{ref}/functions/deploy')` call but no
+/// server route for it — upstream's deploy endpoint is the hosted platform API — so here the POST
+/// falls through to the GET-only `/api/v1/projects/[ref]/functions/[slug]` dynamic route with
+/// `slug="deploy"` and answers `405 Allow: GET`, which Studio renders as the generic "API error
+/// happened while trying to communicate with the server". Intercepted at the edge, AFTER the
+/// ordinary Studio auth gate, so the caller sees the real reason instead of a generic backend
+/// failure. Studio's client reads `body.message` (`handleError`: `message ?? msg ?? error`), so a
+/// reply that wants to be read carries it top-level.
+const STUDIO_FUNCTIONS_DEPLOY_SUFFIX: &str = "/functions/deploy";
+const STUDIO_EDGE_FUNCTIONS_UNAVAILABLE: &str = "Edge Functions are not available on this Supabase stack: no edge-runtime service is provisioned, so a deployed function would have nothing to execute it. This stack serves the database, auth, REST and storage APIs.";
+
 /// The whole `<slug>.{db_domain}` hostname of a Supabase database IS the Studio dashboard: a
 /// basic-auth gate (the generated STUDIO_USERNAME/STUDIO_PASSWORD, the upstream Kong's
 /// `DASHBOARD_*` mechanism with `hide_credentials`: the Authorization header is checked here and
@@ -1972,6 +2001,29 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         || studio_basic_ok(db, req.headers());
     if !ok {
         return studio_unauthorized();
+    }
+
+    // Edge Functions are a hosted-platform feature: the pinned Studio's deploy button calls a
+    // route this self-hosted build does not have, and no edge-runtime is provisioned to serve a
+    // deployed function. Answer here (gated exactly like every other Studio call) instead of
+    // relaying a POST that can only come back `405 Allow: GET`.
+    if data_plane.is_none()
+        && req.method() == axum::http::Method::POST
+        && studio_functions_deploy_path(&raw_path)
+    {
+        tracing::warn!(
+            db = %db.id,
+            path = %raw_path,
+            "supabase edge function deploy refused: no edge-runtime provisioned"
+        );
+        return no_store(
+            (
+                StatusCode::NOT_IMPLEMENTED,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({ "message": STUDIO_EDGE_FUNCTIONS_UNAVAILABLE }).to_string(),
+            )
+                .into_response(),
+        );
     }
 
     let port_key = data_plane
