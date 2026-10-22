@@ -31,6 +31,12 @@ pub struct Database<S: RelationalStorage> {
     /// the degenerate compare-and-swap, and it is taken at every save site
     /// (autocommit, `persist_catalog`, `COMMIT`).
     ///
+    /// An explicit transaction holds it for its WHOLE life, not just at
+    /// `COMMIT`: the catalog a `COMMIT` saves is the snapshot its `BEGIN`
+    /// loaded, so a guard taken only at `COMMIT` would serialize a save of a
+    /// document that is already stale, and every table another session created
+    /// after that `BEGIN` would be erased by a save that reports `Ok`.
+    ///
     /// It is always acquired BEFORE any lock or table load, so a session
     /// waiting on it holds nothing and cannot deadlock against the session
     /// holding it. A statement that cannot save the catalog (a read, or one
@@ -172,6 +178,17 @@ struct Transaction {
     /// (DDL/identity advance), because a cached `LoadedTable` whose `Table`
     /// meta went stale would silently serve dropped/added columns wrong.
     table_cache: HashMap<QualifiedName, LoadedTable>,
+    /// The catalog's read-modify-write guard, held from the `BEGIN` that loaded
+    /// this transaction's catalog until the `COMMIT` that saves it (or the
+    /// `ROLLBACK`/drop that discards it). The catalog this transaction saves is
+    /// the snapshot `BEGIN` loaded, so the span has to cover the whole
+    /// transaction — taking the guard at `COMMIT` alone is too late, because by
+    /// then every table another session created after `BEGIN` is already
+    /// missing from the snapshot and `COMMIT` would erase them while reporting
+    /// `Ok`. Held for its `Drop`, never read: the span it protects IS the
+    /// transaction's lifetime.
+    #[allow(dead_code)]
+    catalog_write: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// A connection-scoped session.
@@ -363,19 +380,24 @@ impl<S: RelationalStorage> Session<S> {
     ) -> Result<ExecResult> {
         // Hold the catalog's read-modify-write span for this statement (see
         // `Database::catalog_write`), from before the catalog is loaded until
-        // after it is saved. A `SELECT` never saves the catalog, and a
-        // statement inside an explicit transaction only stages its changes
-        // (`COMMIT` is what saves), so neither takes part in the race and
-        // neither pays for the guard.
+        // after it is saved. A `SELECT` never saves the catalog.
+        //
+        // A statement inside an explicit transaction only STAGES its changes,
+        // and that transaction owns the span already: `begin()` took the guard
+        // when it loaded the catalog and `commit()`/`rollback()` release it.
+        // Taking it again here would self-deadlock (tokio's `Mutex` is not
+        // reentrant), and leaving it to `COMMIT` alone was the bug: the
+        // snapshot `COMMIT` saves was read at `BEGIN`, so every table another
+        // session created in between was erased by a save that reported `Ok`.
         let _catalog_guard: Option<tokio::sync::OwnedMutexGuard<()>> = match stmt {
             Statement::Query(_) => None,
-            _ if self.txn.is_some() && !matches!(stmt, Statement::Commit { .. }) => None,
+            _ if self.txn.is_some() => None,
             _ => Some(self.db.catalog_write.clone().lock_owned().await),
         };
 
         // Transaction control bypasses locking/abort handling.
         match stmt {
-            Statement::StartTransaction { .. } => return self.begin().await,
+            Statement::StartTransaction { .. } => return self.begin(_catalog_guard).await,
             Statement::Commit { .. } => return self.commit().await,
             Statement::Rollback { .. } => return self.rollback().await,
             _ => {}
@@ -1304,7 +1326,15 @@ impl<S: RelationalStorage> Session<S> {
 
     // ---- transaction control -------------------------------------------
 
-    async fn begin(&mut self) -> Result<ExecResult> {
+    /// Open an explicit transaction, keeping `catalog_write` — the guard
+    /// `execute_one` took before this statement — for the transaction's whole
+    /// life. The catalog this transaction will save at `COMMIT` is the snapshot
+    /// loaded here, so no other session may write the catalog between this
+    /// `BEGIN` and that `COMMIT` (see [`Database::catalog_write`]).
+    async fn begin(
+        &mut self,
+        catalog_write: Option<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<ExecResult> {
         if self.txn.is_none() {
             let catalog = self.load_catalog().await?;
             self.txn = Some(Transaction {
@@ -1317,6 +1347,7 @@ impl<S: RelationalStorage> Session<S> {
                 pending_deferred: Vec::new(),
                 deferred_triggers: Vec::new(),
                 table_cache: HashMap::new(),
+                catalog_write,
             });
         }
         Ok(ExecResult::empty_command("BEGIN"))
