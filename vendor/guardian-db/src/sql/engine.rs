@@ -20,6 +20,23 @@ pub struct Database<S: RelationalStorage> {
     storage: Arc<S>,
     pub name: String,
     locks: Arc<LockManager>,
+    /// Serializes the catalog's read-modify-write span.
+    ///
+    /// The catalog is ONE JSON document: a statement loads it whole, mutates it
+    /// and saves it whole, with no compare-and-swap at the store, so two
+    /// sessions doing that concurrently LOSE one of the two writes while both
+    /// still report `Ok` — a just-created table can vanish from the catalog
+    /// with every statement in the sequence succeeding. Holding this mutex
+    /// across the whole span (load through save) makes the span atomic; it is
+    /// the degenerate compare-and-swap, and it is taken at every save site
+    /// (autocommit, `persist_catalog`, `COMMIT`).
+    ///
+    /// It is always acquired BEFORE any lock or table load, so a session
+    /// waiting on it holds nothing and cannot deadlock against the session
+    /// holding it. A statement that cannot save the catalog (a read, or one
+    /// staged onto an open transaction) takes no part in the race and acquires
+    /// nothing, so reads stay parallel.
+    catalog_write: Arc<tokio::sync::Mutex<()>>,
     /// Registered row-change listeners (see [`Database::subscribe_changes`]).
     /// Closed receivers are pruned lazily on the next emission.
     change_listeners: std::sync::RwLock<Vec<tokio::sync::mpsc::UnboundedSender<ChangeEvent>>>,
@@ -31,6 +48,7 @@ impl<S: RelationalStorage> Database<S> {
             storage,
             name: name.into(),
             locks: Arc::new(LockManager::new()),
+            catalog_write: Arc::new(tokio::sync::Mutex::new(())),
             change_listeners: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -266,12 +284,17 @@ impl<S: RelationalStorage> Session<S> {
                     }
                 }
                 Piece::AlterExtension(cmd) => {
+                    // Hand-parsed statements bypass `execute_one`, so they take
+                    // the catalog guard at their own entry (see
+                    // `Database::catalog_write`).
+                    let _catalog_guard = self.catalog_write_guard().await;
                     results.push(self.execute_alter_extension(&cmd).await?);
                 }
                 Piece::SetConstraints(cmd) => {
                     results.push(self.execute_set_constraints(&cmd).await?);
                 }
                 Piece::TsDict(cmd) => {
+                    let _catalog_guard = self.catalog_write_guard().await;
                     results.push(self.execute_ts_dict(cmd).await?);
                 }
             }
@@ -338,6 +361,18 @@ impl<S: RelationalStorage> Session<S> {
         stmt: &Statement,
         params: &[SqlValue],
     ) -> Result<ExecResult> {
+        // Hold the catalog's read-modify-write span for this statement (see
+        // `Database::catalog_write`), from before the catalog is loaded until
+        // after it is saved. A `SELECT` never saves the catalog, and a
+        // statement inside an explicit transaction only stages its changes
+        // (`COMMIT` is what saves), so neither takes part in the race and
+        // neither pays for the guard.
+        let _catalog_guard: Option<tokio::sync::OwnedMutexGuard<()>> = match stmt {
+            Statement::Query(_) => None,
+            _ if self.txn.is_some() && !matches!(stmt, Statement::Commit { .. }) => None,
+            _ => Some(self.db.catalog_write.clone().lock_owned().await),
+        };
+
         // Transaction control bypasses locking/abort handling.
         match stmt {
             Statement::StartTransaction { .. } => return self.begin().await,
@@ -366,6 +401,16 @@ impl<S: RelationalStorage> Session<S> {
             }
         }
         outcome
+    }
+
+    /// Holds the catalog's read-modify-write span for a hand-parsed statement
+    /// that can save the catalog (see `Database::catalog_write`); `None` inside
+    /// an explicit transaction, where `persist_catalog` only stages.
+    async fn catalog_write_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.txn.is_some() {
+            return None;
+        }
+        Some(self.db.catalog_write.clone().lock_owned().await)
     }
 
     /// Sidecar-aware execution wrapper. Routing rules (see

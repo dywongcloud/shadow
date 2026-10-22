@@ -41,7 +41,10 @@ pub(crate) async fn init_schema() {
     }
     let index_keys = db.storage().index_len();
     let mut session = Session::new(db, "hive-init");
-    for (table, ddl) in [
+    // (name, `CREATE TABLE IF NOT EXISTS` ddl) for every table this node's
+    // catalog must hold. Named once, so the durable re-verify below checks
+    // exactly the tables this pass creates.
+    const SCHEMA_TABLES: &[(&str, &str)] = &[
         (
             "project_teams",
             "CREATE TABLE IF NOT EXISTS project_teams (\
@@ -211,26 +214,90 @@ pub(crate) async fn init_schema() {
             created_ms BIGINT NOT NULL\
         )",
         ),
-    ] {
+    ];
+    for (table, ddl) in SCHEMA_TABLES {
         ensure_table_exists(&mut session, table, ddl).await;
     }
     reconcile_project_teams_schema(&mut session).await;
     reconcile_billing_accounts_schema(&mut session).await;
     reconcile_billing_checkouts_schema(&mut session).await;
     reconcile_billing_invoices_schema(&mut session).await;
+    // Re-verify from the durable catalog, on a FRESH autocommit statement (txn
+    // is `None`, so the engine re-reads the store instead of trusting this
+    // session's copy), and recreate anything a concurrent writer erased AFTER
+    // its own `CREATE TABLE` reported `Ok`. Without this the bring-up below
+    // reports success for a catalog that already lost tables: every CREATE and
+    // every per-table verify in the loop above returned `Ok`.
+    let mut missing = missing_schema_tables(&mut session, SCHEMA_TABLES).await;
+    if !missing.is_empty() {
+        tracing::error!(
+            missing = ?missing,
+            "relational: schema bring-up found tables the catalog lost after their CREATE \
+             TABLE reported success (a concurrent catalog read-modify-write); recreating"
+        );
+        for (table, ddl) in SCHEMA_TABLES.iter().filter(|(t, _)| missing.contains(t)) {
+            ensure_table_exists(&mut session, table, ddl).await;
+        }
+        missing = missing_schema_tables(&mut session, SCHEMA_TABLES).await;
+    }
     let failed = SCHEMA_BRINGUP_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if failed == 0 {
+    if missing.is_empty() && failed == 0 {
         tracing::info!(
             keys = index_keys,
             "relational: schema bring-up complete (every table verified present in the catalog)"
+        );
+    } else if missing.is_empty() {
+        tracing::warn!(
+            keys = index_keys,
+            failed,
+            "relational: schema bring-up complete after recreating tables the catalog had lost"
         );
     } else {
         tracing::error!(
             keys = index_keys,
             failed,
+            missing = ?missing,
             "relational: schema bring-up finished with tables that could not be verified"
         );
     }
+}
+
+/// The `SCHEMA_TABLES` names the durable catalog does NOT currently hold, read
+/// back with one fresh autocommit statement. A read failure means "unverified",
+/// so every name comes back missing rather than being silently assumed present.
+async fn missing_schema_tables<'a>(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    tables: &'a [(&'a str, &'a str)],
+) -> Vec<&'a str> {
+    let wanted: Vec<&str> = tables.iter().map(|(t, _)| *t).collect();
+    let list = wanted.iter().map(|t| q(t)).collect::<Vec<_>>().join(", ");
+    let sql = format!("SELECT table_name FROM information_schema.tables WHERE table_name IN ({list})");
+    let found: std::collections::HashSet<String> = match exec(s, &sql).await {
+        Ok(results) => results
+            .iter()
+            .flat_map(|r| match r {
+                ExecResult::Rows { rows, .. } => rows
+                    .iter()
+                    .filter_map(|row| match row.first() {
+                        Some(SqlValue::Text(t)) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                _ => Vec::new(),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "relational: schema bring-up could not re-read the catalog to verify its tables"
+            );
+            return wanted;
+        }
+    };
+    wanted
+        .into_iter()
+        .filter(|t| !found.contains(*t))
+        .collect()
 }
 
 /// Tables `ensure_table_exists` gave up on this process (for the bring-up
@@ -242,14 +309,20 @@ const SCHEMA_BRINGUP_MAX_ATTEMPTS: u32 = 4;
 
 /// Runs `ddl`, then VERIFIES the table is in the catalog, re-running up to
 /// `SCHEMA_BRINGUP_MAX_ATTEMPTS` times. The SQL catalog is ONE JSON document that every autocommit
-/// statement loads and rewrites whole with no compare-and-swap, so a concurrent session's catalog
-/// write can silently erase a just-created table while every statement still returns `Ok`.
+/// statement loads and rewrites whole, so a concurrent session's catalog write can silently erase a
+/// just-created table while every statement still returns `Ok`. The engine now holds that
+/// read-modify-write span under one mutex (`guardian_db::sql` `Database::catalog_write`), so the
+/// window is closed; this retry and the bring-up's durable re-verify are the backstop that keeps a
+/// lost table from being reported as a verified one.
 async fn ensure_table_exists(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     table: &str,
     ddl: &str,
 ) {
     if !index_ready() {
+        // Counted: an index-not-ready skip is a table the catalog may not hold,
+        // so the bring-up summary must never report "every table verified".
+        SCHEMA_BRINGUP_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         warn_index_not_ready(table);
         return;
     }
