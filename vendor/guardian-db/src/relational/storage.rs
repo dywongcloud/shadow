@@ -54,6 +54,32 @@ pub trait RelationalStorage: Send + Sync {
 
     /// Persist the catalog document.
     async fn save_catalog(&self, catalog: &Json) -> Result<()>;
+
+    /// Persist the catalog document ONLY while the stored document is still
+    /// `expected` — the compare-and-swap that closes the read-modify-write
+    /// window a whole-document save leaves open.
+    ///
+    /// The catalog is ONE document: a writer loads it whole, mutates it and
+    /// saves it whole. A mutex inside one process cannot hold off a write from
+    /// OUTSIDE that process — `crates/hive-cloud/src/guardian.rs` opens the
+    /// identical database "hive" on every node and iroh-docs replication
+    /// converges each node's copy — so the save has to prove nobody moved the
+    /// document while this span was working. `Ok(false)` means the stored
+    /// document is not `expected`: another writer won, and saving anyway would
+    /// erase that write.
+    async fn save_catalog_cas(&self, expected: Option<&Json>, next: &Json) -> Result<bool> {
+        let current = self.load_catalog().await?;
+        let unchanged = match (expected, &current) {
+            (None, None) => true,
+            (Some(e), Some(c)) => e == c,
+            _ => false,
+        };
+        if !unchanged {
+            return Ok(false);
+        }
+        self.save_catalog(next).await?;
+        Ok(true)
+    }
 }
 
 /// Deterministic in-memory storage.

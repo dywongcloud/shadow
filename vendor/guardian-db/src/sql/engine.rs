@@ -198,6 +198,11 @@ pub struct Session<S: RelationalStorage> {
     txn: Option<Transaction>,
     session_id: SessionId,
     lock_timeout: Option<Duration>,
+    /// The durable catalog document this read-modify-write span loaded, kept
+    /// so `save_catalog` can compare-and-swap against it — a whole-document
+    /// save is only safe while the store still holds exactly this document.
+    /// `None` means no catalog had been persisted when it was read.
+    catalog_base: Option<serde_json::Value>,
     /// Session variables (`SET name = value`), including extension GUCs.
     vars: HashMap<String, String>,
     /// Lazily pinned connection to the PostgreSQL sidecar runtime (closed
@@ -221,6 +226,12 @@ pub struct Prepared {
     pub param_count: usize,
 }
 
+/// How many times one catalog read-modify-write span retries its
+/// compare-and-swap before it reports a conflict. Each retry re-reads the
+/// winning document and merges this span's delta onto it, so the bound is on a
+/// genuinely concurrent store, never on a lost write.
+const CATALOG_CAS_ATTEMPTS: u32 = 4;
+
 impl<S: RelationalStorage> Session<S> {
     pub fn new(db: Arc<Database<S>>, username: impl Into<String>) -> Self {
         let session_id = db.locks.new_session();
@@ -230,6 +241,7 @@ impl<S: RelationalStorage> Session<S> {
             txn: None,
             session_id,
             lock_timeout: None,
+            catalog_base: None,
             vars: HashMap::new(),
             sidecar: None,
         }
@@ -1438,18 +1450,77 @@ impl<S: RelationalStorage> Session<S> {
 
     // ---- storage helpers -----------------------------------------------
 
-    async fn load_catalog(&self) -> Result<Catalog> {
-        match self.db.storage.load_catalog().await? {
+    /// The durable catalog as this span's `base`, parsed from the document it
+    /// read. `None` means nothing had been persisted yet, so the base is a
+    /// fresh catalog.
+    fn parse_catalog(
+        raw: Option<serde_json::Value>,
+        name: &str,
+    ) -> Result<Catalog> {
+        match raw {
             Some(json) => serde_json::from_value(json)
                 .map_err(|e| SqlError::Storage(format!("corrupt catalog: {e}"))),
-            None => Ok(Catalog::new(&self.db.name)),
+            None => Ok(Catalog::new(name)),
         }
     }
 
-    async fn save_catalog(&self, catalog: &Catalog) -> Result<()> {
-        let json = serde_json::to_value(catalog)
-            .map_err(|e| SqlError::Storage(format!("serialize catalog: {e}")))?;
-        self.db.storage.save_catalog(&json).await
+    /// Reads the catalog AND records the durable document this read-modify-write
+    /// span started from (`catalog_base`), so the save that ends the span can
+    /// compare-and-swap against it. Every span that can save the catalog loads
+    /// through this, never through the untacked read.
+    async fn load_catalog(&mut self) -> Result<Catalog> {
+        let raw = self.db.storage.load_catalog().await?;
+        self.catalog_base = raw.clone();
+        Self::parse_catalog(raw, &self.db.name)
+    }
+
+    /// Saves the catalog: compare-and-swap against the document this span
+    /// loaded, and MERGE onto the winner when the swap loses.
+    ///
+    /// A whole-document save is only safe while the store still holds the
+    /// document the span read. When it does not — a peer's replication landed
+    /// mid-span, which no in-process mutex can prevent — a blind save erases
+    /// that writer's work: the failure that left a node holding 2 of its 14
+    /// tables while every statement still returned `Ok`. So the loser re-reads
+    /// the winner, folds its own delta onto it (`Catalog::merge_onto`) and
+    /// retries, bounded by `CATALOG_CAS_ATTEMPTS`.
+    ///
+    /// It never falls back to a blind save: a span that cannot persist its
+    /// catalog change reports the failure, because a false `Ok` here is the
+    /// bug this closes.
+    async fn save_catalog(&mut self, catalog: &Catalog) -> Result<()> {
+        let mut mine = catalog.clone();
+        let mut expected = self.catalog_base.clone();
+        for attempt in 1..=CATALOG_CAS_ATTEMPTS {
+            let next = serde_json::to_value(&mine)
+                .map_err(|e| SqlError::Storage(format!("serialize catalog: {e}")))?;
+            if self
+                .db
+                .storage
+                .save_catalog_cas(expected.as_ref(), &next)
+                .await?
+            {
+                self.catalog_base = Some(next);
+                return Ok(());
+            }
+            if attempt == CATALOG_CAS_ATTEMPTS {
+                break;
+            }
+            // Another writer's document won. This span's change is a delta
+            // against `expected`, so fold it onto the winner and swap again.
+            let theirs_raw = self.db.storage.load_catalog().await?;
+            let theirs = Self::parse_catalog(theirs_raw.clone(), &self.db.name)?;
+            let base = Self::parse_catalog(expected.clone(), &self.db.name)?;
+            let mut merged = theirs;
+            mine.merge_onto(&base, &mut merged);
+            mine = merged;
+            expected = theirs_raw;
+        }
+        Err(SqlError::Storage(format!(
+            "catalog write conflict: the stored catalog changed on every one of {} \
+             compare-and-swap attempts, so this statement's catalog change was not saved",
+            CATALOG_CAS_ATTEMPTS
+        )))
     }
 
     async fn load_table(

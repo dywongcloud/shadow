@@ -14,6 +14,182 @@ use crate::guardian::SqlDb;
 /// tables: waits for the first index walk, creates and verifies each table, then reconciles the
 /// columns added after first release. Best-effort: a failure only leaves the fleet read fallback
 /// unavailable until the next successful call, never a boot failure.
+/// (name, `CREATE TABLE IF NOT EXISTS` ddl) for every table this node's catalog must hold.
+/// Named once, so the durable re-verify after the CREATE pass checks exactly the tables the
+/// pass creates, and `schema_ddl` can recreate one the catalog loses AFTER boot (a statement
+/// that failed with `relation "<name>" does not exist`).
+const SCHEMA_TABLES: &[(&str, &str)] = &[
+    (
+        "project_teams",
+        "CREATE TABLE IF NOT EXISTS project_teams (\
+        project TEXT PRIMARY KEY, \
+        team TEXT NOT NULL, \
+        root_dir TEXT NOT NULL DEFAULT '', \
+        updated_ms BIGINT NOT NULL, \
+        deleted_ms BIGINT NOT NULL DEFAULT 0\
+    )",
+    ),
+    (
+        "billing_accounts",
+        "CREATE TABLE IF NOT EXISTS billing_accounts (\
+        tenant TEXT PRIMARY KEY, \
+        plan TEXT NOT NULL, \
+        status TEXT NOT NULL, \
+        included_cents BIGINT NOT NULL, \
+        used_cents BIGINT NOT NULL, \
+        balance_cents BIGINT NOT NULL, \
+        stripe_customer TEXT NOT NULL DEFAULT '', \
+        stripe_subscription TEXT NOT NULL DEFAULT '', \
+        period_start_ms BIGINT NOT NULL, \
+        period_end_ms BIGINT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "billing_ledger",
+        "CREATE TABLE IF NOT EXISTS billing_ledger (\
+        id TEXT PRIMARY KEY, \
+        tenant TEXT NOT NULL, \
+        ts_ms BIGINT NOT NULL, \
+        kind TEXT NOT NULL, \
+        amount_cents BIGINT NOT NULL, \
+        balance_after_cents BIGINT NOT NULL, \
+        note TEXT NOT NULL DEFAULT ''\
+    )",
+    ),
+    (
+        "billing_invoices",
+        "CREATE TABLE IF NOT EXISTS billing_invoices (\
+        id TEXT PRIMARY KEY, \
+        tenant TEXT NOT NULL, \
+        number TEXT NOT NULL, \
+        plan TEXT NOT NULL, \
+        period_start_ms BIGINT NOT NULL, \
+        period_end_ms BIGINT NOT NULL, \
+        subtotal_cents BIGINT NOT NULL, \
+        total_cents BIGINT NOT NULL, \
+        status TEXT NOT NULL, \
+        created_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "billing_invoice_lines",
+        "CREATE TABLE IF NOT EXISTS billing_invoice_lines (\
+        id TEXT PRIMARY KEY, \
+        invoice_id TEXT NOT NULL, \
+        description TEXT NOT NULL, \
+        amount_cents BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "billing_checkouts",
+        "CREATE TABLE IF NOT EXISTS billing_checkouts (\
+        id TEXT PRIMARY KEY, \
+        tenant TEXT NOT NULL, \
+        kind TEXT NOT NULL, \
+        plan TEXT NOT NULL, \
+        amount_cents BIGINT NOT NULL, \
+        sku TEXT NOT NULL DEFAULT '', \
+        target TEXT NOT NULL DEFAULT '', \
+        stripe_session_id TEXT NOT NULL DEFAULT '', \
+        created_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "billing_ledger_snapshot",
+        "CREATE TABLE IF NOT EXISTS billing_ledger_snapshot (\
+        tenant TEXT PRIMARY KEY, \
+        ledger_json TEXT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "billing_invoices_snapshot",
+        "CREATE TABLE IF NOT EXISTS billing_invoices_snapshot (\
+        tenant TEXT PRIMARY KEY, \
+        invoices_json TEXT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "teams",
+        "CREATE TABLE IF NOT EXISTS teams (\
+        slug TEXT PRIMARY KEY, \
+        name TEXT NOT NULL, \
+        plan TEXT NOT NULL, \
+        member_count BIGINT NOT NULL, \
+        sso_enabled BIGINT NOT NULL, \
+        created_ms BIGINT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "team_members",
+        "CREATE TABLE IF NOT EXISTS team_members (\
+        id TEXT PRIMARY KEY, \
+        team TEXT NOT NULL, \
+        email TEXT NOT NULL, \
+        name TEXT NOT NULL DEFAULT '', \
+        role TEXT NOT NULL, \
+        added_ms BIGINT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "deployments",
+        "CREATE TABLE IF NOT EXISTS deployments (\
+        id TEXT PRIMARY KEY, \
+        project TEXT NOT NULL, \
+        team TEXT NOT NULL, \
+        node TEXT NOT NULL, \
+        alias TEXT NOT NULL DEFAULT '', \
+        kind TEXT NOT NULL DEFAULT '', \
+        target TEXT NOT NULL DEFAULT '', \
+        state TEXT NOT NULL DEFAULT '', \
+        production BIGINT NOT NULL, \
+        created_at_ms BIGINT NOT NULL, \
+        updated_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "drive_nodes",
+        "CREATE TABLE IF NOT EXISTS drive_nodes (\
+        id TEXT PRIMARY KEY, \
+        project TEXT NOT NULL, \
+        parent_id TEXT NOT NULL, \
+        name TEXT NOT NULL, \
+        kind TEXT NOT NULL, \
+        size_bytes BIGINT NOT NULL DEFAULT 0, \
+        mime TEXT NOT NULL DEFAULT '', \
+        content_hash TEXT NOT NULL DEFAULT '', \
+        owner_user TEXT NOT NULL DEFAULT '', \
+        owner_node TEXT NOT NULL DEFAULT '', \
+        mtime BIGINT NOT NULL, \
+        ctime BIGINT NOT NULL, \
+        deleted_at BIGINT NOT NULL DEFAULT 0\
+    )",
+    ),
+    (
+        "drive_shares",
+        "CREATE TABLE IF NOT EXISTS drive_shares (\
+        id TEXT PRIMARY KEY, \
+        node_id TEXT NOT NULL, \
+        token_hash TEXT NOT NULL, \
+        scope TEXT NOT NULL, \
+        expires_at BIGINT NOT NULL, \
+        created_ms BIGINT NOT NULL\
+    )",
+    ),
+    (
+        "drive_tokens",
+        "CREATE TABLE IF NOT EXISTS drive_tokens (\
+        project TEXT PRIMARY KEY, \
+        token_hash TEXT NOT NULL, \
+        created_ms BIGINT NOT NULL\
+    )",
+    ),
+];
+
 pub(crate) async fn init_schema() {
     let deadline = std::time::Instant::now() + index_build_timeout();
     let db = loop {
@@ -41,180 +217,6 @@ pub(crate) async fn init_schema() {
     }
     let index_keys = db.storage().index_len();
     let mut session = Session::new(db, "hive-init");
-    // (name, `CREATE TABLE IF NOT EXISTS` ddl) for every table this node's
-    // catalog must hold. Named once, so the durable re-verify below checks
-    // exactly the tables this pass creates.
-    const SCHEMA_TABLES: &[(&str, &str)] = &[
-        (
-            "project_teams",
-            "CREATE TABLE IF NOT EXISTS project_teams (\
-            project TEXT PRIMARY KEY, \
-            team TEXT NOT NULL, \
-            root_dir TEXT NOT NULL DEFAULT '', \
-            updated_ms BIGINT NOT NULL, \
-            deleted_ms BIGINT NOT NULL DEFAULT 0\
-        )",
-        ),
-        (
-            "billing_accounts",
-            "CREATE TABLE IF NOT EXISTS billing_accounts (\
-            tenant TEXT PRIMARY KEY, \
-            plan TEXT NOT NULL, \
-            status TEXT NOT NULL, \
-            included_cents BIGINT NOT NULL, \
-            used_cents BIGINT NOT NULL, \
-            balance_cents BIGINT NOT NULL, \
-            stripe_customer TEXT NOT NULL DEFAULT '', \
-            stripe_subscription TEXT NOT NULL DEFAULT '', \
-            period_start_ms BIGINT NOT NULL, \
-            period_end_ms BIGINT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "billing_ledger",
-            "CREATE TABLE IF NOT EXISTS billing_ledger (\
-            id TEXT PRIMARY KEY, \
-            tenant TEXT NOT NULL, \
-            ts_ms BIGINT NOT NULL, \
-            kind TEXT NOT NULL, \
-            amount_cents BIGINT NOT NULL, \
-            balance_after_cents BIGINT NOT NULL, \
-            note TEXT NOT NULL DEFAULT ''\
-        )",
-        ),
-        (
-            "billing_invoices",
-            "CREATE TABLE IF NOT EXISTS billing_invoices (\
-            id TEXT PRIMARY KEY, \
-            tenant TEXT NOT NULL, \
-            number TEXT NOT NULL, \
-            plan TEXT NOT NULL, \
-            period_start_ms BIGINT NOT NULL, \
-            period_end_ms BIGINT NOT NULL, \
-            subtotal_cents BIGINT NOT NULL, \
-            total_cents BIGINT NOT NULL, \
-            status TEXT NOT NULL, \
-            created_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "billing_invoice_lines",
-            "CREATE TABLE IF NOT EXISTS billing_invoice_lines (\
-            id TEXT PRIMARY KEY, \
-            invoice_id TEXT NOT NULL, \
-            description TEXT NOT NULL, \
-            amount_cents BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "billing_checkouts",
-            "CREATE TABLE IF NOT EXISTS billing_checkouts (\
-            id TEXT PRIMARY KEY, \
-            tenant TEXT NOT NULL, \
-            kind TEXT NOT NULL, \
-            plan TEXT NOT NULL, \
-            amount_cents BIGINT NOT NULL, \
-            sku TEXT NOT NULL DEFAULT '', \
-            target TEXT NOT NULL DEFAULT '', \
-            stripe_session_id TEXT NOT NULL DEFAULT '', \
-            created_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "billing_ledger_snapshot",
-            "CREATE TABLE IF NOT EXISTS billing_ledger_snapshot (\
-            tenant TEXT PRIMARY KEY, \
-            ledger_json TEXT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "billing_invoices_snapshot",
-            "CREATE TABLE IF NOT EXISTS billing_invoices_snapshot (\
-            tenant TEXT PRIMARY KEY, \
-            invoices_json TEXT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "teams",
-            "CREATE TABLE IF NOT EXISTS teams (\
-            slug TEXT PRIMARY KEY, \
-            name TEXT NOT NULL, \
-            plan TEXT NOT NULL, \
-            member_count BIGINT NOT NULL, \
-            sso_enabled BIGINT NOT NULL, \
-            created_ms BIGINT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "team_members",
-            "CREATE TABLE IF NOT EXISTS team_members (\
-            id TEXT PRIMARY KEY, \
-            team TEXT NOT NULL, \
-            email TEXT NOT NULL, \
-            name TEXT NOT NULL DEFAULT '', \
-            role TEXT NOT NULL, \
-            added_ms BIGINT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "deployments",
-            "CREATE TABLE IF NOT EXISTS deployments (\
-            id TEXT PRIMARY KEY, \
-            project TEXT NOT NULL, \
-            team TEXT NOT NULL, \
-            node TEXT NOT NULL, \
-            alias TEXT NOT NULL DEFAULT '', \
-            kind TEXT NOT NULL DEFAULT '', \
-            target TEXT NOT NULL DEFAULT '', \
-            state TEXT NOT NULL DEFAULT '', \
-            production BIGINT NOT NULL, \
-            created_at_ms BIGINT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "drive_nodes",
-            "CREATE TABLE IF NOT EXISTS drive_nodes (\
-            id TEXT PRIMARY KEY, \
-            project TEXT NOT NULL, \
-            parent_id TEXT NOT NULL, \
-            name TEXT NOT NULL, \
-            kind TEXT NOT NULL, \
-            size_bytes BIGINT NOT NULL DEFAULT 0, \
-            mime TEXT NOT NULL DEFAULT '', \
-            content_hash TEXT NOT NULL DEFAULT '', \
-            owner_user TEXT NOT NULL DEFAULT '', \
-            owner_node TEXT NOT NULL DEFAULT '', \
-            mtime BIGINT NOT NULL, \
-            ctime BIGINT NOT NULL, \
-            deleted_at BIGINT NOT NULL DEFAULT 0\
-        )",
-        ),
-        (
-            "drive_shares",
-            "CREATE TABLE IF NOT EXISTS drive_shares (\
-            id TEXT PRIMARY KEY, \
-            node_id TEXT NOT NULL, \
-            token_hash TEXT NOT NULL, \
-            scope TEXT NOT NULL, \
-            expires_at BIGINT NOT NULL, \
-            created_ms BIGINT NOT NULL\
-        )",
-        ),
-        (
-            "drive_tokens",
-            "CREATE TABLE IF NOT EXISTS drive_tokens (\
-            project TEXT PRIMARY KEY, \
-            token_hash TEXT NOT NULL, \
-            created_ms BIGINT NOT NULL\
-        )",
-        ),
-    ];
     for (table, ddl) in SCHEMA_TABLES {
         ensure_table_exists(&mut session, table, ddl).await;
     }
@@ -739,11 +741,100 @@ async fn exec(
     exec_with_budget(s, sql, SQL_OP_TIMEOUT).await
 }
 
-/// `exec` at a caller's budget, which MUST be the bound a request path uses: `block_in_place` holds
-/// the serving worker thread inside `block_on` for the whole inner bound, so a
-/// `tokio::time::timeout` wrapped AROUND this call cannot preempt it -- the budget has to be passed
-/// in and applied to `s.execute` itself.
-async fn exec_with_budget(
+/// The `CREATE TABLE IF NOT EXISTS` ddl this node declares for `table`, if any.
+/// Only a name in `SCHEMA_TABLES` is repairable: a table the platform never
+/// declares is a tenant relation, and recreating one from nothing would be a
+/// data-destroying guess.
+fn schema_ddl(table: &str) -> Option<&'static str> {
+    SCHEMA_TABLES
+        .iter()
+        .find(|(t, _)| *t == table)
+        .map(|(_, ddl)| *ddl)
+}
+
+/// Minimum spacing between two runtime recreations of the SAME table. A
+/// statement that keeps failing must not become a DDL loop, so a repair is a
+/// bounded, logged event per table, never a per-statement reflex.
+const TABLE_REPAIR_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each schema table was last recreated outside `init_schema`.
+static TABLE_REPAIR_AT: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+> = std::sync::OnceLock::new();
+
+fn table_repair_at(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    TABLE_REPAIR_AT.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The relation a guardian `relation "<name>" does not exist` error names.
+/// `None` for any other error, so nothing else is ever treated as 42P01.
+fn missing_relation(err: &str) -> Option<&str> {
+    let rest = err.split_once("relation \"")?.1;
+    let name = rest.split_once('"')?.0;
+    (!name.is_empty()).then_some(name)
+}
+
+/// Recreates a table the catalog lost AFTER boot, and reports whether the
+/// caller should retry its statement once.
+///
+/// `ensure_table_exists` is called only from `init_schema`, so before this a
+/// table lost at runtime stayed missing until the next restart: every later
+/// statement against it failed with `relation "<name>" does not exist` while
+/// `init_schema` had already logged success. Guardian ships no 42P01 code to
+/// match on (its errors are text), so the name is read out of the message and
+/// accepted only when `SCHEMA_TABLES` declares it.
+async fn repair_missing_table(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    err: &str,
+    budget: std::time::Duration,
+) -> bool {
+    let Some(name) = missing_relation(err) else {
+        return false;
+    };
+    let table = name.strip_prefix("public.").unwrap_or(name);
+    let Some(ddl) = schema_ddl(table) else {
+        return false;
+    };
+    if !index_ready() {
+        return false;
+    }
+    {
+        let mut at = table_repair_at()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = std::time::Instant::now();
+        if let Some(last) = at.get(table) {
+            if now.duration_since(*last) < TABLE_REPAIR_MIN_INTERVAL {
+                return false;
+            }
+        }
+        at.insert(table.to_string(), now);
+    }
+    match exec_once(s, ddl, budget).await {
+        Ok(_) => {
+            tracing::error!(
+                table,
+                "relational: a table this node's schema declares was missing from the catalog \
+                 (lost to a concurrent catalog read-modify-write); recreated it at runtime"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                table,
+                error = %e,
+                "relational: could not recreate a table the catalog lost; the statement's \
+                 failure stands"
+            );
+            false
+        }
+    }
+}
+
+/// One guardian statement, bounded: no repair, no retry. Every SQL path reaches
+/// the store through `exec_with_budget`, which wraps exactly one of these.
+async fn exec_once(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     sql: &str,
     budget: std::time::Duration,
@@ -758,6 +849,29 @@ async fn exec_with_budget(
             }
         })
     })
+}
+
+/// `exec` at a caller's budget, which MUST be the bound a request path uses: `block_in_place` holds
+/// the serving worker thread inside `block_on` for the whole inner bound, so a
+/// `tokio::time::timeout` wrapped AROUND this call cannot preempt it -- the budget has to be passed
+/// in and applied to `s.execute` itself.
+///
+/// A statement that fails with a missing relation it can name gets ONE repair
+/// and ONE retry: the table is recreated from `SCHEMA_TABLES` and the original
+/// statement runs again, so a table the catalog loses after boot heals without
+/// a restart instead of failing every statement until one.
+async fn exec_with_budget(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    sql: &str,
+    budget: std::time::Duration,
+) -> Result<Vec<ExecResult>, String> {
+    match exec_once(s, sql, budget).await {
+        Ok(res) => Ok(res),
+        Err(e) => match repair_missing_table(s, &e, budget).await {
+            true => exec_once(s, sql, budget).await,
+            false => Err(e),
+        },
+    }
 }
 
 /// Time left on a request-path deadline; `None` = spent, so the caller skips the statement instead

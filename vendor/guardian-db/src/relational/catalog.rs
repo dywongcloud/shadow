@@ -715,6 +715,132 @@ impl From<CatalogRaw> for Catalog {
     }
 }
 
+/// Whether two catalog objects are the same object, compared as their
+/// persisted form: `Table`, `Index`, `View` and friends carry no `PartialEq`
+/// (a table holds triggers, policies and column defaults), so the merge
+/// compares what is actually stored.
+fn same_stored<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    match (serde_json::to_vec(a), serde_json::to_vec(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        // Unserializable on either side: treat them as different, so the merge
+        // takes the writer's own version rather than dropping its change.
+        _ => false,
+    }
+}
+
+/// Three-way merge of one keyed collection: `theirs` keeps every object this
+/// span did not touch, gains every object this span created or replaced, and
+/// loses every object this span dropped.
+fn merge_keyed<K: Ord + Clone, V: Clone + serde::Serialize>(
+    base: &BTreeMap<K, V>,
+    mine: &BTreeMap<K, V>,
+    theirs: &mut BTreeMap<K, V>,
+) {
+    for (k, v) in mine {
+        match base.get(k) {
+            // Created by this span: it must survive onto their document.
+            None => {
+                theirs.insert(k.clone(), v.clone());
+            }
+            // Replaced by this span: this span's version is the one its caller
+            // is waiting on, so it wins over a concurrent edit.
+            Some(b) if !same_stored(b, v) => {
+                theirs.insert(k.clone(), v.clone());
+            }
+            // Untouched by this span: theirs wins.
+            Some(_) => {}
+        }
+    }
+    for k in base.keys() {
+        // Dropped by this span: a real DROP, so it stays dropped on theirs.
+        if !mine.contains_key(k) {
+            theirs.remove(k);
+        }
+    }
+}
+
+/// The same three-way merge over a `Vec` of named objects (`CREATE FUNCTION`,
+/// `CREATE TEXT SEARCH DICTIONARY`), keyed by qualified name.
+fn merge_named<T: Clone + serde::Serialize, K: Ord + Clone>(
+    base: &[T],
+    mine: &[T],
+    theirs: &mut Vec<T>,
+    key: fn(&T) -> K,
+) {
+    let base_keys: BTreeMap<K, &T> = base.iter().map(|t| (key(t), t)).collect();
+    let mine_keys: BTreeMap<K, &T> = mine.iter().map(|t| (key(t), t)).collect();
+    for (k, v) in &mine_keys {
+        let mine_changed = match base_keys.get(k) {
+            None => true,
+            Some(b) => !same_stored(*b, *v),
+        };
+        if mine_changed {
+            theirs.retain(|t| &key(t) != k);
+            theirs.push((*v).clone());
+        }
+    }
+    for k in base_keys.keys() {
+        if !mine_keys.contains_key(k) {
+            theirs.retain(|t| &key(t) != k);
+        }
+    }
+}
+
+impl Catalog {
+    /// Fold this span's catalog change onto a catalog another writer saved
+    /// while the span ran.
+    ///
+    /// `base` is the document this span loaded, `self` is what the span
+    /// produced, and `theirs` is the document now in the store. Objects this
+    /// span ADDED (in `self`, absent from `base`) are copied into `theirs`;
+    /// objects this span REMOVED (in `base`, absent from `self`) are removed
+    /// from `theirs`; objects this span replaced are taken from `self`.
+    /// Everything else — every object `theirs` changed on its own — survives.
+    ///
+    /// That is the property a whole-document save lacks: a table this span
+    /// created is restored on top of a peer's snapshot that never saw it,
+    /// while a table that peer really dropped stays dropped. An object BOTH
+    /// writers replaced keeps this span's version, because the alternative is
+    /// losing the change the caller is blocked on.
+    pub fn merge_onto(&self, base: &Catalog, theirs: &mut Catalog) {
+        merge_keyed(&base.tables, &self.tables, &mut theirs.tables);
+        merge_keyed(&base.indexes, &self.indexes, &mut theirs.indexes);
+        merge_keyed(&base.sequences, &self.sequences, &mut theirs.sequences);
+        merge_keyed(&base.views, &self.views, &mut theirs.views);
+        merge_keyed(&base.schemas, &self.schemas, &mut theirs.schemas);
+        merge_keyed(&base.extensions, &self.extensions, &mut theirs.extensions);
+        merge_named(
+            &base.functions,
+            &self.functions,
+            &mut theirs.functions,
+            FunctionDef::qualified,
+        );
+        merge_named(
+            &base.ts_dictionaries,
+            &self.ts_dictionaries,
+            &mut theirs.ts_dictionaries,
+            |d| QualifiedName::new(d.schema.clone(), d.name.clone()),
+        );
+        if base.search_path != self.search_path {
+            theirs.search_path = self.search_path.clone();
+        }
+        // OIDs are allocated monotonically: never reuse one a survivor holds.
+        theirs.next_oid = theirs.next_oid.max(self.next_oid);
+        theirs.rebuild_table_to_indexes();
+    }
+
+    /// Rebuilds the reverse index map after a merge replaced `indexes`.
+    fn rebuild_table_to_indexes(&mut self) {
+        self.table_to_indexes.clear();
+        for (q, idx) in &self.indexes {
+            self.table_to_indexes
+                .entry((idx.schema.clone(), idx.table.clone()))
+                .or_default()
+                .push(q.clone());
+        }
+    }
+}
+
 impl Catalog {
     /// A fresh catalog containing only the `public` and system schemas.
     pub fn new(database: impl Into<String>) -> Self {
