@@ -9446,6 +9446,20 @@ async fn compose_container_manifest(
                     .unwrap_or_default()
             ));
             let t0 = now_ms();
+            let qualified = write_qualified_dockerfile(&dockerfile, bid).await?;
+            if qualified.is_some() {
+                log(format!(
+                    "Rewrote short-name base image reference(s) in {} to fully-qualified refs \
+                     (podman enforces short-name resolution).",
+                    dockerfile
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "Dockerfile".to_string())
+                ));
+            }
+            let build_file = qualified
+                .clone()
+                .unwrap_or_else(|| dockerfile.to_path_buf());
             let mut args = vec![
                 "build".to_string(),
                 // --layers enables BuildKit-style cache mounts (`RUN --mount=type=cache`); without
@@ -9454,7 +9468,7 @@ async fn compose_container_manifest(
                 "-t".to_string(),
                 tag.clone(),
                 "-f".to_string(),
-                dockerfile.to_string_lossy().to_string(),
+                build_file.to_string_lossy().to_string(),
             ];
             if let Some(target) = build.target.as_deref() {
                 args.push("--target".to_string());
@@ -9465,15 +9479,14 @@ async fn compose_container_manifest(
                 .args(&args)
                 .env("PATH", &podman_path)
                 .output()
-                .await?;
+                .await;
+            if let Some(copy) = &qualified {
+                // Our own copy, never the tenant's file: remove it on success and on failure alike.
+                let _ = tokio::fs::remove_file(copy).await;
+            }
+            let out = out?;
             if !out.status.success() {
-                let err = String::from_utf8_lossy(&out.stderr);
-                let msg = err
-                    .lines()
-                    .rev()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("build failed");
-                anyhow::bail!("podman build failed: {}", msg.trim());
+                return Err(podman_failed("build", &out));
             }
             log(format!(
                 "Built image {tag} in {}ms",
@@ -9549,6 +9562,20 @@ async fn dockerfile_container_manifest(
             .unwrap_or_else(|| "Dockerfile".to_string())
     ));
     let t0 = now_ms();
+    let qualified = write_qualified_dockerfile(dockerfile, bid).await?;
+    if qualified.is_some() {
+        log(format!(
+            "Rewrote short-name base image reference(s) in {} to fully-qualified refs \
+             (podman enforces short-name resolution).",
+            dockerfile
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "Dockerfile".to_string())
+        ));
+    }
+    let build_file = qualified
+        .clone()
+        .unwrap_or_else(|| dockerfile.to_path_buf());
     let out = Command::new("podman")
         .args([
             "build",
@@ -9558,20 +9585,19 @@ async fn dockerfile_container_manifest(
             "-t",
             &tag,
             "-f",
-            &dockerfile.to_string_lossy(),
+            &build_file.to_string_lossy(),
             &dir.to_string_lossy(),
         ])
         .env("PATH", &path)
         .output()
-        .await?;
+        .await;
+    if let Some(copy) = &qualified {
+        // Our own copy, never the tenant's file: remove it on success and on failure alike.
+        let _ = tokio::fs::remove_file(copy).await;
+    }
+    let out = out?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("build failed");
-        anyhow::bail!("podman build failed: {}", msg.trim());
+        return Err(podman_failed("build", &out));
     }
     log(format!(
         "Built image {tag} in {}ms",
@@ -9995,6 +10021,61 @@ pub(crate) fn podman_path_env() -> String {
     format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base}")
 }
 
+/// Collapses a podman invocation's captured output into one line for the build log, keeping up to
+/// `per_stream` trailing non-empty lines of stdout and then of stderr (newest last).
+///
+/// The LAST line alone used to be the whole error, and it is almost always the least informative
+/// one: `podman build` ends with `Error: building at STEP "RUN apk add …": while running runtime:
+/// exit status 4`, which says nothing about WHY the command failed. The command's own output —
+/// apk's `ERROR: unable to select packages: …` — is on stdout, above it. Both are kept, deduped and
+/// capped, so an operator can tell "no package index reachable" from "no such package" from a bad
+/// base image. A build's output is that tenant's own, in that tenant's own build log.
+fn podman_output_tail(out: &std::process::Output, per_stream: usize, max_chars: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    // stderr first so that, once reversed, the build's own steps lead and its errors follow.
+    for stream in [&out.stderr, &out.stdout] {
+        let text = String::from_utf8_lossy(stream);
+        for line in text
+            .lines()
+            .rev()
+            .filter(|line| !line.trim().is_empty())
+            .take(per_stream)
+        {
+            let line = line.trim().to_string();
+            if !parts.contains(&line) {
+                parts.push(line);
+            }
+        }
+    }
+    parts.reverse();
+    let mut joined = parts.join(" | ");
+    if joined.len() > max_chars {
+        // Keep the TAIL (the newest lines) and never cut inside a UTF-8 sequence.
+        let cut = joined
+            .char_indices()
+            .find(|(index, _)| joined.len() - index <= max_chars)
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        joined = format!("... {}", &joined[cut..]);
+    }
+    joined
+}
+
+/// Reports a failed podman invocation with its output tail and its exit status, so a build log says
+/// what the command actually printed instead of only podman's own summary line.
+fn podman_failed(verb: &str, out: &std::process::Output) -> anyhow::Error {
+    // 14 lines per stream: measured on fc-sanjose, a `RUN apk add` that cannot fetch an index prints
+    // two `WARNING: fetching …: temporary error` lines, then an `ERROR: unable to select packages:`
+    // block naming every package, then podman's own summary — 12 lines, and the LAST one alone is
+    // the "exit status 4" that says nothing.
+    let detail = podman_output_tail(out, 14, 1200);
+    if detail.is_empty() {
+        anyhow::anyhow!("podman {verb} failed with no output ({})", out.status)
+    } else {
+        anyhow::anyhow!("podman {verb} failed ({}): {}", out.status, detail)
+    }
+}
+
 /// Fully qualifies a container-image reference for podman: Linux podman ENFORCES short-name
 /// resolution (`user/img:tag` fails with "short-name resolution enforced" unless registries.conf
 /// lists search registries; macOS podman-machine resolves docker.io implicitly). A ref whose first
@@ -10014,6 +10095,130 @@ pub(crate) fn qualify_image_ref(image: &str) -> String {
             }
         }
     }
+}
+
+/// Rewrites one `FROM` line of a Dockerfile/Containerfile so its base image reference is fully
+/// qualified, returning the rewritten line (only when the reference actually changed) and the stage
+/// name this line declares, if any. Flags before the image (`FROM --platform=… base`) are skipped.
+///
+/// A base that is `scratch`, an already-declared stage name (`FROM builder AS runtime`) or a
+/// build-arg/ENV substitution (`FROM $BASE`) is left alone: none of those name a registry image, and
+/// rewriting any of them would point the build at one that does not exist.
+fn qualify_from_line(line: &str, stages: &[String]) -> (Option<String>, Option<String>) {
+    let body = line.trim();
+    if body.len() < 5 || !body[..4].eq_ignore_ascii_case("FROM") {
+        return (None, None);
+    }
+    let rest = &body[4..];
+    if !rest.starts_with(char::is_whitespace) {
+        return (None, None);
+    }
+    let after = rest.trim_start();
+    // Byte offset, within `line`, at which `after` begins: the line's own leading whitespace, the
+    // four bytes of "FROM", and the whitespace that follows it.
+    let after_start = (line.len() - line.trim_start().len()) + 4 + (rest.len() - after.len());
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut open: Option<usize> = None;
+    for (index, ch) in after.char_indices() {
+        if ch.is_whitespace() {
+            if let Some(start) = open.take() {
+                spans.push((start, index));
+            }
+        } else if open.is_none() {
+            open = Some(index);
+        }
+    }
+    if let Some(start) = open {
+        spans.push((start, after.len()));
+    }
+    let tokens: Vec<&str> = spans.iter().map(|&(s, e)| &after[s..e]).collect();
+    // A stage name is case-insensitive, as in every Dockerfile instruction.
+    let stage = tokens
+        .windows(2)
+        .find(|pair| pair[0].eq_ignore_ascii_case("AS"))
+        .map(|pair| pair[1].to_ascii_lowercase());
+    let mut index = 0;
+    while index < tokens.len() && tokens[index].starts_with("--") {
+        index += 1;
+    }
+    if index >= tokens.len() {
+        return (None, stage);
+    }
+    let image = tokens[index];
+    let lower = image.to_ascii_lowercase();
+    let qualifiable = !lower.eq("scratch")
+        && !image.contains('$')
+        && !stages.iter().any(|known| known == &lower)
+        && qualify_image_ref(image) != image;
+    if !qualifiable {
+        return (None, stage);
+    }
+    let (start, end) = spans[index];
+    let mut rewritten = String::with_capacity(line.len() + 32);
+    rewritten.push_str(&line[..after_start + start]);
+    rewritten.push_str(&qualify_image_ref(image));
+    rewritten.push_str(&line[after_start + end..]);
+    (Some(rewritten), stage)
+}
+
+/// Applies [`qualify_from_line`] to every `FROM` of a Dockerfile/Containerfile, returning the
+/// rewritten text and how many base references changed.
+///
+/// This exists for the same reason as [`qualify_image_ref`]: Linux podman runs with
+/// `short-name-mode = "enforcing"`, so a tenant Dockerfile that says `FROM maven:3.9` dies at
+/// "creating build container: short-name resolution enforced but cannot prompt without a TTY" —
+/// the tenant's source is correct and the node policy is the one to keep, so the fix is a
+/// deterministic rewrite of the reference, never a relaxation of that policy.
+pub(crate) fn qualify_dockerfile_froms(contents: &str) -> (String, usize) {
+    let mut stages: Vec<String> = Vec::new();
+    let mut out = String::with_capacity(contents.len() + 64);
+    let mut changed = 0usize;
+    for line in contents.split_inclusive('\n') {
+        let (rewritten, stage) = qualify_from_line(line, &stages);
+        if let Some(stage) = stage {
+            stages.push(stage);
+        }
+        match rewritten {
+            Some(rewritten) => {
+                changed += 1;
+                out.push_str(&rewritten);
+            }
+            None => out.push_str(line),
+        }
+    }
+    (out, changed)
+}
+
+/// Writes a copy of the build's Dockerfile with [`qualify_dockerfile_froms`] applied, returning
+/// `Some(path)` only when a base reference actually changed — otherwise the tenant's file is built
+/// exactly as written. The copy sits next to the original, inside the build context, so `podman
+/// build -f` resolves relative `COPY`/`ADD` sources the same way, and the tenant's file is never
+/// modified. The caller removes the copy.
+async fn write_qualified_dockerfile(
+    dockerfile: &Path,
+    bid: &str,
+) -> anyhow::Result<Option<std::path::PathBuf>> {
+    let original = match tokio::fs::read_to_string(dockerfile).await {
+        Ok(text) => text,
+        // An unreadable Dockerfile is `podman build`'s own failure to report, not ours.
+        Err(_) => return Ok(None),
+    };
+    let (rewritten, changed) = qualify_dockerfile_froms(&original);
+    if changed == 0 {
+        return Ok(None);
+    }
+    let name = dockerfile
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Dockerfile".to_string());
+    let copy = dockerfile
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!(".hive-qualified-{}-{name}", sanitize_tag(bid)));
+    tokio::fs::write(&copy, rewritten)
+        .await
+        .map_err(|error| anyhow::anyhow!("cannot write {}: {error}", copy.display()))?;
+    Ok(Some(copy))
 }
 
 /// Deploys a PRE-BUILT OCI image from any registry (Docker Hub / Quay / arbitrary): `podman pull`
@@ -10071,13 +10276,7 @@ async fn image_container_manifest(
             .output()
             .await?;
         if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let msg = err
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("pull failed");
-            anyhow::bail!("podman pull {image} failed: {}", msg.trim());
+            return Err(podman_failed(&format!("pull {image}"), &out));
         }
         log(format!(
             "Pulled {image} in {}ms",

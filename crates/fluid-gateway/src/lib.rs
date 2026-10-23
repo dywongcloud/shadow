@@ -1472,6 +1472,10 @@ impl Gateway {
         const MAX_HEADER_COUNT: usize = 128;
         const MAX_HEADER_BYTES: usize = 32 * 1024;
         const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+        /// Response bytes kept for the failure message when a readiness request comes back
+        /// unacceptable: enough to carry a framework's error page, far too little to carry a body.
+        const ERROR_EXCERPT_BYTES: usize = 512;
+        const ERROR_EXCERPT_CHARS: usize = 240;
 
         let (deployment, static_root, build_output_v3) = {
             let st = self.state.lock();
@@ -1529,10 +1533,16 @@ impl Gateway {
         for function in &deployment.manifest.functions {
             let key = func_key(id.as_str(), &function.name);
             let timeout = readiness_probe_timeout();
+            // ONE budget covers the cell lease AND the request, so a timeout has to say which half
+            // spent it: "did not launch" is a platform-side cold start (the app never got a chance),
+            // "request exceeded" is an app that was reached and did not answer. Collapsed into one
+            // message, both read as the app being broken, and only one of them is.
+            let launched = Arc::new(AtomicBool::new(false));
             let receipt = tokio::time::timeout(timeout, async {
                 let lease = self.fluid.lease(&key).await.map_err(|error| {
                     anyhow::anyhow!("{} failed to launch: {error}", function.name)
                 })?;
+                launched.store(true, Ordering::Relaxed);
                 let cell_id = lease.cell_id().to_string();
                 if function.needs_raw_proxy() {
                     return Ok(ReadinessFunctionReceipt {
@@ -1573,22 +1583,20 @@ impl Gateway {
                     "{} returned oversized readiness headers",
                     function.name
                 );
+                let platform_error = response
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("x-hive-error"))
+                    .map(|(_, value)| value.to_string());
                 anyhow::ensure!(
-                    !response
-                        .headers
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case("x-hive-error")),
-                    "{} returned a platform-generated error response",
-                    function.name
-                );
-                anyhow::ensure!(
-                    (100..500).contains(&response.status),
-                    "{} readiness request returned HTTP {}",
+                    platform_error.is_none(),
+                    "{} returned a platform-generated error response ({})",
                     function.name,
-                    response.status
+                    platform_error.as_deref().unwrap_or("none")
                 );
                 let mut response_bytes = 0usize;
                 let mut response_truncated = false;
+                let mut excerpt: Vec<u8> = Vec::new();
                 let body_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
                 while response_bytes < MAX_RESPONSE_BYTES {
                     let remaining =
@@ -1600,6 +1608,10 @@ impl Gateway {
                         Ok(Some(chunk)) => {
                             let available = MAX_RESPONSE_BYTES - response_bytes;
                             response_bytes += chunk.len().min(available);
+                            let keep = ERROR_EXCERPT_BYTES.saturating_sub(excerpt.len());
+                            if keep > 0 {
+                                excerpt.extend_from_slice(&chunk[..keep.min(chunk.len())]);
+                            }
                             if chunk.len() > available {
                                 response_truncated = true;
                                 break;
@@ -1612,6 +1624,16 @@ impl Gateway {
                 if response_bytes == MAX_RESPONSE_BYTES {
                     response_truncated = true;
                 }
+                // The body is read BEFORE the status is judged, so a rejected status can quote what
+                // the app actually said: "returned HTTP 500" alone cannot distinguish an app that
+                // threw from a platform that handed it the wrong configuration.
+                anyhow::ensure!(
+                    (100..500).contains(&response.status),
+                    "{} readiness request returned HTTP {}{}",
+                    function.name,
+                    response.status,
+                    body_excerpt(&excerpt, ERROR_EXCERPT_CHARS)
+                );
                 Ok(ReadinessFunctionReceipt {
                     function: function.name.clone(),
                     cell_id,
@@ -1624,8 +1646,13 @@ impl Gateway {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "{} readiness probe exceeded {}ms",
+                    "{} {} {}ms",
                     function.name,
+                    if launched.load(Ordering::Relaxed) {
+                        "readiness request exceeded"
+                    } else {
+                        "did not launch within"
+                    },
                     timeout.as_millis()
                 )
             })??;
@@ -2686,6 +2713,24 @@ fn readiness_probe_timeout() -> Duration {
         .unwrap_or(90_000)
         .clamp(1_000, 300_000);
     Duration::from_millis(millis)
+}
+
+/// A bounded, single-line rendering of the first bytes of a readiness response, appended to a failed
+/// probe's message. Control characters are dropped so the build log keeps one line per event, and
+/// the excerpt is capped so an oversized or hostile body costs nothing.
+fn body_excerpt(bytes: &[u8], max_chars: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let flat: String = text
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_chars)
+        .collect();
+    let flat = flat.trim();
+    if flat.is_empty() {
+        String::new()
+    } else {
+        format!(" (body: {flat})")
+    }
 }
 
 fn static_dir_path(dep: &Deployment) -> PathBuf {
