@@ -65,13 +65,86 @@ pub enum Consistency {
 pub struct GuardianRelationalStorage {
     store: Arc<dyn DocumentStore<Error = GuardianError>>,
     consistency: Consistency,
+    /// Keys this node has PROVEN no admitted peer can serve: the index names
+    /// them with a hash, but the blob behind that hash is gone
+    /// ("P2P blob fetch failed from every admitted peer"). That is exactly the
+    /// residue an interrupted first open (or an interrupted replication) leaves
+    /// behind -- a row that is indexed but never materialized -- and re-asking
+    /// for it on every scan is a self-sustaining network storm (measured:
+    /// 31,634 fetches of ONE key in 6 hours). A miss is recorded here and
+    /// answered as absent without touching the network until
+    /// [`UNRESOLVABLE_TTL`] expires, so a blob that later arrives from a peer
+    /// is still picked up on a subsequent walk.
+    ///
+    /// Only keys whose presence in the index is certain are ever recorded (the
+    /// `scan`/`row_ids` miss path walks `index.keys()`); a plain `get` miss,
+    /// which cannot tell "absent" from "not yet materialized", never is --
+    /// recording one would hide the catalog itself for the TTL.
+    unresolvable: std::sync::RwLock<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// How long a proven-unresolvable key answers as absent without a fetch.
+const UNRESOLVABLE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Cap on the remembered set: a per-node ledger of dead hashes is diagnostic
+/// state, never an unbounded map. At the cap the oldest entries are dropped.
+const UNRESOLVABLE_MAX: usize = 4096;
 
 impl GuardianRelationalStorage {
     pub fn new(store: Arc<dyn DocumentStore<Error = GuardianError>>) -> Self {
         Self {
             store,
             consistency: Consistency::LocalFirst,
+            unresolvable: std::sync::RwLock::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// `true` while `gkey` is a remembered unresolvable key: answering `None`
+    /// now costs nothing, so a scan over a table holding one does not re-fetch
+    /// it row after row.
+    fn unresolvable_fresh(&self, gkey: &str) -> bool {
+        let Ok(guard) = self.unresolvable.read() else {
+            return false;
+        };
+        match guard.get(gkey) {
+            Some(at) => at.elapsed() < UNRESOLVABLE_TTL,
+            None => false,
+        }
+    }
+
+    /// Remembers `gkey` as unresolvable, once per TTL: re-warning on every scan
+    /// of the same table is its own log flood.
+    fn mark_unresolvable(&self, gkey: &str) {
+        let now = std::time::Instant::now();
+        let mut guard = match self.unresolvable.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if guard
+            .get(gkey)
+            .map(|at| at.elapsed() < UNRESOLVABLE_TTL)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if guard.len() >= UNRESOLVABLE_MAX {
+            // Drop the oldest half rather than grow without bound.
+            let mut by_age: Vec<(std::time::Instant, String)> = guard
+                .iter()
+                .map(|(k, v)| (*v, k.clone()))
+                .collect::<Vec<_>>();
+            by_age.sort();
+            for (_, k) in by_age.into_iter().take(UNRESOLVABLE_MAX / 2) {
+                guard.remove(&k);
+            }
+        }
+        if guard.insert(gkey.to_string(), now).is_none() {
+            tracing::warn!(
+                key = %gkey,
+                "sql: a row this node's index names has no payload any admitted peer can serve \
+                 (residue of an interrupted write or replication); it answers as absent until a \
+                 peer serves the blob, and is not fetched again for {}s",
+                UNRESOLVABLE_TTL.as_secs()
+            );
         }
     }
 
@@ -127,7 +200,7 @@ impl GuardianRelationalStorage {
     /// rows from different tables never collide on `_id`.
     async fn write_wrapped(&self, gkey: String, collection: &str, doc: &Json) -> RelResult<()> {
         let mut wrapped = Map::new();
-        wrapped.insert("_id".to_string(), Json::String(gkey));
+        wrapped.insert("_id".to_string(), Json::String(gkey.clone()));
         wrapped.insert(
             "__collection".to_string(),
             Json::String(collection.to_string()),
@@ -135,6 +208,31 @@ impl GuardianRelationalStorage {
         wrapped.insert("doc".to_string(), doc.clone());
         let document: Document = Box::new(Json::Object(wrapped));
         self.store.put(document).await.map_err(map_err)?;
+        // Close the interrupted-first-open window from the WRITE side: never
+        // leave behind a key the index names but whose payload this node cannot
+        // produce. A put that lands the index entry and dies before the blob is
+        // durable is how a row becomes permanently unresolvable -- every later
+        // scan then asks every admitted peer for a hash nobody holds, forever.
+        // It is NOT marked unresolvable here: this node is the one that just
+        // wrote it, so a store that simply has not cached the value yet must not
+        // have its own row hidden. The read path marks only keys it took from
+        // `index.keys()`, which is where a dead hash actually shows up.
+        if self
+            .store
+            .index()
+            .get_bytes(&gkey)
+            .map_err(map_err)?
+            .is_none()
+        {
+            // Materialize it through the same lazy path a reader would use.
+            if self.get_wrapped(&gkey).await?.is_none() {
+                tracing::warn!(
+                    key = %gkey,
+                    "sql: a row this node just wrote has no locally materialized payload \
+                     (interrupted write?); it answers as absent until the store catches up"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -155,7 +253,33 @@ impl GuardianRelationalStorage {
     /// catalog is exactly such a key on every boot: reading it through the
     /// index made the engine load an empty catalog on a fully built index
     /// (every table "does not exist"), measured 2026-09-02 fleet-wide.
+    ///
+    /// Never records an unresolvable key: a single-key `get` cannot tell "the
+    /// key is absent" from "the key is known but its payload is not here yet",
+    /// and the SQL catalog is exactly the second case on a cold start. Marking
+    /// it would make the engine read an empty catalog -- every table "does not
+    /// exist" -- for the whole TTL.
     async fn fetch_wrapped(&self, gkey: &str) -> RelResult<Option<Json>> {
+        self.get_wrapped(gkey).await
+    }
+
+    /// As [`fetch_wrapped`], for a key `scan`/`row_ids` took from
+    /// `index.keys()`: its presence in the index is certain, so a fetch that
+    /// yields nothing proves the payload is unresolvable and is remembered (see
+    /// `unresolvable`). This is the path that was re-asking eight peers for one
+    /// dead hash on every scan of one table.
+    async fn fetch_indexed_wrapped(&self, gkey: &str) -> RelResult<Option<Json>> {
+        if self.unresolvable_fresh(gkey) {
+            return Ok(None);
+        }
+        let found = self.get_wrapped(gkey).await?;
+        if found.is_none() {
+            self.mark_unresolvable(gkey);
+        }
+        Ok(found)
+    }
+
+    async fn get_wrapped(&self, gkey: &str) -> RelResult<Option<Json>> {
         let documents = self.store.get(gkey, None).await.map_err(map_err)?;
         for document in documents {
             let Some(wrapped) = document.downcast_ref::<Json>() else {
@@ -233,7 +357,7 @@ impl RelationalStorage for GuardianRelationalStorage {
             let fetch_started = std::time::Instant::now();
             let fetched: Vec<(usize, String, RelResult<Option<Json>>)> =
                 futures::stream::iter(misses.into_iter().map(|(slot, row_id, key)| async move {
-                    (slot, row_id, self.fetch_wrapped(&key).await)
+                    (slot, row_id, self.fetch_indexed_wrapped(&key).await)
                 }))
                 .buffer_unordered(SCAN_FETCH_CONCURRENCY)
                 .collect()
@@ -299,7 +423,7 @@ impl RelationalStorage for GuardianRelationalStorage {
         if !misses.is_empty() {
             let fetched: Vec<(usize, String, RelResult<Option<Json>>)> =
                 futures::stream::iter(misses.into_iter().map(|(slot, row_id, key)| async move {
-                    (slot, row_id, self.fetch_wrapped(&key).await)
+                    (slot, row_id, self.fetch_indexed_wrapped(&key).await)
                 }))
                 .buffer_unordered(SCAN_FETCH_CONCURRENCY)
                 .collect()

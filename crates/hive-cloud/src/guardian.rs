@@ -38,21 +38,63 @@ const KV_NAMESPACE: &str = "hive-state";
 pub(crate) type SqlDb =
     Arc<guardian_db::sql::Database<guardian_db::sql::GuardianRelationalStorage>>;
 
-static SQL_HANDLE: OnceCell<SqlDb> = OnceCell::const_new();
+/// The live relational/SQL database, held in a slot that can be REPLACED in
+/// place (see [`reopen_sql_db`]). A process-global `OnceCell` could not be
+/// reopened at all, so the only recovery from an in-process stall was an
+/// operator reset of the namespace -- which destroys data and is never the fix.
+static SQL_HANDLE: OnceLock<tokio::sync::RwLock<Option<SqlDb>>> = OnceLock::new();
+
+fn sql_slot() -> &'static tokio::sync::RwLock<Option<SqlDb>> {
+    SQL_HANDLE.get_or_init(|| tokio::sync::RwLock::new(None))
+}
 
 /// Lazily opens (once) the in-process relational/SQL database on this SAME live `GuardianDB`
 /// instance `handle()` uses (no network hop, never pgwire); every node opens the identical named
 /// database "hive" and iroh-docs CRDT replication converges each node's copy.
 pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
-    SQL_HANDLE
-        .get_or_try_init(|| async {
-            let h = handle().await?;
-            guardian_db::sql::open_sql(&h.db, "hive")
-                .await
-                .map_err(|e| anyhow::anyhow!("guardian sql open: {e}"))
-        })
+    if let Some(db) = sql_slot().read().await.as_ref() {
+        return Ok(db.clone());
+    }
+    let mut slot = sql_slot().write().await;
+    if let Some(db) = slot.as_ref() {
+        return Ok(db.clone());
+    }
+    let h = handle().await?;
+    let db = guardian_db::sql::open_sql(&h.db, "hive")
         .await
-        .cloned()
+        .map_err(|e| anyhow::anyhow!("guardian sql open: {e}"))?;
+    *slot = Some(db.clone());
+    Ok(db)
+}
+
+/// Reopens the relational/SQL database IN PLACE and returns the new handle.
+///
+/// This is the in-code recovery for a stalled SQL mirror, and it is deliberately
+/// NOT a namespace reset: it opens a fresh `Database` over the SAME live
+/// `GuardianDB`, the same iroh-docs document and the same blobs on disk, so
+/// nothing is deleted and no row is dropped. What it discards is only the
+/// in-process state that can wedge -- a catalog read-modify-write span
+/// abandoned mid-flight, a lock-manager entry, a session id -- and it re-reads
+/// the catalog from the persisted store on the next statement.
+///
+/// The SQL mirror is a read-only projection of canonical state
+/// (`state.json` + `store_sync`), never its source: a caller that needs rows
+/// back rebuilds them from canonical state, and reopening never writes.
+pub(crate) async fn reopen_sql_db(reason: &str) -> anyhow::Result<SqlDb> {
+    let h = handle().await?;
+    let db = guardian_db::sql::open_sql(&h.db, "hive")
+        .await
+        .map_err(|e| anyhow::anyhow!("guardian sql reopen: {e}"))?;
+    let mut slot = sql_slot().write().await;
+    let replaced = slot.replace(db.clone()).is_some();
+    drop(slot);
+    tracing::warn!(
+        reason,
+        replaced,
+        "guardian: relational database reopened in place (the catalog is re-read from persisted \
+         state; no namespace reset, no data deleted)"
+    );
+    Ok(db)
 }
 
 /// Upper bound on how long a caller WAITS for the whole bring-up (iroh endpoint bind, keystore,

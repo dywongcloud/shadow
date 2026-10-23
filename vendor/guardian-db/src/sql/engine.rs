@@ -232,6 +232,57 @@ pub struct Prepared {
 /// genuinely concurrent store, never on a lost write.
 const CATALOG_CAS_ATTEMPTS: u32 = 4;
 
+/// Marker a caller can match on in the flattened error string: this statement
+/// never got to run, because it could not take the catalog read-modify-write
+/// mutex inside [`catalog_write_wait`]. Distinguishing it from "the statement
+/// itself was slow" is the whole point -- the two need opposite remedies, and
+/// printing one message for both is what made a mutex queue read like a wedged
+/// namespace.
+pub const CATALOG_WRITE_BUSY_MARKER: &str = "sql-catalog-write-busy";
+
+/// The same for the save half of the span: the mutex was taken but the catalog
+/// could not be persisted inside [`catalog_save_timeout`], so the statement's
+/// catalog change was NOT saved.
+pub const CATALOG_SAVE_TIMEOUT_MARKER: &str = "sql-catalog-save-timeout";
+
+/// How long a statement waits for the catalog read-modify-write mutex before it
+/// gives up and says so. `GDB_CATALOG_WRITE_WAIT_MS` overrides.
+///
+/// Unbounded, this wait is the primitive that turned one slow statement into a
+/// flood: every non-`SELECT` statement parks on this ONE process-global mutex,
+/// so a burst of concurrent DDL behind a holder that cannot finish in the
+/// statement budget left every waiter burning its own full budget doing nothing
+/// (measured: 240 concurrent copies of one `ALTER TABLE` per minute, all
+/// expiring at the same second, none ever completing). It must stay below the
+/// below EVERY caller's statement budget -- a request path passes ~2.5 s -- or the
+/// caller's own timeout fires first and the wait is never named.
+fn catalog_write_wait() -> Duration {
+    std::env::var("GDB_CATALOG_WRITE_WAIT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(2_000))
+}
+
+/// How long the catalog save half of the span may take. `GDB_CATALOG_SAVE_TIMEOUT_MS`
+/// overrides. A save is a compare-and-swap against the iroh-docs document, so on a
+/// node whose transport is degraded it can outlast any statement budget; unbound it
+/// holds the mutex (and therefore every other writer on the node) for as long as it
+/// takes. Bounding it fails the ONE statement whose change was not persisted
+/// instead of stalling every writer behind it.
+fn catalog_save_timeout() -> Duration {
+    std::env::var("GDB_CATALOG_SAVE_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(7_000))
+}
+
+/// A wait at or above this is worth a WARN: something is queueing.
+const CATALOG_WRITE_SLOW_MS: u64 = 250;
+
 impl<S: RelationalStorage> Session<S> {
     pub fn new(db: Arc<Database<S>>, username: impl Into<String>) -> Self {
         let session_id = db.locks.new_session();
@@ -316,14 +367,14 @@ impl<S: RelationalStorage> Session<S> {
                     // Hand-parsed statements bypass `execute_one`, so they take
                     // the catalog guard at their own entry (see
                     // `Database::catalog_write`).
-                    let _catalog_guard = self.catalog_write_guard().await;
+                    let _catalog_guard = self.catalog_write_guard().await?;
                     results.push(self.execute_alter_extension(&cmd).await?);
                 }
                 Piece::SetConstraints(cmd) => {
                     results.push(self.execute_set_constraints(&cmd).await?);
                 }
                 Piece::TsDict(cmd) => {
-                    let _catalog_guard = self.catalog_write_guard().await;
+                    let _catalog_guard = self.catalog_write_guard().await?;
                     results.push(self.execute_ts_dict(cmd).await?);
                 }
             }
@@ -404,7 +455,7 @@ impl<S: RelationalStorage> Session<S> {
         let _catalog_guard: Option<tokio::sync::OwnedMutexGuard<()>> = match stmt {
             Statement::Query(_) => None,
             _ if self.txn.is_some() => None,
-            _ => Some(self.db.catalog_write.clone().lock_owned().await),
+            _ => Some(self.acquire_catalog_write().await?),
         };
 
         // Transaction control bypasses locking/abort handling.
@@ -440,11 +491,44 @@ impl<S: RelationalStorage> Session<S> {
     /// Holds the catalog's read-modify-write span for a hand-parsed statement
     /// that can save the catalog (see `Database::catalog_write`); `None` inside
     /// an explicit transaction, where `persist_catalog` only stages.
-    async fn catalog_write_guard(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+    async fn catalog_write_guard(&self) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>> {
         if self.txn.is_some() {
-            return None;
+            return Ok(None);
         }
-        Some(self.db.catalog_write.clone().lock_owned().await)
+        Ok(Some(self.acquire_catalog_write().await?))
+    }
+
+    /// Takes the process-global catalog read-modify-write mutex, bounded by
+    /// [`catalog_write_wait`], and reports the wait when it was long.
+    ///
+    /// This is the chokepoint a "guardian sql execute timed out" is usually
+    /// really about: `N` statements behind one holder each pay their own full
+    /// budget for a wait, and whichever of them the caller's timeout abandons
+    /// takes its critical section with it. Bounding the acquisition makes the
+    /// failure name itself (55P03 + [`CATALOG_WRITE_BUSY_MARKER`]) so the
+    /// caller can stop issuing the statement instead of blaming the namespace.
+    async fn acquire_catalog_write(&self) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        let bound = catalog_write_wait();
+        let started = std::time::Instant::now();
+        match tokio::time::timeout(bound, self.db.catalog_write.clone().lock_owned()).await {
+            Ok(guard) => {
+                let waited_ms = started.elapsed().as_millis() as u64;
+                if waited_ms >= CATALOG_WRITE_SLOW_MS {
+                    tracing::warn!(
+                        waited_ms,
+                        "sql: catalog write mutex took {waited_ms} ms to acquire -- catalog \
+                         writers are queueing behind one read-modify-write span"
+                    );
+                }
+                Ok(guard)
+            }
+            Err(_) => Err(SqlError::LockNotAvailable(format!(
+                "{CATALOG_WRITE_BUSY_MARKER}: catalog write mutex not acquired within {} ms; \
+                 one catalog read-modify-write span is still holding it, so this statement never \
+                 ran (its catalog save is what has to finish first)",
+                bound.as_millis()
+            ))),
+        }
     }
 
     /// Sidecar-aware execution wrapper. Routing rules (see
@@ -1488,18 +1572,46 @@ impl<S: RelationalStorage> Session<S> {
     /// It never falls back to a blind save: a span that cannot persist its
     /// catalog change reports the failure, because a false `Ok` here is the
     /// bug this closes.
+    /// Each half of the span is bounded by [`catalog_save_timeout`] as well: a
+    /// save that cannot reach the iroh-docs document must fail THIS statement,
+    /// not hold the catalog mutex until every other writer on the node has
+    /// timed out behind it.
     async fn save_catalog(&mut self, catalog: &Catalog) -> Result<()> {
+        let bound = catalog_save_timeout();
+        let started = std::time::Instant::now();
         let mut mine = catalog.clone();
         let mut expected = self.catalog_base.clone();
         for attempt in 1..=CATALOG_CAS_ATTEMPTS {
+            let left = bound.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Err(SqlError::Storage(format!(
+                    "{CATALOG_SAVE_TIMEOUT_MARKER}: catalog save exceeded its {} ms bound after {} \
+                     compare-and-swap attempt(s); this statement's catalog change was NOT saved",
+                    bound.as_millis(),
+                    attempt - 1
+                )));
+            }
             let next = serde_json::to_value(&mine)
                 .map_err(|e| SqlError::Storage(format!("serialize catalog: {e}")))?;
-            if self
-                .db
-                .storage
-                .save_catalog_cas(expected.as_ref(), &next)
-                .await?
+            let swapped = match tokio::time::timeout(
+                left,
+                self.db.storage.save_catalog_cas(expected.as_ref(), &next),
+            )
+            .await
             {
+                Ok(Ok(swapped)) => swapped,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(SqlError::Storage(format!(
+                        "{CATALOG_SAVE_TIMEOUT_MARKER}: catalog compare-and-swap exceeded the {} ms \
+                         left of its {} ms bound on attempt {attempt}; this statement's catalog \
+                         change was NOT saved",
+                        left.as_millis(),
+                        bound.as_millis()
+                    )))
+                }
+            };
+            if swapped {
                 self.catalog_base = Some(next);
                 return Ok(());
             }
@@ -1508,7 +1620,19 @@ impl<S: RelationalStorage> Session<S> {
             }
             // Another writer's document won. This span's change is a delta
             // against `expected`, so fold it onto the winner and swap again.
-            let theirs_raw = self.db.storage.load_catalog().await?;
+            let theirs_raw = match tokio::time::timeout(left, self.db.storage.load_catalog()).await
+            {
+                Ok(Ok(raw)) => raw,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(SqlError::Storage(format!(
+                        "{CATALOG_SAVE_TIMEOUT_MARKER}: re-reading the winning catalog to merge onto \
+                         it exceeded the {} ms left of its bound on attempt {attempt}; this \
+                         statement's catalog change was NOT saved",
+                        left.as_millis()
+                    )))
+                }
+            };
             let theirs = Self::parse_catalog(theirs_raw.clone(), &self.db.name)?;
             let base = Self::parse_catalog(expected.clone(), &self.db.name)?;
             let mut merged = theirs;

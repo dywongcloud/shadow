@@ -390,6 +390,27 @@ async fn ensure_table_exists(
 static PROJECT_TEAMS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Serializes the reconcile so concurrent callers never issue N copies of the same DDL. Seven
+/// call sites (including one periodic loop whose fan-out reached 240 concurrent calls per minute)
+/// used to each run their own `ALTER TABLE` under `block_in_place`; all of them then queued on the
+/// one catalog write mutex and all of them expired on their own clock. Now the first caller runs
+/// it and the rest await THIS mutex -- as async tasks, not pinned threads -- and see the result.
+fn project_teams_reconcile_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Wall-clock ms before which no caller retries the reconcile (`0` = no cooldown).
+static PROJECT_TEAMS_RECONCILE_NEXT_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static PROJECT_TEAMS_RECONCILE_FAILURES: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+/// First retry spacing after a failed reconcile, and the ceiling it grows to. A statement that
+/// cannot complete must NOT be reissued on every caller, every minute, forever: that is what
+/// turned one slow DDL into ~14k timeouts an hour.
+const RECONCILE_BACKOFF_MS: u64 = 30_000;
+const RECONCILE_BACKOFF_MAX_MS: u64 = 600_000;
+
 /// Adds the `deleted_ms` tombstone column to a `project_teams` table that predates deletion
 /// generations (`CREATE TABLE IF NOT EXISTS` never alters an existing table); memoized.
 async fn reconcile_project_teams_schema(
@@ -401,11 +422,38 @@ async fn reconcile_project_teams_schema(
 /// Bounded by `deadline` (a write path passes `SQL_OP_TIMEOUT`; a request path passes its own read
 /// budget). The latch is only reached when BOTH statements succeed, so a partial reconcile is
 /// retried -- but never at the expense of the deadline.
+///
+/// A FAILED reconcile also latches, negatively: every caller that hit it used to reissue the
+/// identical doomed DDL at once, so one statement that could not complete became a burst that
+/// starved the node. Now a failure backs off ([`RECONCILE_BACKOFF_MS`], doubling to
+/// [`RECONCILE_BACKOFF_MAX_MS`]) and is logged once per backoff step instead of once per caller.
 async fn reconcile_project_teams_schema_by(
     s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
     deadline: std::time::Instant,
 ) {
-    if PROJECT_TEAMS_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
+    use std::sync::atomic::Ordering;
+    if PROJECT_TEAMS_SCHEMA_RECONCILED.load(Ordering::Acquire) {
+        return;
+    }
+    let now = wall_ms();
+    let next = PROJECT_TEAMS_RECONCILE_NEXT_MS.load(Ordering::Acquire);
+    if next != 0 && now < next {
+        return;
+    }
+    // Wait for the single-flight lock only for as long as the caller's own deadline allows: a
+    // reader that arrives while one reconcile is running must not inherit that reconcile's wait.
+    let Some(budget) = budget_left(deadline) else {
+        return;
+    };
+    let Ok(_single) = tokio::time::timeout(budget, project_teams_reconcile_lock().lock()).await
+    else {
+        return;
+    };
+    if PROJECT_TEAMS_SCHEMA_RECONCILED.load(Ordering::Acquire) {
+        return;
+    }
+    let next = PROJECT_TEAMS_RECONCILE_NEXT_MS.load(Ordering::Acquire);
+    if next != 0 && wall_ms() < next {
         return;
     }
     let Some(budget) = budget_left(deadline) else {
@@ -418,7 +466,7 @@ async fn reconcile_project_teams_schema_by(
     )
     .await
     {
-        tracing::warn!(error = %e, "relational: ALTER TABLE project_teams add deleted_ms failed");
+        back_off_project_teams_reconcile(&format!("ALTER TABLE project_teams: {e}"));
         return;
     }
     let Some(budget) = budget_left(deadline) else {
@@ -431,10 +479,32 @@ async fn reconcile_project_teams_schema_by(
     )
     .await
     {
-        tracing::warn!(error = %e, "relational: project_teams deleted_ms backfill failed");
+        back_off_project_teams_reconcile(&format!("deleted_ms backfill: {e}"));
         return;
     }
-    PROJECT_TEAMS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    PROJECT_TEAMS_SCHEMA_RECONCILED.store(true, Ordering::Release);
+    PROJECT_TEAMS_RECONCILE_FAILURES.store(0, Ordering::Release);
+    PROJECT_TEAMS_RECONCILE_NEXT_MS.store(0, Ordering::Release);
+}
+
+/// Records a failed reconcile and sets the cooldown every caller observes. Logged once per step,
+/// not once per caller: with seven call sites on a periodic loop the same message otherwise
+/// repeats hundreds of times a minute.
+fn back_off_project_teams_reconcile(detail: &str) {
+    use std::sync::atomic::Ordering;
+    let failures = PROJECT_TEAMS_RECONCILE_FAILURES
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    let step = failures.min(20) as u32;
+    let wait_ms = (RECONCILE_BACKOFF_MS * (1u64 << step.saturating_sub(1).min(5)))
+        .min(RECONCILE_BACKOFF_MAX_MS);
+    PROJECT_TEAMS_RECONCILE_NEXT_MS.store(wall_ms() + wait_ms, Ordering::Release);
+    tracing::warn!(
+        failures,
+        retry_in_ms = wait_ms,
+        "relational: project_teams schema reconcile failed ({detail}); backing off before any \
+         caller reissues it -- the DDL is retried on a schedule, never per caller"
+    );
 }
 
 /// One-time boot backfill of THIS node's `ProjectStore` rows into the mirror; safe on every node
@@ -841,6 +911,186 @@ async fn repair_missing_table(
     }
 }
 
+/// How many guardian statements this process runs at once (`HIVE_SQL_EXEC_MAX_CONCURRENCY`,
+/// default 24; `0` disables the cap).
+///
+/// Every statement runs under `block_in_place`, so one concurrent statement is one extra OS
+/// thread held for its whole budget. A burst of concurrent DDL once took a live node from 73 to
+/// 313 threads in one second, with all 240 of them parked on the same catalog mutex and each
+/// burning its own 10 s bound -- the flood the operator saw. Capping concurrency keeps the thread
+/// count flat and turns the flood into a queue that fails fast instead.
+const DEFAULT_SQL_EXEC_MAX_CONCURRENCY: usize = 24;
+
+fn sql_exec_slots() -> Option<&'static tokio::sync::Semaphore> {
+    static SLOTS: std::sync::OnceLock<Option<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SLOTS
+        .get_or_init(|| {
+            let n = std::env::var("HIVE_SQL_EXEC_MAX_CONCURRENCY")
+                .ok()
+                .and_then(|s| s.trim().parse::<usize>().ok())
+                .unwrap_or(DEFAULT_SQL_EXEC_MAX_CONCURRENCY);
+            (n > 0).then(|| tokio::sync::Semaphore::new(n))
+        })
+        .as_ref()
+}
+
+/// Catalog read-modify-write stalls this process has PROVEN (the engine said so, it is not a
+/// guess): the statement never ran because it could not take the catalog mutex in time.
+static CATALOG_STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CATALOG_STALL_LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Rate-limit latch for the stall WARN above (60 s).
+static CATALOG_STALL_WARNED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Wall-clock ms of the last in-place reopen, also its single-flight latch.
+static LAST_REOPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Stalls that must accumulate before one reopen, so a single slow statement never triggers one.
+const REOPEN_STALL_THRESHOLD: u64 = 8;
+/// Minimum spacing between two reopens: a reopen that does not help must not become a loop.
+const REOPEN_MIN_INTERVAL_MS: u64 = 300_000;
+
+/// The SQL mirror's stall counters, for a health/diagnostic surface. A node that reports
+/// `catalog_stalls` climbing with `index_ready` true and no `42P01` is queueing on the catalog
+/// read-modify-write mutex -- it is NOT a wedged namespace, and resetting one would destroy data
+/// without touching the cause.
+pub(crate) fn sql_mirror_stalls() -> (u64, u64) {
+    (
+        CATALOG_STALLS.load(std::sync::atomic::Ordering::Acquire),
+        CATALOG_STALL_LAST_MS.load(std::sync::atomic::Ordering::Acquire),
+    )
+}
+
+/// Records a proven catalog stall and, once enough have accumulated, schedules one reopen.
+///
+/// Deliberately SYNCHRONOUS and never awaited by `exec_once`: the recovery task re-runs the
+/// schema bring-up, whose future contains `exec_once`, so awaiting it there would make the two
+/// futures mutually recursive and the `Send` obligation cyclic (rustc breaks the cycle by
+/// answering `false`, which is the error this shape avoids).
+fn note_catalog_stall() {
+    use std::sync::atomic::Ordering;
+    let now = wall_ms();
+    CATALOG_STALLS.fetch_add(1, Ordering::AcqRel);
+    CATALOG_STALL_LAST_MS.store(now, Ordering::Release);
+
+    // DETECT: one rate-limited WARN that names the mechanism, so a node flooding with these is
+    // legible without a human guessing. It never asserts a wedged namespace -- that claim was
+    // measurably false on a node printing it ~14k times an hour (namespace open, index built,
+    // 42P01 zero fleet-wide) -- and it never advises a reset, which destroys data without
+    // touching the cause.
+    let last_warn = CATALOG_STALL_WARNED_MS.load(Ordering::Acquire);
+    if now.saturating_sub(last_warn) >= 60_000
+        && CATALOG_STALL_WARNED_MS
+            .compare_exchange(last_warn, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+    {
+        let (stalls, last_ms) = sql_mirror_stalls();
+        tracing::warn!(
+            stalls,
+            since_last_ms = now.saturating_sub(last_ms),
+            index_ready = index_ready(),
+            "relational: statements are timing out on the catalog read-modify-write span, not on \
+             the namespace -- every non-SELECT statement queues on one process-global mutex and \
+             this node is not finishing a catalog save inside the budget. Check mesh reachability \
+             and 'sql: catalog write mutex took N ms' before any reset; the in-place reopen \
+             recovery runs after {REOPEN_STALL_THRESHOLD} stalls."
+        );
+    }
+
+    let stalls = CATALOG_STALLS.load(Ordering::Acquire);
+    if stalls < REOPEN_STALL_THRESHOLD {
+        return;
+    }
+    let now = wall_ms();
+    let last = LAST_REOPEN_MS.load(Ordering::Acquire);
+    if now.saturating_sub(last) < REOPEN_MIN_INTERVAL_MS {
+        return;
+    }
+    if LAST_REOPEN_MS
+        .compare_exchange(last, now, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    crate::bulkhead::spawn(recover_from_catalog_stall(stalls));
+}
+
+/// Reopens the SQL database in place once a sustained catalog stall proves in-process retries are
+/// not going to clear it. Rate-limited and single-flight (a CAS on [`LAST_REOPEN_MS`]); the
+/// reopen itself deletes nothing -- see `guardian::reopen_sql_db`.
+///
+/// Afterwards the schema bring-up runs again, so any table the catalog lost is recreated from
+/// `SCHEMA_TABLES` (code-owned, canonical DDL) and rows the mirror needs are re-derived from
+/// canonical state by the existing backfill -- never the other way round: this module is a
+/// read-only projection of `state.json` + `store_sync`.
+async fn recover_from_catalog_stall(stalls: u64) {
+    use std::sync::atomic::Ordering;
+    let reason = "catalog read-modify-write span stalled";
+    match crate::guardian::reopen_sql_db(reason).await {
+        Ok(db) => {
+            CATALOG_STALLS.store(0, Ordering::Release);
+            // The reopen may have cleared whatever the reconcile was waiting on; let it retry at
+            // once instead of sitting out the rest of its backoff.
+            PROJECT_TEAMS_RECONCILE_NEXT_MS.store(0, Ordering::Release);
+            PROJECT_TEAMS_RECONCILE_FAILURES.store(0, Ordering::Release);
+            tracing::warn!(
+                reason,
+                stalls,
+                "relational: recovered from a stalled catalog by reopening the SQL database in \
+                 place (no namespace reset, no data deleted); re-verifying the schema"
+            );
+            // A fresh `Database` carries a fresh storage index, and a schema bring-up against an
+            // UNBUILT index reads an empty catalog -- its `CREATE TABLE` would then overwrite the
+            // durable one, which is the failure `init_schema` already refuses to risk on an
+            // unbuilt index. Walk first, and refuse the bring-up if the walk populates nothing.
+            match tokio::time::timeout(index_build_timeout(), db.storage().refresh()).await {
+                Ok(Ok(())) if db.storage().index_len() > 0 => init_schema().await,
+                Ok(Ok(())) => tracing::error!(
+                    "relational: the reopened store's index walked to 0 keys; the schema \
+                     bring-up is skipped rather than recreated over a catalog this node cannot read"
+                ),
+                Ok(Err(e)) => tracing::error!(
+                    error = %e,
+                    "relational: the reopened store's index walk failed; the schema bring-up is \
+                     skipped rather than run against a catalog this node cannot read"
+                ),
+                Err(_) => tracing::error!(
+                    bound_secs = index_build_timeout().as_secs(),
+                    "relational: the reopened store's index walk exceeded its bound; the schema \
+                     bring-up is skipped rather than run against a catalog this node cannot read"
+                ),
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                reason,
+                stalls,
+                error = %e,
+                "relational: could not reopen the SQL database; the stall stands until the \
+                 catalog write span clears"
+            );
+        }
+    }
+}
+
+/// What a statement timeout actually means.
+///
+/// The string this replaces asserted "namespace likely wedged from an interrupted first-open;
+/// restart or reset this node guardian data" on EVERY timeout. That diagnosis is unobservable
+/// from here and was measurably false on a node flooding with it: the namespace was open
+/// (735 snapshot batches committed in 6 h), the index was built, and `42P01` was 0 fleet-wide.
+/// What was really happening: 240 concurrent copies of one `ALTER TABLE`, each parked in
+/// `block_in_place` on the process-global catalog read-modify-write mutex, each with its own
+/// 10 s clock. Report the mechanism that is actually observable and let the counters carry the
+/// rest.
+fn timeout_diagnosis(sql: &str) -> String {
+    let shape = sql.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    format!(
+        "the statement did not finish in its budget (statement: {shape}...). A non-SELECT \
+         statement takes the process-global catalog write mutex first, so this is either that \
+         wait or the catalog save behind it -- look for 'sql: catalog write mutex took N ms' and \
+         for 'sql-catalog-save-timeout'. The namespace is not necessarily wedged: check \
+         `GuardianDB snapshot batch committed` and the 42P01 count before any reset."
+    )
+}
+
 /// One guardian statement, bounded: no repair, no retry. Every SQL path reaches
 /// the store through `exec_with_budget`, which wraps exactly one of these.
 async fn exec_once(
@@ -848,16 +1098,48 @@ async fn exec_once(
     sql: &str,
     budget: std::time::Duration,
 ) -> Result<Vec<ExecResult>, String> {
+    // Concurrency cap FIRST, before `block_in_place`: a waiter here is an async task, not a
+    // pinned OS thread, so a burst costs nothing until it actually runs.
+    let _slot: Option<tokio::sync::SemaphorePermit<'static>> = match sql_exec_slots() {
+        Some(sem) => match tokio::time::timeout(budget, sem.acquire()).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => None,
+            Err(_) => {
+                return Err(format!(
+                    "guardian sql execute queue saturated: {DEFAULT_SQL_EXEC_MAX_CONCURRENCY} \
+                     statements were already in flight and none finished within {budget:?}"
+                ))
+            }
+        },
+        None => None,
+    };
     let handle = tokio::runtime::Handle::current();
-    tokio::task::block_in_place(move || {
+    let raw = tokio::task::block_in_place(move || {
         handle.block_on(async {
             match tokio::time::timeout(budget, s.execute(sql)).await {
                 Ok(Ok(res)) => Ok(res),
                 Ok(Err(e)) => Err(format!("{e}")),
-                Err(_) => Err(format!("guardian sql execute timed out after {budget:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
+                Err(_) => Err(format!("guardian sql execute timed out after {budget:?}")),
             }
         })
-    })
+    });
+    match &raw {
+        Err(e) => {
+            let catalog_stall = e.contains(guardian_db::sql::engine::CATALOG_WRITE_BUSY_MARKER)
+                || e.contains(guardian_db::sql::engine::CATALOG_SAVE_TIMEOUT_MARKER);
+            if catalog_stall {
+                note_catalog_stall();
+                Err(e.clone())
+            } else if e.starts_with("guardian sql execute timed out") {
+                // The caller's own timeout fired without the engine naming a cause; say what is
+                // observable rather than asserting a wedged namespace.
+                Err(format!("{}: {}", e, timeout_diagnosis(sql)))
+            } else {
+                Err(e.clone())
+            }
+        }
+        Ok(_) => raw,
+    }
 }
 
 /// `exec` at a caller's budget, which MUST be the bound a request path uses: `block_in_place` holds
