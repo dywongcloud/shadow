@@ -1080,12 +1080,39 @@ impl Catalog {
         if !self.schemas.contains_key(&table.schema) {
             return Err(RelError::UndefinedSchema(table.schema.clone()));
         }
+        // An index entry naming a table the catalog does not hold is
+        // unreachable — the engine reaches an index only through its table (`table_to_indexes`)
+        // — and it BLOCKS this table's re-creation: `CREATE TABLE IF NOT EXISTS` inserts the table
+        // first and its primary-key index second, so a surviving `<t>_pkey` fails the insert with
+        // `relation "public.<t>_pkey" already exists` and the table stays missing until a restart.
+        // The table being inserted is absent by the check above, so every index naming it is such
+        // an orphan and is dropped here.
+        self.drop_orphan_indexes_of(&q);
         if table.storage_collection.is_empty() {
             table.storage_collection = format!("__gdb_sql_rows_{}", table.oid);
         }
         table.rebuild_column_map();
         self.tables.insert(q, table);
         Ok(())
+    }
+
+    /// Drops every index entry whose owning table is `q` — called only from
+    /// [`Catalog::insert_table`], where `q` is known absent, so each is an
+    /// orphan. Returns how many were dropped.
+    fn drop_orphan_indexes_of(&mut self, q: &QualifiedName) -> usize {
+        let orphans: Vec<QualifiedName> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| idx.schema == q.schema && idx.table == q.name)
+            .map(|(iq, _)| iq.clone())
+            .collect();
+        for iq in &orphans {
+            self.indexes.remove(iq);
+        }
+        if !orphans.is_empty() {
+            self.rebuild_table_to_indexes();
+        }
+        orphans.len()
     }
 
     /// Foreign keys on *other* tables whose referenced table is `q` (the

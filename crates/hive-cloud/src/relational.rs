@@ -771,8 +771,17 @@ fn table_repair_at(
 /// `None` for any other error, so nothing else is ever treated as 42P01.
 fn missing_relation(err: &str) -> Option<&str> {
     let rest = err.split_once("relation \"")?.1;
-    let name = rest.split_once('"')?.0;
-    (!name.is_empty()).then_some(name)
+    let (name, tail) = rest.split_once('"')?;
+    // 42P01 only, never any message that happens to quote a relation: the
+    // engine writes `relation "x_pkey" already exists` too, and a repair
+    // triggered by that would run a no-op CREATE TABLE IF NOT EXISTS, use up
+    // this table's 60 s slot and log "recreated it at runtime" for a table
+    // that was never missing. Measured on the live engine: the lost-table
+    // message is exactly `relation "billing_accounts" does not exist`.
+    if name.is_empty() || !tail.contains("does not exist") {
+        return None;
+    }
+    Some(name)
 }
 
 /// Recreates a table the catalog lost AFTER boot, and reports whether the
