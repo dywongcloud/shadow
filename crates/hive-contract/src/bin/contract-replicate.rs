@@ -100,6 +100,7 @@ async fn run_plan(
                 p.payload.clone(),
                 &p.target,
                 ts,
+                Ok(()),
             )
             .await;
         ts += 1;
@@ -216,10 +217,12 @@ async fn main() {
             team: d.team.clone(),
             project: d.project.clone(),
             status: d.status.clone(),
+            write_count: None,
+            last_bytes: None,
         })
         .collect();
     dbs.sort_by(|a, b| a.id.cmp(&b.id));
-    let canonical = reconcile::project(&dbs, &snap.database_tombstones);
+    let mut canonical = reconcile::project(&dbs, &snap.database_tombstones);
     println!("\n== P1 real snapshot ==");
     println!(
         "databases        : {} ({} tombstoned)",
@@ -301,6 +304,24 @@ async fn main() {
     });
 
     let results = run_plan(&engine, &contract, &plan, 1_790_000_000_000u64).await;
+    // Canonical state records the write plane for the writes the plan actually performed: the first
+    // four databases, two writes each (4096 then 8192 bytes). The write plane is inside coverage
+    // now, so a recorded count is what keeps the two sides comparable instead of unattested.
+    let plan_len = dbs.len();
+    for (k, d) in dbs.iter_mut().take(4).enumerate() {
+        let base = plan_len + 2 * k;
+        let committed = (0..2)
+            .filter(|n| results.get(base + n).copied().unwrap_or(false))
+            .count() as u64;
+        if committed > 0 {
+            d.write_count = Some(committed);
+            d.last_bytes = (0..2)
+                .filter(|n| results.get(base + n).copied().unwrap_or(false))
+                .map(|n| ((n + 1) * 4096).to_string())
+                .last();
+        }
+    }
+    canonical = reconcile::project(&dbs, &snap.database_tombstones);
     let committed = results.iter().filter(|r| **r).count();
     let refused = results.len() - committed;
     let owner_log = engine
@@ -506,6 +527,7 @@ async fn main() {
             hive_contract::contract::AuthPolicy::TenantAuthorized,
             hive_contract::contract::Effect::StateWrite,
             &["db_id", "kind", "project"],
+            "db_id",
         )
         .expect("db.create");
     let mut r = Replica::new(older);

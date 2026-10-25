@@ -46,6 +46,10 @@ pub struct DeclaredOp {
     /// The exact payload key set. Exact in both directions: a missing key and an unexpected key are
     /// both refusals.
     pub payload_keys: &'static [&'static str],
+    /// Which payload key names the operation's target. `contract::validate` refuses an op whose
+    /// submitted target is not this key's value, so the database the contract authorized is the
+    /// database whose state moves.
+    pub target_key: &'static str,
 }
 
 /// The contract: the closed set of declared operation kinds.
@@ -59,24 +63,28 @@ pub const DECLARED_OPS: &[DeclaredOp] = &[
         auth: AuthPolicy::TenantAuthorized,
         effect: Effect::StateWrite,
         payload_keys: &["db_id", "kind", "project"],
+        target_key: "db_id",
     },
     DeclaredOp {
         kind: "db.delete",
         auth: AuthPolicy::TenantAuthorized,
         effect: Effect::StateWrite,
         payload_keys: &["db_id", "project"],
+        target_key: "db_id",
     },
     DeclaredOp {
         kind: "db.write",
         auth: AuthPolicy::TenantAuthorized,
         effect: Effect::StateWrite,
         payload_keys: &["bytes", "db_id", "project"],
+        target_key: "db_id",
     },
     DeclaredOp {
         kind: "db.propose",
         auth: AuthPolicy::OpenParticipation,
         effect: Effect::LogOnly,
         payload_keys: &["db_id", "note"],
+        target_key: "db_id",
     },
 ];
 
@@ -89,7 +97,7 @@ pub fn managed_db_contract() -> Contract {
     let mut c = Contract::new(CONTRACT_ID);
     c.version = CONTRACT_VERSION;
     for op in DECLARED_OPS {
-        c.declare(op.kind, op.auth, op.effect, op.payload_keys)
+        c.declare(op.kind, op.auth, op.effect, op.payload_keys, op.target_key)
             .unwrap_or_else(|e| panic!("managed-db contract row '{}' is invalid: {e}", op.kind));
     }
     c

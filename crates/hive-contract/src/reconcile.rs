@@ -17,15 +17,18 @@
 //! against canonical state instead of against a second replay.
 //!
 //! COVERAGE BOUNDARY, stated rather than hidden: canonical state can attest only the keys the
-//! platform itself stores. For the managed-db contract that is `{tenant}/{db_id}/status`; the write
-//! counter and last-bytes keys (`{tenant}/{target}/writes`, `.../last_bytes`) are facts the contract
-//! keeps and the platform does not, so they are out of the projection's coverage and are reported as
-//! `contract_only` rather than silently ignored.
+//! platform itself stores. For the managed-db contract that is the liveness key
+//! (`{tenant}/{db_id}/status`) AND the write plane -- the per-database write count and the last
+//! bytes value -- because a `db.write` is a mutation of tenant data and leaving it out of coverage
+//! is what let 500 unauthorized writes reconcile as `in_sync` with zero divergences
+//! (contract-write-plane-outside-canonical-coverage). [`CanonicalDb`] carries the write plane as
+//! `Option`s: when the platform records it, the two sides are compared; when it does not, the
+//! contract's claim is reported as a divergence rather than as a contract-local fact nobody checks.
 
 use crate::exec::Index;
 use std::collections::BTreeMap;
 
-/// The platform's view of one managed database: only the fields canonical state can attest.
+/// The platform's view of one managed database: the fields canonical state can attest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalDb {
     pub id: String,
@@ -33,6 +36,13 @@ pub struct CanonicalDb {
     pub team: String,
     pub project: String,
     pub status: String,
+    /// Canonical state's own count of writes to this database: the write plane, which is the part of
+    /// a `db.write` this projection used to be silent about. `None` means the platform records no
+    /// write count for this database, so any count the contract claims is unattested.
+    pub write_count: Option<u64>,
+    /// The `bytes` value canonical state recorded for the database's last write. `None` = not
+    /// recorded, so a last-bytes value in the contract index is unattested.
+    pub last_bytes: Option<String>,
 }
 
 /// One declared mutation path that belongs in contract scope.
@@ -70,10 +80,19 @@ pub fn scope_report() -> (usize, usize) {
 
 /// The index key canonical state and the contract both speak for one database's liveness.
 ///
-/// Mirrors `exec::apply`'s `db.create` key exactly (`{tenant}/{target}/status`); if the two ever
-/// drift, reconciliation reports a divergence on every row instead of silently agreeing.
+/// Mirrors `exec::apply`'s `db.create` key exactly; if the two ever drift, reconciliation reports a
+/// divergence on every row instead of silently agreeing.
 pub fn status_key(tenant: &str, target: &str) -> String {
-    format!("{tenant}/{target}/status")
+    format!("{}/status", crate::exec::namespace(tenant, target))
+}
+
+/// The write-plane keys, mirroring `exec::apply`'s `db.write` keys exactly.
+pub fn writes_key(tenant: &str, target: &str) -> String {
+    format!("{}/writes", crate::exec::namespace(tenant, target))
+}
+
+pub fn last_bytes_key(tenant: &str, target: &str) -> String {
+    format!("{}/last_bytes", crate::exec::namespace(tenant, target))
 }
 
 /// Project canonical state into contract-index shape.
@@ -82,6 +101,10 @@ pub fn status_key(tenant: &str, target: &str) -> String {
 /// live status key; a tombstoned one (`DatabaseStore::remove_db`, `databases.rs:740`, tombstone
 /// written at :742) has none. Tombstones are permanent there ("absence never erases a row" is the
 /// row-merge rule; a tombstone is the erasure), so they are the platform's delete-of-record here.
+///
+/// The write plane is projected too, and only where the platform actually recorded it: a `None` is
+/// left out rather than defaulted to zero, so the reconciler never manufactures a canonical value it
+/// was not given -- it reports the contract's claim as unattested instead.
 pub fn project(dbs: &[CanonicalDb], tombstones: &BTreeMap<String, u64>) -> Index {
     let mut out = Index::new();
     for d in dbs {
@@ -94,6 +117,12 @@ pub fn project(dbs: &[CanonicalDb], tombstones: &BTreeMap<String, u64>) -> Index
             other => other.to_string(),
         };
         out.insert(status_key(&tenant, &d.id), value);
+        if let Some(n) = d.write_count {
+            out.insert(writes_key(&tenant, &d.id), n.to_string());
+        }
+        if let Some(b) = &d.last_bytes {
+            out.insert(last_bytes_key(&tenant, &d.id), b.clone());
+        }
     }
     out
 }
@@ -135,8 +164,9 @@ pub struct Divergence {
 pub struct ReconcileReport {
     /// Keys either side can attest that were compared.
     pub compared: usize,
-    /// Keys only the contract holds, outside canonical coverage by design (write counters, last
-    /// bytes). Reported, never dropped -- an unexpected entry here is how coverage drift shows up.
+    /// Keys only the contract holds, outside canonical coverage by design (a key that is not one of
+    /// the managed-db contract's attestable keys). Reported, never dropped -- an unexpected entry
+    /// here is how coverage drift shows up.
     pub contract_only: Vec<String>,
     pub divergences: Vec<Divergence>,
 }
@@ -185,8 +215,9 @@ pub fn reconcile(canonical: &Index, contract: &Index) -> ReconcileReport {
                 });
             }
             (None, Some(xv)) => {
-                // Outside canonical coverage by design (a write counter) or a genuine stale row.
-                // Distinguished by the coverage predicate, not by guesswork.
+                // An attestable key canonical state does not hold: a genuinely stale row, or a
+                // write-plane claim the platform never recorded. Distinguished by the coverage
+                // predicate, not by guesswork -- and never treated as "in sync".
                 if is_attestable(k) {
                     report.compared += 1;
                     report.divergences.push(Divergence {
@@ -207,8 +238,12 @@ pub fn reconcile(canonical: &Index, contract: &Index) -> ReconcileReport {
     report
 }
 
-/// Whether canonical state can speak to this key at all. Only the liveness key is attestable today;
-/// everything else the contract holds is a contract-local fact and is reported as `contract_only`.
+/// Whether canonical state can speak to this key at all.
+///
+/// The liveness key AND the write plane: a write count or a last-bytes value is a claim about a
+/// database, and canonical state is the only authority that can say whether the database exists to
+/// be written to and how many writes it recorded. Covering only `/status` is what let an entire
+/// unauthorized write plane reconcile as in sync.
 pub fn is_attestable(key: &str) -> bool {
-    key.ends_with("/status")
+    key.ends_with("/status") || key.ends_with("/writes") || key.ends_with("/last_bytes")
 }

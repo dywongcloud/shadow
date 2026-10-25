@@ -102,7 +102,7 @@ async fn main() {
     let mut failures = 0usize;
 
     // ---- P1: the real surface, unmodified -------------------------------------------------
-    let dbs: Vec<CanonicalDb> = snap
+    let mut dbs: Vec<CanonicalDb> = snap
         .databases
         .iter()
         .map(|d| CanonicalDb {
@@ -110,6 +110,8 @@ async fn main() {
             team: d.team.clone(),
             project: d.project.clone(),
             status: d.status.clone(),
+            write_count: None,
+            last_bytes: None,
         })
         .collect();
     let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
@@ -134,18 +136,20 @@ async fn main() {
     probe(&mut failures,!dbs.is_empty(), "real input loaded", format!("{} databases", dbs.len()));
 
     // ---- P2: canonical projection ---------------------------------------------------------
-    let canonical = reconcile::project(&dbs, &snap.database_tombstones);
+    // Status only at this point: no writes have been performed yet, so no write plane is recorded.
+    let canonical_status = reconcile::project(&dbs, &snap.database_tombstones);
     println!("\n== P2 canonical projection ==");
-    println!("projected keys   : {}", canonical.len());
+    println!("projected keys   : {}", canonical_status.len());
     probe(&mut failures,
-        canonical.len() == dbs.len(),
+        canonical_status.len() == dbs.len(),
         "every live database is attestable",
-        format!("{} keys for {} rows", canonical.len(), dbs.len()),
+        format!("{} keys for {} rows", canonical_status.len(), dbs.len()),
     );
 
     // ---- P3: run the real contract over the real databases ---------------------------------
     let contract = managed_db_contract();
     let engine = Engine::new(hive_contract::engine::DEFAULT_SHARDS);
+    let mut writes_per_db: BTreeMap<String, u64> = BTreeMap::new();
     for d in &snap.databases {
         let tenant = record_tenant(Some(&d.team));
         let r = engine
@@ -160,12 +164,14 @@ async fn main() {
                 ]),
                 &d.id,
                 d.created_ms,
+                Ok(()),
             )
             .await
             .expect("submit");
         assert!(r.committed, "db.create refused: {:?}", r.error);
-        // Two writes per database: these produce the contract-local keys canonical state cannot
-        // attest, which is exactly the coverage boundary the reconciler has to report, not hide.
+        // Two writes per database. They used to produce keys canonical state could not attest and
+        // the reconciler reported as contract-only: the write plane was outside coverage, so 500
+        // unauthorized writes reconciled as in sync. P10 re-runs that attack.
         for _ in 0..2 {
             let w = engine
                 .submit(
@@ -179,12 +185,25 @@ async fn main() {
                     ]),
                     &d.id,
                     d.created_ms,
+                    Ok(()),
                 )
                 .await
                 .expect("submit");
             assert!(w.committed, "db.write refused: {:?}", w.error);
+            *writes_per_db.entry(d.id.clone()).or_default() += 1;
         }
     }
+    // Canonical state records the write plane for the writes it actually performed -- that is what
+    // a wired platform's own account looks like, and it is the only thing that makes the two sides
+    // comparable instead of leaving every write unattested forever.
+    for d in &mut dbs {
+        d.write_count = writes_per_db.get(&d.id).copied();
+        d.last_bytes = writes_per_db
+            .get(&d.id)
+            .copied()
+            .map(|_| "1024".to_string());
+    }
+    let canonical = reconcile::project(&dbs, &snap.database_tombstones);
     let log_len = engine.snapshot_log(&contract.id).await.unwrap().len();
     println!("\n== P3 contract execution over real rows ==");
     println!("ops committed    : {log_len} (1 create + 2 writes per database)");
@@ -203,14 +222,14 @@ async fn main() {
     println!("divergences      : {}", rep.divergences.len());
     println!("contract-only    : {} (outside canonical coverage)", rep.contract_only.len());
     probe(&mut failures,
-        rep.in_sync(),
+        rep.in_sync() && rep.contract_only.is_empty(),
         "in-contract mutations keep the log and canonical state in agreement",
         format!("{} divergences over {} attested keys", rep.divergences.len(), rep.compared),
     );
     probe(&mut failures,
-        rep.contract_only.len() == dbs.len() * 2,
-        "coverage boundary reported, not hidden",
-        format!("{} contract-only keys (writes + last_bytes)", rep.contract_only.len()),
+        rep.compared == dbs.len() * 3,
+        "the write plane is inside coverage and compared, not reported as contract-only",
+        format!("{} compared keys over {} rows (status + writes + last_bytes)", rep.compared, dbs.len()),
     );
 
     // ---- P5: a delete that bypasses the contract -------------------------------------------
@@ -225,10 +244,10 @@ async fn main() {
         println!("  {} {}", d.kind.label(), d.key);
     }
     probe(&mut failures,
-        r5.count(DivergenceKind::StaleInContract) == 1 && !r5.in_sync(),
-        "bypassed delete is detected",
+        r5.count(DivergenceKind::StaleInContract) == 3 && !r5.in_sync(),
+        "bypassed delete is detected, write plane included",
         format!(
-            "stale_in_contract={} (dropped {})",
+            "stale_in_contract={} (dropped {}, status + writes + last_bytes)",
             r5.count(DivergenceKind::StaleInContract),
             dropped.id
         ),
@@ -241,6 +260,8 @@ async fn main() {
         team: snap.databases[0].team.clone(),
         project: snap.databases[0].project.clone(),
         status: "ready".to_string(),
+        write_count: Some(0),
+        last_bytes: Some("0".to_string()),
     });
     let canonical_injected = reconcile::project(&injected, &snap.database_tombstones);
     let r6 = reconcile::reconcile(&canonical_injected, &replayed);
@@ -249,9 +270,9 @@ async fn main() {
         println!("  {} {}", d.kind.label(), d.key);
     }
     probe(&mut failures,
-        r6.count(DivergenceKind::MissingFromContract) == 1,
+        r6.count(DivergenceKind::MissingFromContract) == 3,
         "bypassed create is detected",
-        format!("missing_from_contract={}", r6.count(DivergenceKind::MissingFromContract)),
+        format!("missing_from_contract={} (status + writes + last_bytes)", r6.count(DivergenceKind::MissingFromContract)),
     );
 
     // ---- P7: a re-key that bypasses the contract -------------------------------------------
@@ -265,9 +286,9 @@ async fn main() {
         println!("  {} {}", d.kind.label(), d.key);
     }
     probe(&mut failures,
-        r7.count(DivergenceKind::MissingFromContract) == 1
-            && r7.count(DivergenceKind::StaleInContract) == 1,
-        "bypassed re-key is detected as one stale + one missing",
+        r7.count(DivergenceKind::MissingFromContract) == 3
+            && r7.count(DivergenceKind::StaleInContract) == 3,
+        "bypassed re-key is detected as stale + missing on every attestable key",
         format!(
             "stale={} missing={} (moved {})",
             r7.count(DivergenceKind::StaleInContract),
@@ -287,6 +308,7 @@ async fn main() {
             payload(&[("db_id", &snap.databases[0].id), ("project", &snap.databases[0].project)]),
             &snap.databases[0].id,
             0,
+            Ok(()),
         )
         .await
         .expect("submit");
@@ -303,6 +325,7 @@ async fn main() {
             payload(&[("db_id", "db_x"), ("kind", "redis"), ("project", "p")]),
             "db_x",
             0,
+            Ok(()),
         )
         .await
         .expect("submit");
@@ -312,7 +335,13 @@ async fn main() {
         format!("{:?}", untagged.error),
     );
     let mut backdoor = Contract::new("hive.backdoor.v1");
-    let declared = backdoor.declare("db.write", AuthPolicy::OpenParticipation, Effect::StateWrite, &["db_id"]);
+    let declared = backdoor.declare(
+        "db.write",
+        AuthPolicy::OpenParticipation,
+        Effect::StateWrite,
+        &["db_id"],
+        "db_id",
+    );
     probe(&mut failures,
         declared.is_err(),
         "open participation may never be declared as a state write",
@@ -326,6 +355,7 @@ async fn main() {
             payload(&[("db_id", &snap.databases[0].id), ("note", "observed")]),
             &snap.databases[0].id,
             0,
+            Ok(()),
         )
         .await
         .expect("submit");
@@ -353,6 +383,129 @@ async fn main() {
         declared_n == 6,
         "the declared mutation surface is the one the map located",
         format!("{declared_n} paths"),
+    );
+
+    // ---- P10: the write plane is inside coverage ---------------------------------------------
+    // The attack that exposed contract-write-plane-outside-canonical-coverage: 500 db.write ops
+    // appended into a victim's namespace, none of them authorized by canonical state, reconciled as
+    // in_sync=true with 0 divergences, because `is_attestable` admitted only /status and apply's
+    // db.write emits only /writes and /last_bytes. Same attack, re-run.
+    println!("\n== P10 unauthorized writes in a victim namespace ==");
+    let victim_db = "db-victim";
+    let mut forged = hive_contract::exec::Executor::new(contract.clone());
+    // The victim database exists and is live: canonical state and the contract agree on that key,
+    // which is exactly why the old reconciler saw nothing -- it attested only /status.
+    forged
+        .commit(
+            hive_contract::oplog::Op {
+                seq: 0,
+                contract: contract.id.clone(),
+                tenant: "victim".to_string(),
+                actor: "platform:require_project".to_string(),
+                target: victim_db.to_string(),
+                kind: "db.create".to_string(),
+                payload: payload(&[
+                    ("db_id", victim_db),
+                    ("kind", "sqlite"),
+                    ("project", "proj-victim"),
+                ]),
+            },
+            0,
+            Ok(()),
+        )
+        .expect("commit");
+    for i in 0..500u64 {
+        // Straight onto the executor: the platform's gate never ran, so canonical state authorized
+        // none of these. That is what an out-of-band write path looks like.
+        forged
+            .commit(
+                hive_contract::oplog::Op {
+                    seq: 0,
+                    contract: contract.id.clone(),
+                    tenant: "victim".to_string(),
+                    actor: "out-of-band".to_string(),
+                    target: victim_db.to_string(),
+                    kind: "db.write".to_string(),
+                    payload: payload(&[
+                        ("bytes", "1048576"),
+                        ("db_id", victim_db),
+                        ("project", "proj-victim"),
+                    ]),
+                },
+                i,
+                Ok(()),
+            )
+            .expect("commit");
+    }
+    let forged_index = hive_contract::audit::replay(&contract, &forged.log).expect("replays clean");
+    println!(
+        "  contract index for the victim: writes={:?} last_bytes={:?}",
+        forged_index.get(&reconcile::writes_key("victim", victim_db)),
+        forged_index.get(&reconcile::last_bytes_key("victim", victim_db))
+    );
+    // Canonical state attests the row with the write plane it recorded: no writes.
+    let victim_canonical = reconcile::project(
+        &[CanonicalDb {
+            id: victim_db.to_string(),
+            team: "victim".to_string(),
+            project: "proj-victim".to_string(),
+            status: "ready".to_string(),
+            write_count: Some(0),
+            last_bytes: Some("0".to_string()),
+        }],
+        &BTreeMap::new(),
+    );
+    let r10 = reconcile::reconcile(&victim_canonical, &forged_index);
+    for d in r10.divergences.iter().take(4) {
+        println!(
+            "  {} {} canonical={:?} contract={:?}",
+            d.kind.label(),
+            d.key,
+            d.canonical,
+            d.contract
+        );
+    }
+    probe(&mut failures,
+        !r10.in_sync() && r10.divergences.len() >= 1 && r10.compared >= 1,
+        "500 unauthorized writes produce a divergence instead of in_sync=true",
+        format!(
+            "{} divergences over {} attested keys (was: in_sync=true divergences=0 contract_only=2)",
+            r10.divergences.len(),
+            r10.compared
+        ),
+    );
+    probe(&mut failures,
+        r10.count(DivergenceKind::ValueMismatch) == 2,
+        "the write counter and the last-bytes value are both compared",
+        format!(
+            "value_mismatch={} missing={} stale={}",
+            r10.count(DivergenceKind::ValueMismatch),
+            r10.count(DivergenceKind::MissingFromContract),
+            r10.count(DivergenceKind::StaleInContract)
+        ),
+    );
+    // The control: the SAME 500 writes, with canonical state attesting the count it recorded. No
+    // cry-wolf -- the reconciler only disagrees when the two accounts actually differ.
+    let agreed_canonical = reconcile::project(
+        &[CanonicalDb {
+            id: victim_db.to_string(),
+            team: "victim".to_string(),
+            project: "proj-victim".to_string(),
+            status: "ready".to_string(),
+            write_count: Some(500),
+            last_bytes: Some("1048576".to_string()),
+        }],
+        &BTreeMap::new(),
+    );
+    let r10b = reconcile::reconcile(&agreed_canonical, &forged_index);
+    probe(&mut failures,
+        r10b.in_sync() && r10b.compared == 3,
+        "when canonical state records the same write plane, the two agree",
+        format!(
+            "{} divergences over {} attested keys",
+            r10b.divergences.len(),
+            r10b.compared
+        ),
     );
 
     if failures == 0 {

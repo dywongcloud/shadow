@@ -8,14 +8,25 @@
 //!
 //! Connection credentials in the snapshot are never read and never printed.
 
-use hive_contract::contract::{AuthPolicy, Caller, Contract, Effect, UNTAGGED_TENANT};
+use hive_contract::contract::{AuthPolicy, Caller, Contract, Effect, OpError, UNTAGGED_TENANT};
 use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::{Engine, DEFAULT_SHARDS};
-use hive_contract::oplog::OpLog;
+use hive_contract::exec::{Executor, Index};
+use hive_contract::oplog::{Op, OpLog};
 use hive_contract::{audit, index_hash};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// One probe of a demonstrated defect. The attack that exposed the defect, re-run.
+fn check(failures: &mut usize, ok: bool, label: &str, detail: String) {
+    if ok {
+        println!("PASS {label}: {detail}");
+    } else {
+        println!("FAIL {label}: {detail}");
+        *failures += 1;
+    }
+}
 
 /// A managed database record as it appears in the platform snapshot. Only the non-secret fields are
 /// read: `connection` (passwords, connection strings) is deliberately absent from this struct.
@@ -121,7 +132,13 @@ async fn main() {
     // ---- P1: the one contract shape that would let an unauthenticated proposer write tenant data
     // must be unrepresentable, not merely rejected later. ----
     let mut evil = Contract::new("hive.evil.v1");
-    let p1 = evil.declare("steal", AuthPolicy::OpenParticipation, Effect::StateWrite, &[]);
+    let p1 = evil.declare(
+        "steal",
+        AuthPolicy::OpenParticipation,
+        Effect::StateWrite,
+        &[],
+        "db_id",
+    );
     println!("\n== P1 open-participation write is unrepresentable ==");
     match p1 {
         Err(e) => println!("PASS refused: {e}"),
@@ -186,7 +203,7 @@ async fn main() {
     ];
     for (name, caller, kind, pl) in cases {
         let r = engine
-            .submit(&contract, caller, kind, pl, &probe_target, 1_700_000_000_000)
+            .submit(&contract, caller, kind, pl, &probe_target, 1_700_000_000_000, Ok(()))
             .await
             .expect("submit");
         match (r.committed, r.error) {
@@ -218,6 +235,7 @@ async fn main() {
             payload(&[("db_id", &probe_target), ("note", "relayed by a stranger")]),
             &probe_target,
             1_700_000_000_000,
+            Ok(()),
         )
         .await
         .expect("submit");
@@ -271,7 +289,7 @@ async fn main() {
                         ]),
                     )
                 };
-                e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000).await
+                e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000, Ok(())).await
             }));
         }
     }
@@ -406,7 +424,7 @@ async fn main() {
                             ]),
                         )
                     };
-                    e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000).await
+                    e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000, Ok(())).await
                 }));
             }
         }
@@ -480,7 +498,7 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
                             ]),
                         )
                     };
-                    e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000)
+                    e.submit(&c, caller, &kind, pl, &id, 1_700_000_000_000, Ok(()))
                         .await
                         .expect("submit")
                 }));
@@ -505,5 +523,341 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
         );
     }
 
-    println!("\nALL PROBES PASSED");
+    // ---- P12..P17: the six defects a live adversarial audit demonstrated, re-run here ----
+    // Each probe below is the attack that exposed its defect, executed against the real contract,
+    // the real executor and the real replay auditor. They live in the harness so the attack is
+    // repeatable, not so it is skipped: the crate ships no test files by policy.
+    let mut defects = 0usize;
+
+    // ---- P12: the backend is DOWN. An ack must record EXECUTION, not admission. ----
+    println!("\n== P12 the backend is down: an ack records execution, not admission ==");
+    let down_engine = Engine::new(DEFAULT_SHARDS);
+    down_engine.register(contract.clone()).await;
+    let down_db = "db-down-0001";
+    let mut reported_committed = 0usize;
+    for i in 0..50u64 {
+        let r = down_engine
+            .submit(
+                &contract,
+                owner(&probe_team),
+                "db.write",
+                payload(&[
+                    ("bytes", "4096"),
+                    ("db_id", down_db),
+                    ("project", &probe_project),
+                ]),
+                down_db,
+                1_700_000_000_000 + i,
+                Err("backend: connection refused".to_string()),
+            )
+            .await
+            .expect("submit");
+        if r.committed {
+            reported_committed += 1;
+        }
+    }
+    let down_log = down_engine.snapshot_log(&contract.id).await.expect("log");
+    let false_acks = down_log.entries().iter().filter(|e| !e.ack.success).count();
+    let true_acks = down_log.entries().iter().filter(|e| e.ack.success).count();
+    let down_index = audit::replay(&contract, &down_log).expect("replay of failed writes");
+    println!(
+        "  entries={} success=false:{} success=true:{} reported_committed={}",
+        down_log.len(),
+        false_acks,
+        true_acks,
+        reported_committed
+    );
+    println!(
+        "  index writes key for the down database: {:?}",
+        down_index.get(&format!("{probe_team}/{down_db}/writes"))
+    );
+    check(
+        &mut defects,
+        false_acks == 50 && true_acks == 0 && reported_committed == 0,
+        "a write the backend failed is recorded as success=false, not true",
+        format!("{false_acks} acks carry success=false, {true_acks} carry success=true, \
+                 {reported_committed} reported committed (was: 50 committed, 0 success=false)"),
+    );
+    check(
+        &mut defects,
+        !down_index.keys().any(|k| k.ends_with("/writes")),
+        "a failed write applies no mutation",
+        format!("{} index keys, none of them a write counter", down_index.len()),
+    );
+
+    // The same op with a working backend still commits: the fix must not turn success into failure.
+    let up = down_engine
+        .submit(
+            &contract,
+            owner(&probe_team),
+            "db.write",
+            payload(&[
+                ("bytes", "4096"),
+                ("db_id", down_db),
+                ("project", &probe_project),
+            ]),
+            down_db,
+            1_700_000_000_100,
+            Ok(()),
+        )
+        .await
+        .expect("submit");
+    check(
+        &mut defects,
+        up.committed && up.error.is_none(),
+        "an executed write is still recorded as success=true",
+        format!("committed={} error={:?}", up.committed, up.error),
+    );
+
+    // ---- P13: an undeclared kind reaching the executor is an error, never a panic. ----
+    println!("\n== P13 an undeclared kind is refused by the executor, not a panic ==");
+    let mut ex13 = Executor::new(contract.clone());
+    let r13 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ex13.commit(
+            Op {
+                seq: 0,
+                contract: contract.id.clone(),
+                tenant: probe_team.clone(),
+                actor: "p13".into(),
+                target: probe_target.clone(),
+                kind: "db.grant_superuser".into(),
+                payload: payload(&[("db_id", &probe_target), ("project", &probe_project)]),
+            },
+            1_700_000_000_000,
+            Ok(()),
+        )
+    }));
+    match &r13 {
+        Ok(Err(e)) => println!("  commit returned: {e}"),
+        Ok(Ok(_)) => println!("  commit COMMITTED an undeclared kind"),
+        Err(_) => println!("  commit PANICKED"),
+    }
+    let refused_undeclared = match &r13 {
+        Ok(Err(hive_contract::exec::ExecError::UndeclaredKind { kind })) => {
+            kind == "db.grant_superuser"
+        }
+        _ => false,
+    };
+    check(
+        &mut defects,
+        refused_undeclared && ex13.log.is_empty(),
+        "commit on an undeclared kind returns Err and leaves no partial entry",
+        format!("returned={} log_len={}", r13.is_ok(), ex13.log.len()),
+    );
+
+    // ---- P14: an effect-violating op is recorded as refused, not dropped. ----
+    println!("\n== P14 an op the executor refuses still lands in the log ==");
+    let mut c14 = Contract::new("hive.misdeclared.v1");
+    c14.declare(
+        "db.write",
+        AuthPolicy::TenantAuthorized,
+        Effect::LogOnly,
+        &["bytes", "db_id", "project"],
+        "db_id",
+    )
+    .expect("db.write declared log-only");
+    let e14 = Engine::new(DEFAULT_SHARDS);
+    let r14 = e14
+        .submit(
+            &c14,
+            owner("acme"),
+            "db.write",
+            payload(&[("bytes", "64"), ("db_id", "db-14"), ("project", "p")]),
+            "db-14",
+            1_700_000_000_000,
+            Ok(()),
+        )
+        .await
+        .expect("submit");
+    let l14 = e14.snapshot_log(&c14.id).await.expect("log");
+    println!(
+        "  committed={} error={:?} log_len={}",
+        r14.committed,
+        r14.error,
+        l14.len()
+    );
+    check(
+        &mut defects,
+        !r14.committed
+            && l14.len() == 1
+            && !l14.entries()[0].ack.success
+            && l14.entries()[0]
+                .ack
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("declared log-only"),
+        "the refused op is in the log with success=false and its reason",
+        format!(
+            "log_len={} (was 0) success={} error={:?}",
+            l14.len(),
+            l14.entries().first().map(|e| e.ack.success).unwrap_or(true),
+            l14.entries().first().and_then(|e| e.ack.error.clone())
+        ),
+    );
+
+    // ---- P15: the target must be the database the validated payload names. ----
+    println!("\n== P15 a target that is not the payload's db_id is refused ==");
+    let e15 = Engine::new(DEFAULT_SHARDS);
+    let r15 = e15
+        .submit(
+            &contract,
+            owner("acme"),
+            "db.create",
+            payload(&[("db_id", "db-REAL"), ("kind", "sqlite"), ("project", "p")]),
+            "db-OTHER",
+            1_700_000_000_000,
+            Ok(()),
+        )
+        .await
+        .expect("submit");
+    let idx15 = e15.audit(&contract).await.expect("replay");
+    println!("  committed={} error={:?}", r15.committed, r15.error);
+    check(
+        &mut defects,
+        !r15.committed
+            && r15.error.as_deref()
+                == Some(
+                    OpError::TargetMismatch {
+                        target: "db-OTHER".to_string(),
+                        expected: "db-REAL".to_string(),
+                    }
+                    .to_string()
+                )
+                .as_deref()
+            && !idx15.keys().any(|k| k.contains("db-OTHER")),
+        "a mismatched target is refused and writes nothing",
+        format!(
+            "error={:?}; index keys={:?} (was committed=true, key acme/db-OTHER/status)",
+            r15.error,
+            idx15.keys().collect::<Vec<_>>()
+        ),
+    );
+
+    // ---- P16: no two (tenant, target) pairs may address one key. ----
+    println!("\n== P16 colliding tenant/target pairs do not alias to one key ==");
+    let mut ex16 = Executor::new(contract.clone());
+    let collide: [(&str, &str); 2] = [("alice", "b/c"), ("alice/b", "c")];
+    for (t, g) in collide {
+        ex16.commit(
+            Op {
+                seq: 0,
+                contract: contract.id.clone(),
+                tenant: t.to_string(),
+                actor: "p16".into(),
+                target: g.to_string(),
+                kind: "db.create".into(),
+                payload: payload(&[("db_id", g), ("kind", "sqlite"), ("project", "p")]),
+            },
+            1_700_000_000_000,
+            Ok(()),
+        )
+        .expect("commit");
+    }
+    let keys16: Vec<&String> = ex16.index.keys().collect();
+    println!("  keys: {keys16:?}");
+    check(
+        &mut defects,
+        ex16.index.len() == 2,
+        "two distinct (tenant, target) pairs produce two keys, not one",
+        format!(
+            "{} keys for 2 pairs (was 1: both pairs built alice/b/c)",
+            ex16.index.len()
+        ),
+    );
+    // And one delete reaches only its own namespace.
+    ex16.commit(
+        Op {
+            seq: 0,
+            contract: contract.id.clone(),
+            tenant: "alice".into(),
+            actor: "p16".into(),
+            target: "b/c".into(),
+            kind: "db.delete".into(),
+            payload: payload(&[("db_id", "b/c"), ("project", "p")]),
+        },
+        1_700_000_000_001,
+        Ok(()),
+    )
+    .expect("commit");
+    check(
+        &mut defects,
+        ex16.index.len() == 1 && ex16.index.keys().all(|k| k.starts_with("alice%2Fb/")),
+        "a delete on one pair does not reach the other's keys",
+        format!("{:?} left", ex16.index.keys().collect::<Vec<_>>()),
+    );
+
+    // ---- P17: the properties that already held still hold. ----
+    println!("\n== P17 preserved properties ==");
+    let e17 = Engine::new(DEFAULT_SHARDS);
+    e17.register(contract.clone()).await;
+    for i in 0..500u64 {
+        let t = format!("db-{}", i % 5);
+        e17.submit(
+            &contract,
+            owner("acme"),
+            "db.write",
+            payload(&[("bytes", "512"), ("db_id", &t), ("project", "p")]),
+            &t,
+            1_700_000_000_000 + i,
+            Ok(()),
+        )
+        .await
+        .expect("submit");
+    }
+    let l17 = e17.snapshot_log(&contract.id).await.expect("log");
+    let live17 = e17.index_hash(&contract.id).await.expect("hash");
+    let c17 = contract.clone();
+    let l17a = l17.clone();
+    let t1 = std::thread::spawn(move || audit::replay(&c17, &l17a).map(|i| index_hash(&i)));
+    let h1 = t1.join().expect("replay thread").expect("replay clean");
+    let h2 = audit::replay(&contract, &l17).map(|i| index_hash(&i)).expect("replay clean");
+    let h3 = audit::replay(&contract, &l17).map(|i| index_hash(&i)).expect("replay clean");
+    println!("  500 ops: live={:.16} replay1={:.16} replay2={:.16} replay3={:.16}", live17, h1, h2, h3);
+    check(
+        &mut defects,
+        h1 == live17 && h2 == live17 && h3 == live17,
+        "a 500-op log replayed three times gives one index hash",
+        format!("{} == {} == {} == {}", &live17[..16], &h1[..16], &h2[..16], &h3[..16]),
+    );
+    let mut forward = Index::new();
+    let mut backward = Index::new();
+    for i in 0..10u64 {
+        forward.insert(format!("acme/db-{i}/status"), "live".into());
+    }
+    for i in (0..10u64).rev() {
+        backward.insert(format!("acme/db-{i}/status"), "live".into());
+    }
+    check(
+        &mut defects,
+        index_hash(&forward) == index_hash(&backward),
+        "the index hash is insertion-order independent",
+        format!("{} == {}", &index_hash(&forward)[..16], &index_hash(&backward)[..16]),
+    );
+    let undeclared = e17
+        .submit(
+            &contract,
+            owner("acme"),
+            "db.drop_everything",
+            payload(&[("db_id", "db-0")]),
+            "db-0",
+            1_700_000_000_000,
+            Ok(()),
+        )
+        .await
+        .expect("submit");
+    check(
+        &mut defects,
+        !undeclared.committed
+            && undeclared.error.as_deref() == Some(&OpError::UndeclaredKind("db.drop_everything".to_string()).to_string()),
+        "submit still refuses an undeclared kind",
+        format!("{:?}", undeclared.error),
+    );
+
+    if defects == 0 {
+        println!("\nALL PROBES PASSED");
+    } else {
+        println!("\n{defects} PROBE(S) FAILED");
+        std::process::exit(1);
+    }
 }

@@ -67,6 +67,9 @@ pub enum ContractError {
     OpenParticipationMayNotWrite,
     DuplicateOpKind(String),
     EmptyOpKind,
+    /// `target_key` is not one of the kind's declared payload keys: the op could never be validated,
+    /// because the value that has to equal the caller's target would never be present.
+    TargetKeyNotDeclared { kind: String, key: String },
 }
 
 impl std::fmt::Display for ContractError {
@@ -77,17 +80,28 @@ impl std::fmt::Display for ContractError {
             ),
             ContractError::DuplicateOpKind(k) => write!(f, "duplicate op kind {k}"),
             ContractError::EmptyOpKind => f.write_str("op kind must be non-empty"),
+            ContractError::TargetKeyNotDeclared { kind, key } => write!(
+                f,
+                "op kind {kind} names target key {key}, which is not one of its declared payload keys"
+            ),
         }
     }
 }
 
-/// One operation kind: its authorization requirement, its effect, and the exact payload keys it
-/// accepts (a payload key set is a schema; an operation carrying anything else is invalid).
+/// One operation kind: its authorization requirement, its effect, the exact payload keys it accepts
+/// (a payload key set is a schema; an operation carrying anything else is invalid), and WHICH of
+/// those keys names the operation's target.
+///
+/// `target_key` is what binds a validated payload to the namespace the operation writes: the value
+/// at that key must equal the target the caller submitted, so the identity the contract authorized
+/// and the identity whose state moves cannot be two different strings
+/// (contract-target-not-bound-to-payload-db-id).
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OpSpec {
     pub auth: AuthPolicy,
     pub effect: Effect,
     pub payload_keys: BTreeSet<String>,
+    pub target_key: String,
 }
 
 /// A contract: an id, a version and a closed set of declared operation kinds.
@@ -108,13 +122,15 @@ impl Contract {
     }
 
     /// Declare an operation kind. Returns `Err` for the open-participation-writes combination, so a
-    /// contract that would weaken tenancy can never exist in the system to be called.
+    /// contract that would weaken tenancy can never exist in the system to be called, and for a
+    /// `target_key` outside the declared payload keys, so the target binding can never be vacuous.
     pub fn declare(
         &mut self,
         kind: &str,
         auth: AuthPolicy,
         effect: Effect,
         payload_keys: &[&str],
+        target_key: &str,
     ) -> Result<(), ContractError> {
         if kind.trim().is_empty() {
             return Err(ContractError::EmptyOpKind);
@@ -125,12 +141,19 @@ impl Contract {
         if self.ops.contains_key(kind) {
             return Err(ContractError::DuplicateOpKind(kind.to_string()));
         }
+        if !payload_keys.iter().any(|k| *k == target_key) {
+            return Err(ContractError::TargetKeyNotDeclared {
+                kind: kind.to_string(),
+                key: target_key.to_string(),
+            });
+        }
         self.ops.insert(
             kind.to_string(),
             OpSpec {
                 auth,
                 effect,
                 payload_keys: payload_keys.iter().map(|k| k.to_string()).collect(),
+                target_key: target_key.to_string(),
             },
         );
         Ok(())
@@ -154,6 +177,10 @@ pub enum OpError {
     UntaggedTenant,
     /// A caller whose bound tenant does not own the operation's target.
     TenantMismatch,
+    /// The submitted target is not the identity the validated payload names. Refused rather than
+    /// recorded under the submitted one: otherwise the op the contract authorized and the state the
+    /// op moves are two different databases.
+    TargetMismatch { target: String, expected: String },
 }
 
 impl std::fmt::Display for OpError {
@@ -170,6 +197,10 @@ impl std::fmt::Display for OpError {
             ),
             OpError::UntaggedTenant => f.write_str("tenant-authorized op carries no bound tenant"),
             OpError::TenantMismatch => f.write_str("caller's tenant does not own the target"),
+            OpError::TargetMismatch { target, expected } => write!(
+                f,
+                "target {target} is not the {expected} the payload names"
+            ),
         }
     }
 }
@@ -188,17 +219,23 @@ pub struct Caller {
     pub owns_target: bool,
 }
 
-/// Validate `op` against `contract` for `caller`.
+/// Validate `op` against `contract` for `caller`, acting on `target`.
 ///
-/// Three gates, in order: the kind is declared, the payload matches the declared key set exactly,
-/// and the caller satisfies the kind's [`AuthPolicy`]. The last gate is the one that keeps tenancy
-/// intact: a `TenantAuthorized` op with an untagged tenant fails closed, and `owns_target` is
-/// supplied by the platform's existing check rather than recomputed here.
+/// Four gates, in order: the kind is declared, the payload matches the declared key set exactly, the
+/// payload's declared target key names the target the caller submitted, and the caller satisfies the
+/// kind's [`AuthPolicy`]. The last gate is the one that keeps tenancy intact: a `TenantAuthorized`
+/// op with an untagged tenant fails closed, and `owns_target` is supplied by the platform's existing
+/// check rather than recomputed here.
+///
+/// The target gate is what makes the other three mean anything: `target` is the string the index is
+/// namespaced on, so an op validated against one database and applied to another would move state
+/// the contract never authorized.
 pub fn validate<'a>(
     contract: &'a Contract,
     caller: &Caller,
     kind: &str,
     payload: &BTreeMap<String, String>,
+    target: &str,
 ) -> Result<&'a OpSpec, OpError> {
     let spec = contract.spec(kind).ok_or_else(|| OpError::UndeclaredKind(kind.to_string()))?;
 
@@ -221,6 +258,19 @@ pub fn validate<'a>(
             kind: kind.to_string(),
             missing,
             unexpected,
+        });
+    }
+
+    // The declared target key is one of the payload keys (Contract::declare refuses it otherwise) and
+    // the payload check above proved every declared key is present, so this is a comparison, never a
+    // lookup that can come up empty.
+    if payload.get(&spec.target_key).map(|v| v.as_str()) != Some(target) {
+        return Err(OpError::TargetMismatch {
+            target: target.to_string(),
+            expected: payload
+                .get(&spec.target_key)
+                .cloned()
+                .unwrap_or_else(|| spec.target_key.clone()),
         });
     }
 

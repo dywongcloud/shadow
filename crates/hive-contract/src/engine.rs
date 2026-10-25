@@ -20,7 +20,7 @@
 
 use crate::audit::{replay, Breach};
 use crate::contract::{validate, Caller, Contract, OpError};
-use crate::exec::{index_hash, Executor, ExecError, Index};
+use crate::exec::{index_hash, Executor, Index};
 use crate::oplog::{Op, OpLog};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -78,6 +78,11 @@ impl Engine {
     /// and the verdict of its ownership check; [`validate`] refuses to proceed without them. A
     /// caller that has not been through the platform's gate cannot construct an admissible `Caller`
     /// with `owns_target: true` in any path this crate exposes.
+    ///
+    /// `outcome` is the result of EXECUTING the operation against the real backend, and it is
+    /// required: an `Err` is recorded as an entry with `success: false` and no mutation applied, so
+    /// the log says the write failed instead of asserting a success the database never produced.
+    /// `SubmitResult::committed` is `true` only when the operation was admitted AND executed.
     pub async fn submit(
         &self,
         contract: &Contract,
@@ -86,8 +91,18 @@ impl Engine {
         payload: BTreeMap<String, String>,
         target: &str,
         ts_ms: u64,
+        outcome: Result<(), String>,
     ) -> Result<SubmitResult, OpError> {
-        match validate(contract, &caller, kind, &payload) {
+        let op = Op {
+            seq: 0,
+            contract: contract.id.clone(),
+            tenant: caller.tenant.clone(),
+            actor: caller.actor.clone(),
+            target: target.to_string(),
+            kind: kind.to_string(),
+            payload,
+        };
+        match validate(contract, &caller, kind, &op.payload, target) {
             Ok(_) => {}
             Err(e) => {
                 // The refusal is recorded too: an append-only log that only holds successes is not
@@ -96,15 +111,6 @@ impl Engine {
                 let ex = shard
                     .entry(contract.id.clone())
                     .or_insert_with(|| Executor::new(contract.clone()));
-                let op = Op {
-                    seq: 0,
-                    contract: contract.id.clone(),
-                    tenant: caller.tenant.clone(),
-                    actor: caller.actor.clone(),
-                    target: target.to_string(),
-                    kind: kind.to_string(),
-                    payload,
-                };
                 let ack = ex.commit_refusal(op, ts_ms, &e.to_string());
                 return Ok(SubmitResult {
                     committed: false,
@@ -119,32 +125,28 @@ impl Engine {
         let ex = shard
             .entry(contract.id.clone())
             .or_insert_with(|| Executor::new(contract.clone()));
-        let op = Op {
-            seq: 0,
-            contract: contract.id.clone(),
-            tenant: caller.tenant.clone(),
-            actor: caller.actor.clone(),
-            target: target.to_string(),
-            kind: kind.to_string(),
-            payload,
-        };
-        match ex.commit(op, ts_ms) {
+        // Kept so an op the EXECUTOR refuses is still recorded: `commit` consumes the op it is
+        // given, and an op that vanished here would leave the log silent about it.
+        let refused = op.clone();
+        match ex.commit(op, ts_ms, outcome) {
             Ok(ack) => Ok(SubmitResult {
-                committed: true,
-                error: None,
+                committed: ack.success,
+                error: ack.error.clone(),
                 seq: ack.seq,
                 index_hash: ex.index_hash(),
                 log_head: ack.log_head,
             }),
-            Err(ExecError::EffectViolation { kind, produced }) => {
-                let msg = ExecError::EffectViolation { kind, produced }.to_string();
-                let seq = ex.log.next_seq();
+            Err(e) => {
+                // Same rule as the gate's refusal branch: an op that reached the single writer is
+                // part of the history whether or not it was applied.
+                let msg = e.to_string();
+                let ack = ex.commit_refusal(refused, ts_ms, &msg);
                 Ok(SubmitResult {
                     committed: false,
                     error: Some(msg),
-                    seq,
+                    seq: ack.seq,
                     index_hash: ex.index_hash(),
-                    log_head: ex.log.head().to_string(),
+                    log_head: ack.log_head,
                 })
             }
         }
