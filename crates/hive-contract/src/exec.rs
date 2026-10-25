@@ -106,6 +106,12 @@ pub enum ExecError {
     /// public and `Engine::submit` is not the only caller, so a panic here would take down whatever
     /// task reached it (contract-commit-panics-on-undeclared-kind).
     UndeclaredKind { kind: String },
+    /// The op's `target` is not the value its payload carries at the kind's declared `target_key`.
+    /// `apply` namespaces every key on `target`, so committing such an op would move the state of a
+    /// database the payload never named. Checked here as well as in `contract::validate`, because
+    /// `Executor` is public: `Engine::submit` is not the only caller, and a binding that holds at
+    /// one entry point only is not a binding (contract-target-not-bound-to-payload-db-id).
+    TargetMismatch { target: String, expected: String },
 }
 
 impl std::fmt::Display for ExecError {
@@ -117,6 +123,9 @@ impl std::fmt::Display for ExecError {
             ),
             ExecError::UndeclaredKind { kind } => {
                 write!(f, "op kind {kind} is not declared by this contract")
+            }
+            ExecError::TargetMismatch { target, expected } => {
+                write!(f, "target {target} is not the {expected} the payload names")
             }
         }
     }
@@ -193,6 +202,19 @@ impl Executor {
             .ok_or_else(|| ExecError::UndeclaredKind {
                 kind: op.kind.clone(),
             })?;
+        // Every key this op writes is namespaced on `op.target`, so the target must be the identity
+        // the payload itself names. `contract::validate` refuses this at the gate; refusing it here
+        // too keeps the binding true for a caller that reaches the executor directly.
+        if op.payload.get(&spec.target_key).map(|v| v.as_str()) != Some(op.target.as_str()) {
+            return Err(ExecError::TargetMismatch {
+                target: op.target.clone(),
+                expected: op
+                    .payload
+                    .get(&spec.target_key)
+                    .cloned()
+                    .unwrap_or_else(|| spec.target_key.clone()),
+            });
+        }
         let mutations = apply(&self.index, &op);
         if spec.effect == Effect::LogOnly && !mutations.is_empty() {
             return Err(ExecError::EffectViolation {
