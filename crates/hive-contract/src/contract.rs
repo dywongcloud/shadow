@@ -10,6 +10,10 @@
 //! is the same decision `crates/hive-cloud/src/admin.rs:3368` (`require_project`) already makes;
 //! this module records the decision as a contract term so a replaying monitor can PROVE it held,
 //! and it refuses to construct a contract that does not.
+//!
+//! The managed-database contract INSTANCE is NOT in this file. It lives in
+//! [`crate::contracts::managed_database`] as one declarative table; this module is the machinery
+//! that table is built from and validated against.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -236,40 +240,3 @@ pub fn validate<'a>(
     Ok(spec)
 }
 
-/// The managed-database contract: the default policy set every database mutation path in
-/// `hive-cloud` already enforces, expressed as contract terms.
-///
-/// `db.propose` is the permissionless-participation op: any node may append it, and it is LogOnly,
-/// so it cannot touch a tenant's data.
-pub fn managed_db_contract() -> Contract {
-    let mut c = Contract::new("hive.managed-db.v1");
-    c.declare(
-        "db.create",
-        AuthPolicy::TenantAuthorized,
-        Effect::StateWrite,
-        &["db_id", "kind", "project"],
-    )
-    .expect("db.create");
-    c.declare(
-        "db.delete",
-        AuthPolicy::TenantAuthorized,
-        Effect::StateWrite,
-        &["db_id", "project"],
-    )
-    .expect("db.delete");
-    c.declare(
-        "db.write",
-        AuthPolicy::TenantAuthorized,
-        Effect::StateWrite,
-        &["bytes", "db_id", "project"],
-    )
-    .expect("db.write");
-    c.declare(
-        "db.propose",
-        AuthPolicy::OpenParticipation,
-        Effect::LogOnly,
-        &["db_id", "note"],
-    )
-    .expect("db.propose");
-    c
-}

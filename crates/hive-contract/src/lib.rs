@@ -15,9 +15,14 @@
 //!   * It is not a replacement for `state.json` + `store_sync`. It records a tamper-evident history
 //!     of operations the platform already authorized; the canonical state is still the platform's.
 //!   * It is not a GuardianDB replacement. The relational mirror stays a read-only projection.
+//!
+//! The contract itself -- the declared operation kinds, their authorization policy, their effect and
+//! their payload schema -- is one declarative table in [`contracts::managed_database`]. Everything
+//! else here is the machinery that validates and executes it.
 
 pub mod audit;
 pub mod contract;
+pub mod contracts;
 pub mod engine;
 pub mod exec;
 pub mod oplog;
@@ -25,9 +30,8 @@ pub mod reconcile;
 pub mod replicate;
 
 pub use audit::{verify, Breach};
-pub use contract::{
-    managed_db_contract, record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec,
-};
+pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
+pub use contracts::managed_db_contract;
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
 pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
 pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, OP_DOMAIN};

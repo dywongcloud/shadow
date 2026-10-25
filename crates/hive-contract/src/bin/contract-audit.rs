@@ -8,9 +8,8 @@
 //!
 //! Connection credentials in the snapshot are never read and never printed.
 
-use hive_contract::contract::{
-    managed_db_contract, AuthPolicy, Caller, Contract, Effect, UNTAGGED_TENANT,
-};
+use hive_contract::contract::{AuthPolicy, Caller, Contract, Effect, UNTAGGED_TENANT};
+use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::{Engine, DEFAULT_SHARDS};
 use hive_contract::oplog::OpLog;
 use hive_contract::{audit, index_hash};

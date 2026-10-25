@@ -11,9 +11,8 @@
 //!
 //! `connection` (passwords, connection strings) is never read and never printed.
 
-use hive_contract::contract::{
-    managed_db_contract, record_tenant, Caller, Contract, UNTAGGED_TENANT,
-};
+use hive_contract::contract::{record_tenant, Caller, Contract, UNTAGGED_TENANT};
+use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::Engine;
 use hive_contract::exec::index_hash;
 use hive_contract::oplog::OpLog;

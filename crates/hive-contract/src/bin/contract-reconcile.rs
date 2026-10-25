@@ -11,9 +11,9 @@
 //! `connection` (passwords, connection strings) is never read and never printed.
 
 use hive_contract::contract::{
-    managed_db_contract, record_tenant, AuthPolicy, Caller, Contract, Effect, OpError,
-    UNTAGGED_TENANT,
+    record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, UNTAGGED_TENANT,
 };
+use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::Engine;
 use hive_contract::exec::Index;
 use hive_contract::reconcile::{self, CanonicalDb, DivergenceKind};
