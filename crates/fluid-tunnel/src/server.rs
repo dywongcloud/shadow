@@ -39,7 +39,18 @@ pub fn set_local_connect_permits(permits: usize) {
 
 /// Ceiling on completing a TCP connect to the local (guest) hop; 15 s matches the window a litebox
 /// cold start gets to reach a listening state.
+///
+/// It bounds BOTH shapes of the wait: the single connect's own deadline in
+/// [`proxy_local`], and — through the retry loop in [`handle_request`] — the time a refused
+/// connect is retried for. A refused connect is that window's whole point, and it is the one
+/// failure that resolves on its own, so the loop spends the window on it rather than a count of
+/// attempts.
 const LOCAL_CONNECT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Interval between two attempts on a local hop whose port is not accepting connections yet.
+/// Short enough to pick up a listener that appears mid-window, long enough that a guest which
+/// never binds costs one poll per interval instead of a busy spin.
+const NOT_LISTENING_RETRY: Duration = Duration::from_millis(250);
 
 /// Ceiling on every wait on the local hop — queueing for the connect permit, connecting, writing
 /// the request, and reading each piece of the response. One number, applied to every await in
@@ -395,6 +406,28 @@ impl TunnelServer {
     }
 }
 
+/// The local hop refused the connection: the instance has not bound its port yet, or no longer
+/// holds it. Carried as its own type so [`handle_request`] can spend [`LOCAL_CONNECT_DEADLINE`]
+/// on it — it is the one local failure that is expected to clear on its own, because the instance
+/// is starting — instead of the millisecond backoff a transient failure of a connection that
+/// existed gets.
+#[derive(Debug)]
+struct LocalHopNotListening;
+
+impl std::fmt::Display for LocalHopNotListening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the function's port is not accepting connections")
+    }
+}
+
+impl std::error::Error for LocalHopNotListening {}
+
+/// Whether a [`proxy_local`] failure was a refused local connect — the cold-start window — rather
+/// than a failure of a connection that was established.
+fn is_local_not_listening(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<LocalHopNotListening>().is_some()
+}
+
 /// Returns whether a response head reached the caller — the progress signal
 /// [`UNHEALTHY_FAILURE_STREAK`] counts; a 502 the function sent is an answer, only "no response
 /// at all" is a failure.
@@ -413,8 +446,10 @@ async fn handle_request(
         .map(|meta| matches!(meta.method.as_str(), "GET" | "HEAD"))
         .unwrap_or(false);
     const MAX_ATTEMPTS: u32 = 5;
-    let mut last_error = None;
-    for attempt in 0..MAX_ATTEMPTS {
+    let started = std::time::Instant::now();
+    let mut attempt = 0u32;
+    // Every exit from this loop carries the failure that ended it; there is no fall-through.
+    let error = loop {
         // The caller is gone: stop before spending another attempt — and up to another
         // [`LOCAL_RESPONSE_DEADLINE`] of this slot — on a response nobody will read.
         if cancel.is_cancelled() {
@@ -429,55 +464,76 @@ async fn handle_request(
                 if cancel.is_cancelled() {
                     return Outcome::Cancelled;
                 }
-                if head_sent || !idempotent || attempt + 1 == MAX_ATTEMPTS {
-                    if head_sent {
-                        tracing::warn!(
-                            id,
-                            attempt,
-                            error = %error,
-                            "tunnel: upstream request failed after response head was already sent — truncating stream"
-                        );
-                        return Outcome::Answered;
-                    }
-                    last_error = Some(error);
-                    break;
+                if head_sent {
+                    tracing::warn!(
+                        id,
+                        attempt,
+                        error = %error,
+                        "tunnel: upstream request failed after response head was already sent — truncating stream"
+                    );
+                    return Outcome::Answered;
                 }
+                // A refused connect is the instance not having bound its port yet, i.e. the
+                // failure [`LOCAL_CONNECT_DEADLINE`] exists for. Each attempt fails instantly, so
+                // the millisecond backoff below burns all five in ~300 ms — 50x short of that
+                // window — and reports an instance that is still starting as a hard 502. Wait the
+                // window out for it; every other failure keeps the attempt count and the short
+                // backoff, because it is not expected to clear by waiting.
+                let not_listening = is_local_not_listening(&error);
+                let may_retry = if not_listening {
+                    started.elapsed() < LOCAL_CONNECT_DEADLINE
+                } else {
+                    attempt + 1 < MAX_ATTEMPTS
+                };
+                if !idempotent || !may_retry {
+                    break error;
+                }
+                attempt += 1;
+                let backoff = if not_listening {
+                    NOT_LISTENING_RETRY
+                } else {
+                    Duration::from_millis(20 * attempt as u64)
+                };
                 tracing::debug!(
                     id,
                     attempt,
+                    not_listening,
                     error = %error,
                     "tunnel: upstream request attempt failed, retrying"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(20 * (attempt as u64 + 1)))
-                    .await;
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = cancel.cancelled() => return Outcome::Cancelled,
+                }
             }
         }
-    }
-    if let Some(e) = last_error {
-        tracing::warn!(
-            id,
-            attempts = MAX_ATTEMPTS,
-            idempotent,
-            error = %e,
-            "tunnel: upstream request failed after exhausting retries"
-        );
-        let meta = RespMeta {
-            status: 502,
-            headers: vec![],
-            wait_until_ms: 0,
-        };
-        let _ = out.send(Frame::new(
-            id,
-            FrameKind::RespHead,
-            serde_json::to_vec(&meta).unwrap_or_default(),
-        ));
-        let _ = out.send(Frame::new(
-            id,
-            FrameKind::RespBody,
-            Bytes::from(format!("upstream error: {e}")),
-        ));
-        let _ = out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()));
-    }
+    };
+    tracing::warn!(
+        id,
+        attempts = attempt,
+        idempotent,
+        waited_ms = started.elapsed().as_millis() as u64,
+        error = %error,
+        "tunnel: upstream request failed after exhausting retries"
+    );
+    let meta = RespMeta {
+        status: 502,
+        headers: vec![],
+        wait_until_ms: 0,
+    };
+    let _ = out.send(Frame::new(
+        id,
+        FrameKind::RespHead,
+        serde_json::to_vec(&meta).unwrap_or_default(),
+    ));
+    // The raw error never reaches the caller: it names the instance's internal address and the OS
+    // errno, which is the node's business, not the tenant's. The WARN above carries it.
+    let _ = out.send(Frame::new(
+        id,
+        FrameKind::RespBody,
+        Bytes::from("upstream error: the function did not answer"),
+    ));
+    let _ = out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()));
     Outcome::Failed
 }
 
@@ -546,7 +602,16 @@ async fn proxy_local(
             LOCAL_CONNECT_DEADLINE,
             &format!("local connect to {local_http}"),
         )
-        .await??
+        .await?
+        .map_err(|e| match e.kind() {
+            // Tag the refusal, do not wait it out here: the wait belongs to the retry loop, which
+            // holds no connect permit while it waits. The permit is one per address and litebox
+            // sets it to 1, so waiting under it would serialize every other request to this
+            // instance behind a guest that has not bound its port yet.
+            std::io::ErrorKind::ConnectionRefused => anyhow::Error::new(LocalHopNotListening)
+                .context(format!("local connect to {local_http} refused: {e}")),
+            _ => e.into(),
+        })?
     };
 
     let fwd_host = meta
