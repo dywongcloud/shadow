@@ -23,26 +23,42 @@ pub struct Database<S: RelationalStorage> {
     /// Serializes the catalog's read-modify-write span.
     ///
     /// The catalog is ONE JSON document: a statement loads it whole, mutates it
-    /// and saves it whole, with no compare-and-swap at the store, so two
-    /// sessions doing that concurrently LOSE one of the two writes while both
-    /// still report `Ok` — a just-created table can vanish from the catalog
-    /// with every statement in the sequence succeeding. Holding this mutex
-    /// across the whole span (load through save) makes the span atomic; it is
-    /// the degenerate compare-and-swap, and it is taken at every save site
-    /// (autocommit, `persist_catalog`, `COMMIT`).
+    /// and saves it whole, so two sessions doing that concurrently used to LOSE
+    /// one of the two writes while both still reported `Ok` — a just-created
+    /// table could vanish from the catalog with every statement in the sequence
+    /// succeeding. The save is now a compare-and-swap that merges onto the
+    /// winning document (`save_catalog`), which is what actually closes that
+    /// hole; this mutex serializes the span on top of it.
     ///
-    /// An explicit transaction holds it for its WHOLE life, not just at
-    /// `COMMIT`: the catalog a `COMMIT` saves is the snapshot its `BEGIN`
-    /// loaded, so a guard taken only at `COMMIT` would serialize a save of a
-    /// document that is already stale, and every table another session created
-    /// after that `BEGIN` would be erased by a save that reports `Ok`.
+    /// An explicit transaction used to hold it for its WHOLE life, because the
+    /// catalog a `COMMIT` saves is the snapshot its `BEGIN` loaded. The
+    /// compare-and-swap made that unnecessary — a stale snapshot now loses the
+    /// swap and merges instead of erasing the winner's tables — and holding a
+    /// process-global mutex for a whole transaction was measured as the stall:
+    /// one `BEGIN; ...; COMMIT;` per tenant pinned every other writer on the
+    /// node for the transaction's entire duration (2 s on the worst-connected
+    /// node). `COMMIT` now takes the span for the save alone.
     ///
     /// It is always acquired BEFORE any lock or table load, so a session
     /// waiting on it holds nothing and cannot deadlock against the session
     /// holding it. A statement that cannot save the catalog (a read, or one
     /// staged onto an open transaction) takes no part in the race and acquires
     /// nothing, so reads stay parallel.
+    ///
+    /// It is a SERIALIZER, not the correctness mechanism: since the save became
+    /// a real compare-and-swap that merges onto the winning document
+    /// (`save_catalog`), a concurrent writer no longer loses work to this span —
+    /// it costs the span one retry. So the span is held only where it is the
+    /// cheapest way to get a mutually consistent load and save, and a statement
+    /// that cannot change the catalog stays out of it entirely (see
+    /// [`Database::catalog_dml_can_write`]).
     catalog_write: Arc<tokio::sync::Mutex<()>>,
+    /// Monotone latch for [`Database::catalog_dml_can_write`]. Once this process
+    /// has seen a catalog that a DML statement can modify, it never forgets it:
+    /// a catalog gains its sequences, functions or triggers only through DDL or
+    /// replication, and either sets the latch on the way past. It never clears,
+    /// so a false reading can only ever hold DML ON the span, never off it.
+    catalog_dml_can_write: std::sync::atomic::AtomicBool,
     /// Registered row-change listeners (see [`Database::subscribe_changes`]).
     /// Closed receivers are pruned lazily on the next emission.
     change_listeners: std::sync::RwLock<Vec<tokio::sync::mpsc::UnboundedSender<ChangeEvent>>>,
@@ -55,6 +71,7 @@ impl<S: RelationalStorage> Database<S> {
             name: name.into(),
             locks: Arc::new(LockManager::new()),
             catalog_write: Arc::new(tokio::sync::Mutex::new(())),
+            catalog_dml_can_write: std::sync::atomic::AtomicBool::new(false),
             change_listeners: std::sync::RwLock::new(Vec::new()),
         }
     }
@@ -66,6 +83,37 @@ impl<S: RelationalStorage> Database<S> {
     /// The shared lock manager (single-node coordinator).
     pub fn locks(&self) -> &Arc<LockManager> {
         &self.locks
+    }
+
+    /// Whether a DML statement (`INSERT` / `UPDATE` / `DELETE`) can leave this
+    /// database's catalog modified, in which case it has to take the
+    /// read-modify-write span like any other catalog writer.
+    ///
+    /// It can, in exactly three ways: a column's identity sequence advances
+    /// (`Catalog::next_sequence_value`), a trigger body runs DDL, or a UDF body
+    /// does. Everything else DML touches is a ROW, and rows live in their own
+    /// collections — never in the catalog. So on a catalog that declares none of
+    /// the three, DML is a catalog READ and must not be serialized behind DDL.
+    ///
+    /// This is the fix for the measured stall: every non-`SELECT` statement on
+    /// the node took the one process-global span, so a mirror writing rows
+    /// (hundreds of `INSERT`s a minute, none of which touch the catalog) formed
+    /// a standing queue ~24 deep behind one holder, and every waiter reported
+    /// "catalog write mutex took N ms" while none of them had anything to say to
+    /// the catalog. Reads never queued, writes do not need to.
+    pub fn catalog_dml_can_write(&self) -> bool {
+        self.catalog_dml_can_write
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Sets the [`Database::catalog_dml_can_write`] latch from a catalog this
+    /// process just loaded. Monotone: it never stores `false`, so the worst a
+    /// stale reading does is keep DML on the span it was already on.
+    fn note_catalog_dml_can_write(&self, catalog: &Catalog) {
+        if catalog.dml_can_write() {
+            self.catalog_dml_can_write
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Subscribe to committed row changes. Every row mutation that reaches
@@ -449,12 +497,23 @@ impl<S: RelationalStorage> Session<S> {
         // and that transaction owns the span already: `begin()` took the guard
         // when it loaded the catalog and `commit()`/`rollback()` release it.
         // Taking it again here would self-deadlock (tokio's `Mutex` is not
-        // reentrant), and leaving it to `COMMIT` alone was the bug: the
-        // snapshot `COMMIT` saves was read at `BEGIN`, so every table another
-        // session created in between was erased by a save that reported `Ok`.
+        // reentrant).
+        //
+        // DML on a catalog it cannot modify is a catalog READ: rows live in
+        // their own collections, so it takes no part in the race and acquires
+        // nothing. Handing every `INSERT` the one process-global span is what
+        // turned row traffic into a standing queue on the node. `BEGIN` likewise
+        // no longer holds the span for the transaction's whole life — `COMMIT`
+        // retakes it for the save alone, bounded by `catalog_write_wait`.
         let _catalog_guard: Option<tokio::sync::OwnedMutexGuard<()>> = match stmt {
             Statement::Query(_) => None,
             _ if self.txn.is_some() => None,
+            Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+                if !self.db.catalog_dml_can_write() =>
+            {
+                None
+            }
+            Statement::StartTransaction { .. } if !self.db.catalog_dml_can_write() => None,
             _ => Some(self.acquire_catalog_write().await?),
         };
 
@@ -1422,11 +1481,20 @@ impl<S: RelationalStorage> Session<S> {
 
     // ---- transaction control -------------------------------------------
 
-    /// Open an explicit transaction, keeping `catalog_write` — the guard
-    /// `execute_one` took before this statement — for the transaction's whole
-    /// life. The catalog this transaction will save at `COMMIT` is the snapshot
-    /// loaded here, so no other session may write the catalog between this
-    /// `BEGIN` and that `COMMIT` (see [`Database::catalog_write`]).
+    /// Open an explicit transaction. The guard `execute_one` took for this
+    /// `BEGIN` — when it took one — is kept on the transaction, so no other
+    /// session writes the catalog between this `BEGIN` and that `COMMIT` (see
+    /// [`Database::catalog_write`]).
+    ///
+    /// On a catalog DML cannot modify, `execute_one` takes none and this
+    /// transaction runs WITHOUT the span: its statements stage their changes and
+    /// its `COMMIT` retakes the span for the save alone. That is deliberate --
+    /// holding a process-global mutex for a whole transaction was measured as
+    /// the stall, one `BEGIN; ...; COMMIT;` per tenant pinning every other
+    /// writer on the node for the transaction's entire duration. The save is a
+    /// compare-and-swap that merges onto the winning document, so a `COMMIT`
+    /// whose snapshot another session moved on from loses the swap and merges
+    /// instead of erasing that session's tables.
     async fn begin(
         &mut self,
         catalog_write: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -1517,12 +1585,35 @@ impl<S: RelationalStorage> Session<S> {
                     }
                 }
             }
-            if txn.catalog_dirty {
-                self.save_catalog(&txn.catalog).await?;
-            }
             self.db.emit_changes(events);
+            self.db.locks.release_transaction(self.session_id);
+            // The catalog save comes LAST, and only after this transaction's
+            // locks are gone. A DDL statement acquires the span BEFORE any lock
+            // or table load (see `Database::catalog_write`), so taking the span
+            // at `COMMIT` while still holding locks that DDL is waiting for
+            // would be a lock-order inversion: DDL holds the span and waits for
+            // our lock, we hold the lock and wait for the span. Locks first,
+            // then the span, is the one order both sides can follow.
+            let owned_span = txn.catalog_write.take();
+            if txn.catalog_dirty {
+                match owned_span {
+                    Some(_guard) => self.save_catalog(&txn.catalog).await?,
+                    // This transaction ran without the span, so the snapshot its
+                    // `BEGIN` loaded may have moved on. `save_catalog` swaps
+                    // against that snapshot and, when the swap loses, re-reads
+                    // the winner and folds this transaction's delta onto it
+                    // (`Catalog::merge_onto`) — so a table another session
+                    // created during this transaction survives instead of being
+                    // erased by a save that reports `Ok`.
+                    None => {
+                        let _guard = self.acquire_catalog_write().await?;
+                        self.save_catalog(&txn.catalog).await?;
+                    }
+                }
+            }
+        } else {
+            self.db.locks.release_transaction(self.session_id);
         }
-        self.db.locks.release_transaction(self.session_id);
         Ok(ExecResult::empty_command("COMMIT"))
     }
 
@@ -1555,7 +1646,9 @@ impl<S: RelationalStorage> Session<S> {
     async fn load_catalog(&mut self) -> Result<Catalog> {
         let raw = self.db.storage.load_catalog().await?;
         self.catalog_base = raw.clone();
-        Self::parse_catalog(raw, &self.db.name)
+        let catalog = Self::parse_catalog(raw, &self.db.name)?;
+        self.db.note_catalog_dml_can_write(&catalog);
+        Ok(catalog)
     }
 
     /// Saves the catalog: compare-and-swap against the document this span

@@ -787,6 +787,25 @@ fn merge_named<T: Clone + serde::Serialize, K: Ord + Clone>(
 }
 
 impl Catalog {
+    /// Whether a DML statement (`INSERT` / `UPDATE` / `DELETE`) can leave this
+    /// catalog modified.
+    ///
+    /// It can, in exactly three ways: a column's identity sequence advances
+    /// ([`Catalog::next_sequence_value`]), a trigger body runs DDL, or a UDF body
+    /// does — those are the only `catalog_dirty` sites reachable from DML.
+    /// Everything else DML touches is a ROW, and rows live in their own
+    /// collections, never in the catalog. So a catalog with none of the three
+    /// makes every DML statement a catalog READ.
+    ///
+    /// Conservative by construction: it answers `true` for a catalog that merely
+    /// *could* be written by DML, and the caller latches it monotonically.
+    pub fn dml_can_write(&self) -> bool {
+        !self.sequences.is_empty()
+            || !self.functions.is_empty()
+            || self.tables.values().any(|t| !t.triggers.is_empty())
+            || self.views.values().any(|v| !v.triggers.is_empty())
+    }
+
     /// Fold this span's catalog change onto a catalog another writer saved
     /// while the span ran.
     ///
