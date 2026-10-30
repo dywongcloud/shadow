@@ -1,30 +1,5 @@
 ---
-# fail2ban, fleet-wide -- bans an IP's SSH access after repeated failed
-# logins. Applied to every node in `platform` so a future node gets it
-# automatically, not hand-run once.
-#
-# WHY FROM SOURCE, NOT THE DISTRO PACKAGE: this fleet mixes two OS families
-# (Rocky Linux 10, TencentOS Server 4 -- see AGENTS.md's glibc-groups note),
-# and only Rocky's own repos carry a working fail2ban RPM. TencentOS has
-# neither a native fail2ban package nor a usable EPEL: EPEL's release RPM
-# hard-requires a real `redhat-release` provide TencentOS doesn't ship, and
-# even a hand-added EPEL9 repo's fail2ban RPM hard-requires
-# `python(abi) = 3.9` while TencentOS ships Python 3.11 -- neither
-# `--skip-broken` workaround is a real install. fail2ban is pure Python with
-# no compiled extension, so installing straight from the upstream GitHub
-# release tarball via `setup.py install` works identically on both families
-# and was live-verified on both (Rocky nodes already carried the distro
-# package from earlier fleet work; every TencentOS node in this fleet was
-# fresh-installed this way and confirmed banning real attacker IPs within
-# seconds of going active). Using ONE method fleet-wide, rather than
-# branching on OS family, is deliberate: it is what is actually proven live
-# on every node this fleet has today, and it is what a brand new node -- of
-# either family -- gets from a clean checkout.
-#
-# A prior stopgap, sshguard, was already active on at least one node
-# (installed out-of-band, predating this role) -- disabled here since running
-# two independent ban daemons against the same sshd log is pure redundancy
-# and the user asked for fail2ban by name.
+# fail2ban on every `platform` node, installed from the upstream release tarball so Rocky 10 and TencentOS 4 take the same path (setup.py install: pure Python).
 - name: Check whether fail2ban is already installed and active (idempotency)
   ansible.builtin.command: systemctl is-active fail2ban
   register: f2b_active
@@ -61,10 +36,6 @@
     chdir: /tmp/fail2ban-1.1.0
   when: f2b_active.stdout != "active"
 
-# The unit must exec the fail2ban that is actually installed. A node that got
-# the distro RPM has it at /usr/bin, not /usr/local/bin where the source
-# install lands; hard-coding /usr/local/bin left fc-sanjose's fail2ban dead
-# for over a month (exit after 3 ms, since 2026-08-27, never noticed).
 - name: Locate the installed fail2ban-server and fail2ban-client
   ansible.builtin.shell: |
     set -e
@@ -76,14 +47,6 @@
   ansible.builtin.copy:
     dest: /etc/systemd/system/fail2ban.service
     mode: "0644"
-    # No PYTHONNOUSERSITE here -- upstream's own template sets it, but on
-    # this fleet's Python 3.11/3.12 builds that env var ALSO excludes
-    # /usr/local/lib/pythonX.Y/site-packages (where setup.py installs),
-    # not just the true per-user ~/.local site -- live-witnessed on
-    # fc-bangkok as "ModuleNotFoundError: No module named 'fail2ban'" under
-    # systemd's clean environment despite `python3 -c 'import fail2ban'`
-    # working fine interactively. Root-only server, no untrusted per-user
-    # installs to guard against, so the flag buys nothing here anyway.
     content: |
       [Unit]
       Description=Fail2Ban Service
@@ -103,24 +66,6 @@
       [Install]
       WantedBy=multi-user.target
 
-# Bans go through nftables. The fleet's firewall is nft-only (scripts/
-# hive-lockdown.sh), and Rocky 10 ships no `iptables` binary at all, so the
-# previous `iptables-multiport` banaction failed on every ban it attempted
-# (witnessed on fc-sanjose-7, 2026-09-30: `command -v iptables` empty).
-#
-# `mode = aggressive` for sshd. Password auth is off fleet-wide, so a scanner
-# never produces a "Failed password" line; what it produces is key probing
-# that ends in "Connection reset/closed by authenticating user ... [preauth]",
-# which the default `normal` mode does not count. Witnessed on fc-sanjose-7:
-# real probes from several IPs every few minutes, and the jail's counter at 0.
-#
-# ignoreip is derived from the inventory (every live host's public and
-# private address, retired hosts excluded) plus `hive_fail2ban_ignoreip_extra`
-# (the operator's egress, kept in the untracked inventory), so fail2ban can
-# never ban a fleet peer or lock the operator out mid-deploy.
-#
-# The recidive jail re-bans, on all ports and for a week, a source that keeps
-# getting banned; bantime.increment grows each repeat ban.
   register: f2b_unit
 
 - name: Compute the fail2ban ignore list from the inventory
@@ -185,12 +130,6 @@
       backend = auto
   register: f2b_sshd_local
 
-# OpenSSH 9.8+ (Rocky 10) logs from `sshd-session[pid]:`, not `sshd[pid]:`,
-# and fail2ban 1.1.0's sshd filter predates that split, so its prefix never
-# matched and the jail saw nothing at all. Witnessed on fc-sanjose-7
-# 2026-09-30: fail2ban-regex matched 0 of 164 real lines in either mode; with
-# this override aggressive mode matched 9 attack lines from 6 source IPs. The
-# group is optional, so older sshd builds keep matching exactly as before.
 - name: sshd filter accepts the sshd-session daemon name
   ansible.builtin.copy:
     dest: /etc/fail2ban/filter.d/sshd.local

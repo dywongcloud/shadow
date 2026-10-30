@@ -1,5 +1,4 @@
-# Lima VM for running REAL Firecracker microVMs on Apple Silicon.
-# Requires: M3+ chip, macOS 15+, Lima >=1.0 (nested virtualization via vz).
+# Lima VM for running REAL Firecracker microVMs on Apple Silicon (nested virtualization via vz: M3+, macOS 15+, Lima >= 1.0).
 vmType: "vz"
 nestedVirtualization: true
 arch: "aarch64"

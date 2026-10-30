@@ -10,8 +10,7 @@ EXPECTED_PROTOCOL="${CELL_AGENT_PROTOCOL_EXPECTED:-1}"
 EXPECTED_WIRE_PROTOCOL="${CELL_AGENT_WIRE_PROTOCOL_EXPECTED:-2}"
 EXPECTED_WIRE_CAPABILITIES="${CELL_AGENT_WIRE_CAPABILITIES_EXPECTED:-15}"
 PROBE_TIMEOUT_SECS="${CELL_AGENT_PROTOCOL_TIMEOUT_SECS:-5}"
-# Version of the complete release-fact envelope consumed by the rootfs builder.
-RELEASE_SCHEMA=2
+RELEASE_FACT_SCHEMA=2
 
 fail() {
   printf 'hive-cell-agent install refused: %s\n' "$*" >&2
@@ -103,7 +102,7 @@ PYPROBE
 read -r AGENT_ROOTFS_SCHEMA AGENT_PROTOCOL AGENT_WIRE_PROTOCOL AGENT_WIRE_CAPABILITIES <<<"$PROBE_VALUES"
 
 printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
-  "$RELEASE_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$RELEASE_FACT_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
   "$AGENT_WIRE_CAPABILITIES" "$STAGED_SHA256" >"$FACT_TMP"
 chmod 0444 "$FACT_TMP"
 python3 - "$FACT_TMP" "$EXPECTED_ROOTFS_SCHEMA" "$EXPECTED_PROTOCOL" \
@@ -132,8 +131,6 @@ if [ -e "$DEST" ]; then
 fi
 
 if [ -n "$EXISTING_SHA256" ] && [ "$EXISTING_SHA256" != "$STAGED_SHA256" ]; then
-  # Remove the old proof first. A crash while rotating rollback state therefore
-  # leaves an unproved .old binary, never a proof that can bless the wrong bytes.
   rm -f -- "${FACT}.old"
   OLD_TMP="$(mktemp "${DEST}.old.new.XXXXXX")"
   install -m 0755 -- "$DEST" "$OLD_TMP"
@@ -162,9 +159,6 @@ PYOLD
   fi
 fi
 
-# Each rename is atomic within its directory. The binary moves first and the
-# fact second; a crash between them produces a digest mismatch, so every rootfs
-# bake fails closed until the pair is reconciled.
 if [ "$EXISTING_SHA256" != "$STAGED_SHA256" ]; then
   sync -f "$STAGE"
   mv -f -- "$STAGE" "$DEST"
@@ -201,5 +195,5 @@ if fact != {
     raise SystemExit('published release fact does not describe installed bytes')
 PYFINAL
 printf '{"schema":%s,"rootfs_schema":%s,"runtime_artifact_protocol":%s,"agent_wire_protocol":%s,"agent_wire_capabilities":%s,"agent_sha256":"%s"}\n' \
-  "$RELEASE_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
+  "$RELEASE_FACT_SCHEMA" "$AGENT_ROOTFS_SCHEMA" "$AGENT_PROTOCOL" "$AGENT_WIRE_PROTOCOL" \
   "$AGENT_WIRE_CAPABILITIES" "$INSTALLED_SHA256"

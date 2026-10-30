@@ -43,6 +43,51 @@ pub struct TunnelResponse {
     pub body: mpsc::UnboundedReceiver<Bytes>,
 }
 
+/// The error [`TunnelClient::request`] returns when the instance rejected the request because it is
+/// already serving `max_concurrency` of them. A live, honest capacity answer — not a broken
+/// instance, and not a missed response.
+pub const NACK_ERROR: &str = "instance nack (overloaded)";
+
+/// True when `e` is the instance's own "at capacity" rejection. The router must treat this
+/// differently from a silent upstream: retrying it instantly against the same instance just
+/// collects three more nacks and publishes a timeout to the client.
+pub fn is_nack_error(e: &anyhow::Error) -> bool {
+    e.to_string() == NACK_ERROR
+}
+
+/// Sends `Cancel` for a request the gateway stops waiting for.
+///
+/// Fires on drop — the caller's future was abandoned (client disconnect, or an outer timeout
+/// fired) — and on head timeout. Without it the instance keeps working the request and holds its
+/// `InflightSlot` for as long as the local hop takes (up to `LOCAL_RESPONSE_DEADLINE` per
+/// attempt), so abandoned requests ratchet `inflight` up to `max_concurrency` and every later
+/// request is nacked even though nothing is actually busy. That is the geniee.site outage.
+///
+/// Disarmed once the response head arrives: from then on the response is the caller's to stream,
+/// and a `Nack` never took a slot in the first place.
+struct CancelOnDrop {
+    out: mpsc::UnboundedSender<Frame>,
+    id: u64,
+    armed: bool,
+}
+
+impl CancelOnDrop {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self
+                .out
+                .send(Frame::new(self.id, FrameKind::Cancel, Bytes::new()));
+        }
+    }
+}
+
+
 impl TunnelClient {
     pub fn new<S>(stream: S) -> TunnelClient
     where
@@ -59,7 +104,6 @@ impl TunnelClient {
         });
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
 
-        // Writer task.
         tokio::spawn(async move {
             while let Some(frame) = out_rx.recv().await {
                 if wr.write_all(&frame.encode()).await.is_err() {
@@ -68,7 +112,6 @@ impl TunnelClient {
             }
         });
 
-        // Reader task: demux responses, update health.
         let s = shared.clone();
         tokio::spawn(async move {
             loop {
@@ -92,12 +135,12 @@ impl TunnelClient {
                         }
                     }
                     FrameKind::RespEnd => {
-                        s.pending.lock().remove(&frame.stream_id); // drops body sender
+                        s.pending.lock().remove(&frame.stream_id);
                     }
                     FrameKind::Nack => {
                         if let Some(mut p) = s.pending.lock().remove(&frame.stream_id) {
                             if let Some(h) = p.head.take() {
-                                let _ = h.send(Err(anyhow::anyhow!("instance nack (overloaded)")));
+                                let _ = h.send(Err(anyhow::anyhow!(NACK_ERROR)));
                             }
                         }
                     }
@@ -108,7 +151,6 @@ impl TunnelClient {
                             h.max_concurrency = m.max_concurrency;
                             h.last_update_ms = now_ms();
                             h.alive = true;
-                            // #14: tunnel byte/backpressure metering.
                             h.bytes_in = m.bytes_in;
                             h.bytes_out = m.bytes_out;
                             h.queue_depth = m.queue_depth;
@@ -118,7 +160,6 @@ impl TunnelClient {
                     _ => {}
                 }
             }
-            // Connection closed: fail everything outstanding.
             s.closed.store(true, Ordering::SeqCst);
             s.health.lock().alive = false;
             let mut pending = s.pending.lock();
@@ -144,8 +185,13 @@ impl TunnelClient {
         *self.shared.health.lock()
     }
 
-    /// Send a request and await its response head; the body streams via the
-    /// returned receiver.
+    /// Abandoning this future (or timing it out) cancels the request at the instance, so the work
+    /// stops and its in-flight slot is released immediately.
+    ///
+    /// Send a request and await its response head; the body streams via the returned receiver.
+    /// `head_timeout` is the caller's own per-invocation budget (the deployment's
+    /// `max_duration_secs`): a shorter fixed value misreads a slow-but-running invocation as
+    /// unanswered and retries it, duplicating its side effects.
     pub async fn request(
         &self,
         method: &str,
@@ -183,20 +229,19 @@ impl TunnelClient {
             .send(Frame::new(id, FrameKind::Request, payload))
             .map_err(|_| anyhow::anyhow!("tunnel writer gone"))?;
 
-        // MUST be the caller's own per-invocation budget (the deployment's
-        // `max_duration_secs`, default 300s at the fluid-gateway call site),
-        // never a shorter hardcoded value: a previous fixed 30s here fired
-        // BEFORE the gateway's own `tokio::time::timeout(max_dur, ...)` around
-        // this whole call could ever see a real over-budget timeout, so every
-        // request past 30s (well within budget for an LLM/webhook call) hit
-        // this branch's `Err`, was misread as "the function never answered",
-        // and got retried — while the ORIGINAL invocation was still running
-        // server-side with no cancellation signal, silently duplicating side
-        // effects (this is the "shoomoo incident" `proxy_function` documents:
-        // `last_err = "timed out waiting for response head"` was this branch,
-        // not a real transport failure).
+        let mut cancel = CancelOnDrop {
+            out: self.out.clone(),
+            id,
+            armed: true,
+        };
+
         let meta = match tokio::time::timeout(head_timeout, head_rx).await {
-            Ok(Ok(r)) => r?,
+            Ok(Ok(r)) => {
+                // The instance answered (a Nack included, and a nack never took a slot), so there
+                // is nothing left to release.
+                cancel.disarm();
+                r?
+            }
             Ok(Err(_)) => {
                 self.shared.pending.lock().remove(&id);
                 anyhow::bail!("tunnel closed before response");

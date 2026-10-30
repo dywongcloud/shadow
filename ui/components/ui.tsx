@@ -227,12 +227,6 @@ export function Triangle({ className }: { className?: string }) {
   );
 }
 
-/* ---------------------------------------------------------------------- *
- * Loading-shell primitives — for route-level `loading.tsx` files. A shell
- * should resemble the final layout as closely as possible (same PageHeader +
- * Card/Table shape), so the page doesn't visibly "pop" once real data lands.
- * ---------------------------------------------------------------------- */
-
 /** A single pulsing placeholder block. */
 export function Skeleton({ className }: { className?: string }) {
   return <div className={cn("animate-pulse rounded-md bg-subtle", className)} aria-hidden />;

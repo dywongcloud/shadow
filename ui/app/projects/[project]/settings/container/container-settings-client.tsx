@@ -4,18 +4,9 @@ import { useCallback, useEffect, useState, use } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type ContainerSettings, type ProjectSettings } from "@/lib/api";
 
-/**
- * Container config for a project running the `container` runtime — resource
- * ceilings (memory/CPU/max-PIDs) and the persistent volume's mount path.
- * Saving PUTs `/v1/projects/:project/container`: this is a DASHBOARD-MANAGED
- * override that applies going forward, on the project's NEXT build/redeploy
- * (git.rs's produce_manifest merges it per-field, an explicit fluid.json
- * `container` block always wins) — it does not touch anything already
- * running. Port/protocol live on the separate Network settings page instead,
- * which edits the CURRENT deployment immediately with no redeploy needed —
- * deliberately not duplicated here to avoid two disagreeing places to set
- * the same thing.
- */
+/** Container config for a project on the `container` runtime: resource ceilings (memory/CPU/max-PIDs) and the volume mount path. Saving PUTs
+ *  `/v1/projects/:project/container`, a dashboard-managed override that applies on the NEXT build/redeploy (an explicit fluid.json `container` block always wins; an
+ *  unset field uses the platform default) and never touches running deployments. Port/protocol live on the Network settings page, which edits the CURRENT deployment. */
 export function ContainerSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
   const project = decodeURIComponent(params.project);
@@ -29,8 +20,6 @@ export function ContainerSettings({ paramsPromise }: { paramsPromise: Promise<{ 
     setC(s.container ?? {});
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal await resolves, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
   }, [load]);

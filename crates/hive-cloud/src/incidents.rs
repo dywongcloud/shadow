@@ -1,27 +1,10 @@
-//! Incidents — the operational record the platform owner manages from the ops
-//! dashboard (status-page style: severity, lifecycle, timeline of updates).
-//!
-//! Two origins share one store:
-//!
-//! * an OPERATOR incident (`POST /v1/incidents`, [`IncidentStore::open_new`])
-//!   is declared and closed by a person and never expires;
-//! * an AUTOMATED incident ([`IncidentStore::open`]) is the projection of a
-//!   CONDITION a reconcile loop observes — the level-triggered shape of a
-//!   Kubernetes status condition. The opener re-asserts it on EVERY pass
-//!   (dedup makes that free), declares how long one observation stays valid
-//!   (`OpenReq::ttl_ms`, sized from its own cadence — three passes is the
-//!   convention), and calls [`IncidentStore::clear`] on the branch where it
-//!   can see the condition is gone. The leader-only reconciler
-//!   ([`spawn_reconciler`]) resolves every automated incident whose
-//!   observation lapsed, collapses duplicates and bounds the resolved history.
-//!
-//! Why: on 2026-10-01 the leader held 16,612 incidents, 16,602 of them
-//! unresolved, the oldest 79 days old (5,918 copies of "Geo-DNS delegation
-//! held", 5,223 of "API delegation held", 3,389 of "Redeploying …"), because
-//! every automated opener could open but nothing ever closed. The 10.9 MB list
-//! was persisted on every state write, pulled by every follower (113–231 s per
-//! pull) and polled by the admin console every 4–6 s (2.5 s per poll on the
-//! wire). An incident that cannot resolve itself is not a signal.
+//! Incidents: the operational record the platform owner manages from the ops dashboard (severity,
+//! lifecycle, timeline). An OPERATOR incident (`POST /v1/incidents`, [`IncidentStore::open_new`])
+//! is declared and closed by a person and never expires. An AUTOMATED incident
+//! ([`IncidentStore::open`]) is the level-triggered projection of a CONDITION: the opener
+//! re-asserts it on EVERY pass, declares how long one observation stays valid (`OpenReq::ttl_ms`)
+//! and calls [`IncidentStore::clear`] where the condition is gone; the leader-only
+//! [`spawn_reconciler`] resolves lapsed ones, collapses duplicates and bounds the history.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -52,10 +35,8 @@ pub enum IncidentStatus {
 pub enum Origin {
     /// Declared by a person through `POST /v1/incidents`; closed by a person.
     Operator,
-    /// Opened by a reconcile loop for a condition it observes; resolves itself
-    /// once the condition is no longer observed. The default for rows persisted
-    /// before this field existed: on 2026-10-01 every one of the fleet's 16,612
-    /// rows was automated except the 10 an operator had already resolved.
+    /// Opened by a reconcile loop for a condition it observes; resolves itself once the condition
+    /// is no longer observed. The default for rows persisted before this field existed.
     #[default]
     Automated,
 }
@@ -73,26 +54,25 @@ pub struct Incident {
     pub title: String,
     pub severity: Severity,
     pub status: IncidentStatus,
+    /// Affected regions or components.
     #[serde(default)]
-    pub affected: Vec<String>, // regions / components
+    pub affected: Vec<String>,
     pub created_ms: u64,
     pub updated_ms: u64,
     #[serde(default)]
     pub updates: Vec<IncidentUpdate>,
     #[serde(default)]
     pub origin: Origin,
-    /// Stable key of the observed condition (automated incidents). Absent on
-    /// rows persisted before this field existed; [`Incident::key`] derives one
-    /// from title + affected, which is also what `open` deduplicated on.
+    /// Stable key of the observed condition (automated incidents); absent on older rows, where
+    /// [`Incident::key`] derives it from title + affected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub condition: Option<String>,
     /// Last time the opener observed the condition (re-asserted it). `0` on
     /// legacy rows, where `updated_ms` stands in.
     #[serde(default)]
     pub observed_ms: u64,
-    /// When an automated incident that has not been re-observed may be
-    /// auto-resolved. `0` = never for an operator incident; a legacy automated
-    /// row lapses [`DEFAULT_TTL_MS`] after its last update.
+    /// When an automated incident not re-observed may be auto-resolved: `0` = never (operator
+    /// incident); a legacy automated row lapses [`DEFAULT_TTL_MS`] after its last update.
     #[serde(default)]
     pub expires_ms: u64,
 }
@@ -107,6 +87,10 @@ impl Incident {
 
     fn is_open(&self) -> bool {
         self.status != IncidentStatus::Resolved
+    }
+
+    fn is_open_automated(&self) -> bool {
+        self.is_open() && self.origin == Origin::Automated
     }
 
     fn observed_or_updated(&self) -> u64 {
@@ -142,13 +126,12 @@ pub struct OpenReq {
     #[serde(default)]
     pub message: String,
     /// Stable condition key for an automated opener (`dns:geo-hold`,
-    /// `listener:<node>:<port>:<pid>`). Empty = derived from title + affected.
-    /// Ignored by [`IncidentStore::open_new`].
+    /// `listener:<node>:<port>:<pid>`); empty = derived from title + affected. Ignored by
+    /// `open_new`.
     #[serde(default)]
     pub condition: String,
-    /// How long one observation stays valid without being re-asserted. Sized
-    /// by the opener from its own cadence (three passes); `0` =
-    /// [`DEFAULT_TTL_MS`]. Ignored by [`IncidentStore::open_new`].
+    /// How long one observation stays valid without re-assertion (three passes of the opener's
+    /// cadence); `0` = [`DEFAULT_TTL_MS`]. Ignored by `open_new`.
     #[serde(default)]
     pub ttl_ms: u64,
 }
@@ -162,6 +145,8 @@ pub struct UpdateReq {
 /// Observation validity for an automated opener that declares none, and for
 /// legacy rows (measured from their last update).
 pub const DEFAULT_TTL_MS: u64 = 15 * 60 * 1000;
+
+const PUBLIC_BOARD_RESOLVED_LIMIT: usize = 20;
 
 /// Which rows a paged read returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,9 +208,8 @@ impl IncidentStore {
         v
     }
 
-    /// One page of incidents, newest first: `(rows, matching, open)` where
-    /// `matching` counts every row `filter` admits and `open` every unresolved
-    /// row, so a client can page without a second call.
+    /// One page, newest first, as `(rows, matching, open)`: `matching` counts every row `filter`
+    /// admits and `open` every unresolved row.
     pub fn page(&self, filter: Filter, limit: usize, offset: usize) -> (Vec<Incident>, usize, usize) {
         let items = self.items.read();
         let open = items.iter().filter(|i| i.is_open()).count();
@@ -241,9 +225,9 @@ impl IncidentStore {
         (page, matching, open)
     }
 
-    /// The public status board: OPERATOR incidents only — open ones plus the
-    /// 20 most recently resolved. Automated rows carry node names, pids and
-    /// command lines and never leave the operator console.
+    /// The public status board: OPERATOR incidents only (open plus the newest
+    /// `PUBLIC_BOARD_RESOLVED_LIMIT` resolved); automated rows carry node names, pids and command
+    /// lines and never leave the console.
     pub fn public_board(&self) -> Vec<Incident> {
         let items = self.items.read();
         let mut rows: Vec<&Incident> = items
@@ -256,7 +240,7 @@ impl IncidentStore {
         for inc in rows {
             if inc.is_open() {
                 out.push(inc.clone());
-            } else if resolved < 20 {
+            } else if resolved < PUBLIC_BOARD_RESOLVED_LIMIT {
                 resolved += 1;
                 out.push(inc.clone());
             }
@@ -276,15 +260,10 @@ impl IncidentStore {
         *self.items.write() = data;
     }
 
-    /// Observe a condition: open `req` as an AUTOMATED incident — or, when an
-    /// unresolved incident for the same condition already exists, re-assert
-    /// it (refresh `observed_ms`/`expires_ms`/`updated_ms`; no timeline entry,
-    /// so a condition re-asserted every tick cannot grow it without bound) and
-    /// return it. Lookup and insert happen under ONE write lock, so two
-    /// concurrent openers of one condition get one incident.
-    ///
-    /// Every automated opener calls this on every pass while the condition
-    /// holds; stopping is how the incident resolves (see [`spawn_reconciler`]).
+    /// Observe a condition: open `req` as an AUTOMATED incident or re-assert the unresolved one for
+    /// the same condition (refreshing `observed_ms`/`expires_ms`, no timeline entry) and return it,
+    /// under ONE write lock so concurrent openers get one incident. Openers call this every pass;
+    /// stopping is how it resolves.
     pub fn open(&self, req: OpenReq) -> Incident {
         let now = now_ms();
         let ttl = if req.ttl_ms == 0 {
@@ -323,10 +302,9 @@ impl IncidentStore {
         inc
     }
 
-    /// The condition is observed to be gone: resolve every open automated
-    /// incident for `condition` with `message` on its timeline. Idempotent and
-    /// cheap, so an opener calls it on every healthy pass. Returns how many
-    /// incidents it resolved.
+    /// The condition is gone: resolve every open automated incident for `condition` with `message`.
+    /// Idempotent and cheap, so openers call it on every healthy pass; returns how many it
+    /// resolved.
     pub fn clear(&self, condition: &str, message: &str) -> usize {
         let now = now_ms();
         let mut n = 0;
@@ -334,7 +312,7 @@ impl IncidentStore {
             .items
             .write()
             .iter_mut()
-            .filter(|i| i.is_open() && i.origin == Origin::Automated && i.key() == condition)
+            .filter(|i| i.is_open_automated() && i.key() == condition)
         {
             resolve_in_place(inc, now, message.to_string());
             n += 1;
@@ -382,37 +360,25 @@ impl IncidentStore {
         Some(inc.clone())
     }
 
-    /// Remove an incident entirely (vs. `update` which only transitions its
-    /// status). Returns the removed incident if it existed. The fleet follower
-    /// sync adopts the leader's post-delete snapshot wholesale, so a delete on
-    /// the leader propagates to every node's list on the next tick.
+    /// Remove an incident entirely (`update` only transitions its status); followers adopt the
+    /// leader's post-delete snapshot wholesale.
     pub fn remove(&self, id: &str) -> Option<Incident> {
         let mut items = self.items.write();
         let pos = items.iter().position(|i| i.id == id)?;
         Some(items.remove(pos))
     }
 
-    /// One reconciler pass over the store, in this order:
-    ///
-    /// 1. COLLAPSE — open automated rows sharing one condition (rows opened
-    ///    before `open` deduplicated) fold into the earliest, which inherits
-    ///    the latest observation and a timeline note with the count;
-    /// 2. EXPIRE — every open automated row whose last observation lapsed
-    ///    (`expires_ms`, or `DEFAULT_TTL_MS` after a legacy row's last update)
-    ///    resolves with a timeline entry naming how stale the observation is;
-    /// 3. PRUNE — resolved automated rows beyond the newest `history_max` or
-    ///    older than `retention_ms` are dropped. Operator rows are never pruned.
-    ///
-    /// Only the leader calls this (its gate is in [`spawn_reconciler`]): a
-    /// follower's list is replaced wholesale by the next store pull.
+    /// One leader-only reconciler pass: COLLAPSE open automated duplicates of one condition into
+    /// the earliest, EXPIRE open automated rows whose observation lapsed (with a timeline entry
+    /// naming the staleness), PRUNE resolved automated rows past `history_max` or `retention_ms`.
+    /// Operator rows are never pruned.
     pub fn reconcile(&self, now: u64, history_max: usize, retention_ms: u64) -> ReconcileReport {
         let mut report = ReconcileReport::default();
         let mut items = self.items.write();
 
-        // 1. collapse
         let mut survivor: HashMap<String, usize> = HashMap::new();
         for (i, inc) in items.iter().enumerate() {
-            if !(inc.is_open() && inc.origin == Origin::Automated) {
+            if !inc.is_open_automated() {
                 continue;
             }
             let key = inc.key();
@@ -426,7 +392,7 @@ impl IncidentStore {
         let mut folded: HashMap<usize, (usize, u64)> = HashMap::new();
         let mut drop = vec![false; items.len()];
         for (i, inc) in items.iter().enumerate() {
-            if !(inc.is_open() && inc.origin == Origin::Automated) {
+            if !inc.is_open_automated() {
                 continue;
             }
             let s = survivor[&inc.key()];
@@ -454,9 +420,8 @@ impl IncidentStore {
         }
         retain_kept(&mut items, &drop);
 
-        // 2. expire
         for inc in items.iter_mut() {
-            if !(inc.is_open() && inc.origin == Origin::Automated) {
+            if !inc.is_open_automated() {
                 continue;
             }
             let lapses = inc.lapses_ms();
@@ -478,7 +443,6 @@ impl IncidentStore {
             report.expired += 1;
         }
 
-        // 3. prune
         let mut resolved: Vec<(u64, usize)> = items
             .iter()
             .enumerate()
@@ -539,6 +503,10 @@ impl Default for IncidentStore {
     }
 }
 
+const DEFAULT_RECONCILE_SECS: u64 = 30;
+const DEFAULT_HISTORY_MAX: u64 = 500;
+const DEFAULT_RETENTION_SECS: u64 = 7 * 86_400;
+
 fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
@@ -547,17 +515,14 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/// The leader-only reconciler: every `HIVE_INCIDENT_RECONCILE_SECS` (30) runs
-/// [`IncidentStore::reconcile`] with `HIVE_INCIDENT_HISTORY_MAX` (500) and
-/// `HIVE_INCIDENT_RETENTION_SECS` (7 days), under
-/// `leadership::may_act(IncidentReconcile)` so exactly one node — the store's
-/// writer — ever changes the list. Persists after any change; followers adopt
-/// the compacted list on their next store pull.
+/// The leader-only reconciler: every `HIVE_INCIDENT_RECONCILE_SECS` runs
+/// [`IncidentStore::reconcile`] with `HIVE_INCIDENT_HISTORY_MAX`/`HIVE_INCIDENT_RETENTION_SECS`
+/// under `leadership::may_act(IncidentReconcile)`, persisting after any change.
 pub fn spawn_reconciler(cloud: Arc<crate::state::CloudState>) {
     crate::supervise::spawn_supervised("incident-reconciler", move || {
         let cloud = cloud.clone();
         async move {
-            let every = env_u64("HIVE_INCIDENT_RECONCILE_SECS", 30);
+            let every = env_u64("HIVE_INCIDENT_RECONCILE_SECS", DEFAULT_RECONCILE_SECS);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(every));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -566,8 +531,10 @@ pub fn spawn_reconciler(cloud: Arc<crate::state::CloudState>) {
                 if !crate::leadership::may_act(&cloud, crate::leadership::Job::IncidentReconcile) {
                     continue;
                 }
-                let history_max = env_u64("HIVE_INCIDENT_HISTORY_MAX", 500) as usize;
-                let retention_ms = env_u64("HIVE_INCIDENT_RETENTION_SECS", 7 * 86_400) * 1000;
+                let history_max =
+                    env_u64("HIVE_INCIDENT_HISTORY_MAX", DEFAULT_HISTORY_MAX) as usize;
+                let retention_ms =
+                    env_u64("HIVE_INCIDENT_RETENTION_SECS", DEFAULT_RETENTION_SECS) * 1000;
                 let report = cloud
                     .incidents
                     .reconcile(now_ms(), history_max, retention_ms);

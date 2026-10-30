@@ -1,18 +1,13 @@
 import { NextResponse } from "next/server";
 import { cacheLife } from "next/cache";
 
-// Server-side proxy for the iptv-org catalog. The browser cannot fetch
-// iptv-org.github.io directly — the app's CSP `connect-src` is deliberately
-// tight ('self' + a short allowlist), and iptv is not on it (nor could the
-// hundreds of arbitrary stream hosts ever be). Fetching here, same-origin,
-// keeps the CSP untouched and also sidesteps CORS. The join runs server-side,
-// so the client downloads only the id/name/country/url rows it needs.
-//
-// Coverage is EVERY country iptv-org has a playable https HLS stream for — not
-// just the fleet's serving regions — so the world map can surface all of them.
+// Server-side proxy for the iptv-org catalog: the browser cannot fetch iptv-org.github.io directly (the CSP `connect-src` is tight and neither it nor the arbitrary
+// stream hosts are on it), so fetching here, same-origin, keeps the CSP untouched and sidesteps CORS. The join runs server-side so the client downloads only the
+// id/name/country/url rows it needs; coverage is EVERY country iptv-org has a playable https HLS stream for, not just the fleet's serving regions.
 
 const CHANNELS_URL = "https://iptv-org.github.io/api/channels.json";
 const STREAMS_URL = "https://iptv-org.github.io/api/streams.json";
+const UPSTREAM_TIMEOUT_MS = 20_000;
 
 interface IptvChannel {
   id: string;
@@ -27,17 +22,11 @@ interface IptvStream {
   url: string;
 }
 
-// One transient retry with a bounded timeout: a single blipped upstream fetch
-// (the node's egress hiccups) must not blank the whole world catalog on a
-// user's first load — the same "a blip is not a failure" rule the HLS proxy
-// follows. The hourly cache means this only ever runs on a cold entry.
 async function fetchJson<T>(url: string): Promise<T> {
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      // Caching is controlled by the outer `use cache` scope's cacheLife, not
-      // this fetch's own options.
-      const res = await fetch(url, { signal: AbortSignal.timeout(20_000) });
+      const res = await fetch(url, { signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS) });
       if (res.ok) return (await res.json()) as T;
       lastErr = new Error(`upstream ${res.status}`);
     } catch (e) {
@@ -47,9 +36,6 @@ async function fetchJson<T>(url: string): Promise<T> {
   throw lastErr ?? new Error("upstream unavailable");
 }
 
-// The catalog changes rarely; cache the joined result for an hour so repeat
-// visits (and every node) don't re-pull iptv-org. `use cache` can't apply to
-// the GET export itself, so the data access lives in this cached helper.
 async function getCatalog(): Promise<Record<
   string,
   { id: string; name: string; country: string; categories: string[]; url: string }[]
@@ -61,7 +47,6 @@ async function getCatalog(): Promise<Record<
     fetchJson<IptvStream[]>(STREAMS_URL),
   ]);
 
-  // First https HLS stream per channel id.
   const streamByChannel = new Map<string, string>();
   for (const s of streams) {
     if (!s.channel || streamByChannel.has(s.channel)) continue;
@@ -69,8 +54,6 @@ async function getCatalog(): Promise<Record<
     streamByChannel.set(s.channel, s.url);
   }
 
-  // country → channels with a playable stream. Every country iptv-org covers,
-  // minus NSFW/closed channels and any without an https HLS stream.
   const byCountry: Record<
     string,
     { id: string; name: string; country: string; categories: string[]; url: string }[]

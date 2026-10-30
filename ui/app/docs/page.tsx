@@ -1,28 +1,18 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2 } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-export const metadata: Metadata = {
-  title: "Documentation — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Documentation",
+  socialTitle: "Documentation — shadw",
   description:
-    "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
-  alternates: { canonical: "/docs" },
-  openGraph: {
-    title: "Documentation — shadw",
-    description:
-      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
-    url: "/docs",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Documentation — shadw",
-    description:
-      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines, with guides for GitOps, regions, and the REST API.",
-  },
-};
+    "shadw documentation: deploy serverless functions, containers, and static sites from Git, hosted or on machines you operate, with guides for environment & secrets, GitOps, regions, and the REST API.",
+  twitterDescription:
+    "shadw documentation: deploy serverless functions, containers, and static sites from Git, with guides for GitOps, regions, and the REST API.",
+  path: "/docs",
+});
 
 const HERO_TABS = [
   {
@@ -81,50 +71,47 @@ build_id = res.json()["build_id"]`,
 ];
 
 const CARDS = [
-  { icon: Boxes, title: "Deploying apps", desc: "Git import, framework detection, Dockerfile containers and instant rollback.", href: "/docs/getting-started#deploying" },
-  { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars into build + runtime; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
+  { icon: Boxes, title: "Deploying apps", desc: "Git import, framework detection, Dockerfile containers and rollback.", href: "/docs/getting-started#deploying" },
+  { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars at runtime or into the build; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
   { icon: GitBranch, title: "GitOps", desc: "Connect GitHub once — push to deploy, config-as-code, two-way sync.", href: "/docs/getting-started#gitops" },
-  { icon: Globe2, title: "Regions & the mesh", desc: "Real geo regions over Iroh QUIC with anycast routing and failover.", href: "/docs/getting-started#regions" },
-  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that scale to zero and pack concurrent requests.", href: "/docs/getting-started#deploying" },
-  { icon: Code2, title: "API reference", desc: "Every admin endpoint for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
+  { icon: Globe2, title: "Regions", desc: "Regions follow where your nodes are; requests go to a healthy node in their own region first.", href: "/docs/getting-started#regions" },
+  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that pack concurrent requests; production stays warm, previews scale to zero.", href: "/docs/getting-started#deploying" },
+  { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
 ];
 
 export default function DocsIndex() {
   return (
     <div className="mx-auto max-w-5xl">
-      {/* Hero */}
       <div className="grid gap-10 pb-8 lg:grid-cols-[1.05fr_1fr] lg:items-center">
         <div>
           <h1 className="text-5xl font-bold leading-[1.05] tracking-tight sm:text-6xl">
-            Ship anything,
+            Push to Git,
             <br />
-            on your own mesh
+            get a live URL
           </h1>
           <p className="mt-6 max-w-md text-lg leading-relaxed text-secondary">
-            Deploy serverless functions, containers and static sites to a peer-to-peer cloud of your own
-            machines. Push from git, served from anywhere — in three steps.
+            Deploy serverless functions, containers and static sites from Git, hosted or on machines you
+            operate.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
-            <Link href="/docs/getting-started" className="inline-flex items-center gap-2 rounded-md bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
+            <Link href="/docs/getting-started" className="tap-44 inline-flex items-center gap-2 rounded-md border border-transparent bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
               Get started guide <ArrowRight className="h-4 w-4" />
             </Link>
-            <Link href="/settings/api-keys" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
-            <Link href="/docs/getting-started#api" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
+            <Link href="/settings/api-keys" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
+            <Link href="/docs/getting-started#api" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
           </div>
         </div>
         <CodeBlock tabs={HERO_TABS} />
       </div>
 
-      {/* Intro line */}
       <p className="border-t border-border pt-8 text-[15px] leading-relaxed text-secondary">
         Connect your{" "}
         <Link href="/docs/getting-started#gitops" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">Git repository</Link>{" "}
         to deploy on every push, with{" "}
-        <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">instant preview deployments</Link>{" "}
+        <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">preview deployments</Link>{" "}
         for testing changes before production.
       </p>
 
-      {/* Cards */}
       <h2 className="mb-5 mt-12 text-2xl font-semibold tracking-tight">Build with shadw</h2>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {CARDS.map((c) => (

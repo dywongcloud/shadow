@@ -1,40 +1,8 @@
-//! Live witness for the mainline-DHT address lookup (`hive_p2p::dht`).
-//!
-//! Every line below is a REAL execution against the REAL public BitTorrent DHT
-//! — no mocks, no test harness, no fixtures. Each endpoint is bound through the
-//! production `bind_full` with the exact configuration 12 of 14 fleet hosts run
-//! today (`HIVE_DISCOVERY_N0=0`, no `HIVE_BOOTSTRAP_PEERS`, no
-//! `HIVE_DISCOVERY_DNS`), which is the configuration that leaves a node with NO
-//! address-lookup provider at all.
-//!
-//!   1. `no_source_cannot_dial_by_id`
-//!      → the pain, reproduced: with the DHT off and no seeds/Seer/n0, a
-//!        `connect()` by bare `EndpointId` fails immediately with "No addressing
-//!        information available". This is what `PeerPool::dial_fresh` hits.
-//!   2. `dht_publishes_and_resolves`
-//!      → the fix: A publishes, an INDEPENDENT DHT node (the `--dht-probe`
-//!        code path, no endpoint, no other provider) resolves A's id, and B —
-//!        also seedless — connects to A by bare id. The contrast with (1) is
-//!        the proof; convergence alone would not be.
-//!   3. `probe_misses_unpublished_id`
-//!      → a valid id that was never published is a MISS, so (2)'s hit is not
-//!        the probe answering yes to everything.
-//!   4. `publish_filter_strips_private_addrs`
-//!      → with `HIVE_DHT_PUBLISH_DIRECT=1`, the published record carries the
-//!        relay URL and the host's PUBLIC address, and never an
-//!        RFC1918/CGNAT/link-local one.
-//!   5. `unresolvable_bootstrap_degrades` / `port_conflict_degrades`
-//!      → both failure modes leave the endpoint bound and every existing path
-//!        untouched, with a WARN naming the cause. Never a failed bind.
-//!   6. `existing_sources_intact`
-//!      → with the DHT on, a `HIVE_BOOTSTRAP_PEERS` seed still registers and
-//!        still resolves, `HIVE_DISCOVERY_DNS` still registers, `HIVE_IROH_PORT`
-//!        still pins the QUIC socket (the DHT's UDP socket is a separate one),
-//!        and `HIVE_PUBLIC_IP` still lands in `addr_json`.
-//!
-//! Usage: `cargo run -p hive-p2p --example dht_witness`
-//! Exit code 0 = every witness line passed; 1 = at least one failed.
-//! Needs outbound UDP to the public DHT; takes ~90s.
+//! Live witness for the mainline-DHT address lookup against the REAL public BitTorrent DHT, bound
+//! through the production `bind_full` in the fleet's seedless configuration: no source ⇒ no dial by
+//! id, the DHT publishes and resolves, an unpublished id misses, the publish filter strips private
+//! addresses, bad bootstrap / port conflict degrade without failing the bind, and existing sources
+//! stay intact. `cargo run -p hive-p2p --example dht_witness`; needs outbound UDP, ~90 s.
 
 use std::time::{Duration, Instant};
 
@@ -63,7 +31,6 @@ fn accept_forever(ep: iroh::Endpoint) {
             if let Ok(accepting) = incoming.accept() {
                 tokio::spawn(async move {
                     if let Ok(conn) = accepting.await {
-                        // Hold it briefly so the dialer's handshake completes.
                         let _ = conn;
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
@@ -90,7 +57,6 @@ async fn connect_by_bare_id(
     }
 }
 
-// 1 — the pain, reproduced.
 async fn no_source_cannot_dial_by_id() -> bool {
     const N: &str = "no_source_cannot_dial_by_id";
     std::env::set_var("HIVE_DISCOVERY_DHT", "0");
@@ -119,7 +85,6 @@ async fn no_source_cannot_dial_by_id() -> bool {
     }
 }
 
-// 2 — the fix.
 async fn dht_publishes_and_resolves() -> (bool, Option<iroh::EndpointId>) {
     const N: &str = "dht_publishes_and_resolves";
     let a = match bind_bare("dht_a.key").await {
@@ -137,7 +102,6 @@ async fn dht_publishes_and_resolves() -> (bool, Option<iroh::EndpointId>) {
     println!("      (waiting 25s for A's pkarr record to reach the DHT)");
     tokio::time::sleep(Duration::from_secs(25)).await;
 
-    // Independent resolve: its own DHT node, no endpoint, no other provider.
     match hive_p2p::dht::probe(&a_id.to_string(), Duration::from_secs(60)).await {
         Ok(Some(hit)) => println!(
             "      probe HIT {}ms attempts={} relay={:?} direct={:?}",
@@ -174,7 +138,6 @@ async fn dht_publishes_and_resolves() -> (bool, Option<iroh::EndpointId>) {
     (ok, Some(a_id))
 }
 
-// 3 — the probe is not a yes-machine.
 async fn probe_misses_unpublished_id() -> bool {
     const N: &str = "probe_misses_unpublished_id";
     let never_published = SecretKey::generate().public();
@@ -185,7 +148,6 @@ async fn probe_misses_unpublished_id() -> bool {
     }
 }
 
-// 4 — the privacy filter.
 async fn publish_filter_strips_private_addrs() -> bool {
     const N: &str = "publish_filter_strips_private_addrs";
     std::env::set_var("HIVE_DHT_PUBLISH_DIRECT", "1");
@@ -244,7 +206,6 @@ fn is_public(ip: std::net::IpAddr) -> bool {
     }
 }
 
-// 5a — unresolvable bootstrap must not fail the bind.
 async fn unresolvable_bootstrap_degrades() -> bool {
     const N: &str = "unresolvable_bootstrap_degrades";
     std::env::set_var("HIVE_DHT_BOOTSTRAP", "no-such-host.invalid:6881");
@@ -275,7 +236,6 @@ async fn unresolvable_bootstrap_degrades() -> bool {
     }
 }
 
-// 5b — a pinned-but-taken DHT port must not fail the bind either.
 async fn port_conflict_degrades() -> bool {
     const N: &str = "port_conflict_degrades";
     let squatter = match std::net::UdpSocket::bind("0.0.0.0:0") {
@@ -311,13 +271,9 @@ async fn port_conflict_degrades() -> bool {
     out
 }
 
-// 6 — nothing that worked before stopped working.
 async fn existing_sources_intact() -> bool {
     const N: &str = "existing_sources_intact";
     let seed_key = SecretKey::generate();
-    // 203.0.113.0/24 is TEST-NET-3: routable-looking, guaranteed unroutable, so
-    // a timeout here proves the address was RESOLVED and dialed (the failure
-    // mode we want) rather than never found ("No addressing information").
     let seed_addr = EndpointAddr::from_parts(
         seed_key.public(),
         [TransportAddr::Ip(
@@ -357,9 +313,6 @@ async fn existing_sources_intact() -> bool {
         _ => true,
     });
     let public_advertised = json.contains("198.51.100.42:3399");
-    // The seed's MemoryLookup entry must be CONSULTED: a bare-id dial that gets
-    // as far as a timeout resolved an address; "No addressing information"
-    // would mean the provider was dropped.
     let seed_err = connect_by_bare_id(&ep, seed_key.public(), Duration::from_secs(6))
         .await
         .err()
@@ -400,8 +353,6 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "hive_p2p=info".into()),
         )
         .init();
-    // A stale key dir would reuse identities whose records are already on the
-    // DHT, which would let (2) pass without publishing anything this run.
     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("hive-dht-witness"));
 
     let mut ok = true;

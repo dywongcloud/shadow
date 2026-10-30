@@ -1,16 +1,4 @@
 ---
-# Atomic whole-bundle gVisor install. The reviewed release is one archive with
-# exactly six members (runsc, containerd-shim-runsc-v1, and four gvisor-bin/
-# support binaries); they are downloaded, checksum-verified at the ARCHIVE
-# level (SHA-256 via get_url + an independent SHA-512 recheck) and then at the
-# PER-MEMBER level against the exact six-member allowlist, extracted into a
-# never-mutated versioned release directory, and only then made live by
-# atomically swapping the build_executor_gvisor_current_link directory
-# symlink onto the whole verified tree in one rename(2). runsc is never
-# exposed without the rest of the bundle: the switch covers all six members
-# together, by construction, because they share one release directory and one
-# link.
-
 - name: Create the versioned gVisor releases directory
   ansible.builtin.file:
     path: "{{ build_executor_gvisor_releases_dir }}"
@@ -296,12 +284,6 @@
       Expected runsc version {{ build_executor_runsc_version }}, got:
       {{ _build_executor_runsc_version.stdout | default('<no output>') }}
 
-# Beyond a version string: prove the shim's real argument-parsing/validation
-# logic executes (a corrupted or wrong-arch binary fails to exec at all rather
-# than emitting this exact, well-formed refusal), matching the "-v" contract
-# the shim advertises and the runtime error it gives on a genuinely invalid
-# invocation. Both behaviors were confirmed live against this exact pinned
-# release on a real Linux x86_64 host before being encoded here.
 - name: Read the installed containerd-shim-runsc-v1 version
   ansible.builtin.command:
     argv:
@@ -334,15 +316,6 @@
       containerd-shim-runsc-v1 did not exercise its real argument-validation
       logic; the installed binary may be corrupted or arch-mismatched.
 
-# gvisor-bin/gvisor_sentry is already exercised for real by the live sandbox
-# boot in 50-probe.yml (runsc execs it to launch the sandbox whose
-# /proc/gvisor/kernel_is_gvisor marker that probe reads) -- confirmed by
-# tracing a real `runsc run` on a Linux x86_64 host. The other three
-# gvisor-bin members (checkpointgofer, gvisor-sentry-prewarmer,
-# runsc-metric-server) back optional features runsc does not exercise on an
-# ordinary sandbox boot, so they are proven here directly: each real exit
-# code and output substring below was observed live against this exact
-# pinned release, not guessed from documentation.
 - name: Invoke every gvisor-bin support binary to prove real, not static, behavior
   ansible.builtin.command:
     argv:
@@ -421,9 +394,6 @@
       stale = names[retain:]
       print("\n".join(stale))
 
-# argv is built above as a real list (not a joined string) so a directory
-# name never has to survive a split; the helper receives exactly one argv
-# entry per candidate release.
 - name: Determine releases beyond the retained rollback window
   ansible.builtin.command:
     argv: "{{ _build_executor_gvisor_prune_argv }}"

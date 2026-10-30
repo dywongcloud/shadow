@@ -5,7 +5,6 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { Calendar, ChevronDown, Search, MoreHorizontal, ChevronRight } from "lucide-react";
 
-// Lazy-load the Tremor chart bundle so it isn't in the initial page payload.
 const AreaChart = dynamic(() => import("@tremor/react").then((m) => m.AreaChart), { ssr: false });
 import { Card } from "@/components/ui";
 import { usePoll, type Metrics, type RumSummary } from "@/lib/api";
@@ -17,7 +16,6 @@ const RANGES = [
   { m: 360, label: "Last 6 hours" },
   { m: 720, label: "Last 12 hours" },
 ];
-// Must match page.tsx's server prefetch default (fetchMetricsSummary(team, 720)).
 const DEFAULT_RANGE_MINUTES = 720;
 
 const BAR_COLORS = ["#0070f3", "#f5a623", "#7928ca", "#50e3c2", "#e00", "#f81ce5", "#0070f3", "#79ffe1"];
@@ -39,18 +37,6 @@ export function ObservabilityClient({
 }) {
   const [range, setRange] = useState(DEFAULT_RANGE_MINUTES);
   const [q, setQ] = useState("");
-  // `initialTab` is computed SERVER-SIDE from the URL's `?tab=` query param
-  // (page.tsx) and passed as a prop, so this useState is a plain literal
-  // initializer instead of a function that reads `window.location.search`.
-  //
-  // The old code's initializer function ran on BOTH the server render (where
-  // `window` is undefined -> always "overview") and the client's hydration
-  // render (where, for a URL like ?tab=speed-insights, it read the real
-  // location and returned "speed") -- a genuine server/client mismatch on
-  // every direct link or reload with that query param, the same class of bug
-  // commit b563dac fixed elsewhere in this app (React #418 hydration crash).
-  // Server and client now agree by construction: the value can no longer be
-  // constructed two different ways depending on which environment computes it.
   const [tab, setTab] = useState<"overview" | "speed">(initialTab);
   const { data } = usePoll<Metrics>(`/v1/metrics?minutes=${range}`, 5000, true, initialMetrics);
   const rangeLabel = RANGES.find((r) => r.m === range)?.label ?? "Last 12 hours";
@@ -93,12 +79,6 @@ export function ObservabilityClient({
     Requests: b.requests,
     Errors: b.errors + b.client_err,
   }));
-  // REAL cache hit/miss counts (metrics.rs's Bucket tracks these exactly —
-  // no fabrication). Replaces a previous "Fast Data Transfer" card that
-  // multiplied request count by a hardcoded ~4.3KB/request guess: this crate
-  // has no bytes-transferred instrumentation anywhere (Event/Bucket carry no
-  // such field), so that number was invented, not measured — matching the
-  // user-reported "inaccurate" observability data. Cache hit ratio is exact.
   const cacheSeries = series.map((b) => ({
     t: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
     Hits: b.cache_hits,
@@ -120,7 +100,6 @@ export function ObservabilityClient({
   return (
     <div>
       {tabBar}
-      {/* Top controls */}
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-lg font-semibold">Observability</h1>
         <div className="flex items-center gap-2">
@@ -144,7 +123,6 @@ export function ObservabilityClient({
         </div>
       </div>
 
-      {/* Metric cards */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <MetricCard title="Edge Requests" metric="Invocations" value={fmtNum(totalReq)} href="/observability"
           data={reqSeries} categories={["Requests", "Errors"]} colors={["blue", "amber"]} label={rangeLabel} />
@@ -156,7 +134,6 @@ export function ObservabilityClient({
           data={mwSeries} categories={["Invocations"]} colors={["amber"]} label={rangeLabel} />
       </div>
 
-      {/* Project breakdown */}
       <div className="mt-6">
         <div className="relative mb-3">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />

@@ -14,6 +14,12 @@ npm/@shadw/*/bin/*
 # crates/hive-browser/www/sqlite/build-sqlite.sh, never committed.
 crates/hive-browser/www/sqlite/.build/
 
+# musql browser wasm: ~23 MB raw build artifact of
+# crates/hive-browser/www/musql/build-musql.sh (reproducible from source,
+# never committed). The four JS host files beside it ARE tracked -- they are
+# small, readable and part of the lane's import graph.
+crates/hive-browser/www/musql/musql.wasm
+
 # Ansible: real inventory/secrets are operator-local, never committed --
 # only the .example templates ship in the repo.
 ansible/inventory/hosts.ini

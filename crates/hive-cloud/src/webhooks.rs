@@ -1,7 +1,7 @@
-//! Outbound webhooks — alert your own code/services on platform events
-//! (deployment lifecycle, database provisioning, etc). Each delivery is signed
-//! with HMAC-SHA256 over the JSON body so receivers can verify authenticity, the
-//! same scheme Vercel/GitHub use (`X-Hive-Signature: sha256=<hex>`).
+//! Outbound webhooks: alert your own code or services on platform events (deployment lifecycle,
+//! database provisioning, ...). Each delivery is signed with HMAC-SHA256 over the JSON body so
+//! receivers can verify authenticity, the scheme Vercel and GitHub use (`X-Hive-Signature:
+//! sha256=<hex>`).
 
 use hive_core::now_ms;
 use hmac::{Hmac, Mac};
@@ -16,7 +16,6 @@ type HmacSha256 = Hmac<Sha256>;
 
 /// Event types a webhook can subscribe to (Vercel-style catalog).
 pub const ALL_EVENTS: &[&str] = &[
-    // Deployment
     "deployment.created",
     "deployment.building",
     "deployment.ready",
@@ -27,26 +26,20 @@ pub const ALL_EVENTS: &[&str] = &[
     "deployment.rollback",
     "deployment.checks.failed",
     "deployment.checks.succeeded",
-    // Project
     "project.created",
     "project.removed",
     "project.renamed",
     "project.env-variable.created",
     "project.env-variable.updated",
     "project.env-variable.deleted",
-    // Domain
     "domain.added",
     "domain.created",
     "domain.dns.records.changed",
     "project.domain.verified",
-    // Data
     "database.created",
     "database.ready",
-    // Observability
     "alerts.triggered",
-    // Firewall
     "firewall.attack",
-    // Incidents
     "incident.opened",
     "incident.resolved",
 ];
@@ -54,9 +47,10 @@ pub const ALL_EVENTS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Webhook {
     pub id: String,
-    /// Owning team/tenant. `#[serde(default)]` keeps pre-existing persisted
-    /// webhooks loadable (they normalize to "personal"), so adding tenant
-    /// ownership is backward-compatible with on-disk state.
+    /// Owning team/tenant. `#[serde(default)]` keeps webhooks persisted before tenant ownership
+    /// loadable, but a row with no team is INERT (never listed, never delivered: `owned_by` needs a
+    /// real team) and stays on disk until an operator re-creates it under its team; it is never
+    /// guessed to belong to "personal" or to anyone else.
     #[serde(default)]
     pub team: String,
     /// Project this webhook belongs to ("*" = all projects in the team).
@@ -76,14 +70,73 @@ fn default_true() -> bool {
     true
 }
 
+/// Whose webhooks a store operation may see or change: one team's, or everyone's on the
+/// platform-operator surfaces. A required parameter, never a default, so a store method that
+/// forgets the owner cannot be written.
+#[derive(Clone, Copy)]
+pub enum Scope<'a> {
+    Team(&'a str),
+    Operator,
+}
+
+impl Scope<'_> {
+    fn admits(&self, hook: &Webhook) -> bool {
+        match self {
+            Scope::Team(team) => hook.owned_by(team),
+            Scope::Operator => true,
+        }
+    }
+}
+
+/// Who an event is for: the team that owns the project it happened in, or the whole platform (an
+/// operator-declared incident, which every team-wide `"*"` hook may receive).
+#[derive(Clone, Copy)]
+pub enum Audience<'a> {
+    Team(&'a str),
+    Platform,
+}
+
+/// How [`WebhookStore::remove`] found the row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Removal {
+    Removed,
+    /// The row exists but belongs to another team.
+    NotYours,
+    Absent,
+}
+
+/// A usable owner: never blank, the untagged sentinel or the anonymous tenant, so a lost tag can
+/// never match a row whose tag was also lost.
+fn real_team(team: &str) -> bool {
+    !team.trim().is_empty()
+        && team != crate::admin::UNTAGGED_TENANT
+        && team != crate::admin::ANON_TENANT
+}
+
 impl Webhook {
     fn subscribed(&self, event: &str) -> bool {
         self.enabled && (self.events.is_empty() || self.events.iter().any(|e| e == event))
     }
-    /// For API responses TO THE OWNING TENANT ONLY: decrypt `secret` back to
-    /// its real value (they need it to verify signatures on their receiving
-    /// endpoint) — the stored/persisted form is AEAD-sealed. `decrypt` is a
-    /// safe no-op passthrough for an already-plaintext legacy record.
+    /// Whether `team` (a real tenant) owns this row.
+    fn owned_by(&self, team: &str) -> bool {
+        real_team(team) && crate::admin::record_tenant(&self.team) == team
+    }
+    fn has_owner(&self) -> bool {
+        real_team(crate::admin::record_tenant(&self.team))
+    }
+    /// Whether an event of `audience`, raised in `project`, is for this hook.
+    fn receives(&self, audience: Audience<'_>, project: &str, event: &str) -> bool {
+        self.subscribed(event)
+            && match audience {
+                Audience::Team(team) => {
+                    self.owned_by(team) && (self.project == project || self.project == "*")
+                }
+                Audience::Platform => self.has_owner() && self.project == "*",
+            }
+    }
+    /// For API responses TO THE OWNING TENANT ONLY: decrypts `secret` back to its real value (they
+    /// need it to verify signatures on their receiving endpoint); the stored form is AEAD-sealed.
+    /// `decrypt` is a passthrough for an already-plaintext legacy record.
     pub fn decrypted(mut self) -> Self {
         self.secret = crate::secrets::decrypt(&self.secret);
         self
@@ -113,53 +166,95 @@ impl WebhookStore {
         WebhookStore {
             hooks: RwLock::new(Vec::new()),
             deliveries: RwLock::new(VecDeque::with_capacity(256)),
-            http: reqwest::Client::new(),
+            http: hive_outbound::client(),
         }
     }
 
-    pub fn list(&self, project: Option<&str>) -> Vec<Webhook> {
-        let h = self.hooks.read();
-        match project {
-            Some(p) => h
-                .iter()
-                .filter(|w| w.project == p || w.project == "*")
-                .cloned()
-                .collect(),
-            None => h.clone(),
+    /// The hooks `scope` may see; with `project`, only those that fire for it (its own and the
+    /// scope's team-wide `"*"` rows).
+    pub fn list(&self, scope: Scope<'_>, project: Option<&str>) -> Vec<Webhook> {
+        self.hooks
+            .read()
+            .iter()
+            .filter(|w| scope.admits(w))
+            .filter(|w| project.is_none_or(|p| w.project == p || w.project == "*"))
+            .cloned()
+            .collect()
+    }
+
+    /// Moves `team`'s subscriptions for this project to its new name. A webhook row whose `project`
+    /// no longer matches any project is silently undeliverable (every future event for the renamed
+    /// project would match nothing, and the settings page would still show a webhook that can never
+    /// fire). `*` rows (team-wide) are untouched.
+    pub fn rename_project(&self, team: &str, from: &str, to: &str) -> usize {
+        if from == to {
+            return 0;
         }
+        let mut hooks = self.hooks.write();
+        let mut n = 0;
+        for w in hooks
+            .iter_mut()
+            .filter(|w| w.owned_by(team) && w.project == from)
+        {
+            w.project = to.to_string();
+            n += 1;
+        }
+        n
     }
 
     pub fn snapshot(&self) -> Vec<Webhook> {
         self.hooks.read().clone()
     }
 
+    /// Replaces the rows (boot restore and store-sync adoption). Rows with no owning team are kept
+    /// but inert; they are counted loudly once per process so an operator can re-create them.
     pub fn load(&self, data: Vec<Webhook>) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let unowned = data.iter().filter(|w| !w.has_owner()).count();
+        if unowned > 0 && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                unowned,
+                "webhooks: rows with no owning team are kept but inert (never listed, never delivered); re-create them under their team"
+            );
+        }
         *self.hooks.write() = data;
     }
 
-    pub fn add(&self, mut w: Webhook) -> Webhook {
+    /// Registers a webhook for `w.team` (a real tenant; the handlers resolve it from the verified
+    /// claims), minting its id and a `whsec_` signing secret when absent, and AEAD-seals the secret
+    /// before it is stored or persisted (`secrets::encrypt`, idempotent: re-adding an already sealed
+    /// secret is safe). A webhook secret leaked from a snapshot, backup or GuardianDB replica lets an
+    /// attacker forge signed deliveries, which is why it sits under the primitive that protects
+    /// sensitive project env vars. The endpoint must pass `hive_outbound::validate_url` (https, a
+    /// public host): the node makes the request, so a tenant URL never reaches the node's own
+    /// network.
+    pub fn add(&self, mut w: Webhook) -> Result<Webhook, hive_outbound::Refused> {
+        debug_assert!(real_team(&w.team), "a webhook needs a real owning team");
+        hive_outbound::validate_url(&w.url)?;
+        w.url = w.url.trim().to_string();
         if w.id.is_empty() {
             w.id = format!("wh_{}", uuid::Uuid::new_v4().simple());
         }
         if w.secret.is_empty() {
             w.secret = format!("whsec_{}", uuid::Uuid::new_v4().simple());
         }
-        // AEAD-encrypt the HMAC signing secret before it's stored/persisted —
-        // this platform already has this exact primitive wired in for
-        // sensitive project env vars (secrets.rs), but the webhook secret
-        // (which, if leaked from a snapshot/backup/GuardianDB replica, lets
-        // an attacker forge signed webhook deliveries) was persisted in
-        // plaintext in the same snapshot files that primitive protects
-        // everything else in. `encrypt` is idempotent (passthrough if already
-        // sealed), so re-adding an already-encrypted secret is safe.
         w.secret = crate::secrets::encrypt(&w.secret);
         w.created_ms = now_ms();
         self.hooks.write().push(w.clone());
-        w
+        Ok(w)
     }
 
-    pub fn remove(&self, id: &str) {
-        self.hooks.write().retain(|w| w.id != id);
+    /// Removes row `id` when `scope` admits it.
+    pub fn remove(&self, scope: Scope<'_>, id: &str) -> Removal {
+        let mut hooks = self.hooks.write();
+        match hooks.iter().position(|w| w.id == id) {
+            None => Removal::Absent,
+            Some(i) if scope.admits(&hooks[i]) => {
+                hooks.remove(i);
+                Removal::Removed
+            }
+            Some(_) => Removal::NotYours,
+        }
     }
 
     pub fn deliveries(&self, limit: usize) -> Vec<Delivery> {
@@ -182,7 +277,9 @@ impl Default for WebhookStore {
     }
 }
 
-fn sign(secret: &str, body: &str) -> String {
+/// `sha256=<hex>` HMAC of `body`, the `x-hive-signature` every signed delivery carries (webhooks and
+/// queue consumer batches).
+pub(crate) fn sign(secret: &str, body: &str) -> String {
     match HmacSha256::new_from_slice(secret.as_bytes()) {
         Ok(mut mac) => {
             mac.update(body.as_bytes());
@@ -200,26 +297,56 @@ fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
-/// Fire an event to all subscribed webhooks for `project`, signed + recorded.
-/// Spawns one background delivery round and returns immediately.
-pub fn dispatch(store: &Arc<WebhookStore>, project: &str, event: &str, payload: Value) {
+/// Fire an event raised in `project` of `team` to that team's subscribed webhooks (the project's
+/// own and the team's `"*"` rows, never another team's), signed + recorded. Spawns one background
+/// delivery round and returns immediately.
+pub fn dispatch(store: &Arc<WebhookStore>, team: &str, project: &str, event: &str, payload: Value) {
+    spawn_dispatch(store, Audience::Team(team), project, event, payload);
+}
+
+/// Fire a platform-wide event (an operator-declared incident) to every team's `"*"` webhooks.
+pub fn dispatch_platform(store: &Arc<WebhookStore>, event: &str, payload: Value) {
+    spawn_dispatch(store, Audience::Platform, "*", event, payload);
+}
+
+fn spawn_dispatch(
+    store: &Arc<WebhookStore>,
+    audience: Audience<'_>,
+    project: &str,
+    event: &str,
+    payload: Value,
+) {
     let store = store.clone();
+    let owned_team = match audience {
+        Audience::Team(team) => Some(team.to_string()),
+        Audience::Platform => None,
+    };
     let project = project.to_string();
     let event = event.to_string();
     let event_id = format!("evt_{}", uuid::Uuid::new_v4().simple());
     let created_ms = now_ms();
     tokio::spawn(async move {
-        let _ = dispatch_durable(&store, &event_id, created_ms, &project, &event, payload).await;
+        let audience = match owned_team.as_deref() {
+            Some(team) => Audience::Team(team),
+            None => Audience::Platform,
+        };
+        let _ = dispatch_durable(
+            &store, &event_id, created_ms, audience, &project, &event, payload,
+        )
+        .await;
     });
 }
 
-/// Deliver one durable lifecycle-outbox entry. The stable event id and creation
-/// time survive retries, and success means every currently subscribed endpoint
-/// acknowledged with 2xx (or there were no subscribers).
+/// Delivers one durable lifecycle-outbox entry. The stable event id and creation time survive
+/// retries, and success means every currently subscribed endpoint acknowledged with 2xx (or there
+/// were no subscribers). Each delivery is signed with the webhook's secret, decrypted per delivery
+/// (a passthrough for a legacy plaintext secret). Only hooks `audience` is entitled to are
+/// selected: a team's events never reach another team's hooks.
 pub async fn dispatch_durable(
     store: &Arc<WebhookStore>,
     event_id: &str,
     created_ms: u64,
+    audience: Audience<'_>,
     project: &str,
     event: &str,
     payload: Value,
@@ -228,9 +355,7 @@ pub async fn dispatch_durable(
         .hooks
         .read()
         .iter()
-        .filter(|webhook| {
-            (webhook.project == project || webhook.project == "*") && webhook.subscribed(event)
-        })
+        .filter(|webhook| webhook.receives(audience, project, event))
         .cloned()
         .collect();
     if targets.is_empty() {
@@ -256,21 +381,23 @@ pub async fn dispatch_durable(
         let event = event.to_string();
         let event_id = event_id.to_string();
         async move {
-            // decrypt() is a safe no-op passthrough for an already-plaintext
-            // legacy secret (backward compatible with pre-existing webhooks).
             let signature = sign(&crate::secrets::decrypt(&webhook.secret), &body_str);
-            let response = store
-                .http
-                .post(&webhook.url)
-                .header("content-type", "application/json")
-                .header("x-hive-event", &event)
-                .header("x-hive-delivery", &event_id)
-                .header("x-hive-signature", &signature)
-                .header("user-agent", "Hive-Webhooks/1.0")
-                .body(body_str)
-                .timeout(std::time::Duration::from_secs(10))
-                .send()
-                .await;
+            let response = match hive_outbound::validate_url(&webhook.url) {
+                Ok(url) => store
+                    .http
+                    .post(url)
+                    .header("content-type", "application/json")
+                    .header("x-hive-event", &event)
+                    .header("x-hive-delivery", &event_id)
+                    .header("x-hive-signature", &signature)
+                    .header("user-agent", "Hive-Webhooks/1.0")
+                    .body(body_str)
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(|error| hive_outbound::describe(&error)),
+                Err(refused) => Err(refused.0),
+            };
             let delivery = match response {
                 Ok(response) => {
                     let status = response.status().as_u16();
@@ -285,7 +412,7 @@ pub async fn dispatch_durable(
                         error: String::new(),
                     }
                 }
-                Err(error) => Delivery {
+                Err(reason) => Delivery {
                     id: event_id,
                     webhook_id: webhook.id.clone(),
                     event,
@@ -293,7 +420,7 @@ pub async fn dispatch_durable(
                     status: 0,
                     ok: false,
                     ts_ms: now_ms(),
-                    error: error.to_string(),
+                    error: reason.to_string(),
                 },
             };
             let ok = delivery.ok;
@@ -323,16 +450,18 @@ mod tests {
     #[test]
     fn webhook_secret_is_encrypted_at_rest_but_recoverable_for_owner_and_signing() {
         let store = WebhookStore::new();
-        let created = store.add(Webhook {
-            id: String::new(),
-            team: "acme".into(),
-            project: "*".into(),
-            url: "https://example.com/hook".into(),
-            events: vec![],
-            secret: "whsec_realvalue123".into(),
-            enabled: true,
-            created_ms: 0,
-        });
+        let created = store
+            .add(Webhook {
+                id: String::new(),
+                team: "acme".into(),
+                project: "*".into(),
+                url: "https://example.com/hook".into(),
+                events: vec![],
+                secret: "whsec_realvalue123".into(),
+                enabled: true,
+                created_ms: 0,
+            })
+            .expect("a public https endpoint is accepted");
 
         // The record actually held in the store (== what gets persisted) must
         // NOT be the plaintext secret.

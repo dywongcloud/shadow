@@ -1,11 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createRepo, githubConfigured, resolveEntity } from "@/lib/github";
 
-// Create a GitHub repository using THIS user's GitHub connection (first-party
-// GitHub App preferred, Composio fallback), so the in-browser Git page can make a
-// repo without a pasted PAT. The repo is created EMPTY (autoInit:false) so the
-// page's own first local commit is the initial push (no non-fast-forward against
-// an auto-generated base commit).
+/** Creates a GitHub repository with THIS user's connection (first-party GitHub App preferred, Composio fallback) so the in-browser Git page can make one without a pasted PAT.
+ *  The repo is created EMPTY (`autoInit: false`) so the page's own first local commit is the initial push, with no non-fast-forward against an auto-generated base; an org-approval
+ *  restriction is threaded back (`restricted` + `approve_url`) so the UI can link the approval instead of showing raw GitHub JSON. */
 export async function POST(req: NextRequest) {
   if (!githubConfigured()) {
     return NextResponse.json(
@@ -16,15 +14,12 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const name = typeof body?.name === "string" ? body.name.trim() : "";
   if (!name) return NextResponse.json({ error: "Repo name is required." }, { status: 400 });
-  const isPrivate = body?.isPrivate !== false; // default private
+  const isPrivate = body?.isPrivate !== false;
   const org = typeof body?.org === "string" && body.org.trim() ? body.org.trim() : undefined;
 
-  // Same stable entity as status/repos/connect — so the user's connected account is used.
   const entity = await resolveEntity();
   const res = await createRepo(entity, { name, org, isPrivate, autoInit: false });
   if (!res.ok) {
-    // Thread org-approval restriction (restricted + approve_url) so the UI can show
-    // a direct "approve this app for the organization" link, not raw GitHub JSON.
     return NextResponse.json(
       {
         error: res.error || "Failed to create repository",

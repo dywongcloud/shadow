@@ -1,10 +1,5 @@
 ---
-# Runs ONLY on the elected UI build host (the control-plane leader, see
-# playbooks/parallel-deploy.yml). ONE BUILD, MANY NODES: Next/Turbopack
-# builds are not deterministic, so per-node `next build` produced 13
-# different chunk sets behind one round-robin hostname (the "mobile endless
-# flicker" incident) -- this role builds ONCE and every other host in
-# hive_ui_deploy.yml's push.yml/restart.yml receives the identical artifact.
+# Runs only on the elected UI build host (the control-plane leader, see playbooks/parallel-deploy.yml): ONE build, every other host receives the identical artifact (Next builds are not deterministic).
 
 - name: Ensure the ui directory exists on the build host
   ansible.builtin.file:
@@ -21,10 +16,6 @@
       - "--exclude=node_modules"
       - "--exclude=.next"
       - "--exclude=.git"
-      # ui/.gm is gm-tooling state (spool, config cache) that a running
-      # watcher rewrites at any moment; rsync aborted the whole leader sync
-      # (rc 24, "file has vanished") on 2026-09-02 when its staging dir
-      # churned mid-transfer. It is never part of the dashboard.
       - "--exclude=.gm"
 
 - name: Template ui/.env.local
@@ -61,8 +52,6 @@
 
 - name: Confirm the @workflow/web console patch landed on the build host
   ansible.builtin.command:
-    # single-quoted grep -rl body; failure here means patch-wf-console.mjs
-    # did not run as part of npm run build -- never ship a pristine console.
     cmd: >-
       grep -rl "__hive_rpc_guard"
       node_modules/@workflow/web/build/server/assets/

@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   GitBranch,
@@ -10,7 +11,6 @@ import {
   KeyRound,
   Zap,
   Container,
-  Network,
   Database,
   Clock,
   Activity,
@@ -20,48 +20,38 @@ import {
   Check,
 } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Features — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Features",
+  socialTitle: "Features — shadw",
   description:
-    "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
-  alternates: { canonical: "/features" },
-  openGraph: {
-    title: "Features — shadw",
-    description:
-      "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
-    url: "/features",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Features — shadw",
-    description:
-      "Git deploys, immutable builds, instant rollback, previews, custom domains, secrets, serverless functions, containers, edge, durable data, cron, and observability over a peer-to-peer mesh.",
-  },
-};
+    "Explore shadw's platform: Git deploys, immutable builds, rollback to earlier deployments, preview URLs, custom domains & DNS, secrets, serverless functions, containers, managed databases, cron & workflows, logs and metrics, and experimental ZK preview access.",
+  twitterDescription:
+    "Git deploys, immutable builds, rollback, previews, custom domains, secrets, serverless functions, containers, managed databases, cron, and logs and metrics.",
+  path: "/features",
+});
+export const viewport = darkViewport;
 
 
 const FEATURES = [
   {
     icon: GitBranch,
     title: "Git Deploys",
-    desc: "Push to deploy. Automatic framework detection builds Next.js, Vite, SvelteKit and more — no config required.",
+    desc: "Push to deploy. Framework detection covers Next.js, Vite, SvelteKit and more; a monorepo with several apps needs a root directory.",
   },
   {
     icon: Boxes,
     title: "Immutable Deployments",
-    desc: "Every build is a permanent, content-addressed snapshot. Nothing mutates in place, so what shipped stays shipped.",
+    desc: "Every build is an immutable, content-addressed deployment. Nothing mutates in place, and you can delete a deployment you no longer need.",
   },
   {
     icon: Undo2,
-    title: "Instant Rollback",
-    desc: "Promote any previous deployment back to production in a single click. Recover from a bad release in seconds.",
+    title: "Rollback",
+    desc: "Promote any earlier deployment back to production to recover from a bad release.",
   },
   {
     icon: Eye,
     title: "Preview Deployments",
-    desc: "Every branch and pull request gets its own live URL, so you can review real running code before you merge.",
+    desc: "Every pull request on a connected GitHub repository gets its own live URL, so you can review real running code before you merge.",
   },
   {
     icon: Globe,
@@ -71,12 +61,12 @@ const FEATURES = [
   {
     icon: KeyRound,
     title: "Environment & Secrets",
-    desc: "Per-environment variables and secrets, encrypted at rest and injected only into the deployments that need them.",
+    desc: "Per-environment variables, scoped to build, runtime or both. Sensitive values are encrypted at rest.",
   },
   {
     icon: Zap,
     title: "Serverless Functions",
-    desc: "Fluid compute scales to zero and back instantly. Run request handlers across the mesh with no servers to manage.",
+    desc: "Production stays warm and previews scale to zero when idle, with no servers to manage.",
   },
   {
     icon: Container,
@@ -84,34 +74,29 @@ const FEATURES = [
     desc: "Ship anything with a Dockerfile. Long-running services and custom runtimes deploy alongside your functions.",
   },
   {
-    icon: Network,
-    title: "Edge Functions",
-    desc: "Run lightweight logic close to your users at peers across the network for low-latency responses everywhere.",
-  },
-  {
     icon: Database,
-    title: "Durable Data",
-    desc: "GuardianDB gives you always-on, replicated storage over the mesh — durable state without a central database.",
+    title: "Managed Databases",
+    desc: "Managed Postgres, Redis and SQLite databases for your projects. Each database runs on a single host node.",
   },
   {
     icon: Clock,
     title: "Cron & Workflows",
-    desc: "Schedule jobs with cron and orchestrate multi-step, durable workflows that resume exactly where they left off.",
+    desc: "Schedule jobs with cron and run multi-step workflows, with a console to inspect, cancel and replay runs. Each cron job runs on a single node.",
   },
   {
     icon: Activity,
-    title: "Observability & Logs",
-    desc: "Live logs, metrics, and traces for every deployment. See requests, errors, and cold starts in real time.",
+    title: "Logs & Metrics",
+    desc: "Request logs and metrics for your deployments, polled from the dashboard. See requests, errors and cold-start timings.",
   },
   {
     icon: ShieldCheck,
-    title: "ZK Anonymous Previews",
-    desc: "Share preview deployments behind zero-knowledge access proofs — verify the right viewers without tracking them.",
+    title: "ZK Preview Access",
+    desc: "Experimental. Team members unlock protected previews with a linkable ring-signature proof: the serving node learns that some member signed, not which one.",
   },
   {
     icon: Share2,
-    title: "P2P Mesh Routing",
-    desc: "Traffic is routed peer-to-peer across a self-hosted mesh, with no single point of failure and no cloud lock-in.",
+    title: "Request Routing",
+    desc: "Requests reach the node that runs your deployment: platform DNS favours it, and a request that lands on another node is forwarded. If the coordinating node is lost, a standby takes over.",
   },
 ];
 
@@ -128,25 +113,25 @@ export default function FeaturesPage() {
             </span>
           </>
         }
-        subtitle="A self-hosted, peer-to-peer cloud with the developer experience you already love — Git deploys, instant rollback, previews, durable data, and observability over a decentralized mesh."
+        subtitle="The developer experience you already love — Git deploys, rollback, previews, managed databases, and logs and metrics — on a cloud you can self-host."
       >
         <Link
           href="/sign-up"
-          className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+          className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
         >
           Start free
           <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
         </Link>
         <Link
           href="/pricing"
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
+          className="inline-flex items-center gap-2 tap-44 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
         >
           See pricing
         </Link>
       </MarketingHero>
 
-      {/* 1. Feature grid */}
       <MarketingSection className="py-16">
+        <h2 className="sr-only">Platform features</h2>
         <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3">
           {FEATURES.map(({ icon: Icon, title, desc }) => (
             <GlowCard key={title}>
@@ -160,20 +145,19 @@ export default function FeaturesPage() {
         </div>
       </MarketingSection>
 
-      {/* 2. Deploy in seconds */}
       <MarketingSection className="py-16">
         <div className="grid items-center gap-10 lg:grid-cols-2">
           <div>
-            <h2 className="text-3xl font-bold tracking-tight text-white">Deploy in seconds</h2>
+            <h2 className="text-3xl font-bold tracking-tight text-white">Deploy with a git push</h2>
             <p className="mt-3 text-zinc-400">
-              Connect a repository and push. shadw detects your framework, builds an immutable deployment,
-              and serves it across the mesh — no pipelines to wire up, no servers to provision.
+              Connect a repository and push. shadw detects supported frameworks, builds an immutable deployment,
+              and serves it — no servers to provision.
             </p>
             <ul className="mt-6 space-y-3">
               {[
-                "Zero-config builds with automatic framework detection",
-                "A unique preview URL for every push and pull request",
-                "Promote or roll back to any deployment instantly",
+                "Automatic framework detection; a monorepo with several apps needs a root directory",
+                "A unique deployment URL for every push, and a preview for every pull request on a connected GitHub repository",
+                "Promote or roll back to any earlier deployment",
               ].map((item) => (
                 <li key={item} className="flex items-start gap-3 text-sm text-zinc-300">
                   <span className="mt-0.5 flex h-5 w-5 flex-none items-center justify-center rounded-full border border-emerald-400/30 bg-emerald-400/10">
@@ -195,25 +179,24 @@ export default function FeaturesPage() {
               <div className="text-zinc-200">$ git push</div>
               <div className="text-zinc-400">→ Cloning…</div>
               <div className="text-zinc-400">→ Building (Next.js detected)</div>
-              <div className="text-zinc-400">→ Distributing to mesh peers…</div>
-              <div className="text-emerald-400">✓ Deployed to app.localhost</div>
+              <div className="text-zinc-400">→ Deploying…</div>
+              <div className="text-emerald-400">✓ Deployed to my-app.shadw.app</div>
             </div>
           </GlowCard>
         </div>
       </MarketingSection>
 
-      {/* 3. Closing CTA */}
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
-          <h2 className="text-3xl font-bold tracking-tight text-white">Ship on your own cloud today</h2>
+          <h2 className="text-3xl font-bold tracking-tight text-white">Ship on shadw today</h2>
           <p className="mx-auto mt-3 max-w-xl text-zinc-400">
-            Get the deploy experience you love, fully self-hosted over a peer-to-peer mesh. No lock-in, no central
-            point of failure.
+            Get the deploy experience you love on a cloud you can self-host. The hosted service uses Clerk,
+            Stripe and Vercel DNS.
           </p>
           <div className="mt-8 flex justify-center">
             <Link
               href="/sign-up"
-              className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+              className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
             >
               Start free
               <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

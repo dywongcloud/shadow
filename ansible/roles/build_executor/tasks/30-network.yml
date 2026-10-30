@@ -46,14 +46,6 @@
             "revision": revision,
             "subnet": str(wanted),
         }, sort_keys=True, separators=(",", ":")).encode()
-        # hive-cloud validates this field as an IDENTIFIER
-        # (build_executor.rs:3644: ASCII alphanumeric plus dot/underscore/
-        # dash, max 128), so the digest-pinned form cannot carry the usual
-        # "sha256:" colon -- that colon made the platform reject the whole
-        # capability with "network policy id must use only ASCII letters,
-        # digits, dot, underscore, and dash" and disable repository builds on
-        # this node (fc-virginia, 2026-09-28). The algorithm marker is kept
-        # as a dash-separated prefix instead.
         policy_id = "sha256-" + hashlib.sha256(policy_material).hexdigest()
 
         network_list = json.loads(subprocess.check_output([podman, "network", "ls", "--format", "json"], text=True))

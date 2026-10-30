@@ -1,16 +1,6 @@
-// lib/wf-console/express-bridge.ts
-//
-// Minimal Node<->Web bridge that lets an Express handler (IncomingMessage/
-// ServerResponse based) serve a Next.js App Router request (Request ->
-// Response). Used by app/wf-console/[[...slug]]/route.ts to mount the literal
-// upstream @workflow/web Express app inside hive's dashboard — no iframe, no
-// separate port, the upstream code answers each request in-process.
-//
-// Ported from the agentos wf-app bridge. Handles everything the WDK console
-// actually does: synchronous writes, JSON/HTML payloads, static assets and —
-// critically — BINARY CBOR bodies on /api/rpc (chunks must never go through
-// String(), which mangles them and surfaces client-side as "end of buffer not
-// reached" CBOR decode errors).
+// Minimal Node<->Web bridge that lets an Express handler (IncomingMessage/ServerResponse) serve a Next.js App Router request (Request -> Response); used by
+// app/wf-console/[[...slug]]/route.ts to mount the upstream @workflow/web Express app in-process. Ported from the agentos wf-app bridge; it must carry BINARY
+// CBOR bodies on /api/rpc intact (a chunk through String() surfaces client-side as "end of buffer not reached").
 
 import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
@@ -28,7 +18,6 @@ export async function expressToFetch(
   const url = new URL(req.url);
   const targetUrl = rewriteUrl ?? url.pathname + url.search;
 
-  // Drain the body once so it can be replayed as a Node readable stream.
   let bodyBuf: Buffer | null = null;
   if (req.body && req.method !== "GET" && req.method !== "HEAD") {
     const ab = await req.arrayBuffer();
@@ -36,7 +25,6 @@ export async function expressToFetch(
   }
 
   return new Promise<Response>((resolve, reject) => {
-    // Fake socket — Express pokes at this for remote address etc.
     const socket = new Socket();
 
     const incoming = new IncomingMessage(socket);
@@ -46,7 +34,6 @@ export async function expressToFetch(
     req.headers.forEach((v, k) => {
       headersObj[k.toLowerCase()] = v;
     });
-    // Express 5's req.get()/req.hostname read from these.
     incoming.headers = headersObj;
 
     process.nextTick(() => {
@@ -66,16 +53,10 @@ export async function expressToFetch(
       resolved = true;
       const body = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
       const h = new Headers();
-      // Base layer: the REAL ServerResponse's own header map — anything set
-      // through a path the interceptors below don't wrap (observed: express
-      // send() intermittently landing Content-Type only here) still counts.
-      // The intercepted `respHeaders` overlay wins on conflicts.
       let real: Record<string, unknown> = {};
       try {
         real = res.getHeaders() as Record<string, unknown>;
-      } catch {
-        /* closed/aborted response — captured headers alone */
-      }
+      } catch {}
       for (const [name, val] of Object.entries(real)) {
         if (Array.isArray(val)) {
           for (const v of val) h.append(name, String(v));
@@ -91,7 +72,6 @@ export async function expressToFetch(
           h.set(name, String(val));
         }
       }
-      // 204/304 must not carry a body per the Fetch spec.
       const bodyAllowed = statusCode !== 204 && statusCode !== 304;
       resolve(
         new Response(bodyAllowed ? new Uint8Array(body) : null, {
@@ -133,8 +113,6 @@ export async function expressToFetch(
       return origRemoveHeader(name);
     }) as typeof res.removeHeader;
 
-    // Canonical chunk -> Buffer conversion. Must preserve binary payloads
-    // (CBOR responses from /api/rpc are Uint8Arrays).
     const toBuf = (chunk: unknown, encoding?: unknown): Buffer => {
       if (Buffer.isBuffer(chunk)) return chunk as Buffer;
       if (chunk instanceof Uint8Array) return Buffer.from(chunk);

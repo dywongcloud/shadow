@@ -140,7 +140,6 @@ async fn main() -> anyhow::Result<()> {
             if follow {
                 stream_logs(&http, &cli.server, &job_id).await?;
             } else {
-                // one-shot: stream consumes until done anyway in this MVP
                 stream_logs(&http, &cli.server, &job_id).await?;
             }
         }

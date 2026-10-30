@@ -1,18 +1,13 @@
 #!/usr/bin/env bash
-# Provision the Lima guest to run Hive's Firecracker backend.
-# Run this INSIDE the Lima VM:  limactl shell hive  -> bash scripts/bootstrap-guest.sh
-#
-# It installs firecracker (aarch64), fetches a guest kernel, builds the Rust
-# binaries (hived + hive-cell-agent) from the read-only mounted source into a
-# writable target dir, and bakes a default rootfs. After this, run:
-#   sudo hived --backend firecracker --warm default=2
+# Provision the Lima guest for Hive's Firecracker backend: firecracker (aarch64), a guest kernel, the Rust binaries
+# (built from the read-only mounted source into a writable target dir) and a default rootfs.
+# Usage, INSIDE the VM:  limactl shell hive  ->  bash scripts/bootstrap-guest.sh
 set -euo pipefail
 
 FC_VERSION="${FC_VERSION:-v1.13.0}"
 ARCH="aarch64"
 PREFIX="/usr/local/bin"
 HIVE_LIB="/var/lib/hive"
-# Source dir: the repo mounted read-only by Lima. Adjust if your mount differs.
 SRC_DIR="${SRC_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
 TARGET_DIR="${TARGET_DIR:-$HOME/hive-target}"
 
@@ -32,8 +27,6 @@ firecracker --version | head -1
 echo "== 2. guest kernel =="
 sudo mkdir -p "$HIVE_LIB" "$HIVE_LIB/rootfs" /run/hive
 if [ ! -f "$HIVE_LIB/vmlinux" ]; then
-  # An uncompressed aarch64 kernel that boots under Firecracker. The Firecracker
-  # CI publishes known-good kernels; pin/override KERNEL_URL as needed.
   KERNEL_URL="${KERNEL_URL:-https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.10/aarch64/vmlinux-6.1.102}"
   echo "   downloading kernel from $KERNEL_URL"
   curl -fsSL "$KERNEL_URL" -o /tmp/vmlinux
@@ -58,7 +51,6 @@ sudo install -m0755 "$TARGET_DIR/release/hivectl"          "$PREFIX/hivectl"
 sudo install -m0755 "$TARGET_DIR/release/hive-cell-agent"  "$PREFIX/hive-cell-agent"
 
 echo "== 5. default rootfs =="
-# A small image that has git + coreutils. Customize per logical image name.
 sudo AGENT_BIN="$PREFIX/hive-cell-agent" ROOTFS_DIR="$HIVE_LIB/rootfs" \
   bash "$SRC_DIR/scripts/build-rootfs.sh" "buildpack-deps:24.04-curl" default 4096 || {
     echo "rootfs build failed; ensure docker works in the guest (sudo usermod -aG docker \$USER; relogin)"; exit 1; }

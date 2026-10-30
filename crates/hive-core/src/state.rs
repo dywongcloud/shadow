@@ -1,17 +1,8 @@
 //! Lifecycle state machines for cells and jobs.
-//!
-//! These mirror the lifecycle the Control Plane manages in Hive: cells are
-//! provisioned, pre-warmed, assigned to a job, run, then drained/terminated.
 
 use serde::{Deserialize, Serialize};
 
-/// The lifecycle of a single cell (a Firecracker microVM in the real backend).
-///
-/// ```text
-///   Provisioning ──▶ Warm ──▶ Assigned ──▶ Running ──▶ Draining ──▶ Terminated
-///        │            │          │            │
-///        └────────────┴──────────┴────────────┴────────────▶ Failed
-/// ```
+/// The lifecycle of a single cell; legal moves are defined by [`CellState::can_transition_to`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CellState {
@@ -42,14 +33,15 @@ impl CellState {
     }
 
     /// Validate a transition. Returns false for illegal moves so the control
-    /// plane can refuse to corrupt its own bookkeeping.
+    /// plane can refuse to corrupt its own bookkeeping. A `Warm` cell may drain
+    /// while idle (it is reaped from the pool).
     pub fn can_transition_to(self, next: CellState) -> bool {
         use CellState::*;
         match (self, next) {
             (Provisioning, Warm)
             | (Provisioning, Failed)
             | (Warm, Assigned)
-            | (Warm, Draining) // reaped from the pool while idle
+            | (Warm, Draining)
             | (Warm, Failed)
             | (Assigned, Running)
             | (Assigned, Failed)
@@ -57,20 +49,13 @@ impl CellState {
             | (Running, Failed)
             | (Draining, Terminated)
             | (Draining, Failed) => true,
-            // self-loops are no-ops but allowed
             (a, b) if a == b => true,
             _ => false,
         }
     }
 }
 
-/// The lifecycle of a build job.
-///
-/// ```text
-///   Queued ──▶ Scheduled ──▶ Building ──▶ Succeeded
-///                                    └───▶ Failed | TimedOut
-///   Queued/Scheduled/Building ───────────▶ Canceled
-/// ```
+/// The lifecycle of a build job; `is_terminal` names the end states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {

@@ -103,7 +103,7 @@ impl Exec {
         // Build the per-row provided column maps. Handles VALUES (including the
         // `DEFAULT` keyword per cell), `DEFAULT VALUES` (no source), and SELECT
         // sources.
-        let provided_rows: Vec<BTreeMap<String, SqlValue>> = match &insert.source {
+        let provided_rows: Vec<RowValues> = match &insert.source {
             None => vec![BTreeMap::new()],
             Some(src) => match src.body.as_ref() {
                 sqlparser::ast::SetExpr::Values(values) => {
@@ -122,7 +122,7 @@ impl Exec {
                             if is_default_expr(expr) {
                                 continue; // leave absent so the column default applies
                             }
-                            map.insert(col.clone(), self.eval(expr, &[])?);
+                            map.insert(crate::sql::store::intern_column(col), self.eval(expr, &[])?);
                         }
                         out.push(map);
                     }
@@ -139,7 +139,14 @@ impl Exec {
                                 row.len()
                             )));
                         }
-                        out.push(target_cols.iter().cloned().zip(row).collect());
+                        out.push(
+                            target_cols
+                                .iter()
+                                .cloned()
+                                .zip(row)
+                                .map(|(c, v)| (crate::sql::store::intern_column(&c), v))
+                                .collect(),
+                        );
                     }
                     out
                 }
@@ -364,11 +371,11 @@ impl Exec {
     fn build_row(
         &mut self,
         table: &Table,
-        provided: BTreeMap<String, SqlValue>,
+        provided: RowValues,
     ) -> Result<RowValues> {
         let mut values = BTreeMap::new();
         for col in &table.columns {
-            let value = if let Some(p) = provided.get(&col.name) {
+            let value = if let Some(p) = provided.get(col.name.as_str()) {
                 if p.is_null() {
                     SqlValue::Null
                 } else {
@@ -388,7 +395,7 @@ impl Exec {
             } else {
                 SqlValue::Null
             };
-            values.insert(col.name.clone(), value);
+            values.insert(crate::sql::store::intern_column(&col.name), value);
         }
         Ok(values)
     }
@@ -397,7 +404,7 @@ impl Exec {
     /// ROW triggers have run, matching PostgreSQL's ordering).
     pub(crate) fn check_row_constraints(&self, table: &Table, values: &RowValues) -> Result<()> {
         for col in &table.columns {
-            if !col.nullable && values.get(&col.name).map(SqlValue::is_null).unwrap_or(true) {
+            if !col.nullable && values.get(col.name.as_str()).map(SqlValue::is_null).unwrap_or(true) {
                 return Err(SqlError::NotNullViolation {
                     column: col.name.clone(),
                     table: table.name.clone(),
@@ -422,7 +429,7 @@ impl Exec {
     fn observe_serials(&mut self, table: &Table, values: &RowValues) {
         for col in &table.columns {
             if let Some(seq) = &col.identity_sequence
-                && let Some(v) = values.get(&col.name).and_then(SqlValue::as_i64)
+                && let Some(v) = values.get(col.name.as_str()).and_then(SqlValue::as_i64)
             {
                 self.catalog.observe_sequence_value(&table.schema, seq, v);
             }
@@ -552,7 +559,7 @@ impl Exec {
             ];
             let value = self.eval(&a.value, &frames)?;
             let coerced = coerce_to_col(value, table, &col)?;
-            new_values.insert(col, coerced);
+            new_values.insert(crate::sql::store::intern_column(&col), coerced);
         }
         self.check_constraints(table, &new_values)?;
         Ok(Some(new_values))
@@ -635,7 +642,7 @@ impl Exec {
                 };
                 let value = self.eval(&a.value, &[frame])?;
                 let coerced = coerce_to_col(value, &table, &col)?;
-                new_values.insert(col, coerced);
+                new_values.insert(crate::sql::store::intern_column(&col), coerced);
             }
             // BEFORE ROW triggers run on the assignment result, before
             // NOT NULL/CHECK/row security (which then apply to the
@@ -953,7 +960,7 @@ impl Exec {
                         let mut map = RowValues::new();
                         for (col, expr) in target_cols.iter().zip(content) {
                             if !is_default_expr(expr) {
-                                map.insert(col.clone(), self.eval(expr, &[])?);
+                                map.insert(crate::sql::store::intern_column(col), self.eval(expr, &[])?);
                             }
                         }
                         out.push(map);
@@ -971,7 +978,14 @@ impl Exec {
                                 row.len()
                             )));
                         }
-                        out.push(target_cols.iter().cloned().zip(row).collect());
+                        out.push(
+                            target_cols
+                                .iter()
+                                .cloned()
+                                .zip(row)
+                                .map(|(c, v)| (crate::sql::store::intern_column(&c), v))
+                                .collect(),
+                        );
                     }
                     out
                 }
@@ -1052,7 +1066,7 @@ impl Exec {
                 .fields
                 .iter()
                 .zip(tuple.iter())
-                .map(|(f, v)| (f.name.clone(), v.clone()))
+                .map(|(f, v)| (crate::sql::store::intern_column(&f.name), v.clone()))
                 .collect();
             let mut new_row = old_row.clone();
             for a in &update.assignments {
@@ -1062,7 +1076,7 @@ impl Exec {
                     row: tuple,
                 };
                 let value = self.eval(&a.value, &[frame])?;
-                new_row.insert(col, value);
+                new_row.insert(crate::sql::store::intern_column(&col), value);
             }
             row_pairs.push((old_row, new_row));
         }
@@ -1135,7 +1149,7 @@ impl Exec {
                     .fields
                     .iter()
                     .zip(tuple.iter())
-                    .map(|(f, v)| (f.name.clone(), v.clone()))
+                    .map(|(f, v)| (crate::sql::store::intern_column(&f.name), v.clone()))
                     .collect();
                 old_rows.push(old_row);
             }
@@ -1271,7 +1285,7 @@ pub fn row_tuple(table: &Table, values: &RowValues) -> Tuple {
     table
         .columns
         .iter()
-        .map(|c| values.get(&c.name).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| values.get(c.name.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect()
 }
 

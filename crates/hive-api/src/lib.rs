@@ -1,9 +1,5 @@
-//! `hive-api` — the minimal per-Hive HTTP API.
-//!
-//! In the write-up this is the small API each Hive exposes for cell execution
-//! requests. Here it is the ingress for the build pipeline / `hivectl`:
-//! submit jobs, query state, and stream logs. It is a thin shell over the
-//! control plane.
+//! The minimal per-Hive HTTP API — ingress for the build pipeline / `hivectl`: submit jobs, query
+//! state, stream logs; a thin shell over the control plane.
 
 use axum::{
     body::{Body, Bytes},
@@ -78,7 +74,6 @@ async fn stream_logs(State(hive): State<Arc<Hive>>, Path(id): Path<String>) -> R
                 Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
                 Ok(Err(broadcast::error::RecvError::Closed)) => return None,
                 Err(_) => {
-                    // Timed out waiting; if the build is finished, drain & stop.
                     if st.hive.logs_done(&st.id) {
                         match st.rx.try_recv() {
                             Ok(line) => return Some((ndjson_ok(line), st)),

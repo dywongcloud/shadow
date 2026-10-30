@@ -1,24 +1,20 @@
 //! Additional public HTTPS listeners for the paid dedicated-IPv4 addon.
 //!
-//! A naive implementation would bind the dedicated IP as a bare TCP splice —
-//! `raw_proxy.rs`'s pattern — but that bypasses `edge_pipeline` (WAF + bot
-//! defense) entirely, since that middleware only runs on the shared public
-//! router. `edge_pipeline`'s enforcement is keyed off the REQUEST (host,
-//! path, headers), not the local socket address it arrived on, so reusing
-//! the exact same `axum::Router` this node already built for the primary
-//! HTTPS listener — same `SniResolver`-backed rustls config, same
-//! middleware stack — is what makes a dedicated-IP request get the SAME
-//! WAF/bot coverage a shared-IP request gets. Never build a second, stripped
-//! router for this: that is precisely the gap this module exists to avoid.
+//! A naive implementation would bind the dedicated IP as a bare TCP splice (`raw_proxy.rs`'s
+//! pattern), but that bypasses `edge_pipeline` (WAF and bot defense) entirely, since that
+//! middleware only runs on the shared public router. `edge_pipeline`'s enforcement is keyed off the
+//! REQUEST (host, path, headers), not the local socket address it arrived on, so reusing the exact
+//! same `axum::Router` this node already built for the primary HTTPS listener (same
+//! `SniResolver`-backed rustls config, same middleware stack) is what gives a dedicated-IP request
+//! the SAME WAF/bot coverage a shared-IP request gets. Never build a second, stripped router for
+//! this: that is precisely the gap this module exists to avoid.
 //!
-//! **Which addresses to bind** — a reconcile loop (the `raw_proxy.rs`
-//! pattern applied to `DeploymentInfo::dedicated_ipv4` instead of
-//! `raw_ports`) diffs this node's own Ready deployments' + every gossiped
-//! peer deployment's dedicated-IPv4 allocations, filtered to
-//! `owner_node == cloud.node_name` (only the node the address is actually
-//! associated to at the network layer can bind it — every other node must
-//! NOT, or the bind fails or silently steals traffic depending on host
-//! routing), against the live listener set.
+//! **Which addresses to bind**: a reconcile loop (the `raw_proxy.rs` pattern applied to
+//! `DeploymentInfo::dedicated_ipv4` instead of `raw_ports`) diffs the dedicated-IPv4 allocations of
+//! this node's own Ready deployments and of every gossiped peer deployment, filtered to `owner_node
+//! == cloud.node_name`, against the live listener set. Only the node the address is actually
+//! associated to at the network layer can bind it; every other node must NOT, or the bind fails or
+//! silently steals traffic depending on host routing.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -28,9 +24,8 @@ use fluid_core::DeployState;
 
 use crate::state::CloudState;
 
-/// Spawn the reconcile loop. Runs on every node unconditionally (mirrors
-/// `raw_proxy::spawn`) — a node associated with no dedicated address binds
-/// nothing extra.
+/// Spawns the reconcile loop. Runs on every node unconditionally (as `raw_proxy::spawn` does): a
+/// node associated with no dedicated address binds nothing extra.
 pub fn spawn(cloud: Arc<CloudState>, router: axum::Router) {
     tokio::spawn(async move {
         let mut listeners: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();

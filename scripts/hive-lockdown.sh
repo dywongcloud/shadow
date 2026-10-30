@@ -25,7 +25,7 @@ PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
 # scripts/deploy-ui-fleet.sh already uses for its own host list), whenever a
 # node joins/leaves/changes IP. A hand-typed roster is exactly how this list
 # went stale the first time (6 of 12 current nodes, missing every GPU/CVM node).
-PEERS="43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 170.106.177.140 93.188.162.67"
+PEERS="209.23.0.183 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 170.106.177.140 93.188.162.67"
 # Fleet nodes' PRIVATE (VPC/CCN) addresses, from `hive_private_ip=` in the same
 # inventory. A peer reaching this node over the private path arrives with this
 # source, never its public IP, so strict mode (below) must know both.
@@ -40,29 +40,77 @@ PRIVATE_PEERS="10.0.0.8 10.0.0.10 10.0.0.12 10.0.0.14"
 # it to nft's dash form.
 LOCKED_PORTS="8787 9090 3000 7799 7800 7801 7802 7803 7804 50052 50100:50999"
 
-if command -v iptables >/dev/null 2>&1; then
-  iptables -D INPUT -j HIVE_LOCKDOWN 2>/dev/null || true
-  iptables -F HIVE_LOCKDOWN 2>/dev/null || true
-  iptables -N HIVE_LOCKDOWN 2>/dev/null || true
-  iptables -A HIVE_LOCKDOWN -i lo -j RETURN
-  for p in $PEERS; do iptables -A HIVE_LOCKDOWN -s "$p" -j RETURN; done
-  for port in $LOCKED_PORTS; do iptables -A HIVE_LOCKDOWN -p tcp --dport "$port" -j DROP; done
-  iptables -A HIVE_LOCKDOWN -j RETURN
-  iptables -I INPUT 1 -j HIVE_LOCKDOWN
-  echo "lockdown applied via iptables"
-elif command -v nft >/dev/null 2>&1; then
+# nft FIRST, iptables only as a fallback for a host that has no nft at all.
+# Reordered 2026-10-09 after fc-orlando: that host ships BOTH binaries, and
+# /usr/sbin/iptables there is iptables-nft, which does not create its own
+# table -- it adopts the pre-existing nft-native `ip filter` table the vendor
+# image installs (Atlantic.Net's cloud firewall) and appends HIVE_LOCKDOWN to
+# IT. The rules then land inside a table we neither own nor control (a vendor
+# re-render drops them), they are IPv4-only where the nft branch is `inet`,
+# and `iptables -S` afterwards refuses outright with "table `filter' is
+# incompatible, use 'nft' tool" -- so the ruleset that is actually protecting
+# the host cannot be listed or managed through the tool that wrote it. The
+# nft branch is also the one the fleet already runs (fc-phoenix has no
+# iptables binary at all and has always built `inet hive_lockdown`).
+if command -v nft >/dev/null 2>&1; then
   # Build the nft address-set literal FROM $PEERS at runtime (comma-joined)
-  # instead of a second hardcoded list -- the iptables loop above and this
+  # instead of a second hardcoded list -- the iptables loop below and this
   # branch can no longer drift apart from each other, only $PEERS can go stale.
   PEERS_NFT="$(echo "$PEERS" | tr ' ' ',')"
   PORTS_NFT="$(echo "$LOCKED_PORTS" | tr ' :' ',-')"
   nft delete table inet hive_lockdown 2>/dev/null || true
   nft add table inet hive_lockdown
   nft 'add chain inet hive_lockdown input { type filter hook input priority -100 ; policy accept ; }'
+  # Return traffic of a connection THIS host opened must never be evaluated by
+  # the port drops below: a locked dport range that overlaps
+  # net.ipv4.ip_local_port_range (50100-50999 does -- 32768 60999 by default)
+  # gets handed out by the kernel as the SOURCE port of ordinary outbound
+  # connects, so the SYN-ACK comes back with dport inside the locked range and
+  # is dropped -> Connection timed out (os error 110), socket wedged in
+  # SYN-SENT. Witnessed fleet-wide on fc-sanjose 2026-10-13 (2.2M dropped
+  # 56-byte packets; 100% of wedged sockets had a source port in the range).
+  # Belt-and-braces with `net.ipv4.ip_local_reserved_ports=50100-50999`
+  # (/etc/sysctl.d/60-hive-reserved-ports.conf), which stops the kernel ever
+  # allocating those ports automatically; this rule also covers a process that
+  # binds one explicitly.
+  nft add rule inet hive_lockdown input ct state established,related accept
   nft add rule inet hive_lockdown input iif lo accept
   nft add rule inet hive_lockdown input ip saddr "{ $PEERS_NFT }" accept
   nft add rule inet hive_lockdown input tcp dport "{ $PORTS_NFT }" drop
+  # Retire the legacy iptables-nft era chain, AFTER the table above is live so
+  # there is never a window without a lockdown. Hosts hardened before the
+  # nft-first reorder carry `chain HIVE_LOCKDOWN` inside the vendor `ip filter`
+  # table, entered by a `jump HIVE_LOCKDOWN` from INPUT. Left in place it keeps
+  # enforcing its OLD roster beside the new table: both hook INPUT, so the
+  # effective policy is their INTERSECTION and a peer added to $PEERS is still
+  # dropped by the stale chain (reproduced in a scratch netns, 2026-10-13: a new
+  # peer timed out on 8787 while the audit read the new roster as healthy).
+  nft -a list table ip filter 2>/dev/null | awk '
+    /^[ \t]*chain / { chain = $2 }
+    /jump HIVE_LOCKDOWN/ { for (i = 1; i <= NF; i++) if ($i == "handle") print chain, $(i + 1) }
+  ' | while read -r legacy_chain legacy_handle; do
+    nft delete rule ip filter "$legacy_chain" handle "$legacy_handle"
+  done
+  if nft list chain ip filter HIVE_LOCKDOWN >/dev/null 2>&1; then
+    nft flush chain ip filter HIVE_LOCKDOWN && nft delete chain ip filter HIVE_LOCKDOWN \
+      || { echo "ERROR: legacy ip filter HIVE_LOCKDOWN chain could not be retired" >&2; exit 1; }
+    echo "retired the legacy ip filter HIVE_LOCKDOWN chain"
+  fi
   echo "lockdown applied via nftables"
+elif command -v iptables >/dev/null 2>&1; then
+  iptables -D INPUT -j HIVE_LOCKDOWN 2>/dev/null || true
+  iptables -F HIVE_LOCKDOWN 2>/dev/null || true
+  iptables -N HIVE_LOCKDOWN 2>/dev/null || true
+  # Same reason as the nft branch above (see the comment there): reply packets
+  # of locally-originated connections are never the thing this chain protects
+  # against, so they RETURN before the dport drops see them.
+  iptables -A HIVE_LOCKDOWN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  iptables -A HIVE_LOCKDOWN -i lo -j RETURN
+  for p in $PEERS; do iptables -A HIVE_LOCKDOWN -s "$p" -j RETURN; done
+  for port in $LOCKED_PORTS; do iptables -A HIVE_LOCKDOWN -p tcp --dport "$port" -j DROP; done
+  iptables -A HIVE_LOCKDOWN -j RETURN
+  iptables -I INPUT 1 -j HIVE_LOCKDOWN
+  echo "lockdown applied via iptables"
 else
   echo "ERROR: neither iptables nor nft found" >&2; exit 1
 fi

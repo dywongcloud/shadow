@@ -46,7 +46,6 @@ export function DeploymentResources({ deploymentId }: { deploymentId?: string })
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Filter by path, name, etc." className="w-full rounded-lg border border-border bg-card py-2.5 pl-9 pr-3 text-sm focus:border-border-strong focus:outline-none" />
       </div>
 
-      {/* Functions */}
       <div className="mb-6">
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold">Functions <span className="text-muted">{fns.length}</span></div>
         <Card className="p-0">
@@ -74,7 +73,6 @@ export function DeploymentResources({ deploymentId }: { deploymentId?: string })
         </Card>
       </div>
 
-      {/* Static Assets */}
       <div>
         <div className="mb-2 flex items-center gap-2 text-sm font-semibold">Static Assets <span className="text-muted">{data?.total_static ?? 0}</span></div>
         <Card className="p-0">

@@ -1,8 +1,6 @@
-// Theme-aware appearance for Clerk widgets so the sign-in/up screens match the
-// dashboard's light/dark mode. Built on Clerk's official `dark` baseTheme so
-// every control (text, inputs, social buttons, OTP) is legible in both modes.
 import { dark as darkTheme } from "@clerk/themes";
 
+/** Theme-aware appearance for the sign-in/up Clerk widgets, built on Clerk's official `dark` baseTheme so every control (text, inputs, social buttons, OTP) is legible in both modes. */
 export function clerkAppearance(dark: boolean) {
   return {
     baseTheme: dark ? darkTheme : undefined,

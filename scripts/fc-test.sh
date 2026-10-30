@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
-# Run the REAL Firecracker microVM tenancy test inside the Lima nested-virt VM.
-#
-# Firecracker needs Linux + /dev/kvm, which on this Mac comes from a Lima `vz`
-# VM with nested virtualization (M3+/macOS 15+). This script builds the test in
-# the VM (against a VM-local target dir so it never clobbers the host build) and
-# runs it as root so it can open /dev/kvm and /var/lib/hive.
+# Run the REAL Firecracker microVM tenancy test inside the Lima nested-virt VM (Firecracker needs Linux + /dev/kvm; on a Mac
+# that is a Lima `vz` VM with nested virtualization, M3+/macOS 15+). It builds against a VM-local target dir so it never
+# clobbers the host build, and runs as root for /dev/kvm and /var/lib/hive. The VM needs firecracker, a kernel and a default
+# rootfs installed: scripts/bootstrap-guest.sh does that.
 #
 # Usage:   ./scripts/fc-test.sh
 # Env:     FC_VM=<lima-instance>   (default: hive)
-#
-# If the VM doesn't exist yet, create one with nested virt from the template:
-#   limactl start --name=hive scripts/fc-vm.yaml
-# and provision /usr/local/bin/firecracker + /var/lib/hive/{vmlinux,rootfs/default.ext4}.
 set -uo pipefail
 
 VM="${FC_VM:-hive}"
-REPO="$(cd "$(dirname "$0")/.." && pwd)"   # same absolute path inside the Lima mount
+HOST_REPO_PATH="$(cd "$(dirname "$0")/.." && pwd)"
 
 command -v limactl >/dev/null 2>&1 || { echo "ERROR: limactl not found (brew install lima)"; exit 1; }
 
@@ -27,10 +21,10 @@ if [ "$status" != "Running" ]; then
   exit 1
 fi
 
-echo "==> Firecracker tenancy test in VM '$VM' ($REPO)"
+echo "==> Firecracker tenancy test in VM '$VM' ($HOST_REPO_PATH)"
 limactl shell "$VM" bash -lc "
   set -e
-  cd '$REPO'
+  cd '$HOST_REPO_PATH'
   export CARGO_TARGET_DIR=\$HOME/fc-target
   echo '--> building (VM-local target dir)…'
   cargo test -p hive-backend --test firecracker_tenant --no-run 2>&1 | tail -2

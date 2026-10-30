@@ -1,19 +1,6 @@
-//! Typed model of the **Build Output API v3** — the format every framework build
-//! is normalized into (`.vercel/output/`):
-//!
-//! ```text
-//! .vercel/output/
-//!   config.json                 # routes, images, crons, framework metadata
-//!   static/**                   # static assets served directly by the CDN
-//!   functions/
-//!     <name>.func/
-//!       .vc-config.json         # serverless OR edge function descriptor
-//!       index.js / handler ...  # the function bundle
-//!     <name>.prerender-config.json   # ISR/prerender metadata (optional)
-//! ```
-//!
-//! These types let us read a build output produced by `vercel build` (or by our
-//! own framework adapters) and provision the right primitives from it.
+//! Typed model of the Build Output API v3 (`.vercel/output/`: `config.json`, `static/**`,
+//! `functions/<name>.func/.vc-config.json` + bundle, optional `<name>.prerender-config.json`) that
+//! every framework build is normalized into.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,9 +40,8 @@ impl Default for BuildOutputConfig {
     }
 }
 
-/// A routing rule. Vercel routes are either *source* rules (`src` -> `dest`,
-/// headers, status) or *phase handles* (`handle`: filesystem / rewrite / miss /
-/// hit / error / resource). Edge Middleware appears as a route with
+/// A routing rule: a source rule (`src` -> `dest`, headers, status) or a phase handle (`handle`:
+/// filesystem / rewrite / miss / hit / error / resource); Edge Middleware is a route with
 /// `middlewarePath`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Route {
@@ -194,8 +180,9 @@ pub fn parse_vc_config(v: &serde_json::Value) -> anyhow::Result<FunctionConfig> 
 /// `.prerender-config.json` — ISR / on-demand revalidation metadata.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrerenderConfig {
+    /// Either a number or `false`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expiration: Option<serde_json::Value>, // number | false
+    pub expiration: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<u64>,
     #[serde(rename = "bypassToken", skip_serializing_if = "Option::is_none")]

@@ -5,13 +5,10 @@ import { Card } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import Image from "next/image";
 
-// Structural shape of a New Project template (matches app/new/page.tsx's Template
-// so the page can pass its `selected` template straight through).
+/** Structural shape of a New Project template (a `GitTemplate | ImageTemplate` from app/new/page.tsx passes straight through). */
 export interface CloneTemplate {
   name: string;
   desc: string;
-  // Git-clone templates carry `repo` (+ optional monorepo subdir/branch); a
-  // pre-built image template has neither — see the `repo`-gated branch below.
   repo?: string;
   root?: string;
   branch?: string;
@@ -55,13 +52,8 @@ function Monogram({ t, className = "h-10 w-10" }: { t: CloneTemplate; className?
   );
 }
 
-/**
- * The "Preparing Git Repository" step shown after pressing **Create** on /new,
- * just before the build-logs view. Collapses the New Project card into a summary
- * and visualizes the source repository being cloned into the build environment —
- * a GitHub source badge (with a radar ripple) flowing a data packet along a
- * dashed connector into the destination folder. Mirrors Vercel's flow.
- */
+/** The "Preparing Git Repository" step shown after Create on /new, just before the build-logs view: it collapses the New Project card into a summary
+ *  and visualizes the source repository being cloned into the build environment (a GitHub source badge, a data packet along a dashed connector). */
 export function PreparingDeployment({
   template,
   team,
@@ -77,7 +69,6 @@ export function PreparingDeployment({
 }) {
   return (
     <div className="mx-auto max-w-2xl">
-      {/* Collapsed New Project summary */}
       <Card className="mb-6 p-6 sm:p-8">
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">New Project</h1>
         {template && template.repo ? (
@@ -100,9 +91,6 @@ export function PreparingDeployment({
             </div>
           </div>
         ) : template ? (
-          // Pre-built image template (no git clone) — the monogram + name/desc
-          // still identify what's being prepared, without any GitHub-specific
-          // chrome that would misrepresent an image pull as a clone.
           <div className="flex items-center gap-3 rounded-xl border border-border bg-subtle/40 p-4">
             <Monogram t={template} />
             <div className="min-w-0 flex-1">
@@ -122,24 +110,14 @@ export function PreparingDeployment({
         </div>
       </Card>
 
-      {/* Deployment — Preparing Git Repository (live animation) */}
       <CloneCard src={src} dest={dest} />
     </div>
   );
 }
 
-/**
- * The source-clone visualization card: a GitHub source flowing a data packet
- * along a dashed connector into the destination build folder.
- *
- * Two modes:
- *  • **active** (`idle=false`, default): the live "Preparing Git Repository…"
- *    animation shown on /new right after Create.
- *  • **idle** (`idle=true`): a STILL, successful "Git repository cloned" state —
- *    every animation is removed and a green check marks the completed clone. Used
- *    on the build-logs page, stacked underneath the logs, so the totem reads
- *    "logs → (already) cloned source".
- */
+/** The source-clone card: a GitHub source flowing a data packet along a dashed connector into the destination build folder. `idle=false` (default)
+ *  is the live "Preparing Git Repository…" animation on /new; `idle=true` is a STILL, successful "Git repository cloned" state (no animation, a green
+ *  check) stacked under the logs on the build-logs page. */
 export function CloneCard({
   src,
   dest,
@@ -174,10 +152,7 @@ export function CloneCard({
       </p>
 
       <div className="mt-6 rounded-xl border border-border bg-subtle/30">
-        {/* source → build-env flow */}
         <div className="flex items-center justify-center py-12">
-          {/* Destination: the build environment (a new repo/folder). When idle, a
-              green check badge marks the completed clone. */}
           <div
             className={cn(
               "relative flex h-14 w-14 items-center justify-center rounded-full border border-border bg-card shadow-sm",
@@ -192,7 +167,6 @@ export function CloneCard({
             )}
           </div>
 
-          {/* Dashed connector. The traveling data packet only animates when active. */}
           <div className="relative mx-1 h-px w-20 sm:w-28">
             <div
               className={cn(
@@ -205,7 +179,6 @@ export function CloneCard({
             )}
           </div>
 
-          {/* Source: the GitHub repository. The radar ripple only pulses when active. */}
           <div className="relative flex items-center justify-center">
             {!idle && (
               <>

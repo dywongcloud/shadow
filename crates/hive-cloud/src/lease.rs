@@ -1,15 +1,13 @@
-//! Container placement leases — consensus-free single-owner coordination for
-//! **stateful container deployments** (NOT functions/JS sites, which are
-//! stateless and need no coordination).
+//! Container placement leases: consensus-free single-owner coordination for **stateful container
+//! deployments** (NOT functions/JS sites, which are stateless and need no coordination).
 //!
-//! Design (see the RAFT analysis): we deliberately avoid a global Raft/etcd.
-//! Instead, every node agrees on the *preferred owner* of a container via
-//! **rendezvous (highest-random-weight) hashing** over the set of live nodes that
-//! hold it — deterministic, so no election round-trip. A **fenced lease** (a
-//! monotonic `epoch`) then guarantees safety: only the highest-epoch owner is
-//! authoritative, so a partitioned old owner can't split-brain. On owner death
-//! the lease expires and the next preferred live holder takes over with a bumped
-//! epoch (automatic failover). State converges via gossip (highest epoch wins).
+//! Design: we deliberately avoid a global Raft/etcd. Every node agrees on the *preferred owner* of
+//! a container through **rendezvous (highest-random-weight) hashing** over the set of live nodes
+//! that hold it: deterministic, so no election round-trip. A **fenced lease** (a monotonic `epoch`)
+//! then guarantees safety: only the highest-epoch owner is authoritative, so a partitioned old
+//! owner cannot split-brain. On owner death the lease expires and the next preferred live holder
+//! takes over with a bumped epoch (automatic failover). State converges through gossip (highest
+//! epoch wins).
 
 use std::collections::HashMap;
 
@@ -70,9 +68,9 @@ impl LeaseStore {
         self.owner_of(key).as_deref() == Some(node)
     }
 
-    /// Merge a lease learned from a peer. Higher epoch always wins; on an epoch
-    /// tie, the later expiry (a fresher renewal) wins. This is how lease state
-    /// converges across the mesh without a consensus log.
+    /// Merges a lease learned from a peer. A higher epoch always wins; on an epoch tie the later
+    /// expiry (a fresher renewal) wins. This is how lease state converges across the mesh without a
+    /// consensus log.
     pub fn merge(&self, incoming: ContainerLease) {
         let mut m = self.map.write();
         match m.get(&incoming.key) {
@@ -85,10 +83,9 @@ impl LeaseStore {
         }
     }
 
-    /// Acquire or renew the lease for `self_node`. Returns the lease iff we own it.
-    /// - If we already own it → renew (same epoch, extend expiry).
-    /// - If it's held by a *live* other owner → refuse (None).
-    /// - If it's free or expired → take over with `epoch + 1` (the fencing bump).
+    /// Acquires or renews the lease for `self_node`; returns the lease iff we own it. Already ours:
+    /// renew (same epoch, extended expiry). Held by a *live* other owner: refuse (`None`). Free or
+    /// expired: take over with `epoch + 1` (the fencing bump).
     pub fn acquire_or_renew(
         &self,
         key: &str,
@@ -108,7 +105,7 @@ impl LeaseStore {
                 m.insert(key.to_string(), renewed.clone());
                 Some(renewed)
             }
-            Some(cur) if cur.is_live(now) => None, // someone else holds a live lease
+            Some(cur) if cur.is_live(now) => None,
             other => {
                 let epoch = other.map(|c| c.epoch + 1).unwrap_or(1);
                 let lease = ContainerLease {
@@ -131,7 +128,7 @@ impl LeaseStore {
         let mut m = self.map.write();
         if let Some(cur) = m.get_mut(key) {
             if cur.owner == self_node {
-                cur.expires_ms = 0; // mark expired immediately
+                cur.expires_ms = 0;
             }
         }
     }
@@ -154,10 +151,10 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
-/// Rendezvous (HRW) hashing: the preferred owner of `key` among `nodes` is the
-/// node maximizing hash(key+node). Deterministic → every node agrees without an
-/// election. When a node leaves the set, only keys it owned move (to the next
-/// highest), giving stable, minimal-churn failover.
+/// Rendezvous (HRW) hashing: the preferred owner of `key` among `nodes` is the node maximizing
+/// `hash(key + node)`. Deterministic, so every node agrees without an election; when a node leaves
+/// the set only the keys it owned move (to the next highest), giving stable, minimal-churn
+/// failover.
 pub fn hrw_owner(key: &str, nodes: &[String]) -> Option<String> {
     nodes
         .iter()

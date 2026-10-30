@@ -1,50 +1,34 @@
-//! Instance-side tunnel: demux requests, proxy to the local function over HTTP
-//! concurrently, push in-band metrics, and nack when at capacity.
-//!
-//! Two serving modes, chosen per-function by the backend that fronts it:
-//! * [`TunnelServer::serve`] — the HTTP-framed multiplexed path (the default).
-//! * [`TunnelServer::serve_raw`] — a plain bidirectional byte splice for
-//!   non-HTTP protocols (`needs_raw_proxy()`), with no framing whatsoever.
-//!
-//! A THIRD mode exists for an HTTP-protocol function that ALSO needs an
-//! occasional raw escape on ONE connection — a WebSocket upgrade, which
-//! cannot ride the multiplexed frame format (it needs the whole connection,
-//! unframed, for the life of the upgraded session):
-//! * [`TunnelServer::serve_maybe_raw`] — peeks the connection's first byte
-//!   (non-consuming, `TcpStream::peek`); [`RAW_UPGRADE_MAGIC`] switches this
-//!   ONE connection to [`serve_raw`], anything else (every real HTTP request
-//!   line starts with an uppercase ASCII method letter) is byte-identical
-//!   `serve`. The accept loop that fronts an HTTP-protocol function uses this
-//!   instead of bare `serve` so a caller that knows to send the magic byte
-//!   first (`fluid_gateway`'s local WS splice) can open a raw connection to
-//!   the SAME listener ordinary framed traffic uses, with zero effect on
-//!   every other connection.
+//! Instance-side tunnel: demux requests, proxy to the local function over HTTP concurrently, push
+//! in-band metrics, nack when at capacity. Three serving modes, chosen per function:
+//! [`TunnelServer::serve`] (HTTP-framed, multiplexed), [`TunnelServer::serve_raw`] (a bidirectional
+//! byte splice for non-HTTP protocols) and [`TunnelServer::serve_maybe_raw`] (`serve`, except the
+//! one connection whose first byte is [`TunnelServer::RAW_UPGRADE_MAGIC`] gets `serve_raw`: the
+//! WebSocket-upgrade escape).
 
 use crate::codec::{read_frame, Frame, FrameKind};
 use crate::{Metrics, ReqMeta, RespMeta};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
-/// Write-queue depth (frames waiting to be flushed to the router) at or above
-/// which we count a backpressure event (#14). Tuned to be well clear of normal
-/// streaming bursts so the counter signals a genuinely slow/stalled consumer.
+/// Write-queue depth at or above which a backpressure event is counted; well clear of normal
+/// streaming bursts.
 const BACKPRESSURE_HWM: u64 = 256;
 
-/// How many CONCURRENT local connections one upstream address may receive
-/// across every tunnel in this process. Hosts multiplex fine (default 64,
-/// effectively unlimited); a backend whose guests can only service one
-/// connection at a time lowers it at init — litebox's guest network stack
-/// re-arms a single listener serially, so overlapping connects were
-/// accept-closed and every collision surfaced as a "function closed before
-/// headers" 502 (witnessed live: ~50% of uncached fetches on a busy guest,
-/// while strictly sequential probes never failed). Queueing at the connect is
-/// the correct shape: requests WAIT the microseconds a busy guest needs
-/// instead of failing.
+/// Concurrent local connects one upstream address may receive across every tunnel in this
+/// process; litebox lowers it at init because its guest network stack re-arms a single listener
+/// serially, so connects queue for the microseconds a busy guest needs instead of being
+/// accept-closed.
+///
+/// The permit covers the connect and nothing else: it is released the moment the socket exists
+/// ([`proxy_local`]). Held across the request it is a second, hidden concurrency limit on the
+/// instance that the `inflight` nack gate cannot see, and whenever it is the lower of the two
+/// (litebox sets it to 1) the instance admits `max_concurrency` requests, serves one, and nacks
+/// the rest — the whole instance reports "at capacity" while it is actually serializing.
 static LOCAL_CONNECT_PERMITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(64);
 
@@ -53,9 +37,99 @@ pub fn set_local_connect_permits(permits: usize) {
     LOCAL_CONNECT_PERMITS.store(permits.max(1), Ordering::Relaxed);
 }
 
-/// Per-upstream-address gates. Keyed by the literal `local_http` string; the
-/// map only ever holds one entry per live function address, and is cleared if
-/// it somehow grows past a bound so a churn of ephemeral ports cannot leak.
+/// Ceiling on completing a TCP connect to the local (guest) hop; 15 s matches the window a litebox
+/// cold start gets to reach a listening state.
+const LOCAL_CONNECT_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Ceiling on every wait on the local hop — queueing for the connect permit, connecting, writing
+/// the request, and reading each piece of the response. One number, applied to every await in
+/// [`proxy_local`] through [`hop_await`], so no single wait can hold a connect permit and an
+/// `inflight` slot longer than this: a guest that stalls costs one bounded, retryable failure
+/// instead of pinning the instance's capacity until the OS gives up (~130 s). Generous on purpose:
+/// shorter than forever, never shorter than real work.
+const LOCAL_RESPONSE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Consecutive requests that reached this function's address and produced NO response at all,
+/// after which the tunnel declares the instance not answering and closes the connection — the only
+/// failure signal that reaches the scheduler (`fluid-gateway` reads the close, calls
+/// `Fluid::mark_dead`, the instance is replaced). Any response, the function's own 502 included,
+/// resets the count.
+const UNHEALTHY_FAILURE_STREAK: u32 = 5;
+
+/// Releases one `inflight` slot on Drop, so an abandoned request still hands its slot back
+/// instead of ratcheting `inflight` up to `max_concurrency` for good.
+struct InflightSlot(Arc<AtomicU32>);
+
+impl Drop for InflightSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Per-request cancellation, set by [`FrameKind::Cancel`] when the gateway's caller goes away.
+///
+/// A `Notify` alone is wrong: `notify_waiters` only wakes waiters already parked, so a cancel that
+/// arrives in the window between dispatch and the first await is lost and the request runs to
+/// completion anyway. The flag closes that window — set it first, then wake, and check it again
+/// after registering interest.
+#[derive(Clone, Default)]
+struct CancelSignal {
+    flag: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+}
+
+impl CancelSignal {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        self.wake.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves as soon as the request is cancelled; safe to use as a `select!` branch.
+    async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        let notified = self.wake.notified();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// Live cancel signals for this connection's in-flight requests, keyed by `stream_id`.
+type CancelMap = Arc<std::sync::Mutex<std::collections::HashMap<u64, CancelSignal>>>;
+
+/// Withdraws a request's cancel entry when its task finishes, however it finishes, so the map is
+/// bounded by live concurrency rather than by requests ever seen.
+struct CancelEntry {
+    map: CancelMap,
+    id: u64,
+}
+
+impl Drop for CancelEntry {
+    fn drop(&mut self) {
+        if let Ok(mut m) = self.map.lock() {
+            m.remove(&self.id);
+        }
+    }
+}
+
+/// What one dispatched request produced. `Cancelled` is its own arm because it is NOT evidence
+/// about the function: the caller abandoned the request, so it must neither reset nor advance the
+/// [`UNHEALTHY_FAILURE_STREAK`] that decides whether this instance gets reaped.
+enum Outcome {
+    Answered,
+    Failed,
+    Cancelled,
+}
+
+/// Per-upstream-address connect gates keyed by the literal `local_http`; cleared if the map grows
+/// past a bound so ephemeral-port churn cannot leak.
 fn connect_gate(local_http: &str) -> Arc<tokio::sync::Semaphore> {
     static GATES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
@@ -86,9 +160,8 @@ struct TunnelMeter {
     backpressure_events: AtomicU64,
 }
 
-/// An `UnboundedSender<Frame>` that meters every frame it enqueues (#14): it bumps
-/// the live write-queue depth and trips the backpressure counter when the depth
-/// crosses the high-water mark. Keeps call sites as plain `out.send(frame)`.
+/// An `UnboundedSender<Frame>` that meters every enqueued frame: bumps the live write-queue depth
+/// and trips the backpressure counter past the high-water mark.
 #[derive(Clone)]
 struct MeteredSender {
     tx: mpsc::UnboundedSender<Frame>,
@@ -104,8 +177,6 @@ impl MeteredSender {
                 .fetch_add(1, Ordering::Relaxed);
         }
         if let Err(e) = self.tx.send(f) {
-            // Send failed (tunnel closed) — undo the depth bump so the gauge
-            // doesn't drift upward on a dead tunnel.
             self.meter.queued.fetch_sub(1, Ordering::Relaxed);
             return Err(e);
         }
@@ -131,14 +202,10 @@ impl TunnelServer {
             meter: meter.clone(),
         };
 
-        // Writer task: flushes frames and accounts bytes_out + drains the queue gauge.
         let writer = {
             let meter = meter.clone();
             tokio::spawn(async move {
                 while let Some(frame) = out_rx.recv().await {
-                    // Dequeued: drop the live write-queue depth before the (awaitable)
-                    // socket write, so the gauge reflects "waiting to flush", not
-                    // "currently flushing".
                     meter.queued.fetch_sub(1, Ordering::Relaxed);
                     let enc = frame.encode();
                     if wr.write_all(&enc).await.is_err() {
@@ -151,7 +218,6 @@ impl TunnelServer {
             })
         };
 
-        // Metrics ticker (in-band health + #14 byte/backpressure metering).
         {
             let out = out_tx.clone();
             let inflight = inflight.clone();
@@ -178,19 +244,49 @@ impl TunnelServer {
             });
         }
 
-        // Reader loop: demux requests.
+        let failures = Arc::new(AtomicU32::new(0));
+        let stuck = Arc::new(AtomicBool::new(false));
+        let stuck_notify = Arc::new(Notify::new());
+        let cancels: CancelMap = Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        ));
         loop {
-            let frame = match read_frame(&mut rd).await {
+            let notified = stuck_notify.notified();
+            let frame = match tokio::select! {
+                f = read_frame(&mut rd) => f,
+                _ = notified => {
+                    if stuck.load(Ordering::Relaxed) {
+                        tracing::warn!(
+                            local = %local_http,
+                            failures = failures.load(Ordering::Relaxed),
+                            "function answered none of the last requests; closing the tunnel \
+                             so this instance is reaped"
+                        );
+                        break;
+                    }
+                    continue;
+                }
+            } {
                 Ok(f) => f,
                 Err(_) => break,
             };
-            // Account inbound bytes (#14): request payloads dominate ingress.
             meter
                 .bytes_in
                 .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
             match frame.kind {
                 FrameKind::Ping => {
                     let _ = out_tx.send(Frame::new(0, FrameKind::Pong, Bytes::new()));
+                }
+                FrameKind::Cancel => {
+                    // The caller abandoned this request: stop the work and hand its slot back now
+                    // instead of holding it for as long as the local hop takes.
+                    let signal = cancels
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&frame.stream_id);
+                    if let Some(signal) = signal {
+                        signal.cancel();
+                    }
                 }
                 FrameKind::Request => {
                     let id = frame.stream_id;
@@ -201,10 +297,38 @@ impl TunnelServer {
                     inflight.fetch_add(1, Ordering::Relaxed);
                     let out = out_tx.clone();
                     let local = local_http.clone();
-                    let inflight = inflight.clone();
+                    let slot = InflightSlot(inflight.clone());
+                    let failures = failures.clone();
+                    let stuck = stuck.clone();
+                    let stuck_notify = stuck_notify.clone();
+                    let cancel = CancelSignal::default();
+                    cancels
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(id, cancel.clone());
+                    let entry = CancelEntry {
+                        map: cancels.clone(),
+                        id,
+                    };
                     tokio::spawn(async move {
-                        handle_request(id, frame.payload, &local, &out).await;
-                        inflight.fetch_sub(1, Ordering::Relaxed);
+                        let _slot = slot;
+                        let _entry = entry;
+                        match handle_request(id, frame.payload, &local, &out, &cancel).await {
+                            Outcome::Answered => {
+                                failures.store(0, Ordering::Relaxed);
+                            }
+                            Outcome::Failed => {
+                                let n = failures.fetch_add(1, Ordering::Relaxed) + 1;
+                                if n >= UNHEALTHY_FAILURE_STREAK
+                                    && !stuck.swap(true, Ordering::Relaxed)
+                                {
+                                    stuck_notify.notify_one();
+                                }
+                            }
+                            // The caller left, not the function: neither reset nor advance the
+                            // streak, so client disconnects can never reap a healthy instance.
+                            Outcome::Cancelled => {}
+                        }
                     });
                 }
                 _ => {}
@@ -214,30 +338,31 @@ impl TunnelServer {
         let _ = writer.await;
     }
 
-    /// Serve one accepted connection in RAW byte-splice mode: connect a fresh
-    /// TCP stream to `local_addr` (the function/container's published loopback
-    /// port) and copy bytes bidirectionally until either side closes — ZERO
-    /// HTTP framing, parsing, or tunnel-frame codec. This is the serving mode
-    /// for non-HTTP application protocols (`FunctionConfig::needs_raw_proxy()`:
-    /// gRPC / raw TCP wire protocols like Postgres or Minecraft), whose bytes
-    /// the HTTP-framed [`TunnelServer::serve`] path would corrupt by writing an
-    /// HTTP request line at them and chunk-decoding their responses. Same
-    /// proven splice pattern as hive-cloud's `db_gateway` and `edge::ws_proxy`.
-    ///
-    /// TCP-ONLY by design: `copy_bidirectional` is a byte-stream concept and
-    /// does not apply to UDP datagrams. A UDP service's local hop needs a
-    /// separate datagram relay (host UDP socket <-> the container's published
-    /// loopback UDP port, preserving datagram boundaries) — that relay plugs in
-    /// beside this function at the accept-loop branch in hive-backend's podman
-    /// path, NOT here.
+    /// Serve one accepted connection in RAW byte-splice mode: connect a fresh TCP stream to
+    /// `local_addr` and copy bytes bidirectionally with zero HTTP framing — the mode for non-HTTP
+    /// protocols (`FunctionConfig::needs_raw_proxy()`). TCP only: a UDP service's local hop is a
+    /// separate datagram relay in hive-backend's podman path, never here.
     pub async fn serve_raw<S>(stream: S, local_addr: String)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let mut backend = match TcpStream::connect(&local_addr).await {
-            Ok(b) => b,
-            Err(e) => {
+        let mut backend = match tokio::time::timeout(
+            LOCAL_CONNECT_DEADLINE,
+            TcpStream::connect(&local_addr),
+        )
+        .await
+        {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => {
                 tracing::warn!(local = %local_addr, error = %e, "raw splice: local connect failed");
+                return;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    local = %local_addr,
+                    deadline = ?LOCAL_CONNECT_DEADLINE,
+                    "raw splice: local connect timed out"
+                );
                 return;
             }
         };
@@ -245,23 +370,14 @@ impl TunnelServer {
         let _ = tokio::io::copy_bidirectional(&mut stream, &mut backend).await;
     }
 
-    /// First byte a caller writes to switch ONE connection on an
-    /// HTTP-protocol function's listener (normally exclusively `serve`, the
-    /// framed multiplexed path) to a raw splice for that connection alone —
-    /// see [`serve_maybe_raw`](Self::serve_maybe_raw). Chosen outside the
-    /// ASCII range: every real HTTP request line starts with an uppercase
-    /// method letter (`G`/`P`/`H`/…, all < `0x80`), so this can never
-    /// collide with genuine framed traffic.
+    /// First byte that switches ONE connection on an HTTP-protocol listener to a raw splice (see
+    /// [`serve_maybe_raw`](Self::serve_maybe_raw)); outside ASCII, so it can never collide with an
+    /// HTTP method letter.
     pub const RAW_UPGRADE_MAGIC: u8 = 0xFE;
 
-    /// Peek-and-dispatch entry point for an HTTP-protocol function's
-    /// listener: a plain byte-stream splice for the ONE connection whose
-    /// first byte is [`RAW_UPGRADE_MAGIC`] (magic consumed, never spliced),
-    /// [`serve`](Self::serve) unchanged for every other connection (the
-    /// peek does not consume anything a real request needs). Used by the
-    /// accept loop in place of bare `serve` so a caller that knows the magic
-    /// (`fluid_gateway`'s local WebSocket-upgrade splice) can open a raw
-    /// connection to the SAME listener ordinary framed traffic uses.
+    /// Peek-and-dispatch entry for an HTTP-protocol listener: the one connection whose first byte is
+    /// [`RAW_UPGRADE_MAGIC`](Self::RAW_UPGRADE_MAGIC) (consumed) gets a byte splice, every other
+    /// gets [`serve`](Self::serve) unchanged.
     pub async fn serve_maybe_raw(stream: TcpStream, local_addr: String, max_concurrency: u32) {
         let mut peek = [0u8; 1];
         let is_raw =
@@ -272,8 +388,6 @@ impl TunnelServer {
         }
         let mut stream = stream;
         let mut discard = [0u8; 1];
-        // The peek above only inspected the byte; actually consume it here
-        // (a real read, not another peek) so it never leaks into the splice.
         if stream.read_exact(&mut discard).await.is_err() {
             return;
         }
@@ -281,17 +395,16 @@ impl TunnelServer {
     }
 }
 
-async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) {
-    // An idempotent request whose upstream connection died BEFORE any response
-    // frame was emitted is retried against a fresh connection. Litebox guests
-    // intermittently accept-then-close a connect that lands while another is
-    // being serviced (single-listener re-arm in the guest network stack), so
-    // without this a straight 50% of uncached GETs through a busy guest
-    // surfaced as `upstream error: function closed before headers` 502s —
-    // witnessed live on nodes-wtf /favicon.ico while direct sequential probes
-    // of the same guest never failed once. Retry is ONLY safe while nothing
-    // has been sent (`head_sent` guards it): after the response head frame is
-    // out, a second attempt would interleave two responses on one stream.
+/// Returns whether a response head reached the caller — the progress signal
+/// [`UNHEALTHY_FAILURE_STREAK`] counts; a 502 the function sent is an answer, only "no response
+/// at all" is a failure.
+async fn handle_request(
+    id: u64,
+    payload: Bytes,
+    local_http: &str,
+    out: &MeteredSender,
+    cancel: &CancelSignal,
+) -> Outcome {
     let idempotent = payload
         .get(0..4)
         .and_then(|len| Some(u32::from_be_bytes(len.try_into().ok()?) as usize))
@@ -299,34 +412,32 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         .and_then(|meta| serde_json::from_slice::<ReqMeta>(meta).ok())
         .map(|meta| matches!(meta.method.as_str(), "GET" | "HEAD"))
         .unwrap_or(false);
-    // Witnessed live on fc-sanjose (2026-09-16 02:10-02:24 UTC): a 14-minute
-    // burst against one litebox-backed deployment exhausted all 3 attempts
-    // (total backoff budget 60ms) on every one of 49 requests. The root
-    // cause (litebox dropping a just-written response when the guest closes
-    // right after writing, triggered by this proxy's own now-removed
-    // `Connection: close`) is fixed at the source above; this stays at 5
-    // attempts as defense-in-depth for a real backlog-exhaustion timeout
-    // (litebox's own accept backlog caps at 8 concurrent) or a response with
-    // neither Content-Length nor chunked framing, both genuine residual
-    // races unrelated to the close-triggered one.
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
+        // The caller is gone: stop before spending another attempt — and up to another
+        // [`LOCAL_RESPONSE_DEADLINE`] of this slot — on a response nobody will read.
+        if cancel.is_cancelled() {
+            return Outcome::Cancelled;
+        }
         let mut head_sent = false;
-        match proxy_local(id, &payload, local_http, out, &mut head_sent).await {
-            Ok(()) => return,
+        match proxy_local(id, &payload, local_http, out, &mut head_sent, cancel).await {
+            Ok(()) => return Outcome::Answered,
             Err(error) => {
+                // Distinguish "the caller left" from "the function failed" by the flag, not by
+                // the error text: only the flag is set exactly when we abandoned our own work.
+                if cancel.is_cancelled() {
+                    return Outcome::Cancelled;
+                }
                 if head_sent || !idempotent || attempt + 1 == MAX_ATTEMPTS {
                     if head_sent {
-                        // Frames already flowed; emitting a 502 head now would
-                        // corrupt the stream. The caller sees the truncation.
                         tracing::warn!(
                             id,
                             attempt,
                             error = %error,
                             "tunnel: upstream request failed after response head was already sent — truncating stream"
                         );
-                        return;
+                        return Outcome::Answered;
                     }
                     last_error = Some(error);
                     break;
@@ -343,12 +454,6 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         }
     }
     if let Some(e) = last_error {
-        // This path was previously silent — a 502 body reached the client but
-        // nothing was logged, making every occurrence invisible in the
-        // journal (confirmed live on fc-frankfurt: an active 502 correlated
-        // with zero log lines). Log it so a persistent failure (retries
-        // exhausted, not just one transient race) is diagnosable without a
-        // live reproduction.
         tracing::warn!(
             id,
             attempts = MAX_ATTEMPTS,
@@ -356,7 +461,6 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
             error = %e,
             "tunnel: upstream request failed after exhausting retries"
         );
-        // Make sure the caller gets *something* terminal.
         let meta = RespMeta {
             status: 502,
             headers: vec![],
@@ -374,41 +478,84 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         ));
         let _ = out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()));
     }
+    Outcome::Failed
 }
 
+/// One await on the local hop: bounded by `deadline` and abortable through the caller's
+/// [`CancelSignal`].
+///
+/// Every await in [`proxy_local`] goes through this. It is what stops a stalled or wedged guest
+/// from pinning the two resources a dispatched request owns — an `inflight` slot and a connect
+/// permit — for as long as the guest feels like it: the wait ends, both are dropped, and the
+/// gateway sees one bounded retryable failure instead of an instance that nacks every request it
+/// has already admitted until something reaps it.
+async fn hop_await<F, T>(
+    fut: F,
+    cancel: &CancelSignal,
+    deadline: Duration,
+    what: &str,
+) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::select! {
+        v = fut => Ok(v),
+        _ = tokio::time::sleep(deadline) => {
+            Err(anyhow::anyhow!("{what} timed out after {deadline:?}"))
+        }
+        _ = cancel.cancelled() => {
+            Err(anyhow::anyhow!("caller abandoned the request before it was answered"))
+        }
+    }
+}
+
+/// Relay one framed request to the local hop over a fresh connection as a `RespHead` frame then
+/// `RespBody` frames, marking `head_sent` as the head frame is sent. A chunked body is re-framed
+/// chunk by chunk and its trailers are ignored.
 async fn proxy_local(
     id: u64,
     payload: &[u8],
     local_http: &str,
     out: &MeteredSender,
     head_sent: &mut bool,
+    cancel: &CancelSignal,
 ) -> anyhow::Result<()> {
-    // Split payload: [u32 meta_len][meta json][body].
     anyhow::ensure!(payload.len() >= 4, "short request payload");
     let meta_len = u32::from_be_bytes(payload[0..4].try_into().unwrap()) as usize;
     anyhow::ensure!(payload.len() >= 4 + meta_len, "truncated request meta");
     let meta: ReqMeta = serde_json::from_slice(&payload[4..4 + meta_len])?;
     let body = &payload[4 + meta_len..];
 
-    // Held for the whole request/response exchange (`connect_gate` also
-    // matches litebox guests up to their own backlog) — see
-    // `set_local_connect_permits`.
-    let _connect_permit = connect_gate(local_http).acquire_owned().await?;
-    let mut conn = TcpStream::connect(local_http).await?;
+    // The gate bounds CONCURRENT CONNECTS — which is all its name and its callers' intent ever
+    // claimed — so the permit is released the moment the socket exists. Held across the request it
+    // is a second concurrency limit on the instance that the `inflight` nack gate cannot see, and
+    // when it is the lower of the two the instance serves one request at a time while admitting
+    // `max_concurrency` of them: the parked ones hold slots for as long as they queue, `inflight`
+    // pins at the ceiling, and every request after them is nacked.
+    let mut conn = {
+        let _connect_permit = hop_await(
+            connect_gate(local_http).acquire_owned(),
+            cancel,
+            LOCAL_CONNECT_DEADLINE,
+            &format!("waiting for a local connect permit to {local_http}"),
+        )
+        .await??;
+        hop_await(
+            TcpStream::connect(local_http),
+            cancel,
+            LOCAL_CONNECT_DEADLINE,
+            &format!("local connect to {local_http}"),
+        )
+        .await??
+    };
 
-    // Write HTTP/1.1 request. Deliberately NOT `Connection: close`: asking the
-    // guest to close triggers litebox's guest network stack to send a bare
-    // FIN right after `res.end()` WITHOUT flushing the just-written response
-    // bytes onto the TUN device first — a write-then-close data-loss race in
-    // litebox's userspace TCP stack, packet-captured live on fc-sanjose
-    // (2026-09-17): the request was received (the guest's own counter
-    // incremented) but zero response bytes ever reached the wire, surfacing
-    // here as "function closed before headers" on the very first head-read.
-    // Framing the response via Content-Length/chunked (below, already
-    // implemented) instead of EOF-close sidesteps the guest ever needing to
-    // self-close right after a write: `conn`'s own `Drop` closes this end
-    // once we've read a complete, correctly-framed response, which is an
-    // ordinary client-initiated close the guest was never mid-write for.
+    let fwd_host = meta
+        .headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-host"))
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string());
     let mut req = format!("{} {} HTTP/1.1\r\n", meta.method, meta.path);
     let mut has_host = false;
     for (k, v) in &meta.headers {
@@ -418,19 +565,36 @@ async fn proxy_local(
         }
         if kl == "host" {
             has_host = true;
+            match fwd_host.as_deref() {
+                Some(public) if is_loopback_authority(v.trim()) => {
+                    req.push_str(&format!("host: {public}\r\n"));
+                    continue;
+                }
+                _ => {}
+            }
         }
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     if !has_host {
-        req.push_str("host: fluid.internal\r\n");
+        match fwd_host.as_deref() {
+            Some(public) => req.push_str(&format!("host: {public}\r\n")),
+            None => req.push_str("host: fluid.internal\r\n"),
+        }
     }
     req.push_str(&format!("content-length: {}\r\n", body.len()));
     req.push_str("connection: keep-alive\r\n\r\n");
-    conn.write_all(req.as_bytes()).await?;
-    conn.write_all(body).await?;
-    conn.flush().await?;
+    hop_await(
+        async {
+            conn.write_all(req.as_bytes()).await?;
+            conn.write_all(body).await?;
+            conn.flush().await
+        },
+        cancel,
+        LOCAL_RESPONSE_DEADLINE,
+        "writing the request to the function",
+    )
+    .await??;
 
-    // Read response head.
     let mut raw = Vec::with_capacity(2048);
     let mut tmp = [0u8; 8192];
     let split;
@@ -439,7 +603,13 @@ async fn proxy_local(
             split = pos;
             break;
         }
-        let n = conn.read(&mut tmp).await?;
+        let n = hop_await(
+            conn.read(&mut tmp),
+            cancel,
+            LOCAL_RESPONSE_DEADLINE,
+            &format!("response head from {local_http}"),
+        )
+        .await??;
         anyhow::ensure!(n > 0, "function closed before headers");
         raw.extend_from_slice(&tmp[..n]);
         anyhow::ensure!(raw.len() < 1024 * 1024, "function headers too large");
@@ -465,11 +635,6 @@ async fn proxy_local(
             if kl == "content-length" {
                 content_length = v.parse().ok();
             }
-            // The function may stream its response with chunked transfer-encoding
-            // (Next.js does this, especially for gzipped responses). We must DECODE
-            // the chunk framing here — `transfer-encoding` is hop-by-hop and is
-            // dropped, so the framing bytes would otherwise be forwarded as part of
-            // the body and corrupt it (e.g. break a gzip Content-Encoding).
             if kl == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
                 chunked = true;
             }
@@ -484,20 +649,11 @@ async fn proxy_local(
         }
     }
 
-    // A response to HEAD, or a 1xx/204/304, has no body BY DEFINITION and no
-    // Content-Length/chunked framing to end on. With `connection: keep-alive`
-    // the read-to-EOF arm below never sees the close it waits for, so the
-    // exchange never finished — and it holds the connect gate the whole time:
-    // one 304 forwarded into a litebox node (1 permit) wedged EVERY later
-    // forwarded request behind it, 15 s first-byte timeouts to the peer
-    // (fc-sanjose, 2026-09-19: one loopback exchange idle for 59 minutes).
     let bodiless = meta.method.eq_ignore_ascii_case("HEAD")
         || (100..200).contains(&status)
         || status == 204
         || status == 304;
 
-    // Send response head, then stream the body. `head_sent` flips FIRST: once
-    // any frame may have reached the wire, the caller must never retry.
     let meta = RespMeta {
         status,
         headers,
@@ -509,21 +665,21 @@ async fn proxy_local(
         FrameKind::RespHead,
         serde_json::to_vec(&meta)?,
     ))?;
-    // Stream the body.
     if bodiless {
-        // nothing follows the head
     } else if chunked {
-        // Decode HTTP/1.1 chunked framing and forward ONLY the payload bytes, so
-        // any Content-Encoding (gzip/br) stays valid for the client. Each chunk is
-        // "<hex-size>[;ext]\r\n<data>\r\n", terminated by a zero-size chunk.
         let mut buf = leftover;
         loop {
-            // Read until we have a full chunk-size line.
             let line_end = loop {
                 if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
                     break pos;
                 }
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "chunk size line",
+                )
+                .await??;
                 anyhow::ensure!(r > 0, "function closed before chunk size");
                 buf.extend_from_slice(&tmp[..r]);
                 anyhow::ensure!(buf.len() < 64 * 1024, "chunk size line too long");
@@ -532,13 +688,18 @@ async fn proxy_local(
             let hex = line.split(|&b| b == b';').next().unwrap_or(line);
             let size = usize::from_str_radix(std::str::from_utf8(hex)?.trim(), 16)
                 .map_err(|_| anyhow::anyhow!("invalid chunk size"))?;
-            buf.drain(..line_end + 2); // consume "<size>\r\n"
+            buf.drain(..line_end + 2);
             if size == 0 {
-                break; // last chunk (any trailers are ignored)
+                break;
             }
-            // Ensure the full chunk data + its trailing CRLF are buffered.
             while buf.len() < size + 2 {
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "chunk body",
+                )
+                .await??;
                 anyhow::ensure!(r > 0, "function closed mid-chunk");
                 buf.extend_from_slice(&tmp[..r]);
             }
@@ -547,11 +708,9 @@ async fn proxy_local(
                 FrameKind::RespBody,
                 Bytes::copy_from_slice(&buf[..size]),
             ))?;
-            buf.drain(..size + 2); // consume data + trailing CRLF
+            buf.drain(..size + 2);
         }
     } else {
-        // Prefer content-length (read EXACTLY n bytes — never wait for EOF, which
-        // can hang if the function keeps the socket open); otherwise read to close.
         let mut sent = 0usize;
         if !leftover.is_empty() {
             let take = match content_length {
@@ -566,7 +725,13 @@ async fn proxy_local(
             Some(n) => {
                 while sent < n {
                     let want = (n - sent).min(tmp.len());
-                    let r = conn.read(&mut tmp[..want]).await?;
+                    let r = hop_await(
+                        conn.read(&mut tmp[..want]),
+                        cancel,
+                        LOCAL_RESPONSE_DEADLINE,
+                        "response body",
+                    )
+                    .await??;
                     anyhow::ensure!(r > 0, "function closed mid-body");
                     out.send(Frame::new(
                         id,
@@ -577,7 +742,13 @@ async fn proxy_local(
                 }
             }
             None => loop {
-                let r = conn.read(&mut tmp).await?;
+                let r = hop_await(
+                    conn.read(&mut tmp),
+                    cancel,
+                    LOCAL_RESPONSE_DEADLINE,
+                    "response body",
+                )
+                .await??;
                 if r == 0 {
                     break;
                 }
@@ -598,6 +769,27 @@ fn is_hop_by_hop(h: &str) -> bool {
         h,
         "connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" | "trailers"
     )
+}
+
+/// Is `authority` the cell's own loopback bind address (host or host:port)? Anything else routes
+/// on its Host and is forwarded untouched.
+fn is_loopback_authority(authority: &str) -> bool {
+    let authority = authority.trim();
+    let host = match authority.rfind(':') {
+        Some(i) if !authority.starts_with('[') => &authority[..i],
+        Some(_) if authority.ends_with(']') => authority,
+        Some(i) => &authority[..i],
+        None => authority,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.trim_end_matches('.');
+    host == "localhost"
+        || host == "::1"
+        || host == "0.0.0.0"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 #[cfg(test)]

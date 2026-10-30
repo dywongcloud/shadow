@@ -1,13 +1,12 @@
-//! Secure compute connections — ephemeral WireGuard-style tunnels to private
-//! backends (a customer DB in a VPC), keyed by short-lived credentials from the
-//! Key Exchange Service. Mirrors Vercel Hive's secure connectors.
+//! Secure compute connections: ephemeral WireGuard-style tunnels to private backends (a customer DB
+//! in a VPC), keyed by short-lived credentials from the Key Exchange Service, mirroring Vercel
+//! Hive's secure connectors.
 //!
-//! Datapath: a **connector** binds `127.0.0.1:<local_port>`. A function/build is
-//! handed that local address (injected as a project env var), so it dials a
-//! local socket. For every connection the connector stands up a fresh WireGuard
-//! tunnel and relays bytes — encrypting on the connector side, decrypting on the
-//! gateway side — to the real private backend. No traffic to the backend leaves
-//! the box in plaintext, and no long-lived secrets live in the function.
+//! Datapath: a **connector** binds `127.0.0.1:<local_port>`. A function or build is handed that
+//! local address (injected as a project env var), so it dials a local socket. For every connection
+//! the connector stands up a fresh WireGuard tunnel and relays bytes, encrypting on the connector
+//! side and decrypting on the gateway side, to the real private backend. No traffic to the backend
+//! leaves the box in plaintext, and no long-lived secrets live in the function.
 
 use hive_core::now_ms;
 use hive_wg::{Kes, SecureLink};
@@ -69,19 +68,18 @@ impl SecureLinkStore {
         }
     }
 
-    /// Provision a connector: bind a local listener that relays over WireGuard to
-    /// `target`, mint a lease, and record it. Returns the record (with the local
-    /// address a function should dial).
+    /// Provisions a connector: validates the tunnel is establishable (a real handshake) and mints
+    /// the lease, then brings up the datapath, a local TCP listener relaying over WireGuard to
+    /// `target`, and records it. Returns the record (with the local address a function should
+    /// dial).
     pub async fn provision(
         &self,
         req: ProvisionReq,
         default_region: &str,
     ) -> Result<LinkRecord, String> {
         let ttl = req.ttl_secs.unwrap_or(900).clamp(30, 24 * 3600);
-        // Validate the tunnel is establishable (real handshake), then mint lease.
         let (lease, _probe) = SecureLink::establish_with_kes(&self.kes, &req.target, ttl)?;
 
-        // Bring up the actual datapath: a local TCP listener relaying to target.
         let local_port = start_connector(req.target.clone())
             .await
             .map_err(|e| format!("connector bind failed: {e}"))?;
@@ -113,10 +111,10 @@ impl SecureLinkStore {
         self.links.read().clone()
     }
 
-    /// Snapshot for the fleet follower sync. Link records are pure metadata
-    /// (target/region/status/public_key/timestamps — no per-node secret; the
-    /// tunnel connector itself stays on its origin node), so replicating them
-    /// makes the ops link list fleet-consistent without moving any secret.
+    /// Snapshot for the fleet follower sync. Link records are pure metadata (target, region,
+    /// status, public key, timestamps: no per-node secret, the tunnel connector itself stays on its
+    /// origin node), so replicating them makes the ops link list fleet-consistent without moving
+    /// any secret.
     pub fn snapshot(&self) -> Vec<LinkRecord> {
         self.links.read().clone()
     }
@@ -213,7 +211,6 @@ async fn relay(client: TcpStream, target: &str) -> Result<(), String> {
             r = cr.read(&mut cbuf) => {
                 let n = r.map_err(|e| e.to_string())?;
                 if n == 0 { break; }
-                // client -> (seal) -> tunnel -> (open) -> backend
                 let ct = link.seal_c2s(&cbuf[..n])?;
                 let pt = link.open_c2s(&ct)?;
                 uw.write_all(&pt).await.map_err(|e| e.to_string())?;
@@ -221,7 +218,6 @@ async fn relay(client: TcpStream, target: &str) -> Result<(), String> {
             r = ur.read(&mut ubuf) => {
                 let n = r.map_err(|e| e.to_string())?;
                 if n == 0 { break; }
-                // backend -> (seal) -> tunnel -> (open) -> client
                 let ct = link.seal_s2c(&ubuf[..n])?;
                 let pt = link.open_s2c(&ct)?;
                 cw.write_all(&pt).await.map_err(|e| e.to_string())?;

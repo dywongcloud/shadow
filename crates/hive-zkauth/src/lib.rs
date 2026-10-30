@@ -1,31 +1,7 @@
-//! # hive-zkauth — anonymous team/role membership (EXPERIMENT)
-//!
-//! A self-contained proof-of-concept for **anonymous membership proofs**: a user
-//! proves they belong to a set (a team, or the subset of members with role ≥ R)
-//! **without revealing which member they are**, and emits a per-scope
-//! **nullifier** so a verifier can rate-limit / detect reuse without learning the
-//! prover's identity.
-//!
-//! This is the "Semaphore/group-signature" idea from the ZK discussion, built
-//! here as a **linkable ring signature** (LSAG-style) over Ristretto255 — a
-//! genuine, sound, zero-knowledge-of-identity primitive that needs no SNARK
-//! toolchain. Trade-off vs a Semaphore SNARK: proof size is O(ring size) rather
-//! than O(1), and the anonymity set is the explicit ring (a team is small, so
-//! that's fine). Verification stays cheap; proving is sub-millisecond for small
-//! rings — i.e. usable on a request path, unlike zkVM execution proofs.
-//!
-//! **Safety:** this crate is standalone. Nothing in the platform depends on it;
-//! it's an isolated experiment. Integrating it (e.g. into the preview gate) would
-//! be a deliberate, separate step.
-//!
-//! ## How it maps to teams + roles
-//! - Each member holds a [`SecretKey`]; its [`PublicKey`] is enrolled in a team
-//!   [`Roster`] under a [`Role`].
-//! - To access something requiring role ≥ R, the prover signs over the **ring of
-//!   all members with role ≥ R** ([`Roster::ring`]). A valid proof means "I am
-//!   one of them" — without saying who.
-//! - The proof carries a `nullifier`, bound to a `scope` (e.g. the deployment),
-//!   so reuse within a scope is detectable while staying unlinkable across scopes.
+//! Anonymous team/role membership: a linkable ring signature (LSAG) over Ristretto255. A proof
+//! shows the prover is SOME member of `Roster::ring(min_role)` without revealing which, and
+//! carries a per-scope nullifier so reuse within a scope is detectable while proofs stay
+//! unlinkable across scopes. Proof size is O(ring); verification is cheap on a request path.
 
 use curve25519_dalek::{
     constants::RISTRETTO_BASEPOINT_POINT, ristretto::CompressedRistretto, RistrettoPoint, Scalar,
@@ -85,15 +61,8 @@ impl SecretKey {
             .ok_or(Error::Malformed)
     }
 
-    /// Derive a key **deterministically** from 64 bytes of seed material (e.g.
-    /// a SHA-512 of some domain-separated identity string).
-    ///
-    /// Unlike [`SecretKey::from_bytes`], which requires an already-canonical
-    /// scalar and therefore rejects most raw hash outputs, this reduces the
-    /// wide input modulo the group order — so *any* 64 bytes yield a valid key
-    /// and the derivation can never fail. That makes it usable as a pure
-    /// function of an identity: the same seed always produces the same member
-    /// key, on any machine, with nothing to store or replicate.
+    /// Derive a key deterministically from 64 bytes of seed (reduced mod the group order, so any
+    /// seed yields a valid key and the same seed always yields the same key).
     pub fn from_seed(seed: &[u8; 64]) -> SecretKey {
         SecretKey(Scalar::from_bytes_mod_order_wide(seed))
     }
@@ -120,9 +89,8 @@ pub struct Proof {
 }
 
 impl Proof {
-    /// The per-scope nullifier — equal across proofs from the SAME member in the
-    /// SAME scope (enables reuse/rate-limit detection), but unlinkable across
-    /// scopes and never reveals which member produced it.
+    /// The per-scope nullifier: equal for the same member in the same scope, unlinkable across
+    /// scopes, never reveals the member.
     pub fn nullifier(&self) -> [u8; 32] {
         self.key_image.compress().to_bytes()
     }
@@ -156,10 +124,8 @@ impl Proof {
     }
 }
 
-/// Prove anonymous membership in `ring` for `scope`, signing `message`.
-///
-/// `scope` namespaces the nullifier (e.g. a deployment id / topic). The proof
-/// reveals nothing about which ring member signed — only that one of them did.
+/// Prove anonymous membership in `ring` for `scope`, signing `message`; `scope` namespaces the
+/// nullifier.
 pub fn prove(
     secret: &SecretKey,
     ring: &[PublicKey],
@@ -174,21 +140,17 @@ pub fn prove(
     let pi = ring.iter().position(|p| *p == me).ok_or(Error::NotInRing)?;
 
     let rh = ring_hash(ring);
-    // Per-key hash-to-point, scoped — used uniformly in the ring equations so the
-    // key image binds the nullifier to (member, scope).
     let hp: Vec<RistrettoPoint> = ring.iter().map(|p| hash_to_point(p, scope)).collect();
     let key_image = secret.0 * hp[pi];
 
     let mut c = vec![Scalar::ZERO; n];
     let mut s = vec![Scalar::ZERO; n];
 
-    // Start the chain at the signer with a random commitment `u`.
     let u = Scalar::random(&mut OsRng);
     let l = RISTRETTO_BASEPOINT_POINT * u;
     let r = hp[pi] * u;
     c[(pi + 1) % n] = challenge(&rh, scope, message, &l, &r);
 
-    // Walk the rest of the ring with random responses.
     let mut i = (pi + 1) % n;
     while i != pi {
         s[i] = Scalar::random(&mut OsRng);
@@ -197,7 +159,6 @@ pub fn prove(
         c[(i + 1) % n] = challenge(&rh, scope, message, &l, &r);
         i = (i + 1) % n;
     }
-    // Close the ring at the signer.
     s[pi] = u - c[pi] * secret.0;
 
     Ok(Proof {
@@ -221,11 +182,8 @@ pub fn verify(ring: &[PublicKey], scope: &[u8], message: &[u8], proof: &Proof) -
         let r = hp_i * proof.s[i] + proof.key_image * c;
         c = challenge(&rh, scope, message, &l, &r);
     }
-    // Constant-time scalar equality (dalek's PartialEq is constant-time).
     c == proof.c0
 }
-
-// ---- internal helpers ----
 
 fn ring_hash(ring: &[PublicKey]) -> [u8; 64] {
     let mut h = Sha512::new();
@@ -280,8 +238,6 @@ fn scalar_from(b: &[u8]) -> Result<Scalar, Error> {
     Option::<Scalar>::from(Scalar::from_canonical_bytes(arr(b))).ok_or(Error::Malformed)
 }
 
-// ============================ team / role layer ============================
-
 /// Team roles, ordered (Owner is highest).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Role {
@@ -303,7 +259,6 @@ impl Roster {
         Roster::default()
     }
     pub fn enroll(&mut self, public: PublicKey, role: Role) {
-        // Replace existing entry for this key, else add.
         if let Some(e) = self.members.iter_mut().find(|(p, _)| *p == public) {
             e.1 = role;
         } else {

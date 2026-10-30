@@ -142,6 +142,18 @@ struct Transaction {
     /// transaction. Fired at `COMMIT` before writing to storage; discarded on
     /// `ROLLBACK`.
     deferred_triggers: Vec<DeferredTriggerFiring>,
+    /// Materialized tables carried ACROSS statements of this transaction.
+    ///
+    /// `load_table` otherwise re-scans the whole collection for every
+    /// statement, so an N-statement transaction paid N full materializations
+    /// (the billing mirror's 500-row INSERT batches being the extreme case).
+    /// The value handed to `Exec` IS the running state — `Exec` mutates
+    /// `exec.tables` in lockstep with every `Mutation` it enqueues — so it is
+    /// moved back here at end of statement, never cloned (a clone would be
+    /// O(rows x cols)). Dropped wholesale whenever the catalog changes
+    /// (DDL/identity advance), because a cached `LoadedTable` whose `Table`
+    /// meta went stale would silently serve dropped/added columns wrong.
+    table_cache: HashMap<QualifiedName, LoadedTable>,
 }
 
 /// A connection-scoped session.
@@ -629,13 +641,42 @@ impl<S: RelationalStorage> Session<S> {
                 collect_stmt(&body_stmt, &mut names);
             }
         }
-        let mut tables: HashMap<QualifiedName, LoadedTable> = HashMap::new();
+        // Reuse this transaction's already-materialized tables: only a table
+        // this transaction has not touched yet pays `load_table`.
+        let mut tables: HashMap<QualifiedName, LoadedTable> = match &mut self.txn {
+            Some(t) => std::mem::take(&mut t.table_cache),
+            None => HashMap::new(),
+        };
+        // `COUNT(*)` needs no column value, so its table is loaded from the key
+        // set alone — no blob fetch, no JSON parse, no per-row `RowValues`.
+        // Restricted to autocommit: inside an explicit transaction the loaded
+        // table is cached for later statements, which may read columns, and an
+        // ids-only table would answer NULL for every one of them.
+        let count_target = match (&self.txn, stmt) {
+            (None, Statement::Query(query)) => match &*query.body {
+                sqlparser::ast::SetExpr::Select(select) => {
+                    crate::sql::exec::Exec::count_star_target(
+                        select,
+                        &catalog,
+                        query.order_by.as_ref(),
+                    )
+                }
+                _ => None,
+            },
+            _ => None,
+        };
         for (schema, name) in &names {
             if let Some(q) = catalog.resolve_table_name(schema.as_deref(), name)
                 && !tables.contains_key(&q)
-                && let Some(loaded) = self.load_table(&catalog, &q).await?
             {
-                tables.insert(q, loaded);
+                let loaded = if count_target.as_ref() == Some(&q) {
+                    self.load_table_ids(&catalog, &q).await?
+                } else {
+                    self.load_table(&catalog, &q).await?
+                };
+                if let Some(loaded) = loaded {
+                    tables.insert(q, loaded);
+                }
             }
         }
 
@@ -668,7 +709,22 @@ impl<S: RelationalStorage> Session<S> {
         {
             exec.materialize_with(with)?;
         }
+        let dispatch_started = std::time::Instant::now();
         let result = self.dispatch(&mut exec, stmt)?;
+        let dispatch_ms = dispatch_started.elapsed().as_millis() as u64;
+        let loaded_rows: usize = exec.tables.values().map(|t| t.rows.len()).sum();
+        if dispatch_ms >= 200 || loaded_rows >= 1000 {
+            // The executor half of a statement's cost. `load_table` (scan + build)
+            // was measured under 200 ms for a 21.5k-row table while the statement
+            // as a whole exceeded the 10 s budget, so the time is here: the
+            // per-row scan/filter/aggregate path, not the load.
+            tracing::info!(
+                tables = exec.tables.len(),
+                rows = loaded_rows,
+                dispatch_ms,
+                "sql: dispatch"
+            );
+        }
         // Persist variable writes made during execution (e.g. `set_limit`).
         self.vars = exec.vars.borrow().clone();
 
@@ -691,6 +747,17 @@ impl<S: RelationalStorage> Session<S> {
         // Commit or stage the produced mutations / catalog changes.
         let mutations = std::mem::take(&mut *exec.mutations.lock().unwrap());
         let catalog_dirty = exec.catalog_dirty;
+        // Carry the statement's post-execution table state into the
+        // transaction (or throw it away if the catalog changed — see
+        // `Transaction::table_cache`). Autocommit has no transaction, so its
+        // single statement's tables are simply dropped as before.
+        if let Some(t) = self.txn.as_mut() {
+            if catalog_dirty {
+                t.table_cache.clear();
+            } else {
+                t.table_cache = std::mem::take(&mut exec.tables);
+            }
+        }
         // Foreign-key checks this statement postponed (see `DeferredFkCheck`)
         // because their constraint is currently running `DEFERRED`.
         let new_deferred: Vec<_> = exec.deferred_checks.borrow_mut().drain(..).collect();
@@ -1204,6 +1271,7 @@ impl<S: RelationalStorage> Session<S> {
                 constraint_modes: ConstraintModes::default(),
                 pending_deferred: Vec::new(),
                 deferred_triggers: Vec::new(),
+                table_cache: HashMap::new(),
             });
         }
         Ok(ExecResult::empty_command("BEGIN"))
@@ -1317,7 +1385,10 @@ impl<S: RelationalStorage> Session<S> {
             return Ok(None);
         };
         let collection = table.storage_collection.clone();
+        let scan_started = std::time::Instant::now();
         let mut docs = self.db.storage.scan(&collection).await?;
+        let scan_ms = scan_started.elapsed().as_millis() as u64;
+        let scanned_rows = docs.len();
         if let Some(txn) = &self.txn {
             let truncated = txn.truncated.contains(&collection);
             let overlay = txn.overlay.get(&collection);
@@ -1347,7 +1418,51 @@ impl<S: RelationalStorage> Session<S> {
             .into_iter()
             .cloned()
             .collect();
-        Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
+        let build_started = std::time::Instant::now();
+        let loaded = LoadedTable::build(table.clone(), docs, index_defs)?;
+        let build_ms = build_started.elapsed().as_millis() as u64;
+        if scan_ms + build_ms >= 200 {
+            tracing::info!(
+                collection = %collection,
+                rows = scanned_rows,
+                scan_ms,
+                build_ms,
+                "sql: load_table"
+            );
+        }
+        Ok(Some(loaded))
+    }
+
+    /// Load `q` as row ids only — the `COUNT(*)` shape. See
+    /// `select::count_star_target` for the proof that no column is read, and
+    /// `LoadedTable::build_ids` for why the result must never be cached into a
+    /// transaction.
+    async fn load_table_ids(
+        &self,
+        catalog: &Catalog,
+        q: &QualifiedName,
+    ) -> Result<Option<LoadedTable>> {
+        let Some(table) = catalog.get_table(q) else {
+            return Ok(None);
+        };
+        let collection = table.storage_collection.clone();
+        let started = std::time::Instant::now();
+        let ids = self.db.storage.row_ids(&collection).await?;
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let index_defs = catalog
+            .indexes_for_table(&q.schema, &q.name)
+            .into_iter()
+            .cloned()
+            .collect();
+        if elapsed_ms >= 50 {
+            tracing::info!(
+                collection = %collection,
+                rows = ids.len(),
+                elapsed_ms,
+                "sql: load_table_ids"
+            );
+        }
+        Ok(Some(LoadedTable::build_ids(table.clone(), ids, index_defs)))
     }
 
     /// Load `q` reflecting explicitly-given `overlay`/`truncated` writes —
@@ -1366,7 +1481,10 @@ impl<S: RelationalStorage> Session<S> {
             return Ok(None);
         };
         let collection = table.storage_collection.clone();
+        let scan_started = std::time::Instant::now();
         let mut docs = self.db.storage.scan(&collection).await?;
+        let scan_ms = scan_started.elapsed().as_millis() as u64;
+        let scanned_rows = docs.len();
         let is_truncated = truncated.contains(&collection);
         let collection_overlay = overlay.get(&collection);
         if is_truncated || collection_overlay.is_some() {
@@ -1394,7 +1512,19 @@ impl<S: RelationalStorage> Session<S> {
             .into_iter()
             .cloned()
             .collect();
-        Ok(Some(LoadedTable::build(table.clone(), docs, index_defs)?))
+        let build_started = std::time::Instant::now();
+        let loaded = LoadedTable::build(table.clone(), docs, index_defs)?;
+        let build_ms = build_started.elapsed().as_millis() as u64;
+        if scan_ms + build_ms >= 200 {
+            tracing::info!(
+                collection = %collection,
+                rows = scanned_rows,
+                scan_ms,
+                build_ms,
+                "sql: load_table"
+            );
+        }
+        Ok(Some(loaded))
     }
 
     /// Re-validate every check in `checks` ([`DeferredFkCheck`]) against the

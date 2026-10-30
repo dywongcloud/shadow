@@ -4,9 +4,7 @@ import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import Image from "next/image";
 
-/** Vercel-style globe-outline empty state. Shows the dark globe in dark mode and
- *  the light globe in light mode. The SVG is a half-globe wireframe anchored to
- *  the bottom of its container. */
+/** Globe-outline empty state: the dark globe in dark mode and the light globe in light mode (a half-globe wireframe anchored to the bottom of its container). */
 export function GlobeEmptyState({ title, desc }: { title: string; desc?: string }) {
   const { resolvedTheme } = useTheme();
   const [mounted, setMounted] = useState(false);

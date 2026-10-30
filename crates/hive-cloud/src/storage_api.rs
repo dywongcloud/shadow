@@ -1,31 +1,26 @@
-//! Storage HTTP API — reflink/copy snapshots of a deployment's Firecracker
-//! cell data image (`hive_backend::snapshot`), gated by `storage_broker`
-//! (ownership + id safety + per-project quota).
+//! Storage HTTP API: reflink/copy snapshots of a deployment's Firecracker cell data image
+//! (`hive_backend::snapshot`), gated by `storage_broker` (ownership, id safety, a snapshot-count
+//! quota per deployment).
 //!
-//! # NODE-LOCAL DATA — every route here declares which side it is on
+//! # NODE-LOCAL DATA: every route declares which side it is on
 //!
-//! Per AGENTS.md's round-robin doc: a deployment's data image, and every
-//! snapshot taken of it, live only on the ONE node that actually placed and
-//! runs that cell — there is no replicated store and no leader for this data,
-//! because placement itself is per-deployment, not fleet-uniform. So unlike a
-//! sandbox mutation (which `sandboxes_api` forwards to the single
-//! control-plane LEADER, because sandboxes have no independent placement),
-//! a snapshot request has to reach whichever node actually hosts the
-//! deployment — which may or may not be the leader, and may or may not be
-//! the node the round-robin `api.<domain>` DNS happened to land this request
-//! on.
+//! A deployment's data image, and every snapshot taken of it, live only on the ONE node that placed
+//! and runs that cell: there is no replicated store and no leader for this data, because placement
+//! itself is per-deployment, not fleet-uniform. So unlike a sandbox mutation (which `sandboxes_api`
+//! forwards to the single control-plane LEADER, because sandboxes have no independent placement), a
+//! snapshot request has to reach whichever node hosts the deployment, which may or may not be the
+//! leader and may or may not be the node round-robin `api.<domain>` DNS landed this request on.
 //!
-//! Every handler below therefore: (1) authorizes the caller against `project`
-//! via `require_project` — a check that is itself fleet-aware and safe to run
-//! on ANY node (see `admin::project_owned_by`'s own doc); (2) checks whether
-//! THIS node's local gateway (`c.gw`) actually hosts `deployment_id`; (3) if
-//! not, proxies the whole (already-authorized) request to the hosting node
-//! via `admin::host_node_for_deployment` + an HTTP-then-mesh helper
-//! (`post_body_to_host` / `fetch_from_host` / `delete_to_host`), mirroring
-//! `deployment_build`'s identical fallback. The mesh side of that proxy has
-//! its own `gossip::dispatch` arm (see gossip.rs) so a node with HTTP admin
-//! dispatch blocked (a restrictive security group) still reaches the owning
-//! node over iroh, per AGENTS.md's mesh-networking doc.
+//! Every handler therefore: (1) authorizes the caller through `authorize`: `require_project` (fleet-
+//! aware, safe to run on ANY node, see `admin::project_owned_by`) AND proof that the path's
+//! `deployment_id` is a deployment of that project (`storage_broker::authorize_deployment`: the
+//! project in the path is the caller's own, the deployment id is attacker-chosen); (2) checks
+//! whether THIS node's local gateway (`c.gw`) hosts `deployment_id`; (3) if not, proxies the whole
+//! (already authorized) request to the hosting node through `admin::host_node_for_deployment` and
+//! an HTTP-then-mesh helper (`post_body_to_host` / `fetch_from_host` / `delete_to_host`), the same
+//! fallback as `deployment_build`. The mesh side of that proxy has its own `gossip::dispatch` arm
+//! (see `gossip.rs`), so a node with HTTP admin dispatch blocked (a restrictive security group)
+//! still reaches the owning node over iroh.
 
 use axum::{
     extract::{Path, State},
@@ -65,11 +60,10 @@ pub(crate) struct CreateReq {
     pub(crate) quiesce: bool,
 }
 
-/// A node running the mock/container backend has no per-cell data image at
-/// all — `hive_backend::snapshot` is Firecracker-specific by construction
-/// (see its own module doc on why: reflink needs a real block-backed ext4
-/// image, which only the Firecracker cell path creates). Say so plainly
-/// rather than silently no-op.
+/// A node running the mock/container backend has no per-cell data image at all:
+/// `hive_backend::snapshot` is Firecracker-specific by construction (reflink needs a real
+/// block-backed ext4 image, which only the Firecracker cell path creates). Say so plainly rather
+/// than silently no-op.
 fn require_firecracker(
     c: &Arc<CloudState>,
 ) -> Result<Arc<hive_backend::firecracker::FirecrackerBackend>, (StatusCode, String)> {
@@ -82,19 +76,35 @@ fn require_firecracker(
 fn broker_status(e: crate::storage_broker::BrokerError) -> (StatusCode, String) {
     let code = match &e {
         crate::storage_broker::BrokerError::NotOwner => StatusCode::FORBIDDEN,
+        crate::storage_broker::BrokerError::UnknownDeployment => StatusCode::NOT_FOUND,
         crate::storage_broker::BrokerError::InvalidId(_) => StatusCode::BAD_REQUEST,
         crate::storage_broker::BrokerError::QuotaExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
     };
     (code, e.to_string())
 }
 
-/// Whether `deployment_id` is hosted on THIS node (this node's own gateway
-/// placed and runs it) — the only case where the filesystem call below is
-/// even meaningful.
+/// Whether `deployment_id` is hosted on THIS node (this node's own gateway placed and runs it): the
+/// only case where the filesystem call is even meaningful.
 fn hosted_here(c: &Arc<CloudState>, deployment_id: &str) -> bool {
     c.gw.deployment_records()
         .iter()
         .any(|r| r.id == deployment_id)
+}
+
+/// The ONE authorization every snapshot route crosses, local or proxied (the mesh arms call these
+/// handlers too): the caller owns `project` AND `deployment_id` is a deployment of that project
+/// (`storage_broker::authorize_deployment`). Returns the caller's tenant.
+fn authorize(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: &Claims,
+    project: &str,
+    deployment_id: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = require_project(c, headers, claims.as_ref().map(|e| &e.0), project)?;
+    crate::storage_broker::authorize_deployment(c, &t, project, deployment_id)
+        .map_err(broker_status)?;
+    Ok(t)
 }
 
 pub(crate) async fn create_snapshot(
@@ -104,7 +114,7 @@ pub(crate) async fn create_snapshot(
     Path((project, deployment_id)): Path<(String, String)>,
     Json(body): Json<CreateReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = authorize(&c, &headers, &claims, &project, &deployment_id)?;
 
     if !hosted_here(&c, &deployment_id) {
         let Some(node) = host_node_for_deployment(&c, &deployment_id) else {
@@ -138,13 +148,20 @@ pub(crate) async fn create_snapshot(
     Ok(Json(json!(outcome)))
 }
 
+/// Lists a deployment's snapshot ids. A deployment that is unknown, or whose hosting node is
+/// unreachable, reads as no snapshots visible from here (an empty list), not an error, matching
+/// every other node-local list endpoint's GET posture (`list_sandboxes`'s empty-local fallback).
 pub(crate) async fn list_snapshots(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
     Path((project, deployment_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = match authorize(&c, &headers, &claims, &project, &deployment_id) {
+        Ok(t) => t,
+        Err((StatusCode::NOT_FOUND, _)) => return Ok(Json(json!({ "snapshots": [] }))),
+        Err(refusal) => return Err(refusal),
+    };
 
     if !hosted_here(&c, &deployment_id) {
         if let Some(node) = host_node_for_deployment(&c, &deployment_id) {
@@ -153,9 +170,6 @@ pub(crate) async fn list_snapshots(
                 return Ok(Json(v));
             }
         }
-        // Unknown/unreachable reads as "no snapshots visible from here", not
-        // an error — matches every other node-local list endpoint's GET
-        // posture (e.g. `list_sandboxes`'s empty-local fallback).
         return Ok(Json(json!({ "snapshots": [] })));
     }
 
@@ -172,7 +186,7 @@ pub(crate) async fn delete_snapshot(
     claims: Claims,
     Path((project, deployment_id, snapshot_id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = authorize(&c, &headers, &claims, &project, &deployment_id)?;
 
     if !hosted_here(&c, &deployment_id) {
         let Some(node) = host_node_for_deployment(&c, &deployment_id) else {

@@ -21,6 +21,11 @@ pub enum FrameKind {
     Metrics = 9,
     /// Instance → gateway: request rejected (overloaded) for `stream_id`.
     Nack = 10,
+    /// Gateway → instance: the caller abandoned `stream_id` (client disconnect or head timeout),
+    /// so stop working it and release its in-flight slot now. Without it a slot stays held for as
+    /// long as the local hop takes, and abandoned requests ratchet `inflight` up to
+    /// `max_concurrency` until every request is nacked.
+    Cancel = 11,
 }
 
 impl FrameKind {
@@ -34,10 +39,16 @@ impl FrameKind {
             8 => FrameKind::Pong,
             9 => FrameKind::Metrics,
             10 => FrameKind::Nack,
+            11 => FrameKind::Cancel,
             _ => return None,
         })
     }
 }
+
+/// Largest payload `read_frame` will drain while skipping a kind this build does not know. Bounds
+/// the bytes one unknown frame can cost; the frame header already caps every payload at 64 MiB, so
+/// this only keeps a hostile peer from making a skip read unboundedly.
+const MAX_SKIP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -65,19 +76,36 @@ impl Frame {
     }
 }
 
+/// Read the next frame, SKIPPING kinds this build does not recognise instead of failing.
+///
+/// Gateway and cell agent ship together but not atomically: during a partial roll a newer peer
+/// emits a kind the older side has never seen (today, [`FrameKind::Cancel`]). Failing there kills
+/// the connection, which the gateway reads as an upstream failure and turns into a reroute — so a
+/// version skew would look exactly like the outage Cancel exists to stop. Draining the payload and
+/// continuing keeps a mixed-version fleet serving; the unknown frame carries no work either way.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<Frame> {
     let mut hdr = [0u8; 13];
-    r.read_exact(&mut hdr).await?;
-    let stream_id = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
-    let kind = FrameKind::from_u8(hdr[8])
-        .ok_or_else(|| anyhow::anyhow!("unknown frame kind {}", hdr[8]))?;
-    let len = u32::from_be_bytes(hdr[9..13].try_into().unwrap()) as usize;
-    anyhow::ensure!(len <= 64 * 1024 * 1024, "frame too large: {len}");
-    let mut payload = vec![0u8; len];
-    r.read_exact(&mut payload).await?;
-    Ok(Frame {
-        stream_id,
-        kind,
-        payload: Bytes::from(payload),
-    })
+    loop {
+        r.read_exact(&mut hdr).await?;
+        let stream_id = u64::from_be_bytes(hdr[0..8].try_into().unwrap());
+        let len = u32::from_be_bytes(hdr[9..13].try_into().unwrap()) as usize;
+        let known = FrameKind::from_u8(hdr[8]);
+        if known.is_none() {
+            anyhow::ensure!(len <= MAX_SKIP_BYTES, "unknown frame too large to skip: {len}");
+            if len > 0 {
+                let mut skip = vec![0u8; len];
+                r.read_exact(&mut skip).await?;
+            }
+            continue;
+        }
+        let kind = known.expect("checked above");
+        anyhow::ensure!(len <= 64 * 1024 * 1024, "frame too large: {len}");
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload).await?;
+        return Ok(Frame {
+            stream_id,
+            kind,
+            payload: Bytes::from(payload),
+        });
+    }
 }

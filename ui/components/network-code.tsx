@@ -1,18 +1,12 @@
 import Image from "next/image";
 
-/* ------------------------------------------------------------------ *
- * The P2P network flowchart graphic with a glowing code-sample card
- * layered on top (z-index above the image). The base image shows the mesh
- * of circuit nodes; the card floats in the centre as "code art".
- * ------------------------------------------------------------------ */
-
 const C = {
   kw: "text-violet-400",
   str: "text-emerald-300",
   fn: "text-sky-300",
   com: "text-zinc-500",
-  pl: "text-zinc-400", // plain punctuation
-  id: "text-zinc-200", // identifiers
+  pl: "text-zinc-400",
+  id: "text-zinc-200",
 };
 
 /** A small, hand-highlighted shadw deploy snippet. */
@@ -60,10 +54,10 @@ function CodeSample() {
   );
 }
 
+/** The P2P network flowchart image (a mesh of circuit nodes) with a glowing deploy-snippet card layered above it as "code art". */
 export function NetworkCode() {
   return (
     <div className="relative mx-auto w-full max-w-6xl px-4">
-      {/* Base layer: the P2P network flowchart nodes image. */}
       <Image
         src="/network-nodes.png"
         alt=""
@@ -74,8 +68,6 @@ export function NetworkCode() {
         className="pointer-events-none h-auto w-full select-none"
       />
 
-      {/* Overlay layer (above the image): a glowing code-art card, shifted down so
-          the centre of the node diagram stays visible above it. */}
       <div className="absolute inset-0 z-10 flex items-center justify-center p-4">
         <div
           className="w-full max-w-[22rem] overflow-hidden rounded-xl border border-white/15 bg-[#0a0a0f]/90 shadow-[0_0_70px_-10px_rgba(37,99,235,0.5)] backdrop-blur-sm sm:max-w-xl"

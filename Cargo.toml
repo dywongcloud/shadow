@@ -24,6 +24,7 @@ members = [
     "crates/hive-zkauth",
     "crates/hive-cores",
     "crates/hive-crsql",
+    "crates/hive-outbound",
 ]
 # vendor/guardian-db carries its own dev-dependencies and is consumed purely as
 # a path dependency (see crates/hive-cloud/Cargo.toml) -- excluding it lets its
@@ -93,6 +94,7 @@ hive-browser-proto = { path = "crates/hive-browser-proto" }
 hive-crsql = { path = "crates/hive-crsql" }
 hive-zkauth = { path = "crates/hive-zkauth" }
 hive-cores = { path = "crates/hive-cores" }
+hive-outbound = { path = "crates/hive-outbound" }
 
 # Local fork of guardian-db 0.18.0 (vendor/guardian-db): its Iroh endpoint was
 # hardcoded to n0's public relay/discovery preset with no override — from

@@ -1,66 +1,25 @@
-//! Leader-only BACKGROUND jobs: the one question every single-writer job asks.
+//! Leader-only BACKGROUND jobs: the one question every single-writer job asks, [`may_act`]. It is
+//! stricter than the request-path test (`CloudState::is_control_plane_leader`, which only decides
+//! where a mutation is served), and requires, continuously for [`Job::min_tenure`]:
 //!
-//! Each job used to carry its own leadership test — `is_control_plane_leader()`
-//! here, `control_plane_leader() == node_name` there, a 2-tick window for the
-//! billing meter, a raw `control_plane_owner(..)` with the DNS pin for DNS and
-//! ACME — so they had different strengths, and the weakest one decided the
-//! damage. On 2026-09-24 fc-virginia's per-observer view flapped to "I am the
-//! owner" while fc-sanjose kept serving: its self-heal redeployed a live node's
-//! projects 1512 times in 10 h, it took DNS leadership beside the real writer,
-//! and it metered billing from a stale fork. [`may_act`] is now the ONLY gate
-//! those jobs consult, and it is deliberately stricter than the request-path
-//! test (`CloudState::is_control_plane_leader`, which only decides where a
-//! mutation is served):
+//! * **owner**: this node is the job's designated owner ([`job_owner`]): with `HIVE_CP_OWNER_CHAIN`
+//! the STRICT chain owner (no qualifying entry = HOLD everywhere; the identity election and the
+//! `HIVE_CP_LEADER`/`HIVE_DNS_LEADER_NODE`/`HIVE_BILLING_COORDINATOR_NODE` pins are ignored);
+//! without one a node with a mesh roster (`HIVE_EXPECTED_NODE_IDS`, else `HIVE_TRUSTED_NODE_IDS`)
+//! HOLDS with an ERROR and only a roster-less dev mesh keeps the pre-chain designations;
+//! * **fresh view**: a gossip round completed (a booting backup's registry is empty and would name
+//! ITSELF the owner);
+//! * **not isolated**: `mesh_health().isolated` is false;
+//! * **voter majority, for a BACKUP owner only**: fresh DIRECT contact
+//! ([`CloudState::direct_contact_ids`]) with a strict majority of `HIVE_CP_VOTERS`; the chain head
+//! acts on presence, because a quorum on the head would make "present through relays but short of
+//! direct reach" a writer nobody replaces.
 //!
-//! * **owner** — this node is the job's designated owner. With
-//!   `HIVE_CP_OWNER_CHAIN` set that is the STRICT chain owner
-//!   (`Cluster::strict_chain_owner`: first chain entry present in the gossip-
-//!   fresh set with an identity and a public address; the observer's own
-//!   `healthy` flag is never consulted). No qualifying entry = no owner = HOLD
-//!   everywhere; the identity election and the `HIVE_CP_LEADER` /
-//!   `HIVE_DNS_LEADER_NODE` / `HIVE_BILLING_COORDINATOR_NODE` pins are ignored
-//!   while a chain is set. Without a chain, a node with a mesh roster
-//!   (`HIVE_EXPECTED_NODE_IDS`, else `HIVE_TRUSTED_NODE_IDS`) HOLDS with an
-//!   ERROR — a curated fleet member missing its chain must never elect itself —
-//!   and only a roster-less (dev) mesh keeps the pre-chain designations;
-//! * **fresh view** — this node has completed at least one gossip round (a
-//!   node with no roster has none to wait for). A booting backup's registry is
-//!   empty, so before its first round it would name ITSELF the strict owner;
-//! * **not isolated** — `mesh_health().isolated` is false;
-//! * **voter majority, for a BACKUP owner only** — when this node owns without
-//!   being the chain head (`chain[0]`), it must have fresh DIRECT contact
-//!   ([`CloudState::direct_contact_ids`]: an outbound dial/trunk success or an
-//!   inbound self-report, never relayed gossip) with a strict majority of
-//!   `HIVE_CP_VOTERS` (identical fleet-wide, public servers, odd count),
-//!   counting itself when it is one. The head acts on presence (design CS-1
-//!   1b): a quorum on the head turned "present through relays but short of
-//!   direct reach" into a writer nobody replaces — every other node still sees
-//!   it present, so none of them owns. `HIVE_CP_VOTERS` unset while a chain is
-//!   set logs an ERROR once and drops the quorum term entirely (voters derived
-//!   per observer from differing chains are not a quorum);
-//! * **tenure** — every precondition above has held CONTINUOUSLY for
-//!   [`Job::min_tenure`] (sampled every 3 s by the cluster loop and on every
-//!   call; any lapse — ownership, freshness, isolation, quorum — resets it). A
-//!   returning or re-quorate owner waits its tenure again, which is the window
-//!   in which a backup that acted in its absence sees it present and stops.
-//!
-//! Each continuous run of OWNERSHIP has a term id ([`Verdict::term`]). A lapse
-//! of the other preconditions shorter than [`TERM_LAPSE`] keeps the term — no
-//! other node can have taken over in that time — and a longer one starts a new
-//! term when they hold again (a backup may have written meanwhile). Callers
-//! that do take-over work on "I just became the writer" key it on the term,
-//! never on an edge of [`may_act`]: a quorum or isolation blip is not a new
-//! tenure.
-//!
-//! What this gate cannot do: move the writer away from an owner that is present
-//! but cannot act (a backup short of a voter majority, an isolated head).
-//! Every node still sees it as owner, so the jobs HOLD until it recovers or
-//! disappears. Only the signed control-plane lease (CS-3) expires such an
-//! owner. A future lease swaps in underneath [`may_act`] without any caller
-//! changing. Two leader-coordinated surfaces deliberately do NOT use this gate
-//! yet: the cron loop (fires every node's local jobs) and raw-port allocation
-//! (request-path, leader-local `raw_ports.json`). Both need a replicated store
-//! before a stricter gate can move their writer safely.
+//! Each continuous run of ownership has a term id ([`Verdict::term`]) that survives a lapse shorter
+//! than [`TERM_LAPSE`]; take-over work keys on the term, never on an edge of [`may_act`]. The gate
+//! cannot move the writer off an owner that is present but cannot act: jobs HOLD until it recovers.
+//! The cron loop and raw-port allocation deliberately do not use it: both need a replicated store
+//! first.
 
 use crate::cluster::Cluster;
 use crate::state::CloudState;
@@ -70,10 +29,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-/// Every leader-only background job. One variant per job, never per call
-/// site; a job's designation follows the store it writes (ACME's DNS-01
-/// renewals and its custom-domain HTTP-01 pass write different stores, whose
-/// writers differ on a chain-less mesh, so they are two jobs).
+/// One variant per leader-only job, never per call site: a job's designation follows the store it
+/// writes (ACME's DNS-01 and HTTP-01 passes write different stores, so they are two jobs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Job {
     /// `production_deployments::spawn_node_death_reconcile` — redeploys a dead
@@ -81,18 +38,16 @@ pub enum Job {
     NodeDeathRelocate,
     /// `git::spawn_git_poll_reconcile` — polls tracked branches and deploys.
     GitPoll,
-    /// `main.rs::spawn_billing_meter_loop` (metering + ledger prune), the
-    /// relational mirror's billing section, and the token-mint enterprise
-    /// lock (`admin::mint_token`) — one writer for the billing store.
+    /// `spawn_billing_meter_loop`, the relational mirror's billing section and the token-mint
+    /// enterprise lock (`admin::mint_token`): one writer for the billing store.
     BillingMeter,
     /// `vercel_dns::spawn_reconciler` — the Vercel DNS writer.
     DnsWrite,
     /// `acme::spawn_acme` — DNS-01 platform bundle renewals (its challenge
     /// TXT records must sit with the DNS writer's orphan sweeper).
     Acme,
-    /// `acme::custom_cert_pass` — custom-domain HTTP-01 issuance. Its tokens
-    /// live in the `acme_http01` store followers pull from the control-plane
-    /// owner, so it sits exactly where that store's writer does.
+    /// `acme::custom_cert_pass` (custom-domain HTTP-01): its tokens live in the `acme_http01`
+    /// store, so it sits where that store's writer does.
     AcmeHttp01,
     /// `admin::spawn_domain_verify_loop` — custom-domain verification and
     /// tenant-zone apex pinning.
@@ -114,11 +69,16 @@ pub enum Job {
     BrowserExpiry,
     /// `listener_audit::spawn` — raises foreign-listener incidents.
     ListenerAudit,
-    /// `incidents::spawn_reconciler` — resolves automated incidents whose
-    /// observation lapsed, collapses duplicates and bounds the history: the
-    /// incident store's one writer.
+    /// `incidents::spawn_reconciler`: resolves lapsed automated incidents, collapses duplicates and
+    /// bounds the history; the incident store's one writer.
     IncidentReconcile,
 }
+
+const NODE_DEATH_RELOCATE_TENURE_SECS: u64 = 600;
+const ACME_TENURE_SECS: u64 = 300;
+const BILLING_TENURE_SECS: u64 = 120;
+const DNS_AND_GIT_POLL_TENURE_SECS: u64 = 60;
+const DEFAULT_TENURE_SECS: u64 = 30;
 
 impl Job {
     pub const ALL: [Job; 14] = [
@@ -157,17 +117,15 @@ impl Job {
         }
     }
 
-    /// How long every precondition must have held, continuously, before the
-    /// job may act. Sized to the damage one wrong tenure does: a relocation
-    /// rebuilds a live tenant elsewhere, a billing tick charges a delta, an
-    /// ACME order spends Let's Encrypt's duplicate-certificate budget.
+    /// How long every precondition must have held before the job may act, sized to the damage one
+    /// wrong tenure does (a relocation, a billing tick, an ACME order).
     pub fn min_tenure(self) -> Duration {
         Duration::from_secs(match self {
-            Job::NodeDeathRelocate => 600,
-            Job::Acme | Job::AcmeHttp01 => 300,
-            Job::BillingMeter => 120,
-            Job::DnsWrite | Job::GitPoll => 60,
-            _ => 30,
+            Job::NodeDeathRelocate => NODE_DEATH_RELOCATE_TENURE_SECS,
+            Job::Acme | Job::AcmeHttp01 => ACME_TENURE_SECS,
+            Job::BillingMeter => BILLING_TENURE_SECS,
+            Job::DnsWrite | Job::GitPoll => DNS_AND_GIT_POLL_TENURE_SECS,
+            _ => DEFAULT_TENURE_SECS,
         })
     }
 }
@@ -178,9 +136,8 @@ pub struct Verdict {
     pub allowed: bool,
     /// The job's designated owner in this node's view (`None` = HOLD).
     pub owner: Option<String>,
-    /// Id of this node's current continuous OWNERSHIP run for the job (`None`
-    /// when it is not the owner). Stable across blips of the other
-    /// preconditions; a new value means a new tenure.
+    /// Id of this node's current continuous OWNERSHIP run for the job (`None` when it is not the
+    /// owner): stable across blips of the other preconditions, a new value means a new tenure.
     pub term: Option<u64>,
     pub reason: String,
 }
@@ -203,11 +160,9 @@ struct JobState {
 /// between are counted and reported on the next line.
 const TRANSITION_LOG_EVERY: Duration = Duration::from_secs(60);
 
-/// A lapse this long (or longer) in an owner's ability to act ends its term:
-/// the registry's gossip freshness window, i.e. the earliest any other node can
-/// have seen this one gone and become the owner in its own view. Shorter
-/// lapses cannot have handed the writer to anyone else. Also the promotion
-/// reconcile's re-run bound (`main.rs::spawn_promotion_reconcile_loop`).
+/// A lapse this long in an owner's ability to act ends its term: the registry's gossip freshness
+/// window, the earliest another node can have taken over. Also the promotion reconcile's re-run
+/// bound.
 pub const TERM_LAPSE: Duration = Duration::from_secs(30);
 
 static NEXT_TERM: AtomicU64 = AtomicU64::new(1);
@@ -275,14 +230,10 @@ impl View {
     }
 }
 
-/// The node `job` is designated to run on, from this node's view. With a chain
-/// configured every job sits on the strict chain owner (or on nobody — HOLD).
-/// Without one, a node with a mesh roster HOLDS (ERROR once); a roster-less
-/// node keeps each job's pre-chain designation: the identity election with the
-/// `HIVE_CP_LEADER` pin (this node when nothing is electable), the
-/// `HIVE_DNS_LEADER_NODE` pin first for DNS/DNS-01, and the hard
-/// `HIVE_BILLING_COORDINATOR_NODE` pin for billing. Also the routing answer for
-/// reads that must reach the job's writer (`admin::billing_authority_node`).
+/// The node `job` is designated to run on, from this node's view: the strict chain owner (or
+/// nobody: HOLD) with a chain; without one a roster node HOLDS and a roster-less node keeps the
+/// pre-chain designation (election + `HIVE_CP_LEADER`, the DNS and billing pins). Also the routing
+/// answer for reads that must reach the job's writer.
 pub fn job_owner(cloud: &CloudState, job: Job) -> Option<String> {
     job_owner_in(
         cloud,
@@ -357,9 +308,8 @@ fn voter_reach(cloud: &CloudState, voters: &[String], nodes: &[hive_edge::NodeIn
         .count()
 }
 
-/// Record `job`'s continuity: the ownership term (while owner; renewed after a
-/// lapse of at least [`TERM_LAPSE`]) and how long every other precondition has
-/// held with it.
+/// Record `job`'s continuity: the ownership term (renewed after a lapse of at least [`TERM_LAPSE`])
+/// and how long every other precondition has held with it.
 fn track(job: Job, is_owner: bool, clear: bool) -> (Option<u64>, Option<Duration>) {
     let now = Instant::now();
     let mut map = states().lock();
@@ -454,10 +404,8 @@ pub fn evaluate(cloud: &CloudState, job: Job) -> Verdict {
     evaluate_in(cloud, &View::gather(cloud), job)
 }
 
-/// THE gate for a leader-only background job, with the full verdict (for
-/// callers that key take-over work on [`Verdict::term`]). Logs each change of
-/// the answer per job at INFO (rate-limited to one line a minute, swallowed
-/// flips counted on the next line).
+/// THE gate for a leader-only job, with the full verdict. Logs each change per job at INFO,
+/// rate-limited to a line a minute.
 pub fn check(cloud: &CloudState, job: Job) -> Verdict {
     let verdict = evaluate(cloud, job);
     note(job, &verdict);
@@ -469,10 +417,8 @@ pub fn may_act(cloud: &CloudState, job: Job) -> bool {
     check(cloud, job).allowed
 }
 
-/// Whether this node's view is fresh enough to count ABSENCE as evidence:
-/// a gossip round completed, not isolated, and — when voters are configured —
-/// direct contact with a voter majority. A node that cannot hear the fleet
-/// sees everyone as gone; nothing may start an absence clock from that view.
+/// Whether this node's view is fresh enough to count ABSENCE as evidence: a gossip round completed,
+/// not isolated, and direct contact with a voter majority when voters are configured.
 pub fn view_is_fresh(cloud: &CloudState) -> bool {
     let view = View::gather(cloud);
     view.fresh && !view.isolated && (view.voters.is_empty() || view.has_majority())
@@ -507,10 +453,8 @@ fn note(job: Job, verdict: &Verdict) {
     st.suppressed = 0;
 }
 
-/// Sample every job's continuity. Called by the cluster loop every 3 s so a
-/// job that asks only every few minutes still sees an unbroken tenure, never a
-/// stale one. Also logs, once, the effective voter set and its source, and
-/// warns when pins are set that a configured chain makes inert.
+/// Sample every job's continuity (every 3 s from the cluster loop, so a rarely-asking job still
+/// sees an unbroken tenure); logs once the voter set and warns about pins a chain makes inert.
 pub fn observe(cloud: &CloudState) {
     let view = View::gather(cloud);
     static ANNOUNCED: AtomicBool = AtomicBool::new(false);

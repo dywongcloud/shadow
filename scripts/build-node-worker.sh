@@ -1,21 +1,6 @@
 #!/usr/bin/env bash
-# Builds vendored node-worker (HeyPuter/node-worker) into the ES modules the
-# browser node ships, and stages them where the dashboard sync picks them up.
-#
-# WHY THIS EXISTS. node-worker is not a drop-in JS file: its `build` runs
-# `prepare-node.js` FIRST, which shallow-clones the real Node.js source
-# (nodejs/node at the commit pinned in vendor/node-worker/package.json ->
-# `nodeCore.commit`, currently v25.9.0) into `node_core/`, then rollup bundles
-# that into dist/{index,worker,sw,sw-handler}.js. The Node core is what makes
-# this a genuine Node runtime rather than a shim: `node:async_hooks` (and so
-# AsyncLocalStorage), `node:net`, `node:tls` and the rest are Node's own lib
-# transpiled for a Worker -- which is also why the build is heavy and why the
-# output must be a committed/synced artifact rather than an npm install.
-#
-# Output is copied to crates/hive-browser/www/node-worker/ so
-# ui/scripts/sync-browser-node.mjs publishes it to
-# ui/public/browser-node/node-worker/ exactly like every other browser-node
-# asset. A missing/failed build is a WARN, never a hard failure of the caller.
+# Build vendored node-worker (HeyPuter/node-worker) into crates/hive-browser/www/node-worker/, which
+# ui/scripts/sync-browser-node.mjs publishes. A missing pnpm, vendor dir or dist/ exits 0 (skipped).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

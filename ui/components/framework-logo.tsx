@@ -1,19 +1,6 @@
 import { Triangle } from "@/components/ui";
 import { Box, Server } from "lucide-react";
 
-// Per-project framework logos for the dashboard's project grid. Rendered in the
-// SAME circular avatar chrome the default `Triangle` uses (bordered circle,
-// bg-fg / text-bg) so the grid stays visually uniform — only the glyph inside
-// changes. The inner mark is drawn in `currentColor`, which the avatar sets to
-// the inverted foreground, so it is legible in both light and dark themes
-// without brand-tinted fills that vanish against one background. An unknown or
-// empty framework returns the platform's own `Triangle` avatar unchanged, so a
-// card is never blank.
-//
-// Slugs come from `fluid_build::framework` (nextjs, opennext, vinext, vite,
-// astro, remix, sveltekit, nuxtjs, vue, gatsby, create-react-app, node,
-// static) plus the container/docker kind.
-
 /** The circular avatar wrapper matching `ui.tsx`'s `Triangle`. */
 function Avatar({ className, viewBox, children, label }: { className?: string; viewBox: string; children: React.ReactNode; label: string }) {
   return (
@@ -90,8 +77,8 @@ const MARKS: Record<string, (c?: string) => React.ReactElement> = {
   ),
 };
 
-/** The framework mark for a slug, or the platform Δ fallback (`Triangle`).
- *  Container/image/compose deploys get a box glyph. */
+/** The framework mark for a `fluid_build::framework` slug, drawn in `currentColor` inside the same circular avatar chrome as `Triangle` so the project grid stays uniform in both
+ *  themes. Container/image/compose deploys get a box glyph; an unknown, static or empty framework falls back to the platform's own `Triangle`, so a card is never blank. */
 export function FrameworkLogo({ framework, kind, className }: { framework?: string; kind?: string; className?: string }) {
   const slug = (framework || "").trim().toLowerCase();
   const mk = MARKS[slug];
@@ -103,6 +90,5 @@ export function FrameworkLogo({ framework, kind, className }: { framework?: stri
       </span>
     );
   }
-  // Unknown / static / empty → the platform's own Δ mark, unchanged.
   return <Triangle className={className} />;
 }

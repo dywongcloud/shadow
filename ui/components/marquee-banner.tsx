@@ -1,32 +1,23 @@
-/* ------------------------------------------------------------------ *
- * Landing-page marquee banner.
- *
- * A NEAR-BLACK (dark-grey) banner with a thin, sleek white outline whose exact
- * silhouette — a tab on the top edge (left-of-centre) and a tab on the bottom
- * edge (right) — is rendered from the source path (2048×69) as an inline SVG
- * (dark fill + non-scaling white stroke). An infinitely-scrolling
- * "OWN YOUR CLOUD. ·" ticker rides inside the solid strip band (y 23–55 of the
- * 69-tall viewBox) in white. It sits after the hero globe with a little black
- * space above for contrast, and generous space below before the device showcase.
- * ------------------------------------------------------------------ */
+"use client";
+
+import { Pause, Play } from "lucide-react";
+import { useMotionPause } from "@/components/landing/motion-pause";
 
 const PHRASE = "Own Your Cloud";
 
-// The banner silhouette (matches /public/banner-shape.svg).
+/** The notched outline is the brand's one signature shape: a straight strip reads as any ticker, the two notches (top left of centre, bottom
+ *  right of centre) are what make this one shadw's. The path is the original artwork, drawn on a 2048 x 69 box and stretched to the band. */
 const SHAPE =
   "M0 23H564C567 23 570 21 573 19C578 14 582 8 586 5C589 2 592 0 596 0H719C722 0 724 2 727 4C732 8 735 13 740 18C743 21 747 23 751 23H2048V55H1624C1620 55 1617 59 1613 65C1611 67 1610 68 1608 68H1543C1541 68 1539 66 1538 65C1534 61 1531 58 1527 55H0V23Z";
 
-// The solid strip occupies y23–55 of the 69-unit-tall shape; the tabs extend
-// above/below it. Position the text band over the strip only.
-const STRIP_TOP = "33.33%"; // 23 / 69
-const STRIP_HEIGHT = "46.38%"; // 32 / 69
+const STRIP_TOP = "33.33%";
+const STRIP_HEIGHT = "46.38%";
 
-/** One copy of the ticker. Two sit side-by-side so the -50% translate loops seamlessly.
- *  Each phrase is followed by a perfectly round, centred bold black bullet (a real
- *  circle, not a glyph, so it's symmetric at any size) → "OWN YOUR CLOUD • …". */
-function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
+/** One copy of the ticker; two sit side by side so the -50% translate loops seamlessly. Each phrase is followed by a round, centred bullet (a real
+ *  circle, not a glyph, so it is symmetric at any size). The copies are decorative: the section names the content for assistive technology. */
+function Track() {
   return (
-    <div className="flex shrink-0 items-center" aria-hidden={ariaHidden}>
+    <div className="flex shrink-0 items-center" aria-hidden="true">
       {Array.from({ length: 12 }).map((_, i) => (
         <span key={i} className="flex items-center">
           <span
@@ -42,32 +33,38 @@ function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
   );
 }
 
+/** The brand ticker. Its height is fixed, not proportional to the width, so the text keeps a readable size on a phone. Its button pauses ALL the
+ *  landing's decorative motion (`html.lp-paused` stops the CSS loops and the terminal's typing; SMIL is paused from script), and
+ *  `prefers-reduced-motion` stops it outright. */
 export function MarqueeBanner() {
+  const [paused, togglePause] = useMotionPause();
   return (
-    <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 pb-12 sm:pt-6 sm:pb-16">
-      {/* The element keeps the shape's native aspect ratio so the tabs aren't distorted. */}
-      <div className="relative w-full" style={{ aspectRatio: "2048 / 69" }}>
-        {/* Near-black banner with a clean, thin, sleek white outline trace. */}
-        <svg
-          viewBox="0 0 2048 69"
-          className="absolute inset-0 h-full w-full"
-          preserveAspectRatio="none"
-          aria-hidden="true"
-        >
-          <path d={SHAPE} fill="#131316" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+    <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 sm:pt-6">
+      <div className="relative h-[52px] w-full sm:h-[68px]">
+        <svg viewBox="0 0 2048 69" className="absolute inset-0 h-full w-full" preserveAspectRatio="none" aria-hidden="true">
+          <path d={SHAPE} fill="#0a0a0a" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         </svg>
 
-        {/* Scrolling ticker, confined to the solid strip band (full-width, no tabs).
-            Bold black text + round bullets; sized to fill the strip without bleeding. */}
-        <div
-          className="absolute inset-x-0 overflow-hidden"
-          style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(3px, 0.8vw, 12px)" }}
-        >
-          <div className="flex h-full w-max items-center animate-[marquee_30s_linear_infinite] motion-reduce:animate-none">
+        <div className="absolute inset-x-0 overflow-hidden" style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(11px, 0.9vw, 14px)" }}>
+          <div
+            className="flex h-full w-max items-center animate-[marquee_30s_linear_infinite] motion-reduce:animate-none"
+            style={{ animationPlayState: paused ? "paused" : "running" }}
+          >
             <Track />
-            <Track aria-hidden />
+            <Track />
           </div>
         </div>
+      </div>
+      <div className="mx-auto flex max-w-[1500px] justify-end px-3 lg:px-10">
+        <button
+          type="button"
+          onClick={togglePause}
+          aria-label={paused ? "Play animations" : "Pause animations"}
+          aria-pressed={paused}
+          className="inline-flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md px-3 text-zinc-300 transition-colors hover:text-white"
+        >
+          {paused ? <Play className="h-4 w-4" /> : <Pause className="h-4 w-4" />}
+        </button>
       </div>
     </section>
   );

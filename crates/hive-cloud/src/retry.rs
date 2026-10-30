@@ -1,18 +1,16 @@
-//! Retry / failover SAFETY classification (Fluid hardening #6 / #7 / #8).
+//! Retry / failover SAFETY classification.
 //!
-//! The mesh router fails a request over to another transport (iroh→HTTP) or peer
-//! when an attempt errors. That is only safe when re-attempting cannot duplicate a
-//! side effect or replay/garble a response. This module is the pure, testable
-//! policy the router consults before any RE-attempt (the first attempt is never a
-//! retry). It composes three signals:
+//! The mesh router fails a request over to another transport (iroh -> HTTP) or peer when an attempt
+//! errors. That is only safe when re-attempting cannot duplicate a side effect or replay or garble
+//! a response. This module is the pure, testable policy the router consults before any RE-attempt
+//! (the first attempt is never a retry). It composes three signals:
+//! * **retry-safety**: an idempotent method, or an explicit idempotency key;
+//! * **body replay**: the request body must be fully buffered to be re-sent;
+//! * **response start**: once response bytes have begun flowing to the client, a transparent retry
+//! is impossible.
 //!
-//!   * #6 retry-safety  — idempotent method, or an explicit idempotency key.
-//!   * #7 body replay   — the request body must be fully buffered to be re-sent.
-//!   * #8 response start — once response bytes have begun flowing to the client,
-//!                         a transparent retry is impossible.
-//!
-//! Conservative by design: when in doubt it REFUSES the retry (returns a controlled
-//! error) rather than risk executing a POST twice. The first attempt always runs.
+//! Conservative by design: when in doubt it REFUSES the retry (returns a controlled error) rather
+//! than risk executing a POST twice. The first attempt always runs.
 
 /// Whether the request body can be re-sent on a retry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,27 +45,28 @@ pub fn is_idempotent(method: &str) -> bool {
 
 /// Decide whether an ALREADY-ATTEMPTED request may be retried / failed over.
 /// (The caller must only invoke this for the 2nd+ attempt — the first always runs.)
+///
+/// Refuses, in order, when the response has already started (once bytes are on the wire to the
+/// client a transparent retry is impossible), when the body could not be buffered, and when the
+/// method is not idempotent and carries no idempotency key (it might execute twice).
 pub fn can_retry(
     method: &str,
     has_idempotency_key: bool,
     body: BodyReplay,
     response: ResponseState,
 ) -> RetryDecision {
-    // Once bytes are on the wire to the client, a transparent retry is impossible.
     if response == ResponseState::Started {
         return RetryDecision {
             allowed: false,
             reason: "response_already_started",
         };
     }
-    // Can't re-send a body we couldn't buffer.
     if body == BodyReplay::NonReplayable {
         return RetryDecision {
             allowed: false,
             reason: "body_not_replayable",
         };
     }
-    // A non-idempotent method without an idempotency key might double-execute.
     if !is_idempotent(method) && !has_idempotency_key {
         return RetryDecision {
             allowed: false,

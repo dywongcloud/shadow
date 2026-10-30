@@ -7,12 +7,8 @@ import {
   ShieldHalf, Plug, Network, BarChart3, CreditCard, Settings, Users, User,
   BookOpen, Triangle, CornerDownLeft,
 } from "lucide-react";
-import { apiGet, type Deployment } from "@/lib/api";
+import { loadProjectNames } from "@/lib/projects";
 import { useIsPlatformOwner } from "@/lib/owner";
-
-/* The platform command bar (⌘K / Ctrl-K). Opens from the global shortcut or via
- * the `open-command-bar` window event (dispatched by the Projects search bar).
- * Navigates pages, runs quick actions, and jumps to a project. Theme-aware. */
 
 interface Cmd {
   id: string;
@@ -26,18 +22,18 @@ interface Cmd {
 
 const ic = "h-4 w-4";
 
+/** The platform command bar (⌘K / Ctrl-K), also opened by the `open-command-bar` window event (dispatched by the Projects search bar): navigates pages, runs quick actions and jumps to a project. */
 export function CommandBar() {
   const router = useRouter();
   const isOwner = useIsPlatformOwner();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
-  const [deps, setDeps] = useState<Deployment[]>([]);
+  const [projectNames, setProjectNames] = useState<string[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const isMac = typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
 
-  // Open via ⌘K / Ctrl-K, the projects search bar event, and close via Esc.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
@@ -56,14 +52,13 @@ export function CommandBar() {
     };
   }, []);
 
-  // On open: reset, focus, and load projects for jump-to.
   useEffect(() => {
     if (!open) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- resets dialog-local state each time `open` flips true, not derivable at mount since the same component re-opens repeatedly
     setQ("");
     setIdx(0);
     setTimeout(() => inputRef.current?.focus(), 0);
-    apiGet<Deployment[]>("/deployments").then(setDeps).catch(() => {});
+    loadProjectNames().then(setProjectNames);
   }, [open]);
 
   const go = (href: string) => () => {
@@ -91,7 +86,6 @@ export function CommandBar() {
     const actions: Cmd[] = [
       { id: "new", label: "New Project", group: "Actions", hint: "Deploy", icon: <Plus className={ic} />, keywords: "create deploy import", run: go("/new") },
       { id: "docs", label: "Documentation", group: "Actions", icon: <BookOpen className={ic} />, keywords: "docs api guide help", run: go("/docs") },
-      // Ops entry — platform owner only (middleware enforces; this just hides it).
       ...(isOwner
         ? [{ id: "ops", label: "Operations Console", group: "Actions", icon: <ShieldHalf className={ic} />, keywords: "admin ops", run: go("/admin") } as Cmd]
         : []),
@@ -103,7 +97,7 @@ export function CommandBar() {
       icon,
       run: go(href),
     }));
-    const projects = Array.from(new Set(deps.map((d) => d.project))).map((p) => ({
+    const projects = projectNames.map((p) => ({
       id: "proj-" + p,
       label: p,
       group: "Projects",
@@ -113,7 +107,7 @@ export function CommandBar() {
       run: go(`/projects/${encodeURIComponent(p)}`),
     }));
     return [...actions, ...pages, ...projects];
-  }, [deps, isOwner]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [projectNames, isOwner]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();
@@ -133,7 +127,6 @@ export function CommandBar() {
     else if (e.key === "Enter") { e.preventDefault(); run(filtered[idx]); }
   };
 
-  // Group while preserving order, tracking a flat index for highlight/scroll.
   const groups: { name: string; items: { c: Cmd; i: number }[] }[] = [];
   filtered.forEach((c, i) => {
     let g = groups.find((x) => x.name === c.group);

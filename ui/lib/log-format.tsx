@@ -1,7 +1,3 @@
-// Shared build-log rendering: timestamp formatting + content-aware syntax
-// highlighting for a single log line. Used by the deploy build page and the
-// deployment detail page so both render logs identically.
-
 import React from "react";
 import { cn } from "@/lib/utils";
 
@@ -12,7 +8,6 @@ export function fmtTime(ms: number): string {
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
-// Wrap occurrences of `q` (case-insensitive) in the given string with a <mark>.
 function withFindMarks(text: string, q: string): React.ReactNode {
   if (!q) return text;
   const needle = q.toLowerCase();
@@ -36,7 +31,6 @@ function withFindMarks(text: string, q: string): React.ReactNode {
   return <>{parts}</>;
 }
 
-// Highlight URLs and *.localhost aliases inside a chunk of text, then apply find-marks.
 function highlightInline(text: string, q: string): React.ReactNode {
   const re = /(https?:\/\/[^\s]+|[a-z0-9_-]+\.localhost)/gi;
   const parts: React.ReactNode[] = [];
@@ -58,7 +52,6 @@ function highlightInline(text: string, q: string): React.ReactNode {
   return <>{parts}</>;
 }
 
-// Determine the base text color class for a log line by its content. First match wins.
 function lineColor(line: string): string {
   const t = line.trim();
   const lower = t.toLowerCase();

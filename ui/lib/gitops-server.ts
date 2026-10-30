@@ -1,30 +1,16 @@
 import "server-only";
 import { createHash } from "crypto";
+import { cookies } from "next/headers";
 import { buildArtifacts } from "@/lib/gitops-yaml";
+import { teamRoleOf, type TeamRole } from "@/lib/team-role";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
-
-/**
- * Call the backend admin API scoped to a tenant.
- *
- * `authToken` (the signed-in user's platform JWT) is forwarded as
- * `Authorization: Bearer …` so MUTATIONS pass the backend's `require_auth`
- * (when `HIVE_JWT_SECRET` is set). A Next server route that POSTs to the backend
- * on the user's behalf (deploy, redeploy, GitOps writes) MUST pass it — unlike
- * the `/cloud` rewrite proxy, a server→backend `fetch()` does not carry the
- * browser's `hive_jwt` cookie automatically, so omitting it 401s with
- * "missing or invalid bearer token". Reads (no token) stay unauthenticated, and
- * the backend derives the tenant from the JWT claim (not the spoofable
- * `x-hive-team` header), so forwarding the user's token scopes writes correctly.
- */
-// Mirrors lib/api.ts's fetchWithTimeout: an unbounded server->backend fetch()
-// here (GitHub API calls in commitFiles() share the same failure shape) can
-// stall the whole /api/gitops/sync request indefinitely on a hung backend or
-// far region, which surfaces client-side as a raw "Failed to fetch" instead of
-// a clean, retryable HTTP error. 20s matches apiGet's own default timeout.
 const BACKEND_TIMEOUT_MS = 20_000;
 
-export async function backend(path: string, team: string, init?: RequestInit, authToken?: string | null) {
+/** Calls the backend admin API scoped to a tenant. `authToken` is REQUIRED so no call site can forget it: pass the caller's platform JWT (forwarded as
+ *  `Authorization: Bearer`; a Next route's server->backend `fetch()` does not carry the browser's `hive_jwt` cookie, and the backend derives the tenant from
+ *  the JWT claim, not `x-hive-team`), or an explicit `null` only where an anonymous read is intended (an auth-enforced node answers it as the empty anonymous tenant). */
+export async function backend(path: string, team: string, authToken: string | null, init?: RequestInit) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS);
   try {
@@ -57,35 +43,40 @@ export function authTokenFrom(req: {
   return null;
 }
 
-/**
- * Read the live platform objects for a tenant and render the full GitOps artifact
- * tree. Returns the files plus a content hash (ignoring the volatile generatedAt
- * stamps) so callers can skip a redundant commit when nothing changed.
- *
- * `failures` lists CORE reads that failed (non-2xx). Only `/v1/gitops/projects`
- * is core: committing a tree built without it would omit every project — and,
- * because sync commits with the `projects/` managed prefix, TOMBSTONE every
- * real project file in the repo. Callers must refuse to commit when `failures`
- * is non-empty. The remaining reads degrade to absent-by-design: a personal
- * namespace legitimately has no team row, and the enterprise endpoints are
- * optional features — treating those as fatal would break tenants that simply
- * don't use them.
- */
-export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml", authToken?: string | null) {
+/** The team role and operator status a platform JWT claims, read WITHOUT verifying it: a server route uses them only to refuse an action BEFORE a side effect the backend would refuse anyway (a GitHub repository created for a link
+ *  the matrix rejects); the backend verifies the token and stays the authority. `role: null` = absent or undecodable = UNKNOWN: the route proceeds and the backend answers. */
+export function claimedRole(token: string | null): { role: TeamRole | null; operator: boolean } {
+  try {
+    const part = token?.split(".")[1];
+    if (!part) return { role: null, operator: false };
+    const claims = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as { role?: unknown; platform_admin?: unknown };
+    return { role: teamRoleOf(typeof claims.role === "string" ? claims.role : null), operator: claims.platform_admin === true };
+  } catch {
+    return { role: null, operator: false };
+  }
+}
+
+/** The signed-in user's platform JWT for a Server Component (the httpOnly `hive_jwt` cookie), or null when the request carries none. */
+export async function sessionAuthToken(): Promise<string | null> {
+  return (await cookies()).get("hive_jwt")?.value ?? null;
+}
+
+/** Reads the live platform objects for a tenant and renders the full GitOps artifact tree plus a content hash (ignoring volatile timestamps) so callers
+ *  can skip a redundant commit. `failures` lists CORE reads that failed (only `/v1/gitops/projects` is core): committing a tree without projects would
+ *  TOMBSTONE every real project file under the `projects/` managed prefix, so callers must refuse to commit when it is non-empty; the other reads
+ *  degrade to absent-by-design (a personal namespace has no team row, the enterprise endpoints are optional). */
+export async function buildOrgArtifacts(team: string, authToken: string | null, rootPath = "openedge.yaml") {
   const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes, dbRes] = await Promise.all([
-    backend("/v1/gitops/projects", team, undefined, authToken),
-    backend(`/v1/teams/${encodeURIComponent(team)}`, team, undefined, authToken),
-    backend("/v1/overview", team, undefined, authToken),
-    backend("/v1/routing", team, undefined, authToken),
-    backend("/v1/enterprise/ip-blocks", team, undefined, authToken),
-    backend("/v1/enterprise/siem", team, undefined, authToken),
-    backend("/v1/enterprise/saml", team, undefined, authToken),
-    backend("/v1/enterprise/scim", team, undefined, authToken),
-    backend("/v1/enterprise/microfrontends", team, undefined, authToken),
-    // Same tenant-scoped endpoint the Storage dashboard page polls
-    // (ui/app/storage/page.tsx: usePoll<Database[]>("/v1/databases", …)) —
-    // reused here rather than a bespoke gitops-only route.
-    backend("/v1/databases", team, undefined, authToken),
+    backend("/v1/gitops/projects", team, authToken),
+    backend(`/v1/teams/${encodeURIComponent(team)}`, team, authToken),
+    backend("/v1/overview", team, authToken),
+    backend("/v1/routing", team, authToken),
+    backend("/v1/enterprise/ip-blocks", team, authToken),
+    backend("/v1/enterprise/siem", team, authToken),
+    backend("/v1/enterprise/saml", team, authToken),
+    backend("/v1/enterprise/scim", team, authToken),
+    backend("/v1/enterprise/microfrontends", team, authToken),
+    backend("/v1/databases", team, authToken),
   ]);
   const failures: string[] = [];
   if (!projRes.ok) failures.push(`/v1/gitops/projects -> HTTP ${projRes.status}`);
@@ -110,9 +101,6 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     region: ov?.region,
     rootPath,
     projects: Array.isArray(projects) ? projects : [],
-    // Raw records pass through — declarative-shape extraction (name/kind/region/
-    // mode only, never `connection`/credentials) happens in buildArtifacts's
-    // databaseNode(), mirroring how projectNode() shapes `projects` above.
     databases: Array.isArray(databases) ? databases : [],
     platform: {
       routing: routing ? { redirects: routing.redirects || [], rewrites: routing.rewrites || [] } : undefined,
@@ -132,15 +120,12 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     },
   });
 
-  // Hash over all files with volatile timestamps neutralized so an unchanged
-  // config doesn't re-commit on every poll. Strip BOTH the YAML `generatedAt:`
-  // lines AND any ISO-8601 timestamp anywhere (e.g. the README "Generated …").
-  const stable = files
+  const contentWithoutTimestamps = files
     .map((f) => `${f.path}\n${f.content}`)
     .join("\n")
     .replace(/^\s*generatedAt:.*$/gm, "")
     .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "");
-  const hash = createHash("sha256").update(stable).digest("hex").slice(0, 16);
+  const hash = createHash("sha256").update(contentWithoutTimestamps).digest("hex").slice(0, 16);
 
   return { files, hash, projectCount: Array.isArray(projects) ? projects.length : 0, failures };
 }

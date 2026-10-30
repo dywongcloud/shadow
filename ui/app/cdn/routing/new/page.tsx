@@ -23,8 +23,7 @@ export default function NewRulePage() {
   const [busy, setBusy] = useState(false);
   const platformAdmin = usePlatformAdmin();
 
-  // Lightweight NL → rule generator: "redirect /old to /new with a 301".
-  function generate() {
+  function generateRuleFromSentence() {
     const t = nl.toLowerCase();
     const m = t.match(/(redirect|rewrite)\s+(\S+)\s+to\s+(\S+)(?:.*?(\d{3}))?/);
     if (!m) { alert("Couldn't parse — try: redirect /old-blog/* to /blog/* with a 301"); return; }
@@ -50,10 +49,6 @@ export default function NewRulePage() {
     } catch (e) { alert(String(e)); setBusy(false); }
   }
 
-  // Operator-only surface (the endpoints mutate the GLOBAL edge tables and are
-  // gated by require_operator on the backend). A definitive non-operator session
-  // gets the boundary stated plainly instead of a raw 403 on submit; an UNKNOWN
-  // session (null) renders the form as before and the backend still enforces.
   if (platformAdmin === false) {
     return (
       <div>
@@ -83,7 +78,6 @@ export default function NewRulePage() {
       <Link href="/cdn" className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"><ArrowLeft className="h-4 w-4" /> All Routes</Link>
       <h1 className="mb-8 mt-3 text-3xl font-semibold tracking-tight">New Rule</h1>
 
-      {/* NL generation */}
       <div className="rounded-xl border border-border bg-card p-4">
         <textarea
           value={nl}
@@ -92,7 +86,7 @@ export default function NewRulePage() {
           className="h-28 w-full resize-none bg-transparent text-sm placeholder:text-muted focus:outline-none"
         />
         <div className="flex justify-end">
-          <Button variant="outline" onClick={generate} disabled={!nl.trim()}><Sparkles className="h-4 w-4" /> Generate Rule</Button>
+          <Button variant="outline" onClick={generateRuleFromSentence} disabled={!nl.trim()}><Sparkles className="h-4 w-4" /> Generate Rule</Button>
         </div>
       </div>
 
@@ -100,7 +94,6 @@ export default function NewRulePage() {
         <span className="h-px flex-1 bg-border" /> OR <span className="h-px flex-1 bg-border" />
       </div>
 
-      {/* Manual builder */}
       <div className="rounded-xl border border-border bg-card p-5">
         <div className="mb-3 text-sm font-semibold">Conditions</div>
         <div className="rounded-lg border border-border p-4">

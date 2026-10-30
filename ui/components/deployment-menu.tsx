@@ -4,17 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { MoreHorizontal, RotateCcw, RefreshCw, Trash2, Loader2, XCircle } from "lucide-react";
 
-/** The "⋯" menu at the end of a deployment row — Cancel Build / Instant Rollback
- *  / Redeploy / Delete. Mirrors ProjectMenu: the menu is portaled and
- *  fixed-positioned at the trigger so it overlays everything and is never
- *  clipped by the table's overflow.
- *
- *  `canCancel`/`onCancel` are OPTIONAL so every existing call site keeps
- *  compiling unchanged — a row that never passes them simply renders the menu
- *  it always did. Cancel is listed FIRST when present: it is only offered while
- *  a build is actually in flight (queued/building), where it is the only action
- *  that is time-sensitive, and where Rollback/Redeploy are meaningless because
- *  there is no finished artifact yet. */
+/** The "⋯" menu at the end of a deployment row (Cancel Build / Instant Rollback / Redeploy / Delete), portaled and fixed-positioned at the trigger like ProjectMenu so
+ *  the table's overflow never clips it. `canCancel`/`onCancel` are optional and Cancel is listed first: it is offered only while a build is in flight (queued/building),
+ *  the one time Rollback/Redeploy are meaningless because there is no finished artifact yet. */
 export function DeploymentRowMenu({
   canRollback,
   canRedeploy,
@@ -35,9 +27,7 @@ export function DeploymentRowMenu({
   /** Required in practice whenever `canCancel` is true; the item is not
    *  rendered without it, so a caller can never surface a dead Cancel. */
   onCancel?: () => void;
-  /** Optional for the same reason as `onCancel`: an in-flight build has no
-   *  deployment artifact to delete yet, so its menu omits Delete entirely
-   *  rather than offering an action that cannot apply. */
+  /** Optional for the same reason as `onCancel`: an in-flight build has no artifact to delete yet, so its menu omits Delete. */
   onDelete?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -45,7 +35,6 @@ export function DeploymentRowMenu({
   const btnRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Close on outside click (the portaled menu is not a DOM child of the trigger).
   useEffect(() => {
     const f = (e: MouseEvent) => {
       const t = e.target as Node;
@@ -56,7 +45,6 @@ export function DeploymentRowMenu({
     return () => document.removeEventListener("mousedown", f);
   }, []);
 
-  // Position the portaled menu under the trigger; keep it pinned on scroll/resize.
   useEffect(() => {
     if (!open) return;
     const place = () => {

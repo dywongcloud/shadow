@@ -1,20 +1,11 @@
 ---
-# Day-2: onboard ONE new node and, if the fleet runs the opt-in static
-# peer-trust allowlist, push its iroh id into every OTHER existing node's
-# HIVE_TRUSTED_NODE_IDS. This mirrors, verb for verb, the manual procedure
-# this project's own sessions used to bring a new node online: sync+build,
-# join the mesh, then (only if HIVE_PEER_TRUST=1) fix the exact gap a real
-# session hit -- a new node's id missing from every OTHER node's allowlist,
-# which silently rejects its gossip even though the new node's OWN view of
-# the mesh looks healthy.
+# Day-2: onboard ONE new node and, when the fleet runs the opt-in static peer-trust allowlist (HIVE_PEER_TRUST=1),
+# push its iroh id into every OTHER node's HIVE_TRUSTED_NODE_IDS. Without HIVE_PEER_TRUST the node is still fully
+# provisioned and the allowlist plays do nothing.
 #
 # Usage:
 #   1. Add the new host to inventory/hosts.ini under [fc_kvm] or [fc_pvm].
 #   2. ansible-playbook playbooks/node-join.yml -e new_node=<inventory_hostname>
-#
-# If the fleet does NOT use HIVE_PEER_TRUST (the default -- join-proof
-# self-admit handles everything), this playbook still provisions the node
-# fully; it just skips the allowlist-propagation play (nothing to do).
 
 - name: Fail fast without a valid target
   hosts: localhost
@@ -88,13 +79,10 @@
       ansible.builtin.slurp:
         src: /etc/systemd/system/hive-node.service.d/peer-trust.conf
       register: _fleet_trust_conf
-      # A member provisioned before peer-trust existed may legitimately have
-      # no drop-in; the join-proof self-admit path covers that fleet shape.
       failed_when: false
 
     - name: Publish the fleet's current id set for the later plays
       ansible.builtin.set_fact:
-        # Extract every 64-hex id from the drop-in; empty when absent.
         fleet_base_trust_ids: "{{ (_fleet_trust_conf.content | default('', true) | b64decode | regex_findall('[0-9a-f]{64}')) | unique }}"
       delegate_to: localhost
       delegate_facts: true
@@ -103,11 +91,6 @@
   hosts: "{{ new_node }}"
   become: true
   vars:
-    # Without this the new node boots with an EMPTY allowlist while every
-    # existing node enforces HIVE_PEER_TRUST=1: its own gossip is accepted
-    # (self-admit carried the join) but it can never validate REPLIES, so its
-    # registry stays empty and /v1/mesh reads 0 peers with trunks open —
-    # witnessed live on phx (fc-phoenix, 2026-08-21).
     hive_trusted_node_ids: "{{ ((hostvars['localhost'].fleet_base_trust_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
   tasks:
     - ansible.builtin.include_role:
@@ -134,12 +117,6 @@
   become: true
   serial: 1
   vars:
-    # unique keeps this idempotent -- re-running node-join.yml for the same
-    # new_node (or after a partial failure) must not accumulate duplicate
-    # entries in HIVE_TRUSTED_NODE_IDS on every re-run. Base = the fleet's
-    # LIVE set captured above: building from the inventory default ([] here)
-    # would overwrite a 15+-id allowlist with just the new id and lock every
-    # node out of every peer.
     hive_trusted_node_ids: "{{ ((hostvars['localhost'].fleet_base_trust_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
   tasks:
     - name: Update peer-trust.conf on this existing node

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -7,15 +8,13 @@ import { clerkAppearance } from "@/lib/clerk-appearance";
 import { Logo } from "@/components/logo";
 
 const FEATURES = [
-  "Global edge network across every region",
-  "Fluid compute that scales to zero",
-  "Built-in WAF, CDN & DDoS protection",
-  "Multi-tenant teams with strict isolation",
+  "An edge on every node: routing, firewall and cache",
+  "Fluid compute; previews scale to zero when idle",
+  "Built-in WAF, edge caching and per-IP rate limiting",
+  "Multi-tenant teams with owner, admin, member and viewer roles",
 ];
 
-/** Polished split-screen auth layout shared by sign-in / sign-up. Left: brand
- *  + value props on a subtle gradient. Right: the Clerk widget. Looks good in
- *  both light and dark. */
+/** Split-screen auth layout shared by sign-in and sign-up: brand and value props on a subtle gradient on the left, the Clerk widget on the right; works in light and dark. */
 export function AuthShell({
   render,
   footer,
@@ -31,7 +30,6 @@ export function AuthShell({
 
   return (
     <div className="fixed inset-0 z-50 grid grid-cols-1 bg-bg lg:grid-cols-2">
-      {/* Brand / marketing panel */}
       <div className="relative hidden flex-col justify-between overflow-hidden border-r border-border p-12 lg:flex">
         <div
           className="pointer-events-none absolute inset-0 opacity-70"
@@ -41,14 +39,14 @@ export function AuthShell({
           }}
         />
         <div className="relative flex items-center">
-          <Logo className="h-7 w-auto" />
+          <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center"><Logo className="h-7 w-auto" /></Link>
         </div>
         <div className="relative">
           <h1 className="max-w-md text-3xl font-semibold leading-tight tracking-tight">
-            Your unified, self-hosted cloud.
+            Push to Git. Get a live URL.
           </h1>
           <p className="mt-3 max-w-sm text-sm text-secondary">
-            Builds, Fluid compute, edge and regions — meshed across your own machines.
+            Serverless functions and containers deployed from Git, plus managed databases.
           </p>
           <ul className="mt-8 flex flex-col gap-3">
             {FEATURES.map((f) => (
@@ -61,14 +59,13 @@ export function AuthShell({
             ))}
           </ul>
         </div>
-        <div className="relative text-xs text-muted">© {2026} shadw · The peer-to-peer cloud.</div>
+        <div className="relative text-xs text-muted">© {2026} shadw</div>
       </div>
 
-      {/* Auth panel */}
       <div className="relative flex flex-col items-center justify-center px-4 py-10">
         <div className="absolute right-4 top-4"><ThemeToggle /></div>
         <div className="mb-6 flex items-center lg:hidden">
-          <Logo className="h-6 w-auto" />
+          <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center"><Logo className="h-6 w-auto" /></Link>
         </div>
         <div className="w-full max-w-[400px]">
           {mounted && render(clerkAppearance(dark))}

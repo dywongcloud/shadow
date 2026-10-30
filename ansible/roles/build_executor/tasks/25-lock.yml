@@ -19,10 +19,6 @@
     that:
       - build_executor_invocation_id is match('^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')
 
-# This inline holder uses only preflight-proved host primitives, so the flock is
-# acquired before dnf, capability revocation, file installation, image changes,
-# network inspection, or probes. The unique receipt is written only after flock(2)
-# succeeds; systemd-run returning merely proves that the waiter was launched.
 - name: Start the serialized root-flock holder without pre-lock file mutation
   ansible.builtin.command:
     argv:

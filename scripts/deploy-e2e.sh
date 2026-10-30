@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
-# End-to-end test of the platform's DEPLOYMENTS feature against a REAL node:
-#   1. Next.js  — framework detection, real `npm` install + `next build`, the
-#                 node-server (`next start`) booted in a cell, served via routing.
-#   2. Build cache — a 2nd build of the same repo restores the warm node_modules.
-#   3. Fluid compute — concurrent requests fan out across pool instances.
-#   4. Docker   — Dockerfile -> `podman build` -> container cell, served via routing.
-#   5. Routing  — each project's host alias serves ONLY its own deployment.
-#
-# Hermetic: throwaway node on isolated ports + temp data dir; local file:// repos
-# (the only network use is npm/podman pulling real deps — that's the point).
+# End-to-end test of the DEPLOYMENTS feature against a REAL node: Next.js build + node-server, fluid-compute concurrency,
+# build cache, Dockerfile -> podman, and per-host routing.
+# Hermetic: throwaway node on isolated ports + temp data dir; local file:// repos (the only network use is npm/podman
+# pulling real dependencies, which is the point).
 #
 # Usage:  ./scripts/deploy-e2e.sh
 set -uo pipefail
@@ -30,13 +24,11 @@ trap cleanup EXIT
 ok()  { echo "  PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
-# pub <host> <path> -> body via the public router (Host-based routing).
-pub() { curl -s -m20 -H "Host: $1" "http://127.0.0.1:$PUBLIC$2"; }
-# wait_http <host> <path> <substr> <secs> : poll the public router until body matches.
-wait_http() {
-  local host="$1" path="$2" want="$3" secs="${4:-40}" i
+public_router_get() { local host="$1" path="$2"; curl -s -m20 -H "Host: $host" "http://127.0.0.1:$PUBLIC$path"; }
+wait_until_public_body_contains() {
+  local host="$1" path="$2" substr="$3" secs="${4:-40}" i
   for ((i=0; i<secs*2; i++)); do
-    pub "$host" "$path" 2>/dev/null | grep -qF "$want" && return 0
+    public_router_get "$host" "$path" 2>/dev/null | grep -qF "$substr" && return 0
     sleep 0.5
   done
   return 1
@@ -61,7 +53,6 @@ export HOME="$HOMEDIR"
 KEY="$(curl -s -X POST "$API/v1/apikeys" -H 'content-type: application/json' -d '{"name":"e2e","role":"owner"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')"
 "$SHADW" auth login --token "$KEY" --api "$API" >/dev/null 2>&1
 
-# ----------------------------------------------------------------------------
 echo "==> [1/5] Next.js: framework build + node-server + routing"
 NX="$WORK/nextapp"; mkdir -p "$NX/app"
 cat > "$NX/package.json" <<'JSON'
@@ -92,15 +83,15 @@ grep -qiE "Detected framework: Next\.js|next build" "$WORK/next1.log" && ok "nex
 grep -qi "ready" "$WORK/next1.log" && ok "next: build reached ready" || { bad "next: build did not reach ready"; tail -25 "$WORK/next1.log"; }
 grep -qiE "Saved build cache|build cache (save|restore)" "$WORK/next1.log" && ok "next: build cache SAVED on first build" || bad "next: no build-cache save (1st)"
 
-if wait_http nextapp.localhost / NEXTJS_E2E_OK 60; then ok "next: routed + node-server served the page (fluid cold-start)"; else bad "next: page not served"; pub nextapp.localhost / | head -c 200; fi
+if wait_until_public_body_contains nextapp.localhost / NEXTJS_E2E_OK 60; then ok "next: routed + node-server served the page (fluid cold-start)"; else bad "next: page not served"; public_router_get nextapp.localhost / | head -c 200; fi
 
 echo "==> [2/5] Fluid compute: concurrent requests fan out across the pool"
 : > "$WORK/conc.out"
-pids=()   # wait on THESE pids only — a bare `wait` would also block on the node.
+request_pids=()
 for i in $(seq 1 16); do
-  ( pub nextapp.localhost / | grep -qF NEXTJS_E2E_OK && echo y >> "$WORK/conc.out" ) & pids+=($!)
+  ( public_router_get nextapp.localhost / | grep -qF NEXTJS_E2E_OK && echo y >> "$WORK/conc.out" ) & request_pids+=($!)
 done
-wait "${pids[@]}" 2>/dev/null
+wait "${request_pids[@]}" 2>/dev/null
 NX_OK=$(grep -c y "$WORK/conc.out" 2>/dev/null || echo 0)
 [ "${NX_OK:-0}" -ge 14 ] && ok "next: $NX_OK/16 concurrent requests OK (fluid concurrency)" || bad "next: only ${NX_OK:-0}/16 concurrent OK"
 INST="$(curl -s -m8 "$API/v1/functions" -H "authorization: Bearer $KEY" | python3 -c 'import sys,json
@@ -115,7 +106,6 @@ echo "==> [3/5] Build cache: redeploy the same repo restores node_modules"
 grep -qiE "Restored build cache|Pulled build cache|build cache restore" "$WORK/next2.log" && ok "next: 2nd build RESTORED the warm cache" || { bad "next: cache not restored on 2nd build"; grep -i "cache" "$WORK/next2.log" | head; }
 grep -qi "ready" "$WORK/next2.log" && ok "next: cached redeploy reached ready" || bad "next: cached redeploy failed"
 
-# ----------------------------------------------------------------------------
 if command -v podman >/dev/null; then
   echo "==> [4/5] Docker: Dockerfile -> podman build -> container -> routing"
   DK="$WORK/dockerapp"; mkdir -p "$DK"
@@ -130,19 +120,18 @@ DOCKER
   "$SHADW" deploy "file://$DK" --project dockerapp --follow >"$WORK/docker.log" 2>&1
   grep -qiE "Detected Dockerfile|building container image" "$WORK/docker.log" && ok "docker: Dockerfile detected -> container build" || bad "docker: Dockerfile path not taken"
   grep -qi "ready" "$WORK/docker.log" && ok "docker: container build reached ready" || { bad "docker: not ready"; tail -20 "$WORK/docker.log"; }
-  if wait_http dockerapp.localhost / DOCKER_E2E_OK 45; then ok "docker: routed + container served the page"; else bad "docker: container not served"; pub dockerapp.localhost / | head -c 200; fi
+  if wait_until_public_body_contains dockerapp.localhost / DOCKER_E2E_OK 45; then ok "docker: routed + container served the page"; else bad "docker: container not served"; public_router_get dockerapp.localhost / | head -c 200; fi
 else
   echo "==> [4/5] Docker: SKIPPED (podman not found)"
 fi
 
-# ----------------------------------------------------------------------------
 echo "==> [5/5] Routing isolation: each host serves ONLY its own app"
-N="$(pub nextapp.localhost /)"; D="$(pub dockerapp.localhost / 2>/dev/null)"
+N="$(public_router_get nextapp.localhost /)"; D="$(public_router_get dockerapp.localhost / 2>/dev/null)"
 echo "$N" | grep -qF NEXTJS_E2E_OK && ! echo "$N" | grep -qF DOCKER_E2E_OK && ok "routing: nextapp.localhost -> Next.js only" || bad "routing: nextapp host wrong"
 if command -v podman >/dev/null; then
   echo "$D" | grep -qF DOCKER_E2E_OK && ! echo "$D" | grep -qF NEXTJS_E2E_OK && ok "routing: dockerapp.localhost -> Docker only" || bad "routing: dockerapp host wrong"
 fi
-pub unknown-xyz.localhost / >/dev/null 2>&1 && ok "routing: unknown host handled (no crash)" || ok "routing: unknown host handled"
+public_router_get unknown-xyz.localhost / >/dev/null 2>&1 && ok "routing: unknown host handled (no crash)" || ok "routing: unknown host handled"
 
 echo
 echo "================  $PASS passed, $FAIL failed  ================"

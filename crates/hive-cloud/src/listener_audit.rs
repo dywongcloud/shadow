@@ -1,30 +1,25 @@
-//! Host listener audit — every node, periodic, node-local.
+//! Host listener audit: every node, periodic, node-local.
 //!
-//! The Tencent security group opens TCP+UDP 20000-29999 to the whole internet
-//! on every platform host (published container ports ride the raw proxy
-//! there), so ANY wildcard-bound listener in that range is world-reachable the
-//! moment it binds. On 2026-08-26 two `python3 -m http.server --bind 0.0.0.0`
-//! binary hand-offs were left on fc-virginia:28126/:28127 and served a
-//! directory listing to the internet for a week; the first notice was the
-//! cloud provider's vulnerability ticket, because nothing on the node looked.
+//! The Tencent security group opens TCP+UDP 20000-29999 to the whole internet on every platform
+//! host (published container ports ride the raw proxy there), so ANY wildcard-bound listener in
+//! that range is world-reachable the moment it binds. Two ad-hoc `python3 -m http.server --bind
+//! 0.0.0.0` binary hand-offs once served a directory listing to the internet for a week, and the
+//! first notice was the cloud provider's vulnerability ticket, because nothing on the node looked.
 //!
-//! This module looks. Each pass reads `/proc/net/tcp` + `/proc/net/tcp6`,
-//! keeps LISTEN sockets bound to a wildcard address inside the audited range,
-//! drops the ones this process owns (the raw proxy's own listeners — matched
-//! by socket inode against `/proc/self/fd`, never by port list), and resolves
-//! the rest to a pid/cmdline/cgroup. Everything left is FOREIGN: it is not
-//! hive-cloud, it is inside the internet-open range, and it is bound to every
-//! interface. The report is node-local (`GET /v1/host/listeners`, the
-//! `/v1/dns/stats` precedent: through the dashboard's `/ops/*` proxy you read
-//! the LEADER's report, not the page-serving node's); the fleet view is
+//! This module looks. Each pass reads `/proc/net/tcp` and `/proc/net/tcp6`, keeps LISTEN sockets
+//! bound to a wildcard address inside the audited range, drops the ones this process owns (the raw
+//! proxy's own listeners, matched by socket inode against `/proc/self/fd`, never by port list) and
+//! resolves the rest to a pid/cmdline/cgroup. Everything left is FOREIGN: not hive-cloud, inside
+//! the internet-open range, bound to every interface. The report is node-local (`GET
+//! /v1/host/listeners`, the `/v1/dns/stats` precedent: through the dashboard's `/ops/*` proxy you
+//! read the LEADER's report, not the page-serving node's); the fleet view is
 //! `scripts/audit-public-listeners.sh`.
 //!
-//! Detection only, never remediation: the platform must not kill a process
-//! it did not start (an operator's deliberate tool, a tenant hand-off in
-//! progress). It WARNs every pass while the exposure exists and, on the
-//! control-plane leader, opens ONE deduplicated Major incident per
-//! (port, pid) so the ops dashboard shows it within a pass instead of a
-//! provider ticket showing it a week later.
+//! Detection only, never remediation: the platform must not kill a process it did not start (an
+//! operator's deliberate tool, a tenant hand-off in progress). It WARNs every pass while the
+//! exposure exists and, on the control-plane leader, opens ONE deduplicated Major incident per
+//! (port, pid), so the ops dashboard shows it within a pass instead of a provider ticket showing it
+//! a week later.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -36,9 +31,8 @@ use serde::Serialize;
 
 use crate::state::CloudState;
 
-/// The internet-open published-port range (the Tencent SG rule; see
-/// AGENTS.md "Host firewall & public listeners"). Overridable for a fleet
-/// whose SG shape differs: `HIVE_LISTENER_AUDIT_PORTS=lo-hi`.
+/// The internet-open published-port range (the Tencent security-group rule: TCP+UDP 20000-29999).
+/// Overridable for a fleet whose SG shape differs: `HIVE_LISTENER_AUDIT_PORTS=lo-hi`.
 pub const DEFAULT_RANGE: (u16, u16) = (20000, 29999);
 
 const CMDLINE_CAP: usize = 200;
@@ -110,11 +104,10 @@ struct WildcardListen {
     family: &'static str,
 }
 
-/// Parse one `/proc/net/tcp` / `tcp6` table into its wildcard LISTEN rows.
-/// Row shape: `sl local_address rem_address st ... uid timeout inode`;
-/// `st == 0A` is LISTEN; the local address is `HEXIP:HEXPORT` with a 8-hex
-/// (v4) or 32-hex (v6) ip. A wildcard bind is an all-zero ip in either width
-/// (an IPv6 wildcard also accepts IPv4 unless `IPV6_V6ONLY`, so both count).
+/// Parses one `/proc/net/tcp` or `tcp6` table into its wildcard LISTEN rows. Row shape: `sl
+/// local_address rem_address st ... uid timeout inode`; `st == 0A` is LISTEN; the local address is
+/// `HEXIP:HEXPORT` with an 8-hex (v4) or 32-hex (v6) ip. A wildcard bind is an all-zero ip in
+/// either width (an IPv6 wildcard also accepts IPv4 unless `IPV6_V6ONLY`, so both count).
 fn parse_table(text: &str, family: &'static str) -> Vec<WildcardListen> {
     let mut out = Vec::new();
     for line in text.lines().skip(1) {
@@ -135,8 +128,6 @@ fn parse_table(text: &str, family: &'static str) -> Vec<WildcardListen> {
         let Ok(port) = u16::from_str_radix(port_hex, 16) else {
             continue;
         };
-        // Columns 5..=9 are tx/rx queue, tr/tm->when, retrnsmt, uid, timeout;
-        // the inode is the 10th field (index 9 after the first four).
         let inode = f.nth(5).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         out.push(WildcardListen {
             port,
@@ -169,9 +160,8 @@ fn socket_inodes_of(pid_dir: &str) -> HashSet<u64> {
     set
 }
 
-/// Resolve foreign inodes to their owning pids by walking `/proc/<pid>/fd`.
-/// Stops as soon as every wanted inode is found; a process that exits
-/// mid-walk simply stays unresolved (`pid: None`).
+/// Resolves foreign inodes to their owning pids by walking `/proc/<pid>/fd`. Stops as soon as every
+/// wanted inode is found; a process that exits mid-walk simply stays unresolved (`pid: None`).
 fn owners_of(wanted: &HashSet<u64>) -> HashMap<u64, u32> {
     let mut found = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -289,11 +279,10 @@ fn incident_title(node: &str, f: &ForeignListener) -> String {
     }
 }
 
-/// Re-assert ONE Major incident per (node, port, pid) on every pass while the
-/// listener stays open — the leader's incident store is what the ops dashboard
-/// and the follower sync read, so this runs only where `leader` is true; a
-/// follower's finding is its WARN line plus its own `/v1/host/listeners`. The
-/// observation lapses three passes after the listener is gone and the
+/// Re-asserts ONE Major incident per (node, port, pid) on every pass while the listener stays open.
+/// The leader's incident store is what the ops dashboard and the follower sync read, so this runs
+/// only where `leader` is true; a follower's finding is its WARN line plus its own
+/// `/v1/host/listeners`. The observation lapses three passes after the listener is gone and the
 /// incident resolves itself. Returns how many incidents this pass OPENED.
 fn raise_incidents(cloud: &Arc<CloudState>, report: &AuditReport) -> usize {
     use crate::incidents::{OpenReq, Severity};
@@ -334,11 +323,10 @@ fn raise_incidents(cloud: &Arc<CloudState>, report: &AuditReport) -> usize {
     opened
 }
 
-/// Every node, periodic. First pass ~30 s after boot (the raw proxy's own
-/// listeners are up by then, so they are correctly attributed to self), then
-/// every `HIVE_LISTENER_AUDIT_SECS` (default 300). `leader` is evaluated per
-/// pass so an incident is raised from whichever node currently owns the
-/// control plane.
+/// Every node, periodic. The first pass runs ~30 s after boot (the raw proxy's own listeners are up
+/// by then, so they are correctly attributed to self), then every `HIVE_LISTENER_AUDIT_SECS`
+/// (default 300). `leader` is evaluated per pass, so an incident is raised from whichever node
+/// currently owns the control plane.
 pub fn spawn(cloud: Arc<CloudState>, leader: impl Fn(&Arc<CloudState>) -> bool + Send + 'static) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(30)).await;

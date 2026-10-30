@@ -1,14 +1,5 @@
-//! Concurrency scaling limits, per Vercel's model
-//! (<https://vercel.com/docs/functions/concurrency-scaling>):
-//!
-//! * **Burst concurrency limit** — a sliding window cap of
-//!   `burst_per_window` concurrent executions per `window` (default 1000 / 10s),
-//!   **per region**. Exceeding it yields `503 FUNCTION_THROTTLED`.
-//! * **Max concurrency** — an absolute ceiling by plan (30k Hobby/Pro,
-//!   100k Enterprise).
-//!
-//! This is a region-wide admission gate that runs at the edge before a request
-//! is routed to a function instance.
+//! Region-wide admission gate at the edge: a sliding-window burst limit (`burst_limit` per
+//! `window_ms`, `503 FUNCTION_THROTTLED` when exceeded) under an absolute per-plan ceiling.
 
 use hive_core::now_ms;
 use parking_lot::Mutex;
@@ -60,7 +51,6 @@ impl ConcurrencyLimiter {
         ConcurrencyLimiter {
             region: region.into(),
             plan,
-            // Vercel: 1000 concurrent executions per 10 seconds, per region.
             burst_limit: 1000,
             window_ms: 10_000,
             admissions: Mutex::new(VecDeque::new()),
@@ -80,7 +70,6 @@ impl ConcurrencyLimiter {
     pub fn try_admit(&self) -> bool {
         let now = now_ms();
         let mut q = self.admissions.lock();
-        // Drop timestamps outside the window.
         while let Some(&front) = q.front() {
             if now.saturating_sub(front) >= self.window_ms {
                 q.pop_front();

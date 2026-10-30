@@ -1,37 +1,26 @@
-//! Gossip-round policy on top of [`crate::bounded_round`]: the round
-//! deadline, dead-target backoff, round telemetry, and whether the loop is
-//! still ending rounds at all.
+//! Gossip-round policy on top of [`crate::bounded_round`]: the round deadline, dead-target backoff,
+//! the per-target leash, round telemetry, and whether the loop is still ending rounds at all.
 //!
-//! The round used to be `join_all` over every target, so it lasted as long as
-//! its SLOWEST target. A powered-off seed (fc-bangkok, 2026-09-24) cost two
-//! full dial budgets per round — announce, then the mesh join — which
-//! stretched fc-virginia's round to 25-33 s. Every relayed `last_seen_ms` this
-//! observer holds is only as fresh as its round is short, so fc-sanjose
-//! (which fc-virginia could not dial, but three other nodes heard throughout)
-//! aged past `health::GOSSIP_ALIVE_MS` and was demoted 57 times.
+//! A round that waits on every target lasts as long as its SLOWEST one, and every relayed
+//! `last_seen_ms` this observer holds is only as fresh as its round is short: one dead seed
+//! stretches the round, ages the whole view past `health::GOSSIP_ALIVE_MS` and gets healthy peers
+//! demoted. Two mechanisms bound that.
 //!
-//! The round now ends at [`deadline`] (stragglers run on, see
-//! `bounded_round`). A target with no evidence of life for [`DEAD_AFTER_MS`]
-//! is dialed on a 1 -> 3 min backoff instead of every round — but only while
-//! this node's OWN view is fresh (some target answered within
-//! [`VIEW_FRESH_MS`]): a node that reaches nobody sees every target as silent,
-//! and it must keep dialing every one of them, seeds above all, every round.
-//!
-//! Ending at a deadline is not enough on its own. A target's own dial budget
-//! (`hive_p2p::dial_fallback_ceiling`, 14 s on the fleet) is LONGER than the
-//! round deadline, so one target that never answers still held every round to
-//! the full 8 s — measured fleet-wide as `collect_p50=8000` with a deadline
-//! hit on 45 of 47 rounds. The dead-target backoff above cannot help there:
-//! [`Rounds::admit`] deliberately never backs off a target another node still
-//! gossips about, and the undialable ones (behind NAT, reached only through a
-//! relay) are exactly the ones whose relayed `last_seen_ms` stays fresh.
-//! So the round also gets a per-target LEASH: after
-//! [`LEASH_AFTER_ROUNDS`] consecutive missed deadlines a target is dialed
-//! exactly as often as before, but the round waits only
-//! [`straggler_leash_ms`] for it (see `bounded_round::collect_leashed`).
-//! Parking is never cancellation, never a skip, and never a withdrawal: the
-//! sync keeps running, its result still lands (one round late at worst), and
-//! one answer inside the round restores the full deadline immediately.
+//! * **Deadline and backoff.** The round ends at [`deadline`] (stragglers run on, see
+//! `bounded_round`). A target with no evidence of life for [`DEAD_AFTER_MS`] is dialed on a 1 -> 3
+//! min backoff instead of every round, but only while this node's OWN view is fresh (some target
+//! answered within [`VIEW_FRESH_MS`]): a node that reaches nobody sees every target as silent and
+//! must keep dialing all of them, seeds above all, every round.
+//! * **Leash.** A deadline is not enough on its own: a target's own dial budget
+//! (`hive_p2p::dial_fallback_ceiling`, longer than the round deadline on the fleet) lets one target
+//! that never answers hold every round to the full deadline, and the backoff cannot help because
+//! [`Rounds::admit`] never backs off a target another node still gossips about (the undialable
+//! ones, reached only through a relay, are exactly those). After [`LEASH_AFTER_ROUNDS`] consecutive
+//! missed deadlines a target is dialed exactly as often as before, but the round waits only
+//! [`straggler_leash_ms`] for it (see `bounded_round::collect_leashed`). Parking is never
+//! cancellation, never a skip and never a withdrawal: the sync keeps running, its result still
+//! lands (one round late at worst), and one answer inside the round restores the full deadline
+//! immediately.
 
 use hive_core::now_ms;
 use std::collections::{HashMap, HashSet};
@@ -44,19 +33,17 @@ pub const ROUND_SLEEP: Duration = Duration::from_secs(5);
 /// A target with no evidence of life (no successful sync by us AND no gossip
 /// of it in our registry) for this long is dead: dialed on backoff only.
 pub const DEAD_AFTER_MS: u64 = 600_000;
-/// This node's own view is fresh while some target answered within this long
-/// (four-plus round periods). Outside it no target counts as dead: the
-/// silence is this node's, not theirs.
+/// This node's own view is fresh while some target answered within this long (four-plus round
+/// periods); outside it no target counts as dead, since the silence is this node's.
 pub const VIEW_FRESH_MS: u64 = 60_000;
 const BACKOFF_FIRST_MS: u64 = 60_000;
 /// Inside the mesh's three-minute bound on anything being undialable (the
 /// PeerPool caps): 60 s, 120 s, then 180 s.
 const BACKOFF_MAX_MS: u64 = 180_000;
-/// Consecutive rounds in which a target was dispatched and did NOT report
-/// before the round ended, after which the round stops giving it the full
-/// deadline ([`straggler_leash_ms`] instead). Two, never one: "one stale
-/// reading never withdraws one" — a single slow round is a network event, a
-/// second one in a row is a target that is not answering.
+/// Consecutive rounds in which a target was dispatched and did NOT report before the round ended,
+/// after which the round stops giving it the full deadline ([`straggler_leash_ms`] instead). Two,
+/// never one: a single slow round is a network event, a second in a row is a target that is not
+/// answering.
 const LEASH_AFTER_ROUNDS: u32 = 2;
 /// Round percentiles are logged (and the margin checked) this often.
 const LOG_EVERY_MS: u64 = 600_000;
@@ -89,12 +76,11 @@ pub fn deadline() -> Duration {
     Duration::from_millis(ms)
 }
 
-/// `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (default 2500): how long a round waits
-/// for one target that has already missed the round deadline
-/// [`LEASH_AFTER_ROUNDS`] times running. Comfortably above a healthy gossip
-/// sync (a two-request exchange over a warm trunk, measured 70-550 ms per
-/// request fleet-wide) and far below the 8 s deadline, so it parks targets
-/// that are not answering without ever parking one that is.
+/// `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (default 2500): how long a round waits for one target that has
+/// already missed the round deadline [`LEASH_AFTER_ROUNDS`] times running. Above a healthy gossip
+/// sync (a two-request exchange over a warm trunk, measured 70-550 ms per request fleet-wide) and
+/// far below the 8 s deadline, so it parks targets that are not answering without ever parking one
+/// that is.
 pub fn straggler_leash_ms() -> u64 {
     std::env::var("HIVE_GOSSIP_STRAGGLER_LEASH_MS")
         .ok()
@@ -115,10 +101,10 @@ fn stall_after_ms() -> u64 {
     ((deadline() + ROUND_SLEEP).as_millis() as u64).saturating_mul(4)
 }
 
-/// Has the gossip loop stopped ending rounds? True before the loop starts,
-/// and when no round has ended for four worst-case round periods (a
-/// whole-runtime freeze, a dead loop). This node's registry is not refreshed
-/// then, so every peer looks stale from it — see `health::stale_long_enough`.
+/// Has the gossip loop stopped ending rounds? True before the loop starts and when no round has
+/// ended for four worst-case round periods (a whole-runtime freeze, a dead loop): this node's
+/// registry is not refreshed then, so every peer looks stale from it (see
+/// `health::stale_long_enough`).
 pub fn stalled() -> bool {
     let last = LAST_ROUND_MONO_MS.load(Ordering::Relaxed);
     last == 0 || mono_ms().saturating_sub(last) > stall_after_ms()
@@ -147,18 +133,17 @@ fn endpoint_key(target: &str) -> &str {
 /// Loop-owned round state (single writer: the gossip loop).
 pub struct Rounds {
     targets: HashMap<String, TargetState>,
-    /// Per ENDPOINT, consecutive rounds in which it was dispatched and did not
-    /// report before the round ended, plus the epoch-ms it was last counted.
-    /// At [`LEASH_AFTER_ROUNDS`] the round stops giving that endpoint the full
-    /// deadline; a single report inside a round clears it.
+    /// Per ENDPOINT, consecutive rounds in which it was dispatched and did not report before the
+    /// round ended, plus the epoch-ms it was last counted. At [`LEASH_AFTER_ROUNDS`] the round
+    /// stops giving that endpoint the full deadline; a single report inside a round clears it.
+    /// Entries not counted for [`DEAD_AFTER_MS`] are forgotten in `round_done`, so a node that
+    /// leaves the fleet leaves no leash state behind.
     ///
-    /// Keyed by ENDPOINT ID, never by the target's label: `seed:<64hex>` and
-    /// the bare `<64hex>` roster entry are two labels for ONE endpoint (both
-    /// are dialed every round), and a relayed registry entry that blinks for a
-    /// round drops its label from the candidate set entirely — keyed on the
-    /// label, the count restarted on both, so an endpoint that never answers
-    /// re-bought the full deadline every few rounds (measured: 6 re-acquires
-    /// of one target in 25 min on fc-virginia-3).
+    /// Keyed by ENDPOINT ID, never by the target's label: `seed:<64hex>` and the bare `<64hex>`
+    /// roster entry are two labels for ONE endpoint (both are dialed every round), and a relayed
+    /// registry entry that blinks for a round drops its label from the candidate set. Keyed on the
+    /// label, the count restarted on both, and an endpoint that never answers re-bought the full
+    /// deadline every few rounds.
     slow: HashMap<String, (u32, u64)>,
     /// Epoch-ms some target last answered (0 = none yet).
     last_reached_ms: u64,
@@ -242,10 +227,9 @@ impl Rounds {
         self.window_in_flight_skips += 1;
     }
 
-    /// Is `target` dispatched this round? `heard_ms` is the registry's
-    /// gossiped `last_seen_ms` for it (0 = unknown): a target some other node
-    /// still hears is never backed off, however long OUR dials to it have
-    /// failed — that is a transport fault worth retrying every round.
+    /// Is `target` dispatched this round? `heard_ms` is the registry's gossiped `last_seen_ms` for
+    /// it (0 = unknown): a target some other node still hears is never backed off, however long OUR
+    /// dials to it have failed, since that is a transport fault worth retrying every round.
     pub fn admit(&mut self, target: &str, heard_ms: u64, now: u64) -> bool {
         let view_fresh = self.view_fresh(now);
         let st = self
@@ -267,14 +251,11 @@ impl Rounds {
         true
     }
 
-    /// How long the round waits for `target` this round: `None` = the round
-    /// deadline is the only bound, `Some(ms)` = a leash, measured by
-    /// `bounded_round` from the moment the target was dispatched.
-    ///
-    /// Leashed only after [`LEASH_AFTER_ROUNDS`] consecutive missed deadlines
-    /// AND only while this node's own view is fresh — while it reaches nobody,
-    /// the silence is this node's, and shortening its waits would only make a
-    /// local transport fault look like every peer being slow.
+    /// How long the round waits for `target`: `None` = the round deadline is the only bound,
+    /// `Some(ms)` = a leash, measured by `bounded_round` from the moment the target was dispatched.
+    /// Leashed only after [`LEASH_AFTER_ROUNDS`] consecutive missed deadlines AND only while this
+    /// node's own view is fresh: while it reaches nobody the silence is this node's, and shortening
+    /// its waits would only make a local transport fault look like every peer being slow.
     pub fn leash_ms(&self, target: &str, now: u64) -> Option<u64> {
         let missed = self
             .slow
@@ -288,9 +269,9 @@ impl Rounds {
         (ms > 0).then_some(ms)
     }
 
-    /// `target` was dispatched this round and had not reported when the round
-    /// ended. Two of those in a row and the round stops waiting the full
-    /// deadline for that endpoint — it is still dialed every single round.
+    /// `target` was dispatched this round and had not reported when the round ended. Two of those
+    /// in a row and the round stops waiting the full deadline for that endpoint; it is still dialed
+    /// every single round.
     pub fn note_straggler(&mut self, target: &str, now: u64) {
         let e = self.slow.entry(endpoint_key(target).to_string()).or_insert((0, now));
         if e.0 >= LEASH_AFTER_ROUNDS {
@@ -310,10 +291,11 @@ impl Rounds {
         }
     }
 
-    /// A dispatched target's sync ended (`reached` = the peer answered, as
-    /// `identity` when its roster named itself). `timely` = it reported inside
-    /// the round it was dispatched in; a result that landed late still counts
-    /// as a missed round, since the round had to end without it.
+    /// A dispatched target's sync ended (`reached` = the peer answered, as `identity` when its
+    /// roster named itself). `timely` = it reported inside the round it was dispatched in; a result
+    /// that landed late still counts as a missed round, since the round had to end without it. The
+    /// first answer after a stretch in which this node reached nobody clears every dead-target
+    /// backoff: our own transport works again, so no earlier backoff was evidence about its target.
     pub fn finished(
         &mut self,
         target: &str,
@@ -324,8 +306,6 @@ impl Rounds {
     ) {
         if reached {
             if !self.view_fresh(now) {
-                // The first answer after a blind stretch: our own transport
-                // works again, so no earlier backoff is evidence of anything.
                 let mut cleared = 0usize;
                 for st in self.targets.values_mut().filter(|st| st.backoff_ms > 0) {
                     st.backoff_ms = 0;
@@ -396,12 +376,11 @@ impl Rounds {
         }
     }
 
-    /// A round ended: `collect_ms` is its collect phase (None when it
-    /// dispatched nothing) and `stragglers` its targets still syncing.
-    /// Forgets targets that left the candidate set (never one still in
-    /// flight) and, every LOG_EVERY_MS, logs the percentiles and checks the
-    /// freshness margin. Returns true when the previous round ended more than
-    /// four round periods ago — the loop is resuming from a stall.
+    /// A round ended: `collect_ms` is its collect phase (`None` when it dispatched nothing) and
+    /// `stragglers` its targets still syncing. Forgets targets that left the candidate set (never
+    /// one still in flight) and, every `LOG_EVERY_MS`, logs the percentiles and checks the
+    /// freshness margin. Returns true when the previous round ended more than four round periods
+    /// ago, i.e. the loop is resuming from a stall.
     pub fn round_done(
         &mut self,
         candidates: &[String],
@@ -433,13 +412,8 @@ impl Rounds {
             .filter(|st| st.backoff_ms > 0 && Self::dead(st, now, view_fresh))
             .count();
         BACKED_OFF.store(backed_off as u64, Ordering::Relaxed);
-        // Forget endpoints this loop has not had to wait for in DEAD_AFTER_MS:
-        // the map is one entry per endpoint ever dialed, so a node that leaves
-        // the fleet must not leave leash state behind forever.
         self.slow
             .retain(|_, (_, seen)| now.saturating_sub(*seen) < DEAD_AFTER_MS);
-        // Only counted as leashed while this node's own view is fresh: outside
-        // it the leash is held back too (`leash_ms`) and nothing is parked.
         let leashed = if view_fresh {
             self.slow
                 .values()
@@ -490,10 +464,6 @@ impl Rounds {
             leash_ms = straggler_leash_ms(),
             "gossip rounds (last 10 min)"
         );
-        // The round period is start to start (collect + post-round work +
-        // ROUND_SLEEP) — the interval that actually ages a relayed
-        // `last_seen_ms` — and the prober's term is its bounded round period,
-        // not the bare HIVE_HEALTH_INTERVAL.
         let probe_ms = crate::health::probe_period_bound().as_millis() as u64;
         let needed = p99.saturating_mul(2).saturating_add(probe_ms);
         if crate::health::GOSSIP_ALIVE_MS < needed {

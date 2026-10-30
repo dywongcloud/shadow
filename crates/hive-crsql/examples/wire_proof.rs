@@ -1,24 +1,13 @@
-//! Live, no-mocks wire-format witness for the ten-column `crsql_changes`
-//! v0.17 format: the NATIVE half of a two-runtime sync round trip whose other
-//! peer is the real browser crsqlite wasm build (vendor/cr-sqlite compiled to
-//! wasm32-unknown-emscripten via wa-sqlite tooling) running under Node.
-//!
-//! Orchestrated by crates/hive-browser/www/sqlite/prove-wire.sh:
-//!   wire_proof export-a <db-path> <a.json>        -- peer A local write + dump
-//!   wire_proof apply-final <db-path> <b.json> <a-final.json>
-//! The wasm peer B exports b.json and applies a.json; this side applies b.json;
-//! the compare step then requires the changes that crossed the wire to arrive
-//! byte-identical in ALL ten columns (table, pk, cid, val, col_version,
-//! db_version, site_id, cl, seq, ts) and both peers to converge on the same
-//! row set. Not a test file (see AGENTS.md) -- a real, one-off executable
-//! proof, same category as this repo's other `examples/*.rs`.
+//! Live, no-mocks wire-format witness for the ten-column `crsql_changes` v0.17 format: the NATIVE
+//! half of a two-runtime sync round trip whose other peer is the browser crsqlite wasm build under
+//! Node, orchestrated by `crates/hive-browser/www/sqlite/prove-wire.sh` (`export-a`, `apply-final`,
+//! `export-hcb1`, `apply-hcb1`); the changes that cross the wire must arrive byte-identical.
 
 use anyhow::Context;
 use hive_crsql::Change;
 
-/// Tagged JSON shape for the `val` ANY column -- the exact same shape the
-/// Node side (`wire-proof-node.mjs`) emits and consumes, so a byte-level
-/// JSON comparison of a change that crossed the wire is meaningful.
+/// Tagged JSON shape for the `val` ANY column — the exact shape the Node side
+/// (`wire-proof-node.mjs`) emits and consumes, so a byte-level comparison is meaningful.
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct WireFile {
@@ -111,10 +100,6 @@ fn from_wire(w: &WireChange) -> anyhow::Result<Change> {
 }
 
 fn dump(conn: &rusqlite::Connection) -> anyhow::Result<WireFile> {
-    // Full-state dump expressed through the per-site seam: every origin site
-    // this peer has durable progress for (ascending by site id), each with a
-    // single unbounded export batch. Deterministic ordering, so the JSON is
-    // byte-stable for identical state.
     let mut changes: Vec<Change> = Vec::new();
     for (site, _) in hive_crsql::known_sites(conn)? {
         for batch in hive_crsql::changes_since_site(conn, &site, 0, usize::MAX)? {
@@ -139,8 +124,6 @@ fn dump(conn: &rusqlite::Connection) -> anyhow::Result<WireFile> {
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
-        // Peer A: fresh file-backed db, one CRR, one local write carrying A's
-        // transaction ts; dump everything A would send on the wire.
         Some("export-a") => {
             let db = args.get(2).context("usage: export-a <db> <out.json>")?;
             let out = args.get(3).context("usage: export-a <db> <out.json>")?;
@@ -161,8 +144,6 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        // Peer A, second act: apply the wasm peer B's exported changes, then
-        // dump A's full post-merge state for the compare step.
         Some("apply-final") => {
             let db = args
                 .get(2)
@@ -181,11 +162,6 @@ fn main() -> anyhow::Result<()> {
                 .iter()
                 .map(from_wire)
                 .collect::<anyhow::Result<_>>()?;
-            // Group the peer's dump into one batch per ORIGIN site (the dump
-            // carries both the peer's own writes and ours echoed back), each
-            // chained from 0: our own site comes back as a Replay no-op --
-            // replay idempotency on the live wasm path -- and the peer's
-            // site applies new.
             let mut by_site: std::collections::BTreeMap<Vec<u8>, Vec<Change>> =
                 std::collections::BTreeMap::new();
             for c in changes {
@@ -216,11 +192,6 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
-        // HCB1 canonical-frame proof (bn-browser-fleet-crr-exchange): export
-        // every batch this db would send, ENCODED, one hex line per batch.
-        // The JS side (hcb1-proof-node.mjs) decodes+re-encodes each line and
-        // the two files must compare byte-identical — the JS HCB1
-        // implementation against the Rust one on real exports.
         Some("export-hcb1") => {
             let db = args.get(2).context("usage: export-hcb1 <db> <out.hex>")?;
             let out = args.get(3).context("usage: export-hcb1 <db> <out.hex>")?;
@@ -243,9 +214,6 @@ fn main() -> anyhow::Result<()> {
             println!("export-hcb1: {total} batch(es) encoded");
             Ok(())
         }
-        // The fleet-side consume half of that proof: decode each JS-encoded
-        // hex line with the REAL `ChangeBatch::decode`, re-encode for the
-        // byte-compare, and apply the batches to this db for real.
         Some("apply-hcb1") => {
             let db = args
                 .get(2)
@@ -257,9 +225,6 @@ fn main() -> anyhow::Result<()> {
                 .get(4)
                 .context("usage: apply-hcb1 <db> <in.hex> <reencoded.hex>")?;
             let conn = hive_crsql::open(db)?;
-            // The receiving replica needs the same schema the export came
-            // from (cr-sqlite v0.17 does not replicate schema inside
-            // crsql_changes; the exchange carries it in the spec).
             conn.execute_batch(
                 "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY NOT NULL, label TEXT);",
             )?;

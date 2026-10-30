@@ -1052,6 +1052,32 @@ impl GuardianDBDocumentStore {
         let opts = opts.unwrap_or_default();
 
         let has_multiple_terms = key.contains(' ');
+
+        // FAST PATH: a plain exact-match lookup. The loop below scans the whole
+        // key set — and `key_set()` CLONES every key in the namespace (~38,734
+        // on fc-sanjose) — so one `get` costs O(N) allocations before it
+        // compares anything. `GuardianRelationalStorage::fetch_wrapped` calls
+        // this once per cold row, so a scan of a large table was O(rows x keys)
+        // and blew the 10 s statement budget with no progress across retries.
+        // With default options the scan is an exact string equality test, so a
+        // direct lookup is identical; anything else falls through unchanged.
+        if !has_multiple_terms
+            && !opts.case_insensitive
+            && !opts.partial_matches
+        {
+            if let Some(value_bytes) = self.get_value_lazy(key).await {
+                let doc: Document = serde_json::from_slice(&value_bytes).map_err(|e| {
+                    GuardianError::Serialization(format!(
+                        "Unable to deserialize the value for key {}: {}",
+                        key, e
+                    ))
+                })?;
+                return Ok(vec![doc]);
+            }
+            // Nothing cached under this exact key: fall through to the scan so
+            // hash-only/partial/remote behaviour is exactly as before.
+        }
+
         let mut key_for_search = key.to_string();
 
         if has_multiple_terms {

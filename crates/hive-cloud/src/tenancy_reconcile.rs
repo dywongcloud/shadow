@@ -1,29 +1,30 @@
-//! Project-tenancy REPAIR loop — the restore half of the disappearing-projects
-//! fix.
+//! Project-tenancy REPAIR loop: the restore half of the disappearing-projects fix.
 //!
-//! The prevention half (the scoped relocation reaper, the merge+tombstone
-//! projects store, the sticky tenant stamp) stops NEW losses of the node-local
-//! team tag, but a tag already destroyed before those landed stays destroyed:
-//! the project's deployments keep serving while every tenant-scoped listing on
-//! the affected node fail-closed-hides them — witnessed repeatedly as "the
-//! Minecraft server vanished from my account" / "projects missing from the
-//! thoth division". Reinserting rows by hand fixes one node once; this loop
-//! makes the repair automatic, continuous, and fleet-wide.
+//! The prevention half (the scoped relocation reaper, the merge+tombstone projects store, the
+//! sticky tenant stamp) stops NEW losses of the node-local team tag, but a tag already destroyed
+//! stays destroyed: the project's deployments keep serving while every tenant-scoped listing on the
+//! affected node fail-closed-hides them. Reinserting rows by hand fixes one node once; this loop
+//! makes the repair automatic, continuous and fleet-wide.
 //!
-//! REPAIR-ONLY, by construction: it writes a team tag ONLY where the local row
-//! is currently untagged, from two surviving sources of truth — never untags,
-//! never overwrites an existing tag, never deletes anything (an index/settings
-//! disagreement must never destroy canonical data; deleting because an index
-//! disagrees is the exact anti-pattern that caused the losses).
+//! REPAIR-ONLY, by construction: it writes a team tag ONLY where the local row is currently
+//! untagged, from two surviving sources of truth, and never untags, never overwrites an existing
+//! tag and never deletes anything (an index/settings disagreement must never destroy canonical
+//! data; deleting because an index disagrees is the exact anti-pattern that caused the losses).
 //!
 //! Sources, in precedence order:
-//!  1. The relational `project_teams` replica (GuardianDB, replicated to every
-//!     node) — written on every `set_team`, and the only source that still
-//!     knows a project with ZERO live deployment records (a stopped game
-//!     server between sessions).
-//!  2. The newest TAGGED deployment record, local or gossiped
-//!     (`peer_deployments`) — covers a project actively serving somewhere even
-//!     if the relational replica is cold on this node.
+//! 1. The relational `project_teams` replica (GuardianDB, replicated to every node): written on
+//! every `set_team`, and the only source that still knows a project with ZERO live deployment
+//! records (a stopped game server between sessions);
+//! 2. The newest TAGGED deployment record, local or gossiped (`peer_deployments`): covers a project
+//! actively serving somewhere even if the relational replica is cold on this node.
+//!
+//! The other direction, [`retag_deployments_to_rows`]: once a project row carries a REAL tag it is the
+//! owner of record, so the deployments THIS node hosts follow it. A project transferred to another
+//! team re-tags the deployments of the node that served the transfer at once
+//! (`Gateway::retag_project`); every other host converges here as the row reaches it, within
+//! `HIVE_DEPLOYMENT_RETAG_SECS` (15), so the old team's tenant-scoped views stop listing the project
+//! everywhere (`HIVE_DEPLOYMENT_RETAG=0` disables). Until a host has converged its deployment tags
+//! are only a stale copy: every access gate asks the row first (`admin::row_holder`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,12 +39,28 @@ fn interval_secs() -> u64 {
         .unwrap_or(300)
 }
 
+fn retag_interval_secs() -> u64 {
+    std::env::var("HIVE_DEPLOYMENT_RETAG_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(15)
+}
+
 /// One repair pass. Returns how many project rows were repaired.
+///
+/// The desired (project -> team) map starts from the newest tagged deployment record of each
+/// project, and the relational replica then OVERWRITES on collision: `set_team` writes it on every
+/// explicit ownership change, so it carries operator intent, while a record's tag stamps whatever
+/// was believed at deploy time. A tombstoned project is DELETED, not untagged, and is never
+/// repaired: its relational `project_teams` row can outlive the delete (the `deleted_ms` write
+/// rides guardian replication, which lags or fails behind the projects store_sync that already
+/// carried the tombstone), and repairing it through the touch-stamping setter would RESURRECT it
+/// with `updated_ms = tombstone + 1`, a row the merge then keeps forever as a post-delete
+/// recreation and re-gossips fleet-wide; a genuine recreation returns with its own tagged row and
+/// never reaches this guard. A row that already carries a tag is NEVER overwritten, even on
+/// disagreement.
 pub async fn reconcile_once(cloud: &Arc<CloudState>) -> usize {
-    // Desired (project -> team) from the two surviving sources. Records first,
-    // then the relational replica OVERWRITES on collision — set_team writes it
-    // on every explicit ownership change, so it carries operator intent, while
-    // a record's tag is a stamp of whatever was believed at deploy time.
     let mut desired: HashMap<String, String> = HashMap::new();
     let tagged = |t: &str| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT;
 
@@ -81,24 +98,12 @@ pub async fn reconcile_once(cloud: &Arc<CloudState>) -> usize {
 
     let mut repaired = 0usize;
     for (project, team) in desired {
-        // A tombstoned project is DELETED, not untagged: the relational
-        // `project_teams` row can outlive the delete (its `deleted_ms` write
-        // rides guardian replication, which lags or fails behind the projects
-        // store_sync that already carried the tombstone here). Repairing such
-        // a project via the touch-stamping setter RESURRECTS it with
-        // `updated_ms = tombstone+1` — a row the merge then keeps forever as a
-        // post-delete "recreation" and re-gossips fleet-wide, which is exactly
-        // how a deleted project reappeared in listings minutes after its
-        // delete (witnessed live on `meinkampf`, 2026-08-21: rows re-stamped
-        // 1-4 min after the tombstone on three nodes). Never repair what was
-        // deliberately deleted; a genuine recreation returns with its own
-        // tagged row and never reaches this guard.
         if cloud.projects.tombstone_of(&project).is_some() {
             continue;
         }
         let own = cloud.projects.team_of(&project);
         if tagged(&own) {
-            continue; // already tagged — NEVER overwritten, even on disagreement
+            continue;
         }
         cloud.projects.set_team(&project, &team);
         repaired += 1;
@@ -115,18 +120,77 @@ pub async fn reconcile_once(cloud: &Arc<CloudState>) -> usize {
     repaired
 }
 
-/// Every node, periodic. First pass runs ~60s after boot so gossip and the
-/// GuardianDB replica have warmed; then every `HIVE_TENANCY_RECONCILE_SECS`
-/// (default 300).
+/// Re-tags the deployments THIS node hosts to the tenant their project row names, for every project
+/// whose row carries a real tag and disagrees: the row is the owner of record (it is what access
+/// checks, the preview gate and a transfer all use), the deployment tag a denormalized copy that a
+/// transfer must move. Never touches a row, never a project without a real-tagged row (a deleted
+/// project has none; a recreated one has its own). Returns how many deployments changed.
+pub fn retag_deployments_to_rows(cloud: &Arc<CloudState>) -> usize {
+    if std::env::var("HIVE_DEPLOYMENT_RETAG").is_ok_and(|v| v.trim() == "0") {
+        return 0;
+    }
+    let mut tenants_of: HashMap<String, Vec<String>> = HashMap::new();
+    for d in cloud.gw.list() {
+        tenants_of
+            .entry(d.project.clone())
+            .or_default()
+            .push(d.tenant.clone());
+    }
+    let mut retagged = 0usize;
+    for (project, tenants) in tenants_of {
+        let Some(owner) = crate::admin::row_holder(cloud, &project) else {
+            continue;
+        };
+        if tenants
+            .iter()
+            .all(|tenant| crate::admin::record_tenant(tenant) == owner)
+        {
+            continue;
+        }
+        let changed = cloud.gw.retag_project(&project, &owner);
+        if changed > 0 {
+            tracing::warn!(
+                project,
+                team = %owner,
+                changed,
+                "tenancy reconcile: re-tagged deployments to their project's team (the project was transferred)"
+            );
+            retagged += changed;
+        }
+    }
+    if retagged > 0 {
+        crate::persist::persist(cloud);
+    }
+    retagged
+}
+
+/// Every node, periodic. The first pass runs ~60 s after boot so gossip and the GuardianDB replica
+/// have warmed; then the tag repair every `HIVE_TENANCY_RECONCILE_SECS` (default 300) and, on its own
+/// short cadence because it reads only local state, the deployments' re-tag every
+/// `HIVE_DEPLOYMENT_RETAG_SECS` (default 15).
 pub fn spawn(cloud: Arc<CloudState>) {
+    let repair_cloud = cloud.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            let n = reconcile_once(&cloud).await;
+            let n = reconcile_once(&repair_cloud).await;
             if n > 0 {
                 tracing::info!(repaired = n, "tenancy reconcile: pass complete");
             }
             tokio::time::sleep(Duration::from_secs(interval_secs())).await;
+        }
+    });
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        loop {
+            let moved = retag_deployments_to_rows(&cloud);
+            if moved > 0 {
+                tracing::info!(
+                    retagged = moved,
+                    "tenancy reconcile: deployments follow their project rows"
+                );
+            }
+            tokio::time::sleep(Duration::from_secs(retag_interval_secs())).await;
         }
     });
 }

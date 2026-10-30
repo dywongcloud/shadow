@@ -89,11 +89,8 @@ pub(crate) async fn read(
         .map_err(|_| ReadError::Unavailable)?
 }
 
-/// Whether `relative` names a real file under `static_dir`, without reading its
-/// bytes — the same `openat2`/`RESOLVE_BENEATH` security boundary as [`read`],
-/// used to let a rewrite rule (typically a SPA's catch-all `/(.*) -> /index.html`)
-/// skip itself for a path that is actually a real static asset (e.g.
-/// `/release.json`), matching Vercel's own `"handle": "filesystem"` semantics.
+/// Whether `relative` names a real file under `static_dir` without reading it — the same
+/// `openat2`/`RESOLVE_BENEATH` boundary as [`read`], so a SPA catch-all rewrite can skip a real asset.
 pub(crate) async fn exists(root: &StaticRoot, static_dir: &Path, relative: &Path) -> bool {
     let root = root.clone();
     let static_dir = static_dir.to_owned();
@@ -110,9 +107,8 @@ fn exists_blocking(root: &StaticRoot, static_dir: &Path, relative: &Path) -> boo
     metadata_retry(&file).map(|m| m.is_file()).unwrap_or(false)
 }
 
-/// Read a precompressed sibling, then prove the source still names the exact
-/// generation whose bytes were selected. Only a missing sidecar is a benign
-/// cache miss; a forbidden or unavailable sidecar fails closed.
+/// Read a precompressed sibling, then prove the source still names the generation whose bytes were
+/// selected; only a missing sidecar is a benign miss.
 pub(crate) async fn read_variant(
     root: &StaticRoot,
     static_dir: &Path,
@@ -219,9 +215,6 @@ fn classify(error: io::Error, opened: bool) -> ReadError {
     {
         return ReadError::Forbidden;
     }
-    // openat2 is the security boundary on Linux. Falling back after ENOSYS would
-    // silently discard RESOLVE_BENEATH/NO_MAGICLINKS, so unsupported kernels are
-    // unavailable rather than less protected.
     ReadError::Unavailable
 }
 

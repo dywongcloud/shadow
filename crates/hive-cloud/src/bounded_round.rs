@@ -1,25 +1,20 @@
 //! A periodic fan-out round that never lasts as long as its slowest target.
 //!
-//! `join_all` over every target made each round as long as its SLOWEST
-//! target: one powered-off seed's dial budget stretched fc-virginia's gossip
-//! round to 25-33 s (2026-09-24), and one failing peer's two fallback-ceiling
-//! probe samples stretched every health-probe round to ~33 s. A
-//! [`BoundedRound`] runs each target in its own task and waits for THIS
-//! round's targets only until a deadline. A target still running then is a
-//! straggler: it keeps running under its in-flight flag (never dispatched
-//! twice at once) and its result lands in whichever later round receives it
-//! ([`BoundedRound::begin`] drains those first). Each task reports through a
-//! [`Completion`] drop guard, so a task that panics or is dropped still clears
-//! its flag. The gossip loop and the health prober both run on it.
+//! `join_all` over every target makes a round as long as its SLOWEST target: one powered-off seed's
+//! dial budget stretched the gossip round, and one failing peer's two fallback-ceiling probe
+//! samples stretched every health-probe round. A [`BoundedRound`] runs each target in its own task
+//! and waits for THIS round's targets only until a deadline. A target still running then is a
+//! straggler: it keeps running under its in-flight flag (never dispatched twice at once) and its
+//! result lands in whichever later round receives it ([`BoundedRound::begin`] drains those first).
+//! Each task reports through a [`Completion`] drop guard, so a task that panics or is dropped still
+//! clears its flag. The gossip loop and the health prober both run on it.
 //!
-//! The deadline alone still let ONE target set the pace of every round: the
-//! round waited the full 8 s whenever any target was slower than it, even
-//! after that target had missed the deadline on every round for hours
-//! (fleet-wide: `collect_p50=8000`, `deadline_hits` on 45 of 47 rounds).
-//! [`BoundedRound::collect_leashed`] adds a per-target leash: the round stops
-//! waiting for one target after its own, much shorter budget. Parking is NOT
-//! cancellation — the task keeps running and its result still lands — so a
-//! leash can never cost a peer its dial budget or its discovery fallback.
+//! The deadline alone still let ONE target set the pace of every round: the round waited the full
+//! deadline whenever any target was slower than it, even after that target had missed it on every
+//! round for hours. [`BoundedRound::collect_leashed`] adds a per-target leash: the round stops
+//! waiting for one target after its own, much shorter budget. Parking is NOT cancellation (the task
+//! keeps running and its result still lands), so a leash can never cost a peer its dial budget or
+//! its discovery fallback.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -29,10 +24,9 @@ use tokio::time::{Duration, Instant};
 /// One target's result: (round it was dispatched in, target key, value).
 pub type Landed<T> = (u64, String, T);
 
-/// Sends a target's result to its round exactly once — on
-/// [`Completion::finish`], or with `T::default()` when the task is dropped or
-/// panics first. Without it a panicking task would leave its target's
-/// in-flight flag set forever and the target never dispatched again.
+/// Sends a target's result to its round exactly once: on [`Completion::finish`], or with
+/// `T::default()` when the task is dropped or panics first. Without it a panicking task would leave
+/// its target's in-flight flag set forever and the target would never be dispatched again.
 pub struct Completion<T: Default + Send + 'static> {
     tx: UnboundedSender<Landed<T>>,
     round: u64,
@@ -73,9 +67,9 @@ pub struct BoundedRound<T: Default + Send + 'static> {
     tx: UnboundedSender<Landed<T>>,
     rx: UnboundedReceiver<Landed<T>>,
     in_flight: HashSet<String>,
-    /// Targets dispatched in the current round that have not reported yet,
-    /// mapped to the instant they were dispatched (a per-target leash is
-    /// measured from there, not from the start of the round).
+    /// Targets dispatched in the current round that have not reported yet, mapped to the instant
+    /// they were dispatched (a per-target leash is measured from there, not from the start of the
+    /// round).
     dispatched: HashMap<String, Instant>,
     round: u64,
 }
@@ -98,10 +92,9 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
         }
     }
 
-    /// Start the next round. Returns the stragglers of earlier rounds that
-    /// landed since the last [`collect`](Self::collect), their flags already
-    /// cleared so they are dispatched again this round. Every returned item
-    /// carries a round number BELOW the new one, i.e. it reported late.
+    /// Starts the next round. Returns the stragglers of earlier rounds that landed since the last
+    /// [`collect`](Self::collect), their flags already cleared so they are dispatched again this
+    /// round. Every returned item carries a round number BELOW the new one, i.e. it reported late.
     pub fn begin(&mut self) -> Vec<Landed<T>> {
         self.round += 1;
         self.dispatched.clear();
@@ -144,29 +137,30 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
         true
     }
 
-    /// Wait until every target dispatched THIS round has reported, or until
-    /// `deadline` — no per-target leash (every target may hold the round to
-    /// the full deadline). See [`collect_leashed`](Self::collect_leashed).
+    /// Waits until every target dispatched THIS round has reported, or until `deadline`, with no
+    /// per-target leash (every target may hold the round to the full deadline). See
+    /// [`collect_leashed`](Self::collect_leashed).
     pub async fn collect(&mut self, deadline: Instant) -> (Vec<Landed<T>>, usize) {
         self.collect_leashed(deadline, |_| None).await
     }
 
     /// [`collect`](Self::collect), with a per-target leash.
     ///
-    /// `leash_ms(key)` returns how long THIS round waits for `key`, measured
-    /// from the instant it was dispatched; `None` means the round deadline is
-    /// the only bound. A target that has not reported when its leash expires
-    /// is PARKED, not cancelled: the round stops waiting for it, but its task
-    /// keeps running under its in-flight flag and its result lands in a later
-    /// round exactly as a plain straggler's does. Parking therefore cannot
-    /// cost a target its dial budget (never cut short mid-discovery) and
-    /// cannot withdraw it from anything — only `health::demote` and the
-    /// registry's staleness drop remove a node.
+    /// `leash_ms(key)` returns how long THIS round waits for `key`, measured from the instant it
+    /// was dispatched; `None` means the round deadline is the only bound. A target that has not
+    /// reported when its leash expires is PARKED, not cancelled: the round stops waiting for it,
+    /// but its task keeps running under its in-flight flag and its result lands in a later round
+    /// exactly as a plain straggler's does. Parking therefore cannot cost a target its dial budget
+    /// (never cut short mid-discovery) and cannot withdraw it from anything: only `health::demote`
+    /// and the registry's staleness drop remove a node.
     ///
-    /// Returns everything that landed meanwhile (stragglers of earlier rounds
-    /// included) and how many of this round's targets are still in flight —
-    /// parked ones included, so the count keeps meaning "did not answer in
-    /// time" and does not fall just because the round stopped waiting.
+    /// Each pass waits for the soonest leash that has not fired yet, else for the round deadline;
+    /// once every remaining target is parked there is nothing left to wait for, and when the round
+    /// deadline passes whatever is left is a straggler.
+    ///
+    /// Returns everything that landed meanwhile (stragglers of earlier rounds included) and how
+    /// many of this round's targets are still in flight, parked ones included, so the count keeps
+    /// meaning "did not answer in time" and does not fall just because the round stopped waiting.
     pub async fn collect_leashed(
         &mut self,
         deadline: Instant,
@@ -179,10 +173,7 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
             if now >= deadline {
                 break;
             }
-            // Soonest leash that has not fired yet; `None` while every
-            // remaining target is either parked or bounded only by the round
-            // deadline.
-            let mut next: Option<Instant> = None;
+            let mut next_leash: Option<Instant> = None;
             let mut unleashed = false;
             for (k, started) in &self.dispatched {
                 if parked.contains(k) {
@@ -194,17 +185,16 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
                         if exp <= now {
                             parked.insert(k.clone());
                         } else {
-                            next = Some(next.map_or(exp, |n: Instant| n.min(exp)));
+                            next_leash = Some(next_leash.map_or(exp, |n: Instant| n.min(exp)));
                         }
                     }
                     None => unleashed = true,
                 }
             }
-            // Nothing left to wait for: the rest is parked.
-            if next.is_none() && !unleashed {
+            if next_leash.is_none() && !unleashed {
                 break;
             }
-            let wait = next.unwrap_or(deadline);
+            let wait = next_leash.unwrap_or(deadline);
             match tokio::time::timeout_at(wait, self.rx.recv()).await {
                 Ok(Some(landed)) => {
                     self.in_flight.remove(&landed.1);
@@ -214,9 +204,6 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
                     out.push(landed);
                 }
                 Ok(None) | Err(_) => {
-                    // `wait` was the round deadline: the round is over and
-                    // whatever is left is a straggler. Otherwise a leash
-                    // fired and the next pass parks that target.
                     if wait >= deadline {
                         break;
                     }
@@ -227,8 +214,8 @@ impl<T: Default + Send + 'static> BoundedRound<T> {
     }
 
     /// Targets dispatched this round that had not reported when the last
-    /// [`collect_leashed`](Self::collect_leashed) returned — the round's
-    /// stragglers, parked ones included.
+    /// [`collect_leashed`](Self::collect_leashed) returned: the round's stragglers, parked ones
+    /// included.
     pub fn outstanding(&self) -> Vec<String> {
         self.dispatched.keys().cloned().collect()
     }

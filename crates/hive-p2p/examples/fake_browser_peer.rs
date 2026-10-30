@@ -1,24 +1,8 @@
-//! Live-witness harness for `bn-invoke-http-envelope-validation` /
-//! `bn-invoke-target-lifecycle`: a real hive-p2p endpoint that accepts
-//! `hive/browser/0` connections and answers `Op::Invoke` with a caller-
-//! controlled reply body, so fluid-gateway's REAL `browser_response`
-//! envelope validation (crates/fluid-gateway/src/lib.rs) can be exercised
-//! end-to-end against real bytes on the wire instead of a mock. Not part of
-//! any production binary — same category as `browser_echo_native.rs`.
-//!
-//! Usage: `HIVE_FAKE_BROWSER_REPLY_FILE=/path/to/bytes cargo run --example
-//! fake_browser_peer` — prints `FAKE_BROWSER_ADDR_JSON:<json>` then serves
-//! forever, replying to every Op::Invoke with the exact bytes in that file
-//! (read once, so the caller can rewrite it between requests to change
-//! behavior on the next accepted stream isn't needed — one process per
-//! reply shape, matching how the actual test drives this: start, invoke
-//! once, kill, restart with a different reply file for the next case).
-//!
-//! Set `HIVE_FAKE_BROWSER_DROP_AFTER_READ=1` to read and log the complete
-//! request, then reset the stream without writing a response. This is the
-//! red-capable live witness for `BROWSER_EXECUTION_UNCERTAIN`: the platform
-//! has proof the mutation bytes reached browser-owned execution but no proof
-//! whether that execution committed before the response path failed.
+//! Live-witness harness: a real hive-p2p endpoint that accepts `hive/browser/0` connections and
+//! answers `Op::Invoke` with the bytes in `HIVE_FAKE_BROWSER_REPLY_FILE`, so fluid-gateway's real
+//! `browser_response` envelope validation is exercised against real wire bytes; prints
+//! `FAKE_BROWSER_ADDR_JSON:<json>` then serves forever. `HIVE_FAKE_BROWSER_DROP_AFTER_READ=1` reads
+//! the request and resets the stream without a response (the `BROWSER_EXECUTION_UNCERTAIN` witness).
 
 use hive_browser_proto::{check_len, split_request};
 use hive_p2p::BROWSER_ALPN;
@@ -106,14 +90,6 @@ async fn main() -> anyhow::Result<()> {
                     if read_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(read_delay_ms)).await;
                     }
-                    // Wire framing is [u32 LITTLE-endian len][...] per
-                    // hive-browser-proto::{check_len,encode_request} -- reusing
-                    // the real check_len/split_request here (not a hand-rolled
-                    // big-endian parse) is what caught this: a first attempt
-                    // with from_be_bytes misread the length prefix entirely
-                    // and the stream read failed before ever reaching the op
-                    // byte. Live, witnessed bug in the TEST HARNESS, not in
-                    // production code (which already uses check_len).
                     let mut lenb = [0u8; 4];
                     if let Err(e) = recv.read_exact(&mut lenb).await {
                         eprintln!("fake_browser_peer: failed reading length prefix: {e}");
@@ -168,9 +144,6 @@ async fn main() -> anyhow::Result<()> {
                         let _ = send.reset(0u8.into());
                         return;
                     }
-                    // Reply verbatim with the configured bytes regardless of op —
-                    // the diagnostic controls malformed/truncated variants with
-                    // HIVE_FAKE_BROWSER_REPLY_MODE.
                     let framed = hive_browser_proto::encode_reply(&reply);
                     let bytes = match reply_mode.as_str() {
                         "normal" | "trailing" | "never-fin" => framed.as_slice(),
@@ -211,8 +184,6 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
                     }
-                    // Observe how the REAL client implementation closes its half:
-                    // a Drop-owned guard must reset/stop with one protocol code.
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(observe_ms),
                         send.stopped(),

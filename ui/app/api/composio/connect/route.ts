@@ -13,15 +13,11 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     slug = (body?.slug || "").toString().trim();
-  } catch {
-    // fall through to validation
-  }
+  } catch {}
   if (!slug) {
     return NextResponse.json({ error: "Missing toolkit slug." }, { status: 400 });
   }
 
-  // Stable per-user entity (same as status/repos) + public origin so the OAuth
-  // callback returns to the address the user is on (ngrok or localhost).
   const entity = await resolveEntity();
   const origin = publicOrigin(req);
   const redirectUrl = `${origin}/integrations?connected=${encodeURIComponent(slug)}`;

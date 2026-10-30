@@ -14,24 +14,9 @@ interface WebdavTokenResp {
   webdav_url: string;
 }
 
-/**
- * `/v1/drive/:project/webdav-token` mints (or rotates) the project's ONE
- * WebDAV Basic-auth credential — the backend stores only its SHA-256 hash
- * (`webdav_token_mint`'s own doc comment), so the plaintext password is
- * genuinely shown-once, same discipline as the API Keys page's created-token
- * reveal. Masked by default with a reveal toggle since it's a real
- * credential (the database-detail page's Reveal-secrets precedent).
- *
- * The backend hands back a FULLY QUALIFIED URL against its own public API
- * host (`CloudState::api_base()`), not a relative path — a real WebDAV
- * client (Finder/Explorer/rclone/davfs2) is a native OS network client with
- * no CORS restriction, so it must NOT go through the dashboard's same-origin
- * `/cloud` proxy (that proxy exists only to avoid CORS for the dashboard's
- * own browser-side fetches, and does not reliably pass through WebDAV's
- * non-standard methods like PROPFIND/MKCOL — confirmed live: PROPFIND
- * through `/cloud` times out, the same request against the direct API host
- * answers correctly).
- */
+/** Mints (or rotates) the project's ONE WebDAV Basic-auth credential (`/v1/drive/:project/webdav-token`); the backend keeps only its SHA-256 hash, so the password
+ *  is shown once, masked until revealed. `webdav_url` is the backend's fully qualified public API URL (`CloudState::api_base()`): a native WebDAV client (Finder,
+ *  Explorer, rclone, davfs2) has no CORS restriction and is pointed at it directly, never through the dashboard's same-origin `/cloud` proxy. */
 export function WebdavPanel({ project }: { project: string }) {
   const [cred, setCred] = useState<WebdavTokenResp | null>(null);
   const [revealed, setRevealed] = useState(false);

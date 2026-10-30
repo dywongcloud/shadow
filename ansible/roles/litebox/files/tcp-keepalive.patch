@@ -1,0 +1,61 @@
+diff --git a/litebox_shim_linux/src/syscalls/net.rs b/litebox_shim_linux/src/syscalls/net.rs
+index da4796b..6fc4ac7 100644
+--- a/litebox_shim_linux/src/syscalls/net.rs
++++ b/litebox_shim_linux/src/syscalls/net.rs
+@@ -532,7 +532,32 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+                         },
+                     )?;
+                 }
+-                TcpOption::KEEPCNT | TcpOption::KEEPIDLE | TcpOption::INFO => {
++                // TCP_KEEPIDLE, TCP_KEEPCNT and TCP_KEEPINTVL all reach us on a socket
++                // whose connect is still in flight: libuv's `uv__tcp_keepalive` (Node's
++                // `socket.setKeepAlive`, and therefore undici's global `fetch`) issues
++                // SO_KEEPALIVE and then these immediately after `connect()`, while the
++                // socket is still in SYN_SENT. A kernel stack accepts every one of them
++                // and lets the connect run to completion; answering EOPNOTSUPP here made
++                // libuv fail the PENDING CONNECT with ENOTSUP. Accept and ignore them
++                // instead, the same way IP_TOS and SO_RCVBUF/SO_SNDBUF above are
++                // handled, because Node/libuv treat EOPNOTSUPP from these as fatal.
++                //
++                // All three are ignored rather than applied, not only the two that
++                // arrive in-flight: `set_tcp_option` forwards a keep-alive interval
++                // straight into smoltcp's `set_keep_alive` (litebox/src/net/mod.rs), so
++                // an applied value produces REAL probes, and Node reaches it through
++                // `uv_tcp_keepalive`, which is `uv_tcp_keepalive_ex(handle, on, idle, 1,
++                // 10)` -- a hardcoded 1-second interval. With undici's connection
++                // pooling that is one probe per second per idle socket. Keep the 2-hour
++                // default that SO_KEEPALIVE above already installs.
++                TcpOption::KEEPIDLE | TcpOption::KEEPCNT | TcpOption::KEEPINTVL => {
++                    litebox_util_log::debug!(
++                        "accepting and ignoring setsockopt(TCP_KEEPIDLE/TCP_KEEPCNT/TCP_KEEPINTVL)"
++                    );
++                    return Ok(());
++                }
++                // TCP_INFO is get-only on Linux and unimplemented here.
++                TcpOption::INFO => {
+                     return Err(Errno::EOPNOTSUPP);
+                 }
+                 TcpOption::NODELAY | TcpOption::CORK => {
+@@ -551,22 +576,6 @@ impl<Platform: ShimPlatform, FS: ShimFS> GlobalState<Platform, FS> {
+                         .lock()
+                         .set_tcp_option(fd, litebox::net::TcpOptionData::NODELAY(on))?;
+                 }
+-                TcpOption::KEEPINTVL => {
+-                    const MAX_TCP_KEEPINTVL: u32 = 32767;
+-                    let val: u32 = super::read_from_user::<_, Platform>(optval, size_of::<u32>())?;
+-                    if !(1..=MAX_TCP_KEEPINTVL).contains(&val) {
+-                        return Err(Errno::EINVAL);
+-                    }
+-                    self.net
+-                        .lock()
+-                        .set_tcp_option(
+-                            fd,
+-                            litebox::net::TcpOptionData::KEEPALIVE(Some(
+-                                core::time::Duration::from_secs(u64::from(val)),
+-                            )),
+-                        )
+-                        .expect("set TCP_KEEPALIVE should succeed");
+-                }
+             },
+         }
+         Ok(())

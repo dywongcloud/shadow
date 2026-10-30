@@ -1,9 +1,6 @@
-//! HTTP client + config resolution for the shadw CLI.
-//!
-//! Auth is the platform API key issued in the dashboard (Settings → API Keys):
-//! every request carries `Authorization: Bearer <key>`, which scopes it to the
-//! key's team server-side. Config is resolved (highest priority first) from CLI
-//! flags → environment → `~/.shadw/config.json` → built-in defaults.
+//! HTTP client + config resolution for the shadw CLI: `Authorization: Bearer <key>` scopes every
+//! request to the key's team; config resolves flags → environment → `~/.shadw/config.json` →
+//! defaults.
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
@@ -23,15 +20,13 @@ pub struct Config {
     /// platform-operator derivation; never trusted client-side).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    /// `HIVE_INTERNAL_TOKEN` for mint-mode: when set, the CLI transparently
-    /// mints a short-lived platform JWT via `POST /v1/token` and uses it as the
-    /// bearer. This is what makes MUTATIONS work at the enforced ingress, which
-    /// accepts only JWTs on writes (an API key alone is read-only there).
+    /// `HIVE_INTERNAL_TOKEN` for mint-mode: the CLI mints a short-lived platform JWT via
+    /// `POST /v1/token` and uses it as the bearer, which is what lets MUTATIONS pass the enforced
+    /// ingress (an API key alone is read-only there).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub internal_token: Option<String>,
-    /// Cached minted JWT + its unix-seconds expiry, refreshed automatically
-    /// when fewer than 5 minutes remain. Cache exists so scripted CLI use
-    /// doesn't hit the mint endpoint's 20/60s per-IP rate limit.
+    /// Cached minted JWT + unix-seconds expiry, refreshed when under 5 minutes remain so scripted
+    /// use stays under the mint endpoint's per-IP rate limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,9 +90,8 @@ pub(crate) fn resolve_settings(
     (api.trim_end_matches('/').to_string(), token, team)
 }
 
-/// Read a boolean claim out of a JWT payload WITHOUT verifying the signature —
-/// client-side introspection only (picking the best of several minted tokens,
-/// display); the backend remains the sole verifier.
+/// Read a boolean claim from a JWT payload WITHOUT verifying the signature — client-side
+/// introspection only; the backend remains the sole verifier.
 pub fn jwt_claim_bool(token: &str, claim: &str) -> Option<bool> {
     let payload = token.split('.').nth(1)?;
     let bytes = b64url_decode(payload)?;
@@ -148,13 +142,9 @@ impl Client {
         }
     }
 
-    /// Mint-mode auto-login: when the saved config carries `internal_token`,
-    /// replace the bearer with a fresh platform JWT (minted via `POST
-    /// /v1/token`, cached in the config until <5 min from expiry). An explicit
-    /// `--token`/`SHADW_TOKEN` wins — mint mode only upgrades the DEFAULT
-    /// resolution, so the documented API-key flow is untouched. On mint
-    /// failure the resolved token (API key, read-only at the enforced
-    /// ingress) is kept and the failure is reported on stderr, loudly.
+    /// Mint-mode auto-login: with `internal_token` in the saved config, replace the bearer with a
+    /// fresh platform JWT (cached until <5 min from expiry). An explicit `--token`/`SHADW_TOKEN`
+    /// wins; on mint failure the resolved token is kept and the failure is reported on stderr.
     pub async fn ensure_fresh_token(&mut self, explicit_token: bool) {
         if explicit_token {
             return;
@@ -186,12 +176,7 @@ impl Client {
             "email": email,
         });
         let url = join_url(&self.api, "/v1/token");
-        // The api host is round-robin DNS and each node derives `platform_admin`
-        // from its OWN env — a node with drifted config mints a token that lacks
-        // it. Retry a few times (fresh connection each attempt lands on a
-        // different node) and keep the first operator-grade token; the last
-        // mint is kept regardless so a fully-drifted fleet still logs in.
-        let mut best: Option<(String, u64)> = None;
+        let mut last_minted: Option<(String, u64)> = None;
         for _ in 0..4 {
             let resp = reqwest::Client::new()
                 .post(&url)
@@ -204,9 +189,9 @@ impl Client {
                     let v: Value = r.json().await.unwrap_or(Value::Null);
                     if let Some(tok) = v["token"].as_str().filter(|s| !s.is_empty()) {
                         let ttl = v["expires_in"].as_u64().unwrap_or(3600);
-                        let admin = jwt_claim_bool(tok, "platform_admin").unwrap_or(false);
-                        best = Some((tok.to_string(), ttl));
-                        if admin || email.is_empty() {
+                        let operator_grade = jwt_claim_bool(tok, "platform_admin").unwrap_or(false);
+                        last_minted = Some((tok.to_string(), ttl));
+                        if operator_grade || email.is_empty() {
                             break;
                         }
                     } else {
@@ -226,7 +211,7 @@ impl Client {
                 }
             }
         }
-        if let Some((tok, ttl)) = best {
+        if let Some((tok, ttl)) = last_minted {
             cfg.jwt = Some(tok.clone());
             cfg.jwt_exp = Some(now + ttl);
             if let Err(e) = save_config(&cfg) {

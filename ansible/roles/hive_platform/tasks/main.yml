@@ -1,8 +1,5 @@
 ---
-# Deploy the hive-cloud controller and its exact hive-cell-agent companion to one
-# node. Source is pushed from the Ansible control host's checkout; both binaries
-# are compiled in one Cargo invocation, so a later manual rootfs bake cannot
-# consume bootstrap-vintage guest code.
+# Deploy the hive-cloud controller and its exact hive-cell-agent companion to one node: the source is pushed from the control host's checkout and both binaries are built in one Cargo invocation.
 
 - name: Ensure the source directory exists on the target
   ansible.builtin.file:
@@ -19,10 +16,6 @@
       - "--exclude=target"
       - "--exclude=.git"
 
-# vendor/ needs the SAME excludes as crates/ above. Without them this ships
-# vendor/guardian-db/target — 2.9GB of local build artifacts (gitignored, so
-# invisible in the repo) plus a 155MB tmp/ — to every node on every deploy,
-# against 4.3MB of actual source.
 - name: Sync vendor/ (patched crates, e.g. guardian-db)
   ansible.posix.synchronize:
     src: "{{ playbook_dir }}/../../vendor/"
@@ -53,6 +46,33 @@
   poll: 15
   register: _build
   notify: restart hive-node
+
+- name: Relink the cell agent statically (it is the guest's PID 1)
+  ansible.builtin.command:
+    cmd: >-
+      cargo rustc --release -p hive-cell-agent --
+      -C target-feature=+crt-static
+    chdir: "{{ hive_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TARGET_DIR: "{{ hive_cargo_target_dir }}"
+  async: 1800
+  poll: 15
+
+- name: Confirm the cell agent carries no dynamic interpreter
+  ansible.builtin.command:
+    cmd: >-
+      python3 -c "import struct,sys;
+      h=open(sys.argv[1],'rb').read(64);
+      off,=struct.unpack_from('<Q',h,0x20);
+      cnt,=struct.unpack_from('<H',h,0x38);
+      f=open(sys.argv[1],'rb'); f.seek(off);
+      ph=[struct.unpack('<II',f.read(8)) for _ in range(cnt)];
+      sys.exit(1 if any(t==3 for t,_ in ph) else 0)"
+      {{ hive_cargo_target_dir }}/release/hive-cell-agent
+  register: _agent_static
+  changed_when: false
+  failed_when: _agent_static.rc != 0
 
 - name: Confirm the controller binary was produced
   ansible.builtin.stat:
@@ -91,10 +111,6 @@
     path: "{{ hive_cell_agent_release_fact_path | default('/usr/local/bin/hive-cell-agent.release.json') }}"
   register: _cell_agent_fact_before
 
-# The publisher copies into /usr/local/bin first, SHA-verifies it, then gives the
-# candidate a hard-bounded exact protocol-fact probe. Only a complete schema-2
-# release fact is atomically switched into place. The previous binary remains at
-# hive-cell-agent.old.
 - name: Preflight and atomically install the exact built cell-agent
   ansible.builtin.command:
     argv:
@@ -164,10 +180,6 @@
       Cell-agent publication did not leave root-owned mode-0755 bytes plus a
       root-owned mode-0444 release fact matching the canonical build.
 
-# The browser_db lanes (CRR exchange + browser_db_rest) hard-refuse every
-# round when the cr-sqlite loadable extension is missing — and nothing in a
-# backend-only roll ships it (the binary's baked default path points into the
-# source tree, which only full hive_platform runs sync).
 - name: Build the cr-sqlite loadable extension (no-op when current)
   ansible.builtin.command:
     cmd: make

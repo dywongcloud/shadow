@@ -1,28 +1,14 @@
 "use client";
 
-// Browser-node target resolution (browser-run-node-target-picker): the ONE
-// place that turns the replicated deployment descriptor metadata
-// (`Deployment.browser_functions`, `Deployment.browser_db`) into the picker's
-// selectable-target list and revalidates a persisted selection against it.
-// Shared by the /run-node page (picker rendering + click-time resolution) and
-// use-run-node's owner-handoff replay — a selection is only ever started with
-// a digest re-derived from CURRENT metadata, so a target rotation (redeploy →
-// new policy_digest under the same deployment+function) is picked up instead
-// of replaying a stale one.
-//
-// browser-node-optional-serve-target: a target is OPTIONAL. Running a node and
-// having something browser-servable are independent facts — a donor whose
-// deployments are all long-running servers (Next.js, Express) or containers
-// still joins the mesh, holds a relay identity, publishes presence on the
-// constellation, and (with a `browser_db` block) replicates that database.
-// `null` is therefore a first-class selection meaning "serve nothing", not an
-// error state, and this module never gates Start.
+// Browser-node target resolution: the ONE place that turns the replicated descriptor metadata (`Deployment.browser_functions`,
+// `Deployment.browser_db`) into the picker's selectable targets and revalidates a persisted selection against it, so a node is only ever
+// started with a digest re-derived from CURRENT metadata (a redeploy rotates `policy_digest`). A target is OPTIONAL: `null` means "serve
+// nothing", never an error, and this module never gates Start.
 
 import { apiGet, BROWSER_DB_MAX_BYTES_DEFAULT, BROWSER_DB_VALUE_MAX_BYTES_DEFAULT, type Deployment } from "./api";
 
-/** One selectable serve target: a ready deployment's browser-eligible
- *  function plus the limits its build policy stamped. The digest is the
- *  descriptor's policy digest — the donor never sees or supplies it. */
+/** One selectable serve target: a ready deployment's browser-eligible function plus the limits its build policy stamped; the digest is the
+ *  descriptor's policy digest, which the donor never sees or supplies. */
 export interface BrowserFunctionTarget {
   kind: "function";
   deployment: string;
@@ -37,14 +23,8 @@ export interface BrowserFunctionTarget {
   allowedOps: number[];
 }
 
-/** A DATABASE-only target: a ready deployment carrying a `browser_db` block
- *  but no browser-eligible function. The node replicates that project's CRR
- *  replica and serves nothing — which is exactly what a tenant whose apps are
- *  all servers can still contribute. `fn`/`policyDigest` are empty by
- *  construction, and the backend refuses to route a serve target for an
- *  admission with no function (`BrowserAdmission::serving`, plus
- *  `fluid_gateway::upsert_browser_target`'s own independent rejection of an
- *  empty deployment/function/digest). */
+/** A DATABASE-only target: a ready deployment with a `browser_db` block but no browser-eligible function, so the node replicates that project's
+ *  CRR replica and serves nothing. `fn`/`policyDigest` are empty by construction (the backend refuses to route a serve target without a function). */
 export interface BrowserDatabaseTarget {
   kind: "database";
   deployment: string;
@@ -89,9 +69,6 @@ function databaseTarget(d: Deployment): BrowserDatabaseTarget | null {
     fn: "",
     project: d.project,
     policyDigest: "",
-    // 0 means "platform default" on the wire (fluid_core::BrowserDbPolicy) —
-    // resolved here only for DISPLAY; the fleet resolves its own copy and the
-    // capability the node actually receives is server-derived either way.
     maxBytes: db.max_bytes || BROWSER_DB_MAX_BYTES_DEFAULT,
     maxValueBytes: db.max_value_bytes || BROWSER_DB_VALUE_MAX_BYTES_DEFAULT,
     publicRead: !!db.public_read,
@@ -99,20 +76,9 @@ function databaseTarget(d: Deployment): BrowserDatabaseTarget | null {
   };
 }
 
-/** Every target a donor may attach this node to, in one list:
- *
- *  * a browser-eligible function of a ready deployment (serve +, if the
- *    project opted in, its database), and
- *  * a ready deployment that carries a `browser_db` block but NO
- *    browser-eligible function — database replication only.
- *
- *  A deployment with both contributes only its function targets: selecting one
- *  already carries the same database grant, so a separate database entry would
- *  be a duplicate of a capability the donor already has.
- *
- *  An empty list is NOT a dead end (browser-node-optional-serve-target) — the
- *  node starts with no target at all and contributes everything that does not
- *  require one. */
+/** Every target a donor may attach to: a browser-eligible function of a ready deployment (serve, plus its database if the project opted in)
+ *  and a ready deployment with a `browser_db` block but NO eligible function (database replication only). A deployment with both contributes
+ *  only its function targets; an empty list is not a dead end. */
 export function targetsFromDeployments(deployments: Deployment[]): RunNodeTarget[] {
   const out: RunNodeTarget[] = [];
   for (const d of deployments) {
@@ -131,9 +97,8 @@ export function targetsFromDeployments(deployments: Deployment[]): RunNodeTarget
 export interface ExcludedDeployment {
   deployment: string;
   project: string;
-  /** One sentence naming the cause — build-stamped where the fleet knows it
-   *  (`Deployment.browser_ineligible`), derived here only for the two states
-   *  the fleet cannot stamp: not-ready, and never-evaluated. */
+  /** One sentence naming the cause: build-stamped where the fleet knows it (`Deployment.browser_ineligible`), derived here only for not-ready
+   *  and never-evaluated. */
   reason: string;
 }
 
@@ -144,14 +109,8 @@ function oneLine(text: string, max = 220): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-/** Why this deployment offers nothing to attach to.
- *
- *  The ONE case the fleet cannot stamp at build time is the one that explains
- *  most confused reports: a deployment carrying neither an artifact NOR a
- *  reason was built before the pipeline evaluated browser eligibility at all,
- *  so nothing is wrong with the code — it just needs a redeploy. Reporting
- *  that as "not browser-eligible" (the previous blanket copy) actively sends
- *  the reader to debug a handler that was never examined. */
+/** Why a deployment offers nothing to attach to; the one case the fleet cannot stamp is a deployment with neither an artifact nor a reason,
+ *  built before browser eligibility was evaluated at all: it needs a redeploy, not a code change. */
 function excludedReason(d: Deployment): string {
   if (d.state !== "ready") {
     return `deployment is ${d.state} — it can only be attached once it's ready`;
@@ -166,11 +125,8 @@ function excludedReason(d: Deployment): string {
   return "built before browser eligibility was evaluated — redeploy and its functions are checked automatically";
 }
 
-/** Deployments contributing NO selectable target — not ready, or ready with
- *  neither a browser-eligible function nor a `browser_db` block — each with the
- *  reason. A bare count made a tenant's 14 deployments one undifferentiated
- *  blob whose single blanket explanation was wrong for most of them; the reason
- *  is what turns "my opted-in function isn't listed" into an actionable line. */
+/** Deployments contributing NO selectable target (not ready, or ready with neither a browser-eligible function nor a `browser_db` block),
+ *  each with its reason. */
 export function excludedDeployments(deployments: Deployment[]): ExcludedDeployment[] {
   return deployments
     .filter((d) => d.state !== "ready" || ((d.browser_functions ?? []).length === 0 && !d.browser_db))
@@ -183,13 +139,9 @@ export function excludedDeploymentCount(deployments: Deployment[]): number {
   return excludedDeployments(deployments).length;
 }
 
-/** Revalidate a persisted selection against a FRESH deployment list. Distinct
- *  failure reasons so the UI can say exactly why a previously-working
- *  selection no longer resolves (deleted deployment, no-longer-ready
- *  deployment, function no longer browser-eligible, database block removed)
- *  instead of a generic "not found". A policy-digest ROTATION under the same
- *  deployment+function is not an error — it resolves to the new digest
- *  silently. An empty `fn` selects the deployment's DATABASE target. */
+/** Revalidates a persisted selection against a FRESH deployment list with distinct failure reasons (deleted, not ready, function no longer
+ *  eligible, database block removed); a policy-digest ROTATION under the same deployment+function resolves silently to the new digest, and an
+ *  empty `fn` selects the deployment's DATABASE target. */
 export function resolveTarget(deployments: Deployment[], deployment: string, fn: string): ResolveResult {
   const dep = deployments.find((d) => d.id === deployment);
   if (!dep) {
@@ -224,11 +176,8 @@ export function resolveTarget(deployments: Deployment[], deployment: string, fn:
   return { ok: true, target: functionTarget(dep, f) };
 }
 
-/** Fresh (cache-bypassing) fetch + resolve in one step, for the owner-handoff
- *  replay path: the whole point is that the digest comes from what the fleet
- *  believes NOW, not from anything persisted. Throws on fetch failure so the
- *  caller can leave the persisted start alone and retry on the next handoff
- *  rather than clearing a selection that may still be valid. */
+/** Fresh (cache-bypassing) fetch + resolve for the owner-handoff replay, so the digest comes from what the fleet believes NOW; throws on
+ *  fetch failure so the caller leaves the persisted start alone and retries rather than clearing a selection that may still be valid. */
 export async function resolveTargetFresh(deployment: string, fn: string): Promise<ResolveResult> {
   const deployments = await apiGet<Deployment[]>("/deployments", { fresh: true });
   return resolveTarget(deployments ?? [], deployment, fn);

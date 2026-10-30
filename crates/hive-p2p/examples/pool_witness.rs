@@ -1,17 +1,7 @@
-//! Live witness for `browser-p2p-remove-integration-tests` — replaces the
-//! deleted `tests/pool.rs` and `tests/stream_ws.rs` with live executions of
-//! the same behaviors against REAL bound iroh endpoints. Every assertion the
-//! deleted files made appears here as a printed `WITNESS_OK`/`WITNESS_FAIL`
-//! line; the trust-gating pair (`untrusted_peer_is_rejected` /
-//! `trusted_peer_is_admitted`) lives in `trust_gate_witness.rs` instead.
-//!
-//! Phases run SEQUENTIALLY in one process (the deleted suite's NET_SERIAL
-//! lock existed only because `cargo test` runs tests concurrently; a witness
-//! binary needs no such guard). Timeout-budget phases scope their
-//! `HIVE_P2P_*_MS` overrides with a drop guard exactly like the suite did.
-//!
-//! Usage: `cargo run -p hive-p2p --example pool_witness`
-//! Exit code 0 = every phase passed (or skipped offline); 1 = a real failure.
+//! Live witness for `PeerPool` against REAL bound iroh endpoints: trunk reuse, concurrency on one
+//! connection, re-dial after a killed or severed trunk, relay-vs-direct accounting, signed gossip,
+//! signature primitives, warm(), the connect / first-byte / inter-chunk budgets, and incremental
+//! chunked + raw streams. Phases run sequentially; `cargo run -p hive-p2p --example pool_witness`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -239,7 +229,6 @@ async fn spawn_echo() -> String {
 
 #[tokio::main]
 async fn main() {
-    // ---- Phase: sequential requests reuse ONE trunk -----------------------
     if let Some((pool, id, addr)) = setup().await {
         let (s1, b1) = one(&pool, &id, &addr, "/a").await;
         let (s2, b2) = one(&pool, &id, &addr, "/b").await;
@@ -258,7 +247,6 @@ async fn main() {
         println!("WITNESS_SKIP:sequential-requests-reuse-one-connection: iroh could not bind");
     }
 
-    // ---- Phase: 16 concurrent requests share ONE connection ----------------
     if let Some((pool, id, addr)) = setup().await {
         let (s, _) = one(&pool, &id, &addr, "/warm").await;
         let mut handles = Vec::new();
@@ -289,7 +277,6 @@ async fn main() {
         println!("WITNESS_SKIP:concurrent-requests-share-one-connection: iroh could not bind");
     }
 
-    // ---- Phase: killing the trunk forces an in-call re-dial ----------------
     if let Some((pool, id, addr)) = setup().await {
         let (s1, _) = one(&pool, &id, &addr, "/first").await;
         let opened1 = pool.stats().0;
@@ -308,7 +295,6 @@ async fn main() {
         println!("WITNESS_SKIP:killed-trunk-redials: iroh could not bind");
     }
 
-    // ---- Phase: a severed-but-CACHED trunk is detected and re-dialed -------
     if let Some((pool, id, addr)) = setup().await {
         let (s1, _) = one(&pool, &id, &addr, "/first").await;
         let (opened0, reused0) = pool.stats();
@@ -329,7 +315,6 @@ async fn main() {
         println!("WITNESS_SKIP:severed-cached-trunk-is-detected-and-redialed: iroh could not bind");
     }
 
-    // ---- Phase: relay-vs-direct classification accounts every byte ---------
     if let Some((pool, id, addr)) = setup().await {
         let (s, _) = one(&pool, &id, &addr, "/a").await;
         let rs = pool.relay_stats().await;
@@ -354,7 +339,6 @@ async fn main() {
         println!("WITNESS_SKIP:relay-stats-classifies-and-counts-bytes: iroh could not bind");
     }
 
-    // ---- Phase: gossip round-trips over iroh, second request reuses trunk --
     if let Some(ep_b) = hive_p2p::bind().await.ok() {
         let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
         let id_b = ep_b.id().to_string();
@@ -397,7 +381,6 @@ async fn main() {
         println!("WITNESS_SKIP:gossip-request-round-trips-over-iroh: iroh could not bind");
     }
 
-    // ---- Phase: SIGNED gossip verifies and the handler sees the signer -----
     for trusted_case in [false, true] {
         let _sign = EnvGuard::set("HIVE_GOSSIP_SIGN", "1");
         let _verify = EnvGuard::set("HIVE_GOSSIP_VERIFY", "enforce");
@@ -456,7 +439,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase: signature primitives reject tamper, replay, and mismatch ---
     {
         let sk = iroh::SecretKey::generate();
         let id = sk.public().to_string();
@@ -501,7 +483,6 @@ async fn main() {
         );
     }
 
-    // ---- Phase: warm() pre-establishes the trunk a request then reuses -----
     {
         let _budget = EnvGuard::set("HIVE_P2P_CONNECT_MS", "20000");
         if let Some((pool, id, addr)) = setup().await {
@@ -522,13 +503,11 @@ async fn main() {
         }
     }
 
-    // ---- Phase: blackhole connect times out and is marked dead -------------
     {
         let _g1 = EnvGuard::set("HIVE_P2P_CONNECT_MS", "500");
         let _g2 = EnvGuard::set("HIVE_P2P_OPEN_MS", "500");
         let _g3 = EnvGuard::set("HIVE_P2P_DISCOVERY_MS", "500");
         if let Some(ep_b) = hive_p2p::bind().await.ok() {
-            // Bound but NEVER served: connect/open can't complete.
             let id = ep_b.id().to_string();
             let addr = hive_p2p::addr_json(&ep_b).unwrap();
             let ep_a = hive_p2p::bind().await.unwrap();
@@ -564,7 +543,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase: accept-but-silent owner hits the first-byte budget ---------
     {
         let _g = EnvGuard::set("HIVE_P2P_FIRSTBYTE_MS", "700");
         if let Some(ep_b) = hive_p2p::bind().await.ok() {
@@ -573,7 +551,6 @@ async fn main() {
             tokio::spawn(hive_p2p::serve_silent(ep_b));
             let ep_a = hive_p2p::bind().await.unwrap();
             let pool = hive_p2p::PeerPool::new(ep_a);
-            // Warm outside the measured window so elapsed reflects first-byte.
             let _warm = tokio::time::timeout(Duration::from_secs(12), pool.open_raw(&id, &addr))
                 .await
                 .expect("warm must not hang")
@@ -610,7 +587,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase: idle mid-stream fires the inter-chunk budget ---------------
     {
         let _g = EnvGuard::set("HIVE_P2P_IDLE_MS", "700");
         let func = spawn_slow_function(1, Duration::from_millis(0), true).await;
@@ -658,7 +634,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase: slow-but-alive streams are NOT killed ----------------------
     {
         let _g = EnvGuard::set("HIVE_P2P_IDLE_MS", "700");
         let func = spawn_slow_function(4, Duration::from_millis(150), false).await;
@@ -695,7 +670,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase (stream_ws #1): chunked responses arrive INCREMENTALLY ------
     {
         let fnaddr = spawn_streaming_fn().await;
         if let Some((pool, id, addr)) = setup_serving(fnaddr).await {
@@ -729,7 +703,6 @@ async fn main() {
         }
     }
 
-    // ---- Phase (stream_ws #2): a raw stream splices bytes BOTH ways --------
     {
         let echo = spawn_echo().await;
         if let Some((pool, id, addr)) = setup_serving(echo).await {

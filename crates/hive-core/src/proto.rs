@@ -1,7 +1,5 @@
-//! Wire types shared between the Control Plane, Box Daemon, Cell Daemon, API,
-//! and the CLI. In the MVP these travel in-process over channels and over HTTP
-//! (API <-> client); the same shapes would serialize over sockets/vsock for a
-//! genuinely distributed deployment.
+//! Wire types shared between the Control Plane, Box Daemon, Cell Daemon, API and the CLI —
+//! in-process over channels and over HTTP today, the same shapes over sockets/vsock when distributed.
 
 use crate::ids::{BoxId, CellId, HiveId, JobId};
 use crate::job::{BuildJob, ResourceSpec};
@@ -122,18 +120,6 @@ pub const CELL_FUNCTION_PORT: u32 = 5353;
 /// Guest context id for the cell's vsock device.
 pub const CELL_GUEST_CID: u32 = 3;
 
-// ---------------------------------------------------------------------------
-// Runtime — the ONE source of truth for "what language/engine executes this
-// function's process", replacing what used to be FOUR independent copies of
-// argv-basename sniffing scattered across hive-cloud/git.rs, hive-backend's
-// mock.rs and firecracker.rs, and hive-cell-agent/main.rs. Orthogonal to
-// `FunctionConfig::protocol` (wire protocol) and to package-manager choice (a
-// BUILD-time-only concept that never reaches this struct) — a project can use
-// `bun install` while still running on `runtime=nodejs`, and vice versa. Lives
-// in `hive-core` (not `fluid-core`) so it's reachable from `hive-cell-agent`
-// and `hive-backend`, neither of which depend on `fluid-core`.
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Runtime {
@@ -142,22 +128,9 @@ pub enum Runtime {
     Python,
     /// Podman container (the `__container__` start_cmd sentinel).
     Container,
-    /// A compiled WebAssembly/WASIX module executed via the `wasmer` CLI
-    /// (`wasmer run --net --forward-host-env <module>.wasm`). Runs as an
-    /// ordinary host process under whichever backend placed it (Mock,
-    /// Litebox, Firecracker) — Wasmer needs no dedicated `CellBackend`,
-    /// exactly like Node/Bun/Python don't. Live-verified: a real
-    /// axum+tokio server built with `cargo wasix build --release`
-    /// (target `wasm32-wasmer-wasi`) binds and serves a real HTTP
-    /// request under `wasmer run --net`, and `--forward-host-env`
-    /// correctly carries the dynamically-assigned `$PORT` from the
-    /// spawning backend into the guest — no build-time port baking.
-    /// Guest code MUST bind `0.0.0.0`, never a literal `127.0.0.1`:
-    /// unlike Node/Bun (which get a host-injected `_listen2` shim to
-    /// rescue a hardcoded-loopback bind, see `litebox.rs`), a compiled
-    /// `.wasm` module cannot be monkeypatched, so a loopback-bound guest
-    /// is unreachable through Litebox's per-cell TUN device the same way
-    /// an unshimmed Node app would be.
+    /// A WebAssembly/WASIX module run by the `wasmer` CLI as an ordinary host process under any
+    /// backend; guest code must bind `0.0.0.0` (a `.wasm` module cannot take the loopback-rescue
+    /// shim Node/Bun get).
     Wasmer,
     /// Anything else — a raw command/binary, or genuinely unknown.
     Command,
@@ -183,12 +156,8 @@ impl Runtime {
         }
     }
 
-    /// Parse a persisted/configured `FunctionConfig.runtime` string. Backward
-    /// compatible with every value this codebase has ever written: `"auto"`
-    /// (the build pipeline's historical "infer it" sentinel) and `""`/`"command"`
-    /// both mean "no explicit runtime — caller must fall back to
-    /// [`Runtime::infer_from_argv`]", returned here as `None` rather than
-    /// guessing `Command` so a real basename-based inference still happens.
+    /// Parse a persisted `FunctionConfig.runtime`; `"auto"`, `""` and `"command"` mean "no explicit
+    /// runtime" and return `None` so [`Runtime::infer_from_argv`] still runs.
     pub fn from_config_str(s: &str) -> Option<Runtime> {
         match s.trim().to_ascii_lowercase().as_str() {
             "node" | "nodejs" | "js" | "edge" | "isolate" | "edge-isolate" => Some(Runtime::Node),
@@ -201,14 +170,8 @@ impl Runtime {
         }
     }
 
-    /// Infer the runtime from a raw argv (`start_cmd`) — the fallback path when
-    /// no explicit config value was resolved. Matches on the basename so an
-    /// absolute path (`/usr/bin/node`, `.../bin/bun`) still counts. This is the
-    /// SINGLE canonical replacement for the repo's four independent
-    /// `is_node_start_cmd`-style helpers; `bun` and `node` are deliberately
-    /// DISTINGUISHED here (the old helpers conflated them, which silently made
-    /// Bun processes "eligible" for a V8-only bytecode cache that could never
-    /// produce anything for them).
+    /// Infer the runtime from argv by basename (absolute paths count); `bun` and `node` are
+    /// deliberately distinguished — only V8 has the bytecode cache.
     pub fn infer_from_argv(start_cmd: &[String]) -> Runtime {
         if start_cmd.first().map(String::as_str) == Some("__container__") {
             return Runtime::Container;
@@ -226,19 +189,15 @@ impl Runtime {
         }
     }
 
-    /// Resolve the effective runtime for a function: an explicit config value
-    /// wins; otherwise infer from argv. This is the ONE call every producer
-    /// (build pipeline) and consumer (fluid-compute, backends, guest agent)
-    /// should use instead of re-deriving it independently.
+    /// Resolve the effective runtime: an explicit config value wins, else infer from argv — the ONE
+    /// call every producer and consumer uses instead of re-deriving it.
     pub fn resolve(config_runtime: &str, start_cmd: &[String]) -> Runtime {
         Runtime::from_config_str(config_runtime)
             .unwrap_or_else(|| Runtime::infer_from_argv(start_cmd))
     }
 
-    /// Does this runtime use Node's V8 `NODE_COMPILE_CACHE` mechanism? Only
-    /// genuine Node — Bun uses JavaScriptCore and has its own, structurally
-    /// different bytecode-cache path (build-time bundling with `bun build
-    /// --bytecode`, not a runtime env var).
+    /// Whether this runtime uses Node's V8 `NODE_COMPILE_CACHE`: only genuine Node (Bun's bytecode
+    /// cache is a build-time `bun build --bytecode`, not a runtime env var).
     pub fn uses_v8_compile_cache(&self) -> bool {
         matches!(self, Runtime::Node)
     }
@@ -249,12 +208,9 @@ impl Runtime {
     }
 }
 
-/// One UDP port publish for a CONTAINER function: the port the app listens on
-/// INSIDE its container and the loopback host port podman publishes it on
-/// (`-p 127.0.0.1:<host_port>:<container_port>/udp`). Host ports are chosen by
-/// fluid-compute's `cold_start` (which also records the mapping on the instance
-/// registry so hive-cloud's UDP relay can resolve the local datagram leg); they
-/// ride here so the backends emit the matching `-p …/udp` publish flags.
+/// One UDP port publish for a CONTAINER function: the in-container port and the loopback host
+/// port podman publishes it on (`-p 127.0.0.1:<host>:<container>/udp`); host ports are chosen
+/// by `cold_start`, which also records the mapping for the UDP relay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UdpPublish {
@@ -262,16 +218,10 @@ pub struct UdpPublish {
     pub host_port: u16,
 }
 
-/// One TCP port publish for a CONTAINER function — same shape and role as
-/// [`UdpPublish`] but for the stream side: every raw/published TCP-transport
-/// port spec (extra Tcp/Grpc specs of a multi-port service, and any compose
-/// PUBLISHED Http port) gets its own loopback host port
-/// (`-p 127.0.0.1:<host_port>:<container_port>`), so the raw proxy's mesh
-/// resolver has a direct local splice leg per port instead of only the
-/// primary's tunnel. The PRIMARY port rides here too (host = the launch's
-/// assigned `port`), which is what lets a published Http primary (MinIO's
-/// :9000) be spliced without the HTTP-framed tunnel corrupting it — emitters
-/// of `-p` flags dedupe against the primary pairing they already publish.
+/// One TCP port publish for a CONTAINER function, [`UdpPublish`]'s stream-side twin: every
+/// raw/published TCP port, the PRIMARY included (host = the launch's `port`), gets its own
+/// loopback host port so the raw proxy can splice each directly instead of through the
+/// HTTP-framed tunnel; `-p` emitters dedupe against the primary pairing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TcpPublish {
@@ -282,11 +232,9 @@ pub struct TcpPublish {
 pub const RUNTIME_ARTIFACT_PROTOCOL_VERSION: u16 = 1;
 pub const RUNTIME_ARTIFACT_PACKAGE_PROTOCOL_VERSION: u16 = 1;
 
-/// Complete host-to-guest wire contract. This version covers every
-/// AgentRequest and AgentEvent variant plus every serialized field and semantic
-/// of FunctionLaunch. Adding, removing, defaulting, or reinterpreting any of
-/// those is a protocol change and MUST monotonically increment this constant;
-/// runtime-artifact identity remains independently versioned above.
+/// Complete host-to-guest wire contract version: adding, removing, defaulting or reinterpreting
+/// any AgentRequest/AgentEvent variant or FunctionLaunch field MUST increment it;
+/// runtime-artifact identity is versioned independently.
 pub const AGENT_WIRE_PROTOCOL_VERSION: u16 = 2;
 /// The peer implements the complete AgentRequest/AgentEvent v2 schema.
 pub const AGENT_WIRE_CAPABILITY_COMPLETE_SCHEMA: u64 = 1 << 0;
@@ -298,9 +246,8 @@ pub const AGENT_WIRE_CAPABILITY_AUTHENTICATED_BOOT: u64 = 1 << 2;
 /// Node-attributed launch failures use a typed event whose origin is independent
 /// of tenant-controlled process diagnostics.
 pub const AGENT_WIRE_CAPABILITY_TYPED_FUNCTION_FAULTS: u64 = 1 << 3;
-/// The peer implements `ExecPty`/`PtyInput`/`PtyResize`/`PtyOutput`/`PtyExited`
-/// (Sandboxes interactive terminal) — a real `openpty`/`forkpty` session, not
-/// just line-buffered `Exec`.
+/// The peer implements the `ExecPty`/`PtyInput`/`PtyResize`/`PtyOutput`/`PtyExited` session (a
+/// real `openpty`/`forkpty` shell, not line-buffered `Exec`).
 pub const AGENT_WIRE_CAPABILITY_EXEC_PTY: u64 = 1 << 4;
 /// Exact capability set for AGENT_WIRE_PROTOCOL_VERSION. Peers require equality,
 /// not subset negotiation, so an unknown launch shape is never silently dropped.
@@ -332,9 +279,8 @@ pub const RUNTIME_ARTIFACT_MARKER_FILE: &str = ".hive-runtime-artifact-v1.json";
 /// Read-only marker baked into the guest rootfs beside the exact cell-agent
 /// binary that implements both independently-versioned protocols.
 pub const RUNTIME_ARTIFACT_ROOTFS_MARKER_PATH: &str = "/etc/hive/runtime-artifact-protocol.json";
-/// Host-side content proof written next to <image>.ext4. The host verifies this
-/// descriptor against the exact image bytes before advertising or booting work;
-/// existence or printable version text alone is never a capability.
+/// Host-side content proof beside `<image>.ext4`, verified against the exact image bytes before
+/// advertising or booting; existence alone is never a capability.
 pub const RUNTIME_ARTIFACT_ROOTFS_SIDECAR_SUFFIX: &str = ".runtime-artifact-protocol.json";
 pub const RUNTIME_ARTIFACT_ROOTFS_SCHEMA_VERSION: u16 = 2;
 
@@ -390,9 +336,8 @@ impl RuntimeArtifactRootfsMetadata {
     }
 }
 
-/// First application frame on a versioned host-to-guest connection. The nonce
-/// prevents replay; expected_boot is independently verified from exact image
-/// bytes by the host and against the running executable by the guest.
+/// First application frame on a versioned host-to-guest connection; the nonce prevents replay,
+/// `expected_boot` is verified by both sides independently.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentHandshake {
@@ -446,9 +391,8 @@ pub enum AgentFunctionFaultCode {
     NodeRuntimeMissing,
 }
 
-/// A node-attributed function-start failure. The guest constructs this only
-/// from typed platform error origins; tenant stderr remains exclusively in
-/// `AgentEvent::FunctionError` and can never select this code.
+/// A node-attributed function-start failure, built only from typed platform error origins;
+/// tenant stderr stays in `AgentEvent::FunctionError` and can never select this code.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentFunctionFault {
@@ -465,10 +409,8 @@ impl AgentFunctionFault {
     }
 }
 
-/// Canonical bytes hashed into AgentHandshakeReady::transcript_sha256. The
-/// transcript binds freshness, exact rootfs bytes, packaged agent digest, and
-/// both independently-versioned protocols without adding a hash dependency to
-/// hive-core itself.
+/// Canonical bytes hashed into `AgentHandshakeReady::transcript_sha256`: freshness, exact rootfs
+/// bytes, packaged agent digest and both protocol versions.
 pub fn agent_handshake_transcript(nonce: &str, proof: &AgentBootProof) -> Vec<u8> {
     let nonce = nonce.as_bytes();
     let agent = proof.agent_sha256.as_bytes();
@@ -491,9 +433,8 @@ pub fn agent_handshake_transcript(nonce: &str, proof: &AgentBootProof) -> Vec<u8
     transcript
 }
 
-/// Immutable identity of the exact runtime tree attached to an isolated cell.
-/// The host derives it while materializing the build and the guest echoes it
-/// only after validating the marker inside the mounted artifact.
+/// Immutable identity of the runtime tree attached to a cell: derived by the host, echoed by the
+/// guest only after validating the mounted marker.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeArtifactIdentity {
@@ -502,9 +443,9 @@ pub struct RuntimeArtifactIdentity {
     pub content_sha256: String,
 }
 
-/// Transfer identity for the deterministic package carrying one semantic runtime
-/// tree. The package digest addresses transport bytes; `semantic_tree_sha256`
-/// remains the backend-neutral execution identity every target must recompute.
+/// Transfer identity of the package carrying one semantic runtime tree: the package digest
+/// addresses transport bytes, `semantic_tree_sha256` is the execution identity every target
+/// recomputes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeArtifactPackageDescriptor {
@@ -530,12 +471,9 @@ pub struct FunctionLaunch {
     /// Working dir. For the mock backend this is a host path; inside a microVM
     /// it is the guest path where the deployment was delivered.
     pub workdir: Option<String>,
-    /// Exact isolated-runtime artifact expected by the host. `None` is normal for
-    /// same-host/container paths. An upgraded guest also accepts only the exact
-    /// frozen 13-field pre-v2 frame: `runtime_artifact` is absent while `workdir`
-    /// remains a required (possibly null) field. Upgraded isolated hosts always
-    /// send `Some` and require validation and echo it before `FunctionReady` is
-    /// accepted.
+    /// Exact isolated-runtime artifact expected by the host; `None` for same-host/container paths.
+    /// Isolated hosts always send `Some` and require the guest's validated echo before
+    /// `FunctionReady`; the frozen 13-field pre-v2 frame omits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_artifact: Option<RuntimeArtifactIdentity>,
     /// Port the function server should bind ($PORT). Chosen by the backend.
@@ -547,52 +485,34 @@ pub struct FunctionLaunch {
     /// 0 = use the node's generous default. Ignored for microVM/process functions.
     #[serde(default)]
     pub memory_mib: u32,
-    /// CPU quota for a CONTAINER function's cgroup (podman `--cpus`), e.g. 4.0.
-    /// 0.0 = use the node's generous default. Clamped fleet-wide in
-    /// `ContainerLimits::for_container`. Ignored for microVM/process functions
-    /// (distinct from a microVM's vCPU count, sized elsewhere).
+    /// CPU quota for a CONTAINER cgroup (podman `--cpus`); 0.0 = node default, clamped in
+    /// `ContainerLimits::for_container`, ignored for microVM/process functions.
     #[serde(default)]
     pub cpus: f64,
-    /// Max-PIDs ceiling for a CONTAINER function's cgroup (podman `--pids-limit`)
-    /// — a fork-bomb guard. 0 = use the node's default. Clamped fleet-wide.
-    /// Ignored for microVM/process functions.
+    /// Max-PIDs ceiling for a CONTAINER cgroup (podman `--pids-limit`), a fork-bomb guard; 0 = node
+    /// default, clamped fleet-wide, ignored for microVM/process functions.
     #[serde(default)]
     pub pids: u32,
-    /// The resolved runtime — the SINGLE explicit signal every backend/guest
-    /// agent uses to decide bytecode-cache behavior, replacing ad hoc argv
-    /// re-sniffing. Always set explicitly by the constructor (fluid-compute's
-    /// `cold_start`); `#[serde(default)]` only guards deserialization of a
-    /// hypothetical older/foreign message, never relied on as real inference.
+    /// The resolved runtime — the single signal every backend/guest uses for bytecode-cache
+    /// decisions; always set by `cold_start`, `serde(default)` only for older messages.
     #[serde(default)]
     pub runtime: Runtime,
-    /// The function speaks a NON-HTTP application protocol
-    /// (`fluid_core::FunctionConfig::needs_raw_proxy()`: gRPC / raw TCP / UDP —
-    /// e.g. Postgres wire, Minecraft). The backend fronting the function must
-    /// serve its local tunnel hop as a RAW byte splice
-    /// (`fluid_tunnel::TunnelServer::serve_raw`) instead of the HTTP-framed
-    /// `serve` path, whose request-line writing + chunked decoding would
-    /// corrupt non-HTTP bytes. Set explicitly by fluid-compute's `cold_start`;
-    /// `false` (the default, and the wire-compat default for older messages)
-    /// keeps the existing HTTP-framed path byte-identical.
+    /// The function speaks a non-HTTP protocol (`FunctionConfig::needs_raw_proxy()`: gRPC / raw TCP
+    /// / UDP), so the backend serves its local tunnel hop as a raw splice (`TunnelServer::serve_raw`),
+    /// never the HTTP-framed path. Set by `cold_start`; `false` is the wire-compat default.
     #[serde(default)]
     pub raw_proxy: bool,
-    /// UDP ports a CONTAINER function publishes on loopback (see [`UdpPublish`]).
-    /// Empty for every non-container function and for container functions that
-    /// declare no UDP port specs; `#[serde(default)]` keeps older/foreign
-    /// messages wire-compatible. Ignored by the microVM/process paths.
+    /// UDP ports a CONTAINER function publishes on loopback ([`UdpPublish`]); empty for non-container
+    /// functions and pre-upgrade peers, ignored by microVM/process paths.
     #[serde(default)]
     pub udp_ports: Vec<UdpPublish>,
-    /// TCP ports a CONTAINER function publishes on loopback (see
-    /// [`TcpPublish`]; includes the primary). Same wire-compat posture as
-    /// `udp_ports`: empty for non-container functions and pre-upgrade peers.
+    /// TCP ports a CONTAINER function publishes on loopback ([`TcpPublish`], primary included); same
+    /// wire-compat posture as `udp_ports`.
     #[serde(default)]
     pub tcp_ports: Vec<TcpPublish>,
-    /// Pass the host's GPUs through to a CONTAINER function's cell (CDI
-    /// `nvidia.com/gpu=all`; with a `runsc` sandbox runtime, gVisor `nvproxy`).
-    /// Set by fluid-compute's `cold_start` from `FunctionConfig::gpu`. `false`
-    /// (the wire-compat default) launches exactly as before. Ignored by the
-    /// microVM/process paths — Firecracker has no PCI passthrough, and on FC
-    /// nodes containers run via host podman, which is where the GPU lives.
+    /// Pass the host's GPUs into a CONTAINER cell (CDI `nvidia.com/gpu=all`, gVisor `nvproxy` under
+    /// `runsc`); set from `FunctionConfig::gpu`, `false` is the wire-compat default, ignored by
+    /// microVM/process paths.
     #[serde(default)]
     pub gpu: bool,
 }
@@ -608,9 +528,8 @@ pub enum AgentRequestFrameKind {
     Other,
 }
 
-/// Inspect only the raw JSON envelope. Versioned callers use this before typed
-/// deserialization so an added outer key cannot be ignored by a permissive
-/// future schema.
+/// Inspect only the raw JSON envelope before typed deserialization, so an added outer key cannot
+/// be ignored by a permissive schema.
 pub fn agent_request_frame_kind(frame: &[u8]) -> Result<AgentRequestFrameKind, String> {
     let value: serde_json::Value =
         serde_json::from_slice(frame).map_err(|error| format!("invalid JSON: {error}"))?;
@@ -842,13 +761,8 @@ pub fn validate_agent_versioned_launch_event_frame(frame: &[u8]) -> Result<(), S
     validate_exact::<ExactVersionedLaunchEventFrame>(frame, "versioned launch event")
 }
 
-/// A single argv command to run inside an already-booted, long-lived cell —
-/// the Sandboxes exec path. Deliberately separate from [`BuildJob`]/`Run`
-/// (build-only: shell-string steps, merged stdout/stderr, fixed `/build` cwd,
-/// no kill support, cell self-destructs after one build): Exec preserves argv
-/// (no shell unless `shell` is explicitly set), keeps stdout/stderr distinct,
-/// supports an explicit cwd, and can be killed by `id` from a separate
-/// connection while it's still running.
+/// One argv command inside an already-booted cell (the Sandboxes exec path): argv-exact unless
+/// `shell` is set, distinct stdout/stderr, explicit cwd, killable by `id` from another connection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecRequest {
     /// Caller-chosen id (echoed back on every `ExecOutput`/`ExecDone` event and
@@ -862,28 +776,19 @@ pub struct ExecRequest {
     pub cwd: String,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// Run as root. The agent honors this only if a `sudo` binary is present in
-    /// the guest; otherwise it fails the request loudly (`ExecDone` with a
-    /// nonzero/absent exit code), never silently drops the privilege request.
+    /// Run as root; honored only when `sudo` exists in the guest, otherwise the request fails loudly
+    /// (`ExecDone` without a zero exit code), never silently downgraded.
     #[serde(default)]
     pub sudo: bool,
-    /// Explicit, informed opt-in to shell interpretation (`sh -c "<cmd> <args
-    /// joined>"`). Default false = argv exec (`execvp(cmd, args)`), which makes
-    /// shell injection structurally impossible for the default path.
+    /// Explicit opt-in to shell interpretation (`sh -c`); the default argv exec (`execvp`) makes shell
+    /// injection structurally impossible.
     #[serde(default)]
     pub shell: bool,
 }
 
-/// A single interactive PTY session inside an already-booted, long-lived cell
-/// — the Sandboxes interactive-terminal path. Unlike [`ExecRequest`] (one-shot
-/// argv, line-buffered output, no stdin), this allocates a real pseudo-terminal
-/// in the guest (`openpty`/`forkpty`) running the caller's shell: raw byte
-/// stream in both directions, so `vim`/`less`/tab-completion/`^C` all work
-/// exactly as they would over SSH. One dedicated vsock connection per session,
-/// held open for the session's whole life; `PtyInput`/`PtyResize` ride the
-/// SAME connection (the agent's accept loop distinguishes them by frame type,
-/// not by a fresh connection per call — unlike `KillExec`, which the caller
-/// may not have a live connection to send on).
+/// One interactive PTY session inside an already-booted cell (the Sandboxes terminal): a real
+/// `openpty`/`forkpty` shell with raw bytes both ways, on one dedicated vsock connection that
+/// also carries its `PtyInput`/`PtyResize` frames.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ExecPtyRequest {
     /// Caller-chosen id (echoed on every `PtyOutput`/`PtyExited` event) — the
@@ -897,23 +802,15 @@ pub struct ExecPtyRequest {
     pub cwd: String,
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
-    /// Initial terminal size; a real `struct winsize` is set on the pty before
-    /// the shell forks so full-screen programs (vim, less, htop) render
-    /// correctly from their very first frame.
+    /// Initial terminal size, applied to the pty before the shell forks so full-screen programs
+    /// render from their first frame.
     #[serde(default = "default_pty_cols")]
     pub cols: u16,
     #[serde(default = "default_pty_rows")]
     pub rows: u16,
-    /// Programs the shell must be able to run besides the fixed tool set —
-    /// the sandbox's own runtime (`node` for a `node22` sandbox). Backends
-    /// with a full guest filesystem (Firecracker's rootfs) ignore it; the
-    /// litebox backend stages each one (resolved on the host, with its
-    /// dynamic closure) into the shell's guest tar, which otherwise holds
-    /// only sh + coreutils: `node -v` inside a node22 sandbox shell was a
-    /// not-found, and under litebox's fork emulation a not-found is the
-    /// worst case (the child that prints the error dies "glibc detected an
-    /// invalid stdio handle"), witnessed 2026-09-02. Additive and
-    /// defaulted, so the vsock agent wire shape is unchanged.
+    /// Programs the shell must be able to run besides the fixed tool set (the sandbox's own runtime);
+    /// Firecracker's full rootfs ignores it, litebox stages each one with its dynamic closure into
+    /// the shell's guest tar. Additive and defaulted.
     #[serde(default)]
     pub programs: Vec<String>,
 }
@@ -939,25 +836,20 @@ pub enum AgentRequest {
     CacheData { tar: Vec<u8> },
     /// Liveness probe; agent replies with `AgentEvent::Pong`.
     Ping,
-    /// Run one argv command (Sandboxes). Sent on its OWN dedicated connection;
-    /// the agent spawns a thread for it and keeps accepting other connections
-    /// (unlike `Run`, this does NOT stop the accept loop).
+    /// Run one argv command (Sandboxes) on its own dedicated connection; unlike `Run`, the agent
+    /// keeps accepting other connections.
     Exec(ExecRequest),
-    /// Kill a still-running `Exec` by id, sent on any (typically a fresh)
-    /// connection — the agent tracks live exec child PIDs in a process-global
+    /// Kill a still-running `Exec` by id from any connection; the agent keeps a process-global
     /// registry keyed by `ExecRequest.id`.
     KillExec { id: String },
-    /// Open an interactive PTY session (Sandboxes terminal). Mandatory FIRST
-    /// frame on its own dedicated connection — every subsequent frame on that
-    /// same connection is `PtyInput`/`PtyResize` for this exact session until
-    /// the connection closes or the shell exits.
+    /// Open an interactive PTY session: the mandatory first frame on its own connection, which then
+    /// carries only this session's `PtyInput`/`PtyResize` until it closes.
     ExecPty(ExecPtyRequest),
     /// Raw bytes typed into the terminal — sent on the SAME connection
     /// `ExecPty` opened, any number of times.
     PtyInput { bytes: Vec<u8> },
-    /// Browser terminal was resized — sent on the SAME connection `ExecPty`
-    /// opened. The agent applies it via `TIOCSWINSZ` and the shell's own
-    /// `SIGWINCH` handling takes it from there (full-screen programs redraw).
+    /// Browser terminal resized, on the same connection `ExecPty` opened; applied via `TIOCSWINSZ`,
+    /// the shell's `SIGWINCH` does the rest.
     PtyResize { cols: u16, rows: u16 },
 }
 
@@ -971,9 +863,8 @@ pub enum AgentEvent {
     Pong,
     Log(LogLine),
     Done(BuildResult),
-    /// Guest proof that the mounted runtime tree matches the exact protocol/id/
-    /// content identity requested by the host. A host must receive this before
-    /// accepting `FunctionReady`; old agents therefore fail closed.
+    /// Guest proof that the mounted runtime tree matches what the host requested; a host must
+    /// receive it before accepting `FunctionReady`, so old agents fail closed.
     RuntimeArtifactReady(RuntimeArtifactIdentity),
     /// Function server is up and accepting requests on its port; the agent is
     /// now bridging `CELL_FUNCTION_PORT` -> the function.
@@ -1002,18 +893,14 @@ pub enum AgentEvent {
         stream: LogStream,
         line: String,
     },
-    /// An `Exec` finished. `exit_code = None` means it was killed or the agent
-    /// could not determine an exit status (e.g. sudo requested but
-    /// unavailable) — the caller must NEVER treat `None` as success.
+    /// An `Exec` finished. `exit_code = None` means killed or undeterminable (e.g. sudo
+    /// unavailable) — never success.
     ExecDone {
         id: String,
         exit_code: Option<i32>,
     },
-    /// Raw bytes read from the pty master (shell stdout+stderr interleaved, as
-    /// a real terminal produces) — unlike `ExecOutput`, NOT line-buffered:
-    /// forwarded to the browser as soon as the agent reads them, so a program
-    /// that repaints a line in place (a progress bar, `vim`'s status line)
-    /// looks correct.
+    /// Raw bytes from the pty master, forwarded as read (not line-buffered) so in-place repaints
+    /// look right.
     PtyOutput { id: String, bytes: Vec<u8> },
     /// The pty's shell exited (normally or killed) or the session was torn
     /// down. Same `exit_code = None` meaning as `ExecDone`.

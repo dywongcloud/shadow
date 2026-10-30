@@ -4,14 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { MoreHorizontal, ExternalLink, Settings, Trash2, Loader2 } from "lucide-react";
-import { apiSend } from "@/lib/api";
+import { toast } from "@/components/toast";
+import { apiSend, useCan } from "@/lib/api";
 import { deploymentUrl } from "@/lib/deploy-url";
+import { roleHint } from "@/lib/team-role";
 
-/** The "⋯" menu on a project card/row — Visit / Settings / Delete Project.
- *
- *  The menu is rendered in a PORTAL (fixed-positioned at the trigger) so it
- *  overlays everything and is never clipped by an ancestor's `overflow-hidden`
- *  (which is what made it appear inline inside the list row). */
+/** The "⋯" menu on a project card/row (Visit / Settings / Delete Project), portaled and fixed-positioned at the trigger so it overlays everything and an ancestor's
+ *  `overflow-hidden` never clips it. */
 export function ProjectMenu({
   project,
   alias,
@@ -27,9 +26,8 @@ export function ProjectMenu({
   const btnRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
+  const mayDelete = useCan()("project.delete");
 
-  // Close on outside click (accounting for the portaled menu, which is NOT a DOM
-  // descendant of the trigger).
   useEffect(() => {
     const f = (e: MouseEvent) => {
       const t = e.target as Node;
@@ -40,7 +38,6 @@ export function ProjectMenu({
     return () => document.removeEventListener("mousedown", f);
   }, []);
 
-  // Position the portaled menu under the trigger; keep it pinned on scroll/resize.
   useEffect(() => {
     if (!open) return;
     const place = () => {
@@ -72,7 +69,7 @@ export function ProjectMenu({
       onChange?.();
       router.refresh();
     } catch (err) {
-      alert(String(err));
+      toast(err instanceof Error ? err.message : String(err), { tone: "default" });
     } finally {
       setBusy(false);
     }
@@ -97,7 +94,7 @@ export function ProjectMenu({
             <button onClick={(e) => { stop(e); setOpen(false); router.push(`/projects/${encodeURIComponent(project)}/settings`); }} className={item}>
               <Settings className="h-3.5 w-3.5" /> Settings
             </button>
-            <button onClick={del} disabled={busy} className={`${item} text-red-600 dark:text-red-400 disabled:cursor-not-allowed disabled:opacity-50`}>
+            <button onClick={del} disabled={busy || !mayDelete} title={mayDelete ? undefined : roleHint("project.delete")} className={`${item} text-red-600 dark:text-red-400 disabled:cursor-not-allowed disabled:opacity-50`}>
               <Trash2 className="h-3.5 w-3.5" /> Delete Project
             </button>
           </div>,

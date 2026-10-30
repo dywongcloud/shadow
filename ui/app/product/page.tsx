@@ -1,5 +1,6 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import {
   MarketingShell,
   MarketingHero,
@@ -10,7 +11,6 @@ import {
   ArrowRight,
   Zap,
   Box,
-  Globe,
   Database,
   Network,
   GitBranch,
@@ -19,58 +19,43 @@ import {
   Radar,
 } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Product — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Product",
+  socialTitle: "Product — shadw",
   description:
-    "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
-  alternates: { canonical: "/product" },
-  openGraph: {
-    title: "Product — shadw",
-    description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
-    url: "/product",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Product — shadw",
-    description:
-      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data over an Iroh QUIC mesh, with Vercel-style Git deploys and instant rollbacks.",
-  },
-};
+    "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys, immutable builds, and rollback to earlier deployments.",
+  twitterDescription:
+    "shadw is a cloud you can self-host: serverless functions, containers, and managed databases, with Vercel-style Git deploys and rollback to earlier deployments.",
+  path: "/product",
+});
+export const viewport = darkViewport;
 
 
 const CAPABILITIES = [
   {
     icon: Zap,
     title: "Serverless Functions",
-    desc: "Ship request-driven functions that scale to zero and spin up instantly across the mesh — no servers to manage.",
+    desc: "Ship request-driven functions that stay warm in production, scale previews to zero when idle, and run on nodes picked by the scheduler — no servers to manage.",
   },
   {
     icon: Box,
     title: "Containers (Dockerfile)",
-    desc: "Bring your own Dockerfile. Run any language or runtime as a long-lived container, scheduled onto healthy peers.",
-  },
-  {
-    icon: Globe,
-    title: "Edge Functions",
-    desc: "Execute lightweight logic at the edge, milliseconds from your users, with global routing baked in.",
+    desc: "Bring your own Dockerfile. Run any language or runtime as a long-lived container, scheduled onto healthy nodes.",
   },
   {
     icon: Database,
-    title: "Durable Data (GuardianDB)",
-    desc: "Replicated, always-on storage that survives node churn — strongly consistent state without a central database.",
+    title: "Managed Databases",
+    desc: "Postgres, Redis and SQLite databases per project, each with its own connection details and running on a single host node.",
   },
   {
     icon: Network,
-    title: "P2P Mesh (Iroh QUIC)",
-    desc: "Nodes discover and connect directly over QUIC, forming an encrypted, NAT-traversing peer-to-peer fabric.",
+    title: "Request Routing",
+    desc: "Requests reach the node that runs your deployment: platform DNS favours it, and a request that lands on another node is forwarded. If the coordinating node is lost, a standby takes over, and shared state is eventually consistent.",
   },
   {
     icon: GitBranch,
     title: "GitOps deploys",
-    desc: "Push to Git and we build an immutable deployment automatically — Vercel-style previews and instant rollbacks.",
+    desc: "Push to Git and we build an immutable deployment automatically — Vercel-style previews, and rollback to any earlier deployment.",
   },
 ];
 
@@ -78,17 +63,17 @@ const STEPS = [
   {
     icon: GitFork,
     title: "Connect a repo",
-    desc: "Link your Git repository. Every push triggers a build with zero pipeline configuration.",
+    desc: "Link your Git repository. Every push triggers a build; major frameworks are detected, and a monorepo with several apps needs a root directory.",
   },
   {
     icon: Hammer,
     title: "Build immutable deployment",
-    desc: "We compile your functions, containers, and edge logic into a versioned, reproducible artifact.",
+    desc: "We build your functions and containers into a versioned, content-addressed artifact.",
   },
   {
     icon: Radar,
-    title: "Serve from the nearest node",
-    desc: "The mesh routes each request to the closest healthy peer for the lowest possible latency.",
+    title: "Route to the right node",
+    desc: "Platform DNS favours the node that already serves your app, and a request that arrives at another node is forwarded to the one that runs your deployment.",
   },
 ];
 
@@ -99,38 +84,37 @@ export default function ProductPage() {
         eyebrow="Platform"
         title={
           <>
-            The cloud,{" "}
+            One cloud for{" "}
             <span className="bg-gradient-to-r from-fuchsia-400 via-cyan-300 to-blue-500 bg-clip-text text-transparent">
-              peer-to-peer
+              what you ship
             </span>
           </>
         }
-        subtitle="A self-hosted, peer-to-peer cloud platform. Serverless functions, containers, edge, and durable data running over an encrypted P2P mesh — with Vercel-style deploys straight from Git."
+        subtitle="Serverless functions, containers, and managed databases on one platform — with Vercel-style deploys straight from Git. Hosted, or self-hosted on machines you operate."
       >
         <Link
           href="/sign-up"
-          className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+          className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
         >
           Start building
           <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
         </Link>
         <Link
           href="/docs"
-          className="inline-flex items-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
+          className="inline-flex items-center gap-2 tap-44 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10"
         >
           Read the docs
         </Link>
       </MarketingHero>
 
-      {/* Capabilities */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight text-white">
-            Everything you ship, in one mesh
+            Everything you ship, in one place
           </h2>
           <p className="mt-3 text-zinc-400">
-            Compute, storage, and networking primitives that run on your own
-            nodes — no centralized cloud, no lock-in.
+            Compute, storage, and networking primitives on one platform, hosted or
+            on nodes you can operate yourself.
           </p>
         </div>
 
@@ -147,14 +131,13 @@ export default function ProductPage() {
         </div>
       </MarketingSection>
 
-      {/* How it works */}
       <MarketingSection className="py-16">
         <div className="max-w-2xl">
           <h2 className="text-3xl font-bold tracking-tight text-white">
             How it works
           </h2>
           <p className="mt-3 text-zinc-400">
-            From a Git push to a globally served deployment in three steps.
+            From a Git push to a served deployment in three steps.
           </p>
         </div>
 
@@ -176,21 +159,19 @@ export default function ProductPage() {
         </div>
       </MarketingSection>
 
-      {/* Closing CTA */}
       <MarketingSection className="py-16">
         <GlowCard className="text-center">
           <div className="mx-auto max-w-2xl py-8">
             <h2 className="text-3xl font-bold tracking-tight text-white">
-              Deploy your first node today
+              Deploy your first project today
             </h2>
             <p className="mt-3 text-zinc-400">
-              Spin up the mesh, connect a repo, and watch your code serve from
-              everywhere at once.
+              Connect a repo and push to deploy.
             </p>
             <div className="mt-8 flex justify-center">
               <Link
                 href="/sign-up"
-                className="group inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
+                className="group inline-flex items-center gap-2 tap-44 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black shadow-[0_0_35px_rgba(52,211,153,0.55)] transition-transform hover:scale-[1.03]"
               >
                 Start building
                 <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />

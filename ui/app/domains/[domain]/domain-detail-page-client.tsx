@@ -3,21 +3,26 @@
 import { useState, use, useEffect } from "react";
 import Link from "next/link";
 import {
-  ChevronRight, RefreshCw, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
+  ChevronRight, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
   Pencil, X, DownloadCloud, FileUp, Check, AlertTriangle, Link2,
 } from "lucide-react";
-import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
-import { Switch } from "@/components/ui";
-import { apiGet, apiSend, usePoll, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type Deployment, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { Card, Button, Input, Badge } from "@/components/ui";
+import { apiGet, apiSend, usePoll, useCan, verifyDomainNow, detachDomain, attachDomain, fetchNsRoster, type DomainDetail, type DnsRecord, type DomainAttachResult, type NsRoster } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
+import { RoleGate } from "@/components/role-gate";
+import { roleHint } from "@/lib/team-role";
 import { toast } from "@/components/toast";
 import { timeAgo, copyText } from "@/lib/utils";
 
 interface ScanRecord { name: string; type: string; value: string; ttl: number; priority: number | null }
 
+/** A failure as one sentence: a role refusal already is one ("Your role can't do this. Ask a team admin."), never the raw `Error: ...` string. */
+const sentence = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
 const RECORD_TYPES = ["A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "SRV"];
 
-function fmtDate(ms: number) {
-  return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+function NotAvailable() {
+  return <span className="text-muted">Not available for DNS-only domains</span>;
 }
 
 export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ domain: string }> }) {
@@ -30,14 +35,10 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
     return <div className="py-20 text-center text-sm text-secondary"><Loader2 className="mx-auto h-5 w-5 animate-spin" /></div>;
   }
   const d = data.domain;
-  // A domain with a real attach flow (`verify`) has no registrar/renewal/SSL
-  // state on the platform — those record fields are legacy simulated
-  // placeholders and must not render next to the real verification card.
   const attached = !!d.verify;
 
   return (
     <div className="pb-24">
-      {/* Breadcrumb */}
       <div className="mb-6 flex items-center gap-1.5 text-sm text-secondary">
         <Link href="/domains" className="hover:text-fg">Domains</Link>
         <ChevronRight className="h-3.5 w-3.5 text-muted" />
@@ -46,31 +47,26 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         </span>
       </div>
 
-      {/* Header */}
       <div className="mb-6 flex items-start justify-between">
         <h1 className="text-3xl font-semibold tracking-tight">{domain}</h1>
         <div className="flex items-center gap-2">
-          {!attached && <Button>Renew Domain</Button>}
           <button className="flex h-9 w-9 items-center justify-center rounded-md border border-border-strong text-muted hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
         </div>
       </div>
 
-      {/* Meta row */}
       <div className="mb-8 grid grid-cols-2 gap-y-4 border-b border-border pb-6 text-sm sm:grid-cols-3 lg:grid-cols-6">
-        <Meta label="Expiration Date" value={<span className="flex items-center gap-1.5"><RefreshCw className="h-3.5 w-3.5 text-muted" /> {fmtDate(d.expires_ms)}</span>} />
-        {!attached && <Meta label="Renewal Price" value={d.renewal_price} />}
-        {!attached && <Meta label="Registrar" value={<span className="flex items-center gap-1.5"><Triangle className="h-4 w-4" /> {d.registrar}</span>} />}
-        {!attached && <Meta label="Auto Renewal" value={<AutoRenew domain={domain} on={d.auto_renew} onChange={refresh} />} />}
+        {!attached && <Meta label="Expiration Date" value={<NotAvailable />} />}
+        {!attached && <Meta label="Renewal Price" value={<NotAvailable />} />}
+        {!attached && <Meta label="Registrar" value={<NotAvailable />} />}
+        {!attached && <Meta label="Auto Renewal" value={<NotAvailable />} />}
         <Meta label="Age" value={timeAgo(d.created_ms)} />
         <Meta label="OpenEdge CDN" value={d.cdn_active ? <span className="flex items-center gap-1.5 text-emerald-500"><ShieldCheck className="h-4 w-4" /> Active</span> : "Inactive"} />
       </div>
 
-      {/* Ownership verification (custom-domain attachment) */}
       {d.verify && (
         <VerifyCard domain={domain} v={d.verify} onChange={refresh} />
       )}
 
-      {/* Connected Projects */}
       <Section title="Connected Projects" desc="Subdomains that are connected to projects on this team." action={<Button variant="outline" onClick={() => setConnectOpen(true)}>Connect</Button>}>
         <Card className="p-0">
           {data.connected.length === 0 ? (
@@ -86,42 +82,21 @@ export function DomainDetailPage({ paramsPromise }: { paramsPromise: Promise<{ d
         </Card>
       </Section>
 
-      {/* DNS Records */}
       <DnsRecords domain={domain} records={d.records} onChange={refresh} />
 
-      {/* Migrate / import existing DNS */}
       <MigrateDns domain={domain} onChange={refresh} />
 
-      {/* Nameservers */}
       <Nameservers domain={domain} nameservers={d.nameservers} attached={attached} onChange={refresh} />
 
-      {/* SSL Certificates — simulated placeholder data, only meaningful for
-          legacy DNS-only records (no attach flow). */}
       {!attached && (
-      <Section title="SSL Certificates" desc="By default, OpenEdge issues and auto-renews a free SSL certificate for your domains.">
-        <Card className="p-0">
-          <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-            <span>ID</span><span>CNs</span><span>Renewal</span><span>Expiration</span><span>Age</span>
-          </div>
-          <div className="grid grid-cols-[2fr_1.4fr_0.8fr_1.2fr_auto] items-center gap-2 px-4 py-3 text-sm">
-            <span className="flex items-center gap-2 font-mono text-xs"><Lock className="h-3.5 w-3.5 text-muted" /> {d.ssl.id}</span>
-            <span className="flex flex-wrap gap-1">{d.ssl.cns.map((c) => <span key={c} className="rounded bg-subtle px-1.5 py-0.5 text-[11px] text-secondary">{c}</span>)}</span>
-            <span className="capitalize text-secondary">{d.ssl.renewal}</span>
-            <span className="text-secondary">{fmtDate(d.ssl.expires_ms)}</span>
-            <span className="text-muted">{timeAgo(d.ssl.issued_ms)}</span>
-          </div>
-          <div className="flex items-center justify-between border-t border-border px-4 py-2.5 text-xs text-muted">
-            <span className="flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5 text-emerald-500" /> Provided free by {d.ssl.provider}</span>
-            <button onClick={() => apiSend("POST", `/v1/domains/${encodeURIComponent(domain)}/ssl/renew`).then(refresh)} className="rounded-md border border-border-strong px-2.5 py-1 hover:bg-subtle">Renew now</button>
-          </div>
-        </Card>
+      <Section title="SSL Certificates" desc="Certificates are issued once the domain is attached to a project.">
+        <Card className="px-4 py-6 text-sm"><NotAvailable /></Card>
       </Section>
       )}
 
-      {/* Registrant — simulated WHOIS/registrar copy, legacy DNS-only only. */}
       {!attached && (
-      <Section title="Registrant Information" desc="We collect this information to meet ICANN requirements and establish you as the legal domain holder." action={<Button variant="outline">Manage WHOIS Privacy</Button>}>
-        <Card className="p-5 text-sm text-secondary">WHOIS privacy is enabled — your contact details are protected.</Card>
+      <Section title="Registrant Information" desc="Registrant details are held by your domain's registrar.">
+        <Card className="px-4 py-6 text-sm"><NotAvailable /></Card>
       </Section>
       )}
 
@@ -139,9 +114,8 @@ function Meta({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-/** The ownership-verification card for a custom-domain attachment: pending
- *  shows the TXT to add (with copy + manual re-check); verified shows the
- *  live state and offers detach. */
+/** The ownership-verification card for a custom-domain attachment: pending shows the TXT to add (copy + manual re-check), verified shows the live state
+ *  and offers detach. */
 function VerifyCard({ domain, v, onChange }: { domain: string; v: import("@/lib/api").DomainVerify; onChange: () => void }) {
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -247,13 +221,6 @@ function Section({ title, desc, action, children }: { title: string; desc?: stri
   );
 }
 
-function AutoRenew({ domain, on, onChange }: { domain: string; on: boolean; onChange: () => void }) {
-  const [v, setV] = useState(on);
-  return (
-    <Switch checked={v} onChange={(next) => { setV(next); apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/auto-renew`, { on: next }).then(onChange).catch(() => setV(on)); }} />
-  );
-}
-
 function DnsRecords({ domain, records, onChange }: { domain: string; records: DnsRecord[]; onChange: () => void }) {
   const [name, setName] = useState("");
   const [type, setType] = useState("A");
@@ -262,8 +229,9 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
   const [priority, setPriority] = useState("");
   const [comment, setComment] = useState("");
   const [busy, setBusy] = useState(false);
-  // When set, the form edits an existing record (PUT) instead of adding (POST).
+  const [err, setErr] = useState("");
   const [editId, setEditId] = useState<string | null>(null);
+  const mayWrite = useCan()("dns.write");
   const needsPriority = type === "MX" || type === "SRV";
 
   function reset() {
@@ -279,6 +247,7 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
   async function submit() {
     if (!value.trim()) return;
     setBusy(true);
+    setErr("");
     const body = {
       name, type, value, ttl: parseInt(ttl) || 60,
       priority: needsPriority && priority ? parseInt(priority) : null,
@@ -292,15 +261,19 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
       }
       reset();
       onChange();
-    } finally { setBusy(false); }
+    } catch (e) { setErr(sentence(e)); } finally { setBusy(false); }
   }
   async function del(id: string) {
-    await apiSend("DELETE", `/v1/domains/${encodeURIComponent(domain)}/records/${encodeURIComponent(id)}`).then(onChange).catch(() => {});
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/domains/${encodeURIComponent(domain)}/records/${encodeURIComponent(id)}`);
+      onChange();
+    } catch (e) { setErr(sentence(e)); }
   }
 
   return (
     <Section title="DNS Records" desc="DNS records point to services your domain uses — forwarding, email (MX), subdomains (A/CNAME), wildcards (*), and more.">
-      {/* Add / edit form */}
+      <RoleGate action="dns.write" note>
       <Card className="mb-4 p-5">
         {editId && (
           <div className="mb-3 flex items-center gap-2 rounded-md bg-link/10 px-3 py-2 text-xs text-link">
@@ -329,8 +302,9 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
           </div>
         </div>
       </Card>
+      </RoleGate>
+      {err ? <p className="mb-4 text-sm text-red-500">{err}</p> : null}
 
-      {/* Records table */}
       <Card className="p-0">
         <div className="grid grid-cols-[1.2fr_0.7fr_1.6fr_0.6fr_0.7fr_0.9fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
           <span>Name</span><span>Type</span><span>Value</span><span>TTL</span><span>Priority</span><span>Age</span><span></span>
@@ -349,8 +323,8 @@ function DnsRecords({ domain, records, onChange }: { domain: string; records: Dn
               <span className="flex items-center justify-end gap-2">
                 {!r.system && (
                   <>
-                    <button onClick={() => startEdit(r)} title="Edit" className="text-muted hover:text-fg"><Pencil className="h-3.5 w-3.5" /></button>
-                    <button onClick={() => del(r.id)} title="Delete" className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
+                    <button onClick={() => startEdit(r)} disabled={!mayWrite} title={mayWrite ? "Edit" : roleHint("dns.write")} aria-label="Edit DNS record" className="text-muted hover:text-fg disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"><Pencil className="h-3.5 w-3.5" /></button>
+                    <button onClick={() => del(r.id)} disabled={!mayWrite} title={mayWrite ? "Delete" : roleHint("dns.write")} aria-label="Delete DNS record" className="text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"><Trash2 className="h-3.5 w-3.5" /></button>
                   </>
                 )}
               </span>
@@ -377,9 +351,9 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
     try {
       const r = await apiGet<{ records: ScanRecord[] }>(`/v1/domains/${encodeURIComponent(domain)}/scan`);
       setScanned(r.records || []);
-      setPicked(new Set((r.records || []).map((_, i) => i))); // pre-select all
+      setPicked(new Set((r.records || []).map((_, i) => i)));
       if (!r.records?.length) setMsg("No public DNS records found for this domain yet.");
-    } catch (e) { setMsg(String(e)); } finally { setScanning(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setScanning(false); }
   }
   function toggle(i: number) {
     setPicked((s) => { const n = new Set(s); n.has(i) ? n.delete(i) : n.add(i); return n; });
@@ -394,7 +368,7 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
       setMsg(`Imported ${r.imported} record(s).`);
       setScanned(null); setPicked(new Set());
       onChange();
-    } catch (e) { setMsg(String(e)); } finally { setBusy(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setBusy(false); }
   }
   async function importZone() {
     if (!zone.trim()) return;
@@ -404,13 +378,13 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
       setMsg(`Imported ${r.imported} record(s) from the zone file.`);
       setZone("");
       onChange();
-    } catch (e) { setMsg(String(e)); } finally { setBusy(false); }
+    } catch (e) { setMsg(sentence(e)); } finally { setBusy(false); }
   }
 
   return (
     <Section title="Migrate DNS" desc="Moving a domain from another provider? Detect its current records automatically, or paste your existing zone file — then import them here in one step.">
+      <RoleGate action="dns.write" note>
       <Card className="p-5">
-        {/* Auto-detect */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="text-sm font-medium">Detect existing records</div>
@@ -448,7 +422,6 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
           </div>
         )}
 
-        {/* Paste a zone file */}
         <div className="mt-6 border-t border-border pt-5">
           <div className="text-sm font-medium">Or paste a zone file</div>
           <div className="mt-0.5 text-xs text-muted">BIND-style lines, e.g. <span className="font-mono">www 3600 IN A 76.76.21.21</span></div>
@@ -468,14 +441,14 @@ function MigrateDns({ domain, onChange }: { domain: string; onChange: () => void
 
         {msg && <p className="mt-4 text-sm text-secondary">{msg}</p>}
       </Card>
+      </RoleGate>
     </Section>
   );
 }
 
 /** Attach this domain (or a subdomain of it) to a project. */
 function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; open: boolean; onClose: () => void; onChange: () => void }) {
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 8000);
-  const projects = Array.from(new Set((deps ?? []).map((d) => d.project)));
+  const projects = useProjectNames(8000);
   const [project, setProject] = useState("");
   const [sub, setSub] = useState("");
   const [err, setErr] = useState("");
@@ -492,8 +465,6 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
       const r = await attachDomain(project, fqdn);
       onChange();
       if (r.status === "pending" && r.verify) {
-        // Attached but not live: ownership TXT is outstanding — show it
-        // instead of closing as if the domain were already routed.
         setPending(r);
       } else {
         onClose(); setProject(""); setSub(""); setPending(null);
@@ -568,57 +539,75 @@ function ConnectDomain({ domain, open, onClose, onChange }: { domain: string; op
   );
 }
 
+/** The platform's own nameservers, as the nodes measured them (`/v1/domains-nameserver-roster`): shown only once the set is proven ready. */
+function PlatformNameservers({ roster }: { roster: NsRoster | null }) {
+  const ns = roster?.nameservers ?? [];
+  const ready = roster?.delegation_ready === true && ns.length > 0;
+  return (
+    <Card className="p-0">
+      {ready ? (
+        ns.map((n) => (
+          <div key={n} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{n}</div>
+        ))
+      ) : (
+        <div className="px-4 py-3 text-sm text-secondary">Not yet ready — the platform nameserver set is still converging.</div>
+      )}
+    </Card>
+  );
+}
+
+/** Nameservers shown only from what the platform measured (its roster) or the tenant typed (the domain's custom list): there is no invented default to restore. */
 function Nameservers({ domain, nameservers, attached, onChange }: { domain: string; nameservers: string[]; attached: boolean; onChange: () => void }) {
   const [editing, setEditing] = useState(false);
   const [text, setText] = useState(nameservers.join("\n"));
   const [roster, setRoster] = useState<NsRoster | null>(null);
-  // Attached domains have no stored nameserver truth — the record's
-  // `nameservers` are simulated placeholders. The real, peer-attested
-  // platform set comes from the roster endpoint.
+  const [err, setErr] = useState("");
+  const mayWrite = useCan()("dns.write");
   useEffect(() => {
-    if (attached) fetchNsRoster().then(setRoster).catch(() => setRoster(null));
-  }, [attached]);
-  async function save() {
-    const ns = text.split("\n").map((s) => s.trim()).filter(Boolean);
-    await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
-    setEditing(false); onChange();
+    fetchNsRoster().then(setRoster).catch(() => setRoster(null));
+  }, []);
+  async function write(ns: string[]) {
+    setErr("");
+    try {
+      await apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ns });
+      setEditing(false); onChange();
+    } catch (e) { setErr(sentence(e)); }
   }
+  const hint = mayWrite ? undefined : roleHint("dns.write");
+  const delegateDesc = "Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone.";
   if (attached) {
-    const ns = roster?.nameservers ?? [];
-    const ready = roster?.delegation_ready === true && ns.length > 0;
     return (
-      <Section
-        title="Nameservers"
-        desc="Delegate these platform nameservers at your registrar if you want us to serve this domain's DNS zone."
-      >
-        <Card className="p-0">
-          {ready ? (
-            ns.map((n) => (
-              <div key={n} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{n}</div>
-            ))
-          ) : (
-            <div className="px-4 py-3 text-sm text-secondary">Not yet ready — the platform nameserver set is still converging.</div>
-          )}
-        </Card>
+      <Section title="Nameservers" desc={delegateDesc}>
+        <PlatformNameservers roster={roster} />
       </Section>
     );
   }
   return (
-    <Section
-      title="Nameservers"
-      desc="By default, OpenEdge propagates its nameservers for your domains. You can view them or add custom ones here."
-      action={editing ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><Button onClick={save}>Save</Button></div> : <div className="flex gap-2"><Button variant="outline" onClick={() => apiSend("PUT", `/v1/domains/${encodeURIComponent(domain)}/nameservers`, { nameservers: ["ns1.openedge-dns.com", "ns2.openedge-dns.com"] }).then(onChange)}>Restore Original</Button><Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }}>Edit</Button></div>}
-    >
-      <Card className="p-0">
-        {editing ? (
-          <textarea value={text} onChange={(e) => setText(e.target.value)} rows={Math.max(2, nameservers.length)} className="w-full resize-none rounded-xl bg-card px-4 py-3 font-mono text-sm focus:outline-none" />
-        ) : (
-          nameservers.map((ns) => (
-            <div key={ns} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{ns}</div>
-          ))
-        )}
-      </Card>
-    </Section>
+    <>
+      <Section title="Nameservers" desc={delegateDesc}>
+        <PlatformNameservers roster={roster} />
+      </Section>
+      <Section
+        title="Custom nameservers"
+        desc="Nameservers you have recorded for this domain. None are recorded until you add them."
+        action={editing
+          ? <div className="flex gap-2"><Button variant="outline" onClick={() => { setEditing(false); setText(nameservers.join("\n")); }}>Cancel</Button><span title={hint}><Button onClick={() => write(text.split("\n").map((s) => s.trim()).filter(Boolean))} disabled={!mayWrite}>Save</Button></span></div>
+          : <div className="flex gap-2">{nameservers.length > 0 && <span title={hint}><Button variant="outline" onClick={() => write([])} disabled={!mayWrite}>Clear</Button></span>}<span title={hint}><Button onClick={() => { setText(nameservers.join("\n")); setEditing(true); }} disabled={!mayWrite}>Edit</Button></span></div>}
+      >
+        <Card className="p-0">
+          {editing ? (
+            <textarea value={text} onChange={(e) => setText(e.target.value)} rows={Math.max(2, nameservers.length)} className="w-full resize-none rounded-xl bg-card px-4 py-3 font-mono text-sm focus:outline-none" />
+          ) : nameservers.length > 0 ? (
+            nameservers.map((ns) => (
+              <div key={ns} className="border-b border-border px-4 py-3 font-mono text-sm last:border-0">{ns}</div>
+            ))
+          ) : (
+            <div className="px-4 py-3 text-sm text-secondary">No custom nameservers recorded.</div>
+          )}
+        </Card>
+        {err ? <p className="mt-3 text-sm text-red-500">{err}</p> : null}
+      </Section>
+    </>
   );
 }
 

@@ -1,41 +1,32 @@
-//! Managed serverless GPU inference — the platform half of the llama.cpp
-//! pooling stack (the node half, `llama-rpc.service` on every GPU node, is
-//! provisioned infrastructure: CUDA `rpc-server` on port 50052, peers-only via
-//! hive-lockdown).
+//! Managed serverless GPU inference: the platform half of the llama.cpp pooling stack (the node
+//! half, `llama-rpc.service` on every GPU node, is provisioned infrastructure: CUDA `rpc-server` on
+//! port 50052, peers-only via hive-lockdown).
 //!
-//! A project opts in with a `fluid.json` top-level block
-//! (`{"inference": {"model": "<gguf-url-or-hf-path>", "pool": true}}` →
-//! [`crate::project_settings::InferenceSpec`], synced into the replicated
-//! projects store by the deploy path). This module then:
+//! A project opts in with a `fluid.json` top-level block (`{"inference": {"model":
+//! "<gguf-url-or-hf-path>", "pool": true}}` -> [`crate::project_settings::InferenceSpec`], synced
+//! into the replicated projects store by the deploy path). This module then:
 //!
-//!  * elects ONE coordinator GPU node per project — deterministically
-//!    (FNV hash of the project over the sorted GPU-node roster), so every node
-//!    computes the same assignment from the same gossiped registry with no new
-//!    coordination protocol;
-//!  * on that coordinator, downloads/caches the GGUF and runs a real
-//!    `llama-server` (OpenAI-compatible HTTP API) bound to a deterministic
-//!    per-project port in `50100..=50999` — a range hive-lockdown drops for
-//!    non-peers, so the endpoint is fleet-internal only;
-//!  * decides single-node vs pooled per the placement rule: if the model fits
-//!    the coordinator's free VRAM it runs alone (no pooling overhead); only
-//!    when it does NOT fit does it engage llama.cpp's RPC layer-distribution
-//!    (`--rpc member:50052,...`) across enough same-region pool members to
-//!    cover the need — ordered by real coordinator→member RTT, not free VRAM
-//!    (same "region" spans link classes: the San Jose CVM↔GPU pairs are
-//!    ~62-65ms apart while the GPU nodes are <2ms from each other, and one
-//!    high-RTT member link turns an 11GB tensor upload into hours at TCP-cwnd
-//!    speed). Deliberately NO silent CPU fallback: a model that cannot
-//!    fit even the pool's aggregate free VRAM parks the endpoint in a `failed`
-//!    status with an honest error.
-//!  * on the control-plane leader, injects `HIVE_INFERENCE_URL` into the
-//!    project env (same precedent as DB env auto-injection) so app code —
-//!    Next.js, Flask, Django, FastAPI, Fastify, anything — just reads one env
-//!    var and speaks OpenAI-protocol to it.
+//! * elects ONE coordinator GPU node per project, deterministically (a rendezvous hash of the
+//!   project over the sorted GPU-node roster), so every node computes the same assignment from the
+//!   same gossiped registry with no new coordination protocol;
+//! * on that coordinator, downloads and caches the GGUF and runs a real `llama-server`
+//!   (OpenAI-compatible HTTP API) bound to a deterministic per-project port in `50100..=50999`, a
+//!   range hive-lockdown drops for non-peers, so the endpoint is fleet-internal only;
+//! * decides single-node versus pooled by the placement rule: a model that fits the coordinator's
+//!   free VRAM runs alone (no pooling overhead); only when it does NOT fit does it engage
+//!   llama.cpp's RPC layer distribution (`--rpc member:50052,...`) across enough same-region pool
+//!   members to cover the need, ordered by real coordinator-to-member RTT and not by free VRAM
+//!   ('same region' spans link classes, and one high-RTT member link turns a multi-GB tensor upload
+//!   into hours at TCP-cwnd speed). Deliberately NO silent CPU fallback: a model that cannot fit
+//!   even the pool's aggregate free VRAM parks the endpoint in a `failed` status with an honest
+//!   error;
+//! * on the control-plane leader, injects `HIVE_INFERENCE_URL` into the project env (the same
+//!   precedent as DB env auto-injection), so app code just reads one env var and speaks the OpenAI
+//!   protocol to it.
 //!
-//! Reconcile-loop discipline matches `spawn_db_reconcile`: desired state is
-//! derived fresh every tick from replicated stores; the node hosting a piece
-//! of it converges its own local reality (spawn/kill children), self-healing
-//! across restarts with no imperative cross-node RPC.
+//! The reconcile loop follows `spawn_db_reconcile`'s discipline: desired state is derived fresh
+//! every tick from replicated stores, and the node hosting a piece of it converges its own local
+//! reality (spawn/kill children), self-healing across restarts with no imperative cross-node RPC.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -45,10 +36,9 @@ use serde::Serialize;
 
 use crate::state::CloudState;
 
-/// VRAM safety margin: quantized weights get mmapped roughly at file size; KV
-/// cache, CUDA context and fragmentation ride on top. 1.2x + 800MB tracks the
-/// live-measured footprint of the small-model E2E within reason without
-/// starving co-tenants.
+/// VRAM safety margin: quantized weights get mmapped at roughly file size, with KV cache, CUDA
+/// context and fragmentation on top; 1.2x + 800 MB tracks the measured footprint of a small model
+/// without starving co-tenants.
 fn vram_need_mb(model_bytes: u64) -> u64 {
     (model_bytes / (1024 * 1024)) * 12 / 10 + 800
 }
@@ -62,10 +52,9 @@ fn fnv(s: &str) -> u64 {
     h
 }
 
-/// Deterministic per-project endpoint port. Collisions between two projects
-/// hashing to the same slot are tolerated by the coordinator check (second
-/// server fails to bind, surfaces as failed status) — with 900 slots this is
-/// rare enough to keep the mapping stateless.
+/// Deterministic per-project endpoint port. Collisions between two projects hashing to the same
+/// slot are tolerated by the coordinator check (the second server fails to bind and surfaces as a
+/// failed status): with 900 slots this is rare enough to keep the mapping stateless.
 pub fn port_for(project: &str) -> u16 {
     50100 + (fnv(project) % 900) as u16
 }
@@ -83,17 +72,13 @@ fn gpu_roster(cloud: &Arc<CloudState>) -> Vec<hive_edge::NodeInfo> {
     v
 }
 
-/// Deterministic coordinator election: same inputs (gossiped registry) →
-/// same answer on every node. Region choice: the region with the largest
-/// total pool VRAM (stable, capacity-anchored). Within the region,
-/// RENDEZVOUS (highest-random-weight) hashing, not modulo: a node dropping
-/// out of the roster moves ONLY the endpoints that hashed onto that node,
-/// and — critically — when the roster recovers (a health flap, a rolling
-/// restart) every endpoint's winner is the SAME node as before, so routine
-/// fleet rolls stop reassigning (and therefore killing) mid-load inference
-/// servers. Live-witnessed with modulo: a rolling GPU-group restart shifted
-/// every project's slot and the reconcile killed a 25-minutes-into-load 14B
-/// endpoint mid tensor-upload.
+/// Deterministic coordinator election: the same inputs (the gossiped registry) give the same answer
+/// on every node. Region choice: the region with the largest total pool VRAM (stable,
+/// capacity-anchored). Within the region, RENDEZVOUS (highest-random-weight) hashing, not modulo: a
+/// node dropping out of the roster moves ONLY the endpoints that hashed onto that node, and when
+/// the roster recovers (a health flap, a rolling restart) every endpoint's winner is the SAME node
+/// as before, so routine fleet rolls never reassign (and therefore kill) mid-load inference
+/// servers, which modulo hashing did.
 pub fn coordinator_for(cloud: &Arc<CloudState>, project: &str) -> Option<hive_edge::NodeInfo> {
     let roster = gpu_roster(cloud);
     if roster.is_empty() {
@@ -144,15 +129,14 @@ pub struct EndpointStatus {
     /// "starting" | "running" | "failed: <reason>"
     pub status: String,
     pub updated_ms: u64,
-    /// 0 while this node is the elected coordinator; else the moment the
-    /// election first pointed elsewhere — drives the reassignment grace
-    /// window (see the teardown split in `spawn_reconcile`).
+    /// 0 while this node is the elected coordinator; else the moment the election first pointed
+    /// elsewhere, which drives the reassignment grace window (see the teardown split in
+    /// `spawn_reconcile`).
     #[serde(skip_serializing_if = "u64_is_zero", default)]
     pub unassigned_since_ms: u64,
-    /// The moment the CURRENT child entered its loading phase (spawn time);
-    /// cleared to 0 the first time /health answers OK. Drives the load-timeout
-    /// watchdog — 0 means "live or not loading", which is exactly the state
-    /// the watchdog must never touch.
+    /// The moment the CURRENT child entered its loading phase (spawn time); cleared to 0 the first
+    /// time /health answers OK. Drives the load-timeout watchdog: 0 means 'live or not loading',
+    /// which is exactly the state the watchdog must never touch.
     #[serde(skip_serializing_if = "u64_is_zero", default)]
     pub load_started_ms: u64,
 }
@@ -166,11 +150,13 @@ pub struct InferenceRuntime {
     /// project → (child, status). Children are this process's own — killed on
     /// process exit, respawned by the reconcile tick after a restart.
     servers: parking_lot::Mutex<HashMap<String, (Option<tokio::process::Child>, EndpointStatus)>>,
-    /// member ip → (rtt_ms, measured_at_ms): TCP-connect-time probes of member
-    /// rpc ports, in-process with a TTL — the fallback RTT signal for peers the
-    /// registry hasn't measured yet (see `member_rtts`). Only ever populated on
-    /// an elected coordinator, because only `reconcile_local` reads it.
+    /// member ip -> (rtt_ms, measured_at_ms): TCP-connect-time probes of member rpc ports,
+    /// in-process with a TTL, the fallback RTT signal for peers the registry has not measured yet
+    /// (see `member_rtts`). Only ever populated on an elected coordinator, because only
+    /// `reconcile_local` reads it.
     rtt_probe_cache: parking_lot::Mutex<HashMap<String, (u64, u64)>>,
+    /// model URL -> its download's state (see [`model_state`]); shared by every project naming it.
+    fetches: parking_lot::Mutex<HashMap<String, Fetch>>,
 }
 
 impl InferenceRuntime {
@@ -202,16 +188,14 @@ fn scope_name(project: &str) -> String {
     format!("hive-inference-{safe}")
 }
 
-/// The slice every inference scope runs under, so the whole class of inference
-/// workloads is accountable (and capped) as one unit, separately from
-/// `hive-node.service`.
+/// The slice every inference scope runs under, so the whole class of inference workloads is
+/// accountable (and capped) as one unit, separately from `hive-node.service`.
 fn inference_slice() -> String {
     std::env::var("HIVE_INFERENCE_SLICE").unwrap_or_else(|_| "hive-inference.slice".into())
 }
 
-/// Per-endpoint memory ceiling for the scope. Generous by default (a large
-/// quantized model is legitimately many GB resident) but bounded, so one
-/// endpoint cannot consume the host.
+/// Per-endpoint memory ceiling for the scope. Generous by default (a large quantized model is
+/// legitimately many GB resident) but bounded, so one endpoint cannot consume the host.
 fn scope_memory_max() -> String {
     std::env::var("HIVE_INFERENCE_MEMORY_MAX").unwrap_or_else(|_| "48G".into())
 }
@@ -237,52 +221,533 @@ fn models_dir() -> std::path::PathBuf {
     )
 }
 
-/// Download-and-cache the model file (content-addressed by ref hash so a
-/// changed ref refetches). Returns (path, size_bytes).
+/// Domain separator for the model-blob content identity (AGENTS.md: a NEW content identity mints
+/// BLAKE3 via a domain-separated hash of the bytes).
+const MODEL_BLOB_DOMAIN: &[u8] = b"hive-inference-model-blob-v1\0";
+
+/// Largest model this node will download in one `ensure_model` call. `fluid.json`'s
+/// `inference.model` is tenant input reaching a real network fetch with no bound otherwise;
+/// `HIVE_INFERENCE_MAX_MODEL_BYTES` overrides (default 200 GiB, generous for the largest quantized
+/// models this stack targets).
+fn max_model_bytes() -> u64 {
+    std::env::var("HIVE_INFERENCE_MAX_MODEL_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(200 * 1024 * 1024 * 1024)
+}
+
+/// A small pointer from a model ref's cheap lookup key to the content-addressed blob it currently
+/// resolves to: `fnv(url)` is never collision-resistant (a deliberate collision is brute-forceable
+/// in a 64-bit space), so the pointer's own stored `url` is compared verbatim before trusting it —
+/// a colliding ref just misses the cache and re-downloads under its own content hash, it can never
+/// make one tenant's cached bytes serve under a different tenant's model ref.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ModelRef {
+    url: String,
+    file: String,
+}
+
+/// Longest ONE model download may take end to end (`HIVE_INFERENCE_MODEL_TOTAL_SECS`, default 2 h).
+fn model_total_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_TOTAL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(2 * 3600),
+    )
+}
+
+/// Longest the transfer may go without receiving a single byte (`HIVE_INFERENCE_MODEL_STALL_SECS`,
+/// default 30 s); also bounds the connect-and-headers phase. A trickle that delivers a byte now and
+/// then never trips it: [`model_min_bytes_per_sec`] is what ends that.
+fn model_stall_timeout() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_STALL_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(30),
+    )
+}
+
+/// The slowest average a download may sustain over [`model_rate_window`]
+/// (`HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC`, default 64 KiB/s; 0 disables the floor). A slow drip
+/// (a byte every few seconds) delivers data often enough that the stall timeout never fires, and
+/// without a rate floor it would hold one of the node's few download slots for the whole total
+/// timeout (2 h). Every real model transfer runs orders of magnitude above this.
+fn model_min_bytes_per_sec() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(64 * 1024)
+}
+
+/// The window the rate floor is measured over (`HIVE_INFERENCE_MODEL_RATE_WINDOW_SECS`, default 30 s,
+/// never under 1 s): a download is ended when a whole window passes under the floor, so a trickle
+/// holds its slot for one window, not for the total timeout.
+fn model_rate_window() -> Duration {
+    Duration::from_secs(
+        std::env::var("HIVE_INFERENCE_MODEL_RATE_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(30)
+            .max(1),
+    )
+}
+
+/// How long a FAILED download of a model URL is remembered before the next reconcile tick retries
+/// it (`HIVE_INFERENCE_MODEL_RETRY_SECS`, default 300 s): a dead or hostile URL must not be hammered
+/// every tick.
+fn model_retry_cooldown_ms() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_RETRY_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+        * 1000
+}
+
+/// Free space a download must always leave on the models volume
+/// (`HIVE_INFERENCE_MODEL_DISK_RESERVE_BYTES`, default 2 GiB): a model that would fill the disk
+/// fails its own endpoint, it never takes the node's other writers (state, logs, builds) with it.
+fn disk_reserve_bytes() -> u64 {
+    std::env::var("HIVE_INFERENCE_MODEL_DISK_RESERVE_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(2 * 1024 * 1024 * 1024)
+}
+
+/// Free bytes on the volume holding `dir` (the mount whose path is the longest prefix of it), or
+/// `None` when no mount covers it (a probe that cannot answer must not block a download).
+fn free_bytes_on(dir: &std::path::Path) -> Option<u64> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|d| dir.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| d.available_space())
+}
+
+/// Most model downloads this node runs at once (`HIVE_INFERENCE_MODEL_DOWNLOADS_MAX`, default 2,
+/// never under 1): every project's `fluid.json` can name its own multi-GB model, and each running
+/// download holds a connection, a partial file and a claim on the disk.
+fn max_concurrent_downloads() -> usize {
+    std::env::var("HIVE_INFERENCE_MODEL_DOWNLOADS_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(2)
+        .max(1)
+}
+
+/// One permit per running download, node-wide ([`max_concurrent_downloads`]). A URL that finds none
+/// is simply tried again on the next reconcile tick ([`model_state`]); nothing queues.
+static DOWNLOAD_SLOTS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(max_concurrent_downloads())));
+
+/// Most downloads one TENANT may have running at once (`HIVE_INFERENCE_MODEL_DOWNLOADS_PER_TENANT`,
+/// default 1, never under 1): the node's few slots are shared, and a tenant whose projects name
+/// several slow hosts must not be able to hold every one of them.
+fn max_downloads_per_tenant() -> usize {
+    std::env::var("HIVE_INFERENCE_MODEL_DOWNLOADS_PER_TENANT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// How many downloads each tenant has running; an untagged project counts under the fail-closed
+/// `UNTAGGED_TENANT`, so all of them together share one place.
+static TENANT_DOWNLOADS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, usize>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// One running download counted against its tenant ([`max_downloads_per_tenant`]); dropped on every
+/// exit of the download task.
+struct TenantSlot {
+    tenant: String,
+}
+
+impl TenantSlot {
+    /// Counts a download for `tenant`, or `None` when it already has its share running.
+    fn acquire(tenant: &str) -> Option<TenantSlot> {
+        let mut running = TENANT_DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        let n = running.entry(tenant.to_string()).or_insert(0);
+        if *n >= max_downloads_per_tenant() {
+            return None;
+        }
+        *n += 1;
+        Some(TenantSlot {
+            tenant: tenant.to_string(),
+        })
+    }
+}
+
+impl Drop for TenantSlot {
+    fn drop(&mut self) {
+        let mut running = TENANT_DOWNLOADS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = running.get_mut(&self.tenant) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                running.remove(&self.tenant);
+            }
+        }
+    }
+}
+
+/// The bytes every download in flight still EXPECTS to write (its declared length less what has
+/// landed): the disk reserve is shared by all of them, so each admission and each periodic re-check
+/// asks whether the volume can hold ALL of it and still keep the reserve, never just its own file.
+static DISK_CLAIMED: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+
+/// One download's claim on the disk: dropped on every exit, so the ledger never leaks a claim.
+struct DiskClaim {
+    remaining: u64,
+}
+
+impl DiskClaim {
+    /// Admits a download of `declared` bytes (0 when the server declared no length) when the volume
+    /// at `dir` keeps `reserve` free once everything already in flight and this download have
+    /// written what they still expect. The free space is read INSIDE the ledger lock, so it is
+    /// consistent with the claims it is compared against. A volume that cannot be probed admits.
+    fn admit(dir: &std::path::Path, declared: u64, reserve: u64) -> Option<DiskClaim> {
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        if free_bytes_on(dir)
+            .is_some_and(|free| free < claimed.saturating_add(declared).saturating_add(reserve))
+        {
+            return None;
+        }
+        *claimed = claimed.saturating_add(declared);
+        Some(DiskClaim {
+            remaining: declared,
+        })
+    }
+
+    /// `n` bytes reached the disk: they are no longer expected, they are written (the free space
+    /// already reflects them), so they leave the claim.
+    fn landed(&mut self, n: u64) {
+        let take = n.min(self.remaining);
+        self.remaining -= take;
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        *claimed = claimed.saturating_sub(take);
+    }
+
+    /// Whether the volume still holds everything in flight (this download's remainder included)
+    /// and keeps `reserve`.
+    fn still_fits(&self, dir: &std::path::Path, reserve: u64) -> bool {
+        let claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        !free_bytes_on(dir).is_some_and(|free| free < claimed.saturating_add(reserve))
+    }
+}
+
+impl Drop for DiskClaim {
+    fn drop(&mut self) {
+        let mut claimed = DISK_CLAIMED.lock().unwrap_or_else(|e| e.into_inner());
+        *claimed = claimed.saturating_sub(self.remaining);
+    }
+}
+
+/// A partial download that deletes itself on EVERY exit — an error, a timeout, a cap, or the future
+/// being dropped mid-transfer (the load watchdog and a shutdown both cancel it). Only the rename
+/// that publishes the finished blob disarms it.
+struct PartFile(Option<std::path::PathBuf>);
+
+impl Drop for PartFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Deletes what nothing references any more, on every download: partial downloads untouched for 15
+/// minutes (a live one is rewritten continually), the blobs of the retired `fnv(url)`-named cache
+/// (`hive-<16 hex>.gguf`, never read again once the cache is content-addressed) and content blobs
+/// (`<64 hex>.gguf`) that no `*.ref.json` pointer names (the previous blob of a ref whose content
+/// changed, a blob whose pointer write failed) — all only past an hour/15 min of age so a download
+/// that has just published is never raced.
+async fn sweep_orphans(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    let mut files: Vec<(String, std::time::Duration)> = Vec::new();
+    let mut referenced = std::collections::HashSet::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let age = entry
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .unwrap_or_default();
+        if name.ends_with(".ref.json") {
+            if let Ok(raw) = tokio::fs::read(entry.path()).await {
+                if let Ok(pointer) = serde_json::from_slice::<ModelRef>(&raw) {
+                    referenced.insert(pointer.file);
+                }
+            }
+        }
+        files.push((name, age));
+    }
+    for (name, age) in files {
+        let stem = name.strip_suffix(".gguf");
+        let orphan = if name.starts_with("hive-") && name.ends_with(".part") {
+            age > Duration::from_secs(15 * 60)
+        } else if stem
+            .and_then(|s| s.strip_prefix("hive-"))
+            .is_some_and(|s| is_hex(s, 16))
+        {
+            age > Duration::from_secs(3600)
+        } else if stem.is_some_and(|s| is_hex(s, 64)) {
+            !referenced.contains(&name) && age > Duration::from_secs(3600)
+        } else {
+            false
+        };
+        if orphan && tokio::fs::remove_file(dir.join(&name)).await.is_ok() {
+            tracing::info!(file = %name, "inference: removed an orphaned model cache file");
+        }
+    }
+}
+
+/// The cached blob for `model` when a pointer for exactly this URL names a non-empty file (no
+/// network); `Err` only for a ref that resolves to no URL.
+async fn cached_model(model: &str) -> Result<Option<(std::path::PathBuf, u64)>, String> {
+    let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
+    let dir = models_dir();
+    let ref_path = dir.join(format!("hive-{:016x}.ref.json", fnv(&url)));
+    if let Ok(raw) = tokio::fs::read(&ref_path).await {
+        if let Ok(r) = serde_json::from_slice::<ModelRef>(&raw) {
+            if r.url == url {
+                let path = dir.join(&r.file);
+                if let Ok(md) = tokio::fs::metadata(&path).await {
+                    if md.len() > 0 {
+                        return Ok(Some((path, md.len())));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Download-and-cache the model file. The URL is tenant input (`fluid.json` `inference.model`) that
+/// reaches a real fetch, so it goes through the same `hive_outbound` guard as every other
+/// tenant-URL fetcher (public addresses only, redirects re-validated per hop — HuggingFace's CDN
+/// redirects legitimately) and a size cap; a failure is one fixed, generic reason, never the
+/// upstream status or body (no oracle for an internal address). The transfer is bounded in TIME
+/// (a stall timeout between chunks and a total timeout) and in DISK (the models volume must keep a
+/// reserve SHARED by every download in flight — a [`DiskClaim`] — checked up front against the
+/// declared length and again as bytes land), and the partial file is removed on every outcome. The stored blob is named by the BLAKE3 content hash of its OWN
+/// bytes (a NEW content identity, hashed incrementally as it downloads so a multi-GB model is never
+/// held in memory at once) rather than a hash of the URL: the old `fnv(url)` filename let two
+/// different URLs that happened to collide on 64 bits silently share a cache slot. Returns
+/// (path, size_bytes).
 async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> {
+    if let Some(hit) = cached_model(model).await? {
+        return Ok(hit);
+    }
     let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
     let dir = models_dir();
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| e.to_string())?;
-    let path = dir.join(format!("hive-{:016x}.gguf", fnv(&url)));
-    if let Ok(md) = tokio::fs::metadata(&path).await {
-        if md.len() > 0 {
-            return Ok((path, md.len()));
-        }
-    }
-    tracing::info!(%url, ?path, "inference: downloading model");
-    let tmp = path.with_extension("part");
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|e| e.to_string())?;
-    let mut resp = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    sweep_orphans(&dir).await;
+
+    let ref_path = dir.join(format!("hive-{:016x}.ref.json", fnv(&url)));
+    let target = hive_outbound::validate_fetch_url(&url)
+        .map_err(|_| "model URL refused by the outbound policy".to_string())?;
+    tracing::info!(%url, "inference: downloading model");
+    let (total, stall) = (model_total_timeout(), model_stall_timeout());
+    let started = std::time::Instant::now();
+    let mut resp =
+        tokio::time::timeout(stall, hive_outbound::following_client().get(target).send())
+            .await
+            .map_err(|_| "model fetch timed out".to_string())?
+            .map_err(|_| "model fetch failed".to_string())?;
     if !resp.status().is_success() {
-        return Err(format!("model fetch {} -> {}", url, resp.status()));
+        return Err("model fetch failed".to_string());
     }
-    let mut f = tokio::fs::File::create(&tmp)
+    let max_bytes = max_model_bytes();
+    let reserve = disk_reserve_bytes();
+    let declared = resp.content_length();
+    if declared.is_some_and(|len| len > max_bytes) {
+        return Err("model exceeds the maximum download size".to_string());
+    }
+    let Some(mut claim) = DiskClaim::admit(&dir, declared.unwrap_or(0), reserve) else {
+        return Err("insufficient disk space for the model".to_string());
+    };
+    let unique_part_path = dir.join(format!(
+        "hive-{:016x}-{}.part",
+        fnv(&url),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let mut part = PartFile(Some(unique_part_path.clone()));
+    let mut f = tokio::fs::File::create(&unique_part_path)
         .await
         .map_err(|e| e.to_string())?;
     use tokio::io::AsyncWriteExt;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(MODEL_BLOB_DOMAIN);
+    let mut written: u64 = 0;
+    let mut disk_checked_at: u64 = 0;
+    let (min_rate, rate_window) = (model_min_bytes_per_sec(), model_rate_window());
+    let mut window_started = std::time::Instant::now();
+    let mut window_bytes: u64 = 0;
+    loop {
+        let left = total.saturating_sub(started.elapsed());
+        let next = match tokio::time::timeout(stall.min(left), resp.chunk()).await {
+            Ok(r) => r.map_err(|_| "model fetch failed".to_string())?,
+            Err(_) if left <= stall => {
+                return Err("model download exceeded the time limit".to_string())
+            }
+            Err(_) => return Err("model download stalled".to_string()),
+        };
+        let Some(chunk) = next else { break };
+        written += chunk.len() as u64;
+        if written > max_bytes {
+            return Err("model exceeds the maximum download size".to_string());
+        }
+        window_bytes += chunk.len() as u64;
+        if window_started.elapsed() >= rate_window {
+            if window_bytes < min_rate.saturating_mul(rate_window.as_secs()) {
+                return Err("model download too slow".to_string());
+            }
+            window_started = std::time::Instant::now();
+            window_bytes = 0;
+        }
+        if written - disk_checked_at >= 256 * 1024 * 1024 {
+            disk_checked_at = written;
+            if !claim.still_fits(&dir, reserve) {
+                return Err("insufficient disk space for the model".to_string());
+            }
+        }
+        hasher.update(&chunk);
         f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        claim.landed(chunk.len() as u64);
     }
     f.flush().await.map_err(|e| e.to_string())?;
     drop(f);
-    tokio::fs::rename(&tmp, &path)
+
+    let digest = hasher.finalize().to_hex().to_string();
+    let file_name = format!("{digest}.gguf");
+    let path = dir.join(&file_name);
+    tokio::fs::rename(&unique_part_path, &path)
         .await
         .map_err(|e| e.to_string())?;
+    part.0 = None;
     let size = tokio::fs::metadata(&path)
         .await
         .map_err(|e| e.to_string())?
         .len();
+    let pointer = ModelRef {
+        url: url.clone(),
+        file: file_name,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&pointer) {
+        if let Err(e) = tokio::fs::write(&ref_path, &bytes).await {
+            tracing::warn!(error = %e, ?ref_path, "inference: could not persist model-ref pointer (next call will re-download and re-verify)");
+        }
+    }
     Ok((path, size))
 }
 
-/// A member link slower than this is a last resort: llama.cpp's tensor upload
-/// runs one TCP stream per member, so throughput is cwnd-limited by RTT — the
-/// live incident loaded 11GB at ~1.4MB/s over a 65ms "same-region" link.
+/// Where a model URL's download stands, shared by every project naming that URL. A URL is recorded
+/// only once it holds its slots (one that finds none is tried again next tick), so `Running`
+/// always names a transfer that really started.
+enum Fetch {
+    /// `since_ms` bounds how long a `Running` entry is believed: a task that died without recording
+    /// its outcome must not park the URL forever.
+    Running {
+        since_ms: u64,
+    },
+    Failed {
+        error: String,
+        at_ms: u64,
+    },
+}
+
+/// What the reconcile loop learns about a project's model.
+enum ModelState {
+    Ready(std::path::PathBuf, u64),
+    Downloading,
+    Failed(String),
+}
+
+/// The model for `model`, WITHOUT ever blocking the reconcile loop on a download: a cached blob is
+/// returned at once; otherwise the download runs in its own task (bounded by `ensure_model`'s
+/// timeouts) and the loop moves on to every other project, polling again next tick. The loop used
+/// to await the transfer inline, so one slow-drip URL stalled every tenant's endpoint on the
+/// coordinator. A failed URL is remembered for [`model_retry_cooldown_ms`] before it is retried, a URL
+/// two projects share is fetched once, at most [`max_concurrent_downloads`] run at a time and a
+/// tenant has at most [`max_downloads_per_tenant`] of them.
+async fn model_state(cloud: &Arc<CloudState>, project: &str, model: &str) -> ModelState {
+    match cached_model(model).await {
+        Ok(Some((path, bytes))) => return ModelState::Ready(path, bytes),
+        Err(e) => return ModelState::Failed(e),
+        Ok(None) => {}
+    }
+    let Some(url) = model_url(model) else {
+        return ModelState::Failed(format!("unresolvable model ref '{model}'"));
+    };
+    let slots = {
+        let mut fetches = cloud.inference.fetches.lock();
+        let now = hive_core::now_ms();
+        match fetches.get(&url) {
+            Some(Fetch::Running { since_ms })
+                if now.saturating_sub(*since_ms)
+                    < model_total_timeout().as_millis() as u64 + 300_000 =>
+            {
+                return ModelState::Downloading;
+            }
+            Some(Fetch::Failed { error, at_ms })
+                if now.saturating_sub(*at_ms) < model_retry_cooldown_ms() =>
+            {
+                return ModelState::Failed(error.clone());
+            }
+            _ => {}
+        }
+        let tenant = crate::admin::record_tenant(&cloud.projects.team_of(project)).to_string();
+        let Some(tenant_slot) = TenantSlot::acquire(&tenant) else {
+            return ModelState::Downloading;
+        };
+        let Ok(slot) = DOWNLOAD_SLOTS.clone().try_acquire_owned() else {
+            return ModelState::Downloading;
+        };
+        fetches.insert(url.clone(), Fetch::Running { since_ms: now });
+        (slot, tenant_slot)
+    };
+    let (cloud, model) = (cloud.clone(), model.to_string());
+    tokio::spawn(async move {
+        let _slots = slots;
+        let outcome = ensure_model(&model).await;
+        let mut fetches = cloud.inference.fetches.lock();
+        match outcome {
+            Ok(_) => {
+                fetches.remove(&url);
+            }
+            Err(error) => {
+                tracing::warn!(%url, %error, "inference: model download failed");
+                fetches.insert(
+                    url,
+                    Fetch::Failed {
+                        error,
+                        at_ms: hive_core::now_ms(),
+                    },
+                );
+            }
+        }
+    });
+    ModelState::Downloading
+}
+
+/// A member link slower than this (`HIVE_INFERENCE_MAX_MEMBER_RTT_MS`, default 20 ms) is a last
+/// resort: llama.cpp's tensor upload runs one TCP stream per member, so throughput is cwnd-limited
+/// by RTT, and a multi-GB model over a high-RTT 'same-region' link loads at a crawl.
 fn max_member_rtt_ms() -> u64 {
     std::env::var("HIVE_INFERENCE_MAX_MEMBER_RTT_MS")
         .ok()
@@ -297,9 +762,11 @@ fn load_timeout_secs() -> u64 {
         .unwrap_or(3600)
 }
 
-/// The parked status a load-timeout abort leaves behind. Matched EXACTLY by
-/// the relaunch guard in `reconcile_local`, so an endpoint that timed out
-/// loading is never respawned into another hours-long doomed transfer.
+/// The parked status a load-timeout abort leaves behind, matched EXACTLY by the relaunch guard in
+/// `reconcile_local`. An abort PARKS because relaunching the identical spec would start another
+/// equally doomed hours-long transfer on the next tick, turning the watchdog into a retry loop; the
+/// park lifts when the operator changes the model (the spec differs) or the node restarts
+/// (in-process state clears).
 const LOAD_TIMEOUT_STATUS: &str =
     "failed: model load exceeded HIVE_INFERENCE_LOAD_TIMEOUT_SECS (rtt-limited member link?)";
 
@@ -308,15 +775,14 @@ const RTT_PROBE_CACHE_TTL_MS: u64 = 300_000;
 /// over-threshold, so such a member is only ever a last resort.
 const RTT_UNKNOWN: u64 = u64::MAX;
 
-/// Coordinator→member RTT for every same-region pool candidate, keyed by node
-/// name. Primary signal: the registry's `latency_ms` — each node's OWN gossip
-/// probes measure it, and since `reconcile_local` runs only on the elected
-/// coordinator, the local registry vantage IS the coordinator→candidate RTT.
-/// `latency_ms == 0` or `NodeRegistry::RESTORED_LATENCY_MS` on a non-self peer
-/// means "unmeasured by us" (the latter was restored from indirect gossip), so
-/// either hole falls back to a TCP connect-time probe of the member's rpc port,
-/// cached in-process with a TTL. `u64::MAX` is withdrawn and likewise never a
-/// measurement.
+/// Coordinator-to-member RTT for every same-region pool candidate, keyed by node name. Primary
+/// signal: the registry's `latency_ms`, which each node's OWN gossip probes measure; since
+/// `reconcile_local` runs only on the elected coordinator, the local registry vantage IS the
+/// coordinator-to-candidate RTT. `latency_ms == 0` or `NodeRegistry::RESTORED_LATENCY_MS` on a
+/// non-self peer means 'unmeasured by us' (the latter was restored from indirect gossip), so either
+/// hole falls back to a TCP connect-time probe of the member's rpc port, cached in-process with a
+/// TTL and floored at 1 ms so a sub-ms LAN connect never reads as the 'unmeasured' 0. `u64::MAX` is
+/// withdrawn and likewise never a measurement.
 async fn member_rtts(
     cloud: &Arc<CloudState>,
     coordinator: &hive_edge::NodeInfo,
@@ -359,8 +825,6 @@ async fn member_rtts(
                 )
                 .await
                 {
-                    // .max(1): a sub-ms LAN connect must not read as the
-                    // "unmeasured" 0 the registry path treats as a hole.
                     Ok(Ok(_)) => (t0.elapsed().as_millis() as u64).max(1),
                     _ => RTT_UNKNOWN,
                 };
@@ -373,14 +837,15 @@ async fn member_rtts(
     out
 }
 
-/// Placement (pool-aware): fits the coordinator alone → no members. Else, when
-/// pooling is allowed, add same-region members until covered — free VRAM is
-/// the ADMISSION bar (a member only counts for what it can hold), but real
-/// coordinator→member RTT decides the ORDER, ascending: "same region" spans
-/// link classes (see module docs), and preferring big-VRAM over near-RTT is
-/// how a 14B load streamed for hours at cwnd-limited speed. A member over
-/// `max_rtt_ms` is used ONLY when the pool cannot cover the model without it,
-/// and loudly. Else honest failure.
+/// Placement (pool-aware): a model that fits the coordinator alone needs no members. Otherwise,
+/// when pooling is allowed, same-region members are added until the need is covered: free VRAM is
+/// the ADMISSION bar (a member only counts for what it can hold), but real coordinator-to-member
+/// RTT decides the ORDER, ascending, because 'same region' spans link classes (see the module doc)
+/// and preferring big-VRAM over near-RTT streams a large load at cwnd-limited speed for hours. Free
+/// VRAM only breaks RTT ties, with the name as the last tiebreak so the plan is deterministic
+/// across ticks. Members over `max_rtt_ms` are partitioned behind the near ones (a stable
+/// partition, so RTT order holds within each tier) and used ONLY when the pool cannot cover the
+/// model without them, and loudly. Else an honest failure.
 fn plan_members(
     need_mb: u64,
     coordinator: &hive_edge::NodeInfo,
@@ -412,15 +877,12 @@ fn plan_members(
         .iter()
         .filter(|n| n.name != coordinator.name)
         .collect();
-    // Free VRAM only breaks RTT ties; the name tiebreak keeps the plan
-    // deterministic across ticks when both figures match.
     others.sort_by(|a, b| {
         rtt_of(&a.name)
             .cmp(&rtt_of(&b.name))
             .then(b.vram_free_mb.cmp(&a.vram_free_mb))
             .then(a.name.cmp(&b.name))
     });
-    // Stable partition preserves the RTT order within each tier.
     let (near, far): (Vec<_>, Vec<_>) = others
         .into_iter()
         .partition(|n| rtt_of(&n.name) <= max_rtt_ms);
@@ -471,20 +933,40 @@ async fn health_ok(port: u16) -> bool {
 
 /// Reconcile ONE endpoint on its coordinator (this node). Ensures model +
 /// llama-server child; updates status in the runtime map.
+/// A LIVE child is never relaunched, healthy or not: llama-server answers /health with 503 for the
+/// entire multi-minute model load (tensor upload to RPC members dominates for pooled models), and
+/// treating that as dead would spawn a doomed duplicate every tick that fails to bind the port the
+/// loading child holds and orphans the real child's handle. Only an EXITED child triggers a
+/// relaunch; health merely flips the reported status. A transfer-progress watchdog covers the load
+/// itself: one still 'running' past `HIVE_INFERENCE_LOAD_TIMEOUT_SECS` (default 3600) is an
+/// RTT-limited or wedged tensor upload that would hold the endpoint in `starting` forever, so it
+/// aborts to `failed` and parks (see `LOAD_TIMEOUT_STATUS`); `load_started_ms` is 0 once /health
+/// has ever answered OK, so health flaps re-show `starting` but never re-arm the abort.
+///
+/// Pool admission requires a dialable rpc address: `plan_members` counts a member's VRAM toward
+/// coverage, but the `--rpc` list can only name members with a public IP (`ip:50052`, peer-allowed
+/// through hive-lockdown), so address-less candidates are dropped BEFORE planning, otherwise the
+/// plan could claim coverage the launched server can never reach and fail the load with no honest
+/// placement error.
+///
+/// Any UNTRACKED llama-server for this project (a survivor of a previous hive-node process) is
+/// killed first, because it holds the port and a tracked child must own the endpoint so
+/// kill/reassign semantics stay real; both shapes are swept, a bare child and a transient scope
+/// (stopping the scope by name kills its members). The server runs in its OWN cgroup (a transient
+/// `systemd-run --scope` under a dedicated slice; `HIVE_INFERENCE_SCOPE=0` or no systemd means a
+/// plain child), never as a plain child of hive-cloud: a plain child lands in hive-node.service's
+/// memory cgroup, so a model's resident footprint competes with the platform process against the
+/// SERVICE's MemoryMax and the kernel OOM-kills the node's platform process rather than the
+/// inference server. A scope accounts inference memory separately, so an over-large model fails
+/// only its own endpoint (an honest `failed` status) and can never take hive-node down with it.
+/// `LD_LIBRARY_PATH` names both library dirs: the CUDA runtime libs live in lib/, the build's own
+/// libggml*.so in bin/.
 async fn reconcile_local(
     cloud: &Arc<CloudState>,
     project: &str,
     spec: &crate::project_settings::InferenceSpec,
 ) {
     let port = port_for(project);
-    // A LIVE child is never relaunched, healthy or not: llama-server answers
-    // /health with 503 for the entire multi-minute model load (tensor upload
-    // to RPC members dominates for pooled models), and treating that as dead
-    // spawned a doomed duplicate every tick — the duplicate failed to bind
-    // the port held by the loading child and exited, while overwriting (and
-    // orphaning) the real child's handle. Live-witnessed on the first pooled
-    // 14B endpoint. Only an EXITED child triggers a relaunch; health merely
-    // flips the reported status.
     let child_running = {
         let mut servers = cloud.inference.servers.lock();
         if let Some((child, st)) = servers.get_mut(project) {
@@ -508,13 +990,6 @@ async fn reconcile_local(
     if child_running {
         let healthy = health_ok(port).await;
         if !healthy {
-            // Transfer-progress watchdog: /health answers 503 for the entire
-            // load, so a load that has been "running" past the deadline is not
-            // progress, it is an rtt-limited (or wedged) tensor upload that
-            // would otherwise hold the endpoint in "starting" forever —
-            // live-witnessed as an 11GB upload at ~1.4MB/s over a 65ms member
-            // link. Abort to failed; the LIVE-child rule is untouched because
-            // load_started_ms is 0 once /health has ever answered OK.
             let deadline_ms = load_timeout_secs().saturating_mul(1000);
             let overdue = {
                 let servers = cloud.inference.servers.lock();
@@ -551,9 +1026,6 @@ async fn reconcile_local(
         let mut servers = cloud.inference.servers.lock();
         if let Some((_, st)) = servers.get_mut(project) {
             if healthy {
-                // LIVE from here on: the watchdog must never judge a serving
-                // child by its long-ago load start (health flaps re-show
-                // "starting" but must never re-arm the abort).
                 st.load_started_ms = 0;
             }
             let new_status = if healthy { "running" } else { "starting" };
@@ -568,10 +1040,6 @@ async fn reconcile_local(
         return;
     }
 
-    // A load-timeout abort PARKS: relaunching the identical spec would start
-    // another equally-doomed hours-long transfer on the next tick, turning the
-    // watchdog into a retry loop. The park lifts when the operator changes the
-    // model (spec differs) or the node restarts (in-process state clears).
     {
         let servers = cloud.inference.servers.lock();
         if let Some((child, st)) = servers.get(project) {
@@ -607,9 +1075,13 @@ async fn reconcile_local(
         e.1.updated_ms = hive_core::now_ms();
     };
 
-    let (model_path, model_bytes) = match ensure_model(&spec.model).await {
-        Ok(v) => v,
-        Err(e) => {
+    let (model_path, model_bytes) = match model_state(cloud, project, &spec.model).await {
+        ModelState::Ready(path, bytes) => (path, bytes),
+        ModelState::Downloading => {
+            set_status(cloud, "starting".into(), &[]);
+            return;
+        }
+        ModelState::Failed(e) => {
             tracing::warn!(project, error = %e, "inference: model unavailable");
             set_status(cloud, format!("failed: {e}"), &[]);
             return;
@@ -619,12 +1091,6 @@ async fn reconcile_local(
     let me = cloud.registry.nodes().into_iter().find(|n| n.is_self);
     let Some(me) = me else { return };
     let mut pools = crate::gpu_pool::snapshot(cloud).await;
-    // Admission requires a dialable rpc address: plan_members counts a
-    // member's VRAM toward coverage, but the --rpc list below can only name
-    // members with a public IP — an address-less candidate admitted for its
-    // VRAM would let the plan claim coverage the launched server can never
-    // reach, failing the load with no honest placement error. Drop them
-    // BEFORE planning so a genuine shortfall parks the endpoint as failed.
     let addressable: std::collections::HashSet<String> = cloud
         .registry
         .nodes()
@@ -645,8 +1111,6 @@ async fn reconcile_local(
             return;
         }
     };
-    // Member names → ip:50052 rpc endpoints (public IPs are peer-allowed
-    // through hive-lockdown; verified reachable node-to-node).
     let member_addrs: Vec<String> = cloud
         .registry
         .nodes()
@@ -655,11 +1119,6 @@ async fn reconcile_local(
         .filter_map(|n| n.public_ip.map(|ip| format!("{ip}:50052")))
         .collect();
 
-    // Kill any UNTRACKED llama-server for this project first (a survivor of a
-    // previous hive-node process, or an orphan of the pre-fix overwrite bug) —
-    // it holds the port, and a tracked child must own the endpoint so kill/
-    // reassign semantics stay real. Both shapes are swept: a bare child and a
-    // transient scope (the scope is stopped by name, which kills its members).
     let _ = tokio::process::Command::new("pkill")
         .args(["-f", &format!("llama-server.*--alias {project}")])
         .output()
@@ -669,16 +1128,6 @@ async fn reconcile_local(
         .output()
         .await;
 
-    // Run the server in its OWN cgroup, never as a plain child of hive-cloud.
-    // A plain child lands in hive-node.service's memory cgroup, so a model's
-    // resident footprint (15.7GB for a 14B Q8) competes with the platform
-    // process against the SERVICE's MemoryMax — live-witnessed on
-    // fc-sanjose-cvm-2 as `Memory cgroup out of memory: Killed process ...
-    // (hive-cloud) ... oom_memcg=/system.slice/hive-node.service`: the kernel
-    // killed the NODE's platform process, not the inference server. A transient
-    // scope under a dedicated slice accounts inference memory separately, so an
-    // over-large model fails only its own endpoint (honest `failed` status)
-    // and can never take hive-node down with it.
     let use_scope = std::env::var("HIVE_INFERENCE_SCOPE")
         .map(|v| v != "0")
         .unwrap_or(true)
@@ -707,9 +1156,6 @@ async fn reconcile_local(
         .arg("99")
         .arg("--alias")
         .arg(project)
-        // Both dirs: the CUDA runtime libs live in lib/, but the build's own
-        // libggml*.so land in bin/ — the proven-working invocation from the
-        // node bring-up used exactly this pair.
         .env("LD_LIBRARY_PATH", "/opt/llama/bin:/opt/llama/lib");
     if !member_addrs.is_empty() {
         cmd.arg("--rpc").arg(member_addrs.join(","));
@@ -741,6 +1187,14 @@ async fn reconcile_local(
 
 /// The reconcile loop. Every node ticks; each node acts only on the slice it
 /// owns (coordinator role for spawn/kill, leader role for env injection).
+/// Teardown is deliberately asymmetric: a REMOVED spec (project gone from `desired`) kills at once,
+/// so a deleted project's endpoint does not linger, while a MOVED assignment (still desired,
+/// elected elsewhere) gets a grace window (`HIVE_INFERENCE_REASSIGN_GRACE_SECS`, default 600)
+/// before the kill, so a coordinator that dropped out of the roster and briefly computes a partial
+/// roster on rejoin does not slaughter a mid-load server (rendezvous hashing already makes
+/// reassignment rare). A transient scope OUTLIVES the process that spawned it (that is the point:
+/// inference memory is accounted separately from `hive-node.service`), so a kill also stops the
+/// unit by name; otherwise the server keeps serving a project that moved away.
 pub fn spawn_reconcile(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(
         std::env::var("HIVE_INFERENCE_RECONCILE_SECS")
@@ -759,7 +1213,6 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                 .filter_map(|(p, s)| s.inference.map(|i| (p, i)))
                 .collect();
 
-            // Coordinator slice: converge local children to the desired set.
             let mut mine: Vec<(String, crate::project_settings::InferenceSpec)> = Vec::new();
             for (p, spec) in &desired {
                 if coordinator_for(&cloud, p).map(|n| n.name) == Some(cloud.node_name.clone()) {
@@ -767,15 +1220,6 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                 }
             }
             {
-                // Teardown split, deliberately asymmetric:
-                //  * spec REMOVED (project gone from `desired`) → kill now —
-                //    a deleted project's endpoint must not linger;
-                //  * assignment MOVED (still desired, elected elsewhere) →
-                //    grace window before killing. Rendezvous hashing already
-                //    makes reassignment rare, but a coordinator that dropped
-                //    out of the roster long enough to lose its endpoints
-                //    shouldn't slaughter a mid-load server the moment it
-                //    rejoins and briefly computes a partial roster.
                 let assigned: std::collections::HashSet<&String> =
                     mine.iter().map(|(p, _)| p).collect();
                 let specd: std::collections::HashSet<&String> =
@@ -809,11 +1253,6 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                         if let Some(mut c) = child {
                             let _ = c.start_kill();
                         }
-                        // A transient scope OUTLIVES the process that spawned
-                        // it (that is the point — inference memory is accounted
-                        // separately from hive-node.service), so killing the
-                        // spawn handle is not enough: stop the unit by name or
-                        // the server keeps serving a project that moved away.
                         let unit = format!("{}.scope", scope_name(&p));
                         tokio::spawn(async move {
                             let _ = tokio::process::Command::new("systemctl")
@@ -829,7 +1268,6 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                 reconcile_local(&cloud, p, spec).await;
             }
 
-            // Leader slice: env injection for every inference project.
             if crate::leadership::may_act(&cloud, crate::leadership::Job::InferenceEnv) {
                 for (p, _spec) in &desired {
                     let Some(coord) = coordinator_for(&cloud, p) else {

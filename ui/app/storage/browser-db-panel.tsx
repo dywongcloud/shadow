@@ -25,17 +25,9 @@ export function formatBytes(n: number): string {
   return `${n} B`;
 }
 
-/**
- * The SQLite half of the Storage page's create/edit flow — the form only, with
- * no list or section of its own: a browser-replicated database is listed by the
- * one unified table like every other database (see `db-model.ts`).
- *
- * Writes ONLY `ProjectSettings::browser_db` (`PUT /v1/projects/:project/browser-db`,
- * `crates/hive-cloud/src/admin.rs`) — the dashboard-managed mirror the build
- * merges into the manifest when fluid.json itself declares no block (`git.rs`,
- * the `FunctionSettings::gpu` OR precedent). A redeploy is required for it to
- * reach a Ready deployment, which the caller offers right after saving.
- */
+/** The SQLite half of the Storage page's create/edit flow: the form only (a browser-replicated database is listed by the unified table like every other, see `db-model.ts`).
+ *  Writes ONLY `ProjectSettings::browser_db` (`PUT /v1/projects/:project/browser-db`), the dashboard-managed mirror the build merges into the manifest when fluid.json declares no
+ *  block; a redeploy is required for it to reach a Ready deployment, which the caller offers right after saving. */
 export function BrowserDbConfigForm({
   projects,
   project,

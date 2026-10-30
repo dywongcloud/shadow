@@ -1,21 +1,18 @@
 //! docker-compose / `compose.yaml` support.
 //!
-//! Parses a Compose file into a set of container SERVICES that the build pipeline
-//! turns into a MULTI-service manifest (one `__container__` `FunctionConfig` per
-//! service) under a single project namespace. All of a deployment's services run on
-//! the lease owner, joined to one per-project podman network so they reach each other
-//! by service name (Compose semantics). Only the PRIMARY service (the conventional web
-//! entrypoint, or else the first service that publishes `ports:`) gets a public route
-//! by default; every other service — published or not — stays internal-only (reachable
-//! on the shared network by name, kept warm via `min_instances`), e.g. a database a web
-//! service talks to. This is deliberate: a private DB sidecar should not become publicly
-//! reachable just because it happens to declare `ports:`. A non-primary service that DOES
-//! want external exposure (e.g. a standalone Postgres/Redis meant to be reachable from
-//! outside) opts in explicitly via the `x-shadw-expose` custom-extension field — see
-//! [`ComposeExpose`].
+//! Parses a Compose file into normalized container SERVICES. This module is PURE (no podman, no IO
+//! beyond reading the file); the deploy path is `git::compose_container_manifest`, which deploys
+//! ONLY the PRIMARY service ([`primary_service`]: the first published service with a conventional
+//! web name, else the first published service, else the first service) as the project's single
+//! routable container function, because the unit of deployment is one project namespace with one
+//! public entrypoint. It is built from source when it declares `build:`, pulled when it declares
+//! `image:` (`build` wins when both are present, as in Compose), and of the parsed data that path
+//! reads only `build`, `image`, `port` and `protocol`.
 //!
-//! This module is PURE (no podman / IO beyond reading the file) so it's unit-tested;
-//! the actual image builds + manifest assembly live in `git.rs::build_compose_manifest`.
+//! Everything else is modeled and validated here but not applied to the deployment: the other
+//! services, `environment`, `command`, `entrypoint`, every declared port beyond the first
+//! (`all_ports`) and the `x-shadw-expose` extension ([`ComposeExpose`]), the opt-in meant to expose
+//! a NON-PRIMARY service. `hive-cloud --compose-probe` prints what the parser read.
 
 use fluid_core::ServiceProtocol;
 use std::collections::BTreeMap;
@@ -28,17 +25,17 @@ pub struct ComposeBuild {
     pub context: String,
     pub dockerfile: Option<String>,
     /// Build stage to stop at (`target:`). None = build the Dockerfile's final stage.
+    /// The deploy path passes it to `podman build --target`, so the stage the compose file asked
+    /// for is the one built, not the Dockerfile's last.
     pub target: Option<String>,
 }
 
-/// Explicit opt-in for routing a NON-PRIMARY service externally, read from an
-/// `x-shadw-expose` field under the service definition — Compose's own `x-` prefix
-/// convention for tool-specific extension data, silently ignored by real
-/// `docker compose` (mirrors the `fluid.json` `container` override pattern used for
-/// single-Dockerfile deploys; see `git.rs`'s `ContainerOverride`). Shorthand
-/// `x-shadw-expose: true` exposes the service on its own already-parsed port +
-/// protocol; the mapping form lets either be overridden explicitly, e.g. a standalone
-/// Postgres service wanting a raw TCP proxy target:
+/// The `x-shadw-expose` extension field of a service (Compose's `x-` prefix convention for
+/// tool-specific data, ignored by real `docker compose`): the explicit opt-in for exposing a
+/// NON-PRIMARY service externally, so a private sidecar does not become public just because it
+/// declares `ports:`. The shorthand `x-shadw-expose: true` exposes the service on its own parsed
+/// port and protocol; the mapping form overrides either, e.g. a standalone Postgres wanting a raw
+/// TCP target:
 /// ```yaml
 /// services:
 ///   db:
@@ -47,7 +44,9 @@ pub struct ComposeBuild {
 ///     x-shadw-expose:
 ///       protocol: tcp
 /// ```
-/// Absent field (the default) keeps the service internal-only — unchanged behavior.
+/// An absent field (the default) means internal-only. The field is parsed and validated
+/// ([`parse_expose_ext`]), but the deploy path builds only the primary service, so nothing reads it
+/// yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComposeExpose {
     pub enabled: bool,
@@ -59,12 +58,11 @@ pub struct ComposeExpose {
 
 /// One declared container port of a compose service, with its publish request.
 ///
-/// Docker-compose's own `ports:` grammar distinguishes a PUBLISH request from a
-/// bare container-side declaration: `"9000:9000"` (or long-syntax `published:`)
-/// says "make this reachable from outside on host port 9000", while a bare
-/// `"9000"` only documents the container-side listen port. The platform honors
-/// the same split — a published entry asks the raw-port allocator for its
-/// literal host port; a bare entry stays internal-only.
+/// Compose's `ports:` grammar distinguishes a PUBLISH request from a bare container-side
+/// declaration: `"9000:9000"` (or long-syntax `published:`) says 'make this reachable from outside
+/// on host port 9000', while a bare `"9000"` only documents the container-side listen port. `host`
+/// carries that split (`None` = internal-only). The deploy path does not read it; `--compose-probe`
+/// reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComposePort {
     /// Container-side listen port (`CONTAINER` in `HOST:CONTAINER`).
@@ -74,7 +72,9 @@ pub struct ComposePort {
     pub protocol: ServiceProtocol,
 }
 
-/// One parsed Compose service, normalized for the build pipeline.
+/// One parsed Compose service. The deploy path (`git::compose_container_manifest`) reads only
+/// `build`, `image`, `port` and `protocol` of the PRIMARY service; the other fields are parsed and
+/// validated but not applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedService {
     pub name: String,
@@ -84,59 +84,39 @@ pub struct ParsedService {
     pub build: Option<ComposeBuild>,
     /// Port the container listens on (from `ports:` target, else `expose:`, else 8080).
     pub port: u16,
-    /// True when the service publishes `ports:` — it's a PUBLIC (routable) service;
-    /// false = internal-only (reachable on the shared network by name).
+    /// True when the service declares any `ports:` entry; it only steers [`primary_service`].
     pub published: bool,
     /// Service env (`environment:` as a map or `K=V` list).
     pub env: BTreeMap<String, String>,
-    /// Transport/application protocol for `port`, parsed from the compose port's
-    /// `/tcp` or `/udp` short-syntax suffix (or the long-syntax `protocol:` key), e.g.
-    /// `"5432:5432/udp"` -> `Udp`, `"25565:25565/tcp"` -> `Tcp`. No suffix normalizes to
-    /// `Http` — Compose's implicit-default transport, and the pre-existing behavior for
-    /// the overwhelming common case (a web service listening HTTP-over-TCP). An explicit
-    /// `/tcp` is the ONLY way to declare a raw non-HTTP TCP service (Minecraft,
-    /// Postgres-wire, …) through plain compose `ports:` syntax — it must NOT collapse
-    /// into the same `Http` bucket as "unspecified", or nothing could ever opt into the
-    /// raw-splice proxy path (`FunctionConfig::needs_raw_proxy`) without the separate
-    /// `x-shadw-expose` extension.
+    /// Transport/application protocol for `port`, parsed from the compose port's `/tcp` or `/udp`
+    /// short-syntax suffix (the long-syntax `protocol:` key recognizes only `udp`: `tcp` there
+    /// still reads as `Http`), e.g. `"5432:5432/udp"` -> `Udp`, `"25565:25565/tcp"` -> `Tcp`. No
+    /// suffix is `Http`, Compose's implicit default and the overwhelmingly common case (a web
+    /// service listening HTTP-over-TCP). An explicit `/tcp` is the only way to declare a raw
+    /// non-HTTP TCP service (Minecraft, Postgres wire, ...) through plain compose `ports:` syntax,
+    /// so it must NOT collapse into the same `Http` bucket as 'unspecified': the primary's protocol
+    /// decides whether the deployment is spliced as a raw connection
+    /// (`ServiceProtocol::needs_raw_proxy`).
     pub protocol: ServiceProtocol,
     /// Explicit opt-in for external routing when this service is NOT the primary
     /// entrypoint (`x-shadw-expose`). See [`ComposeExpose`]; default is internal-only.
     pub expose: ComposeExpose,
-    /// EVERY container-side port the service declares, in declaration order —
-    /// `port`/`protocol` above are just the first of these.
-    ///
-    /// Only the first was ever parsed, so a service publishing more than one port
-    /// had the rest discarded without a word. MinIO — the exact case that broke
-    /// `compose-yaml.shadw.app` — declares `["9000:9000", "9001:9001"]`: the S3 API
-    /// and the web console. The console simply did not exist as far as the platform
-    /// was concerned, and nothing in the build output said so, which is why the
-    /// symptom presented as "the port closes the connection" with no diagnosis
-    /// available anywhere. Carrying the full list lets the manifest DOCUMENT the
-    /// extra ports (and allocate public ones for raw-protocol extras) exactly the
-    /// way the single-image path already does from the image's `ExposedPorts`.
+    /// EVERY container-side port the service declares, in declaration order; `port`/`protocol`
+    /// above are just the first of these. A service can declare several (MinIO declares
+    /// `["9000:9000", "9001:9001"]`: the S3 API and the web console); the deploy path routes only
+    /// the first.
     pub all_ports: Vec<ComposePort>,
-    /// `command:` — the argv appended AFTER the image, exactly as Docker/Compose
-    /// treat it (it overrides the image's `CMD`, not its `ENTRYPOINT`).
-    ///
-    /// Dropping this silently makes a large class of real compose files
-    /// unstartable, because many official images ship an ENTRYPOINT that is
-    /// useless without arguments. The canonical MinIO compose — the exact case
-    /// that broke `compose-yaml.shadw.app` — is `image: minio/minio` plus
-    /// `command: server /data --console-address ":9001"`; run bare, `minio`
-    /// prints usage and exits non-zero in well under a second, so the container
-    /// never listens, every cold start fails, and the deployment's circuit
-    /// opens. Same for `postgres` with a custom `-c` flag, `redis-server` with a
-    /// config path, and so on.
+    /// `command:`: the argv appended AFTER the image, as Docker/Compose treat it (it overrides the
+    /// image's `CMD`, not its `ENTRYPOINT`). Parsed here but not applied by the deploy path, which
+    /// starts the primary with its image's own `CMD`.
     pub command: Option<Vec<String>>,
-    /// `entrypoint:` — replaces the image's own ENTRYPOINT (podman
-    /// `--entrypoint`). Parsed alongside `command` for the same reason.
+    /// `entrypoint:`: replaces the image's own ENTRYPOINT (podman `--entrypoint`). Parsed with
+    /// `command`, and likewise not applied by the deploy path.
     pub entrypoint: Option<Vec<String>>,
 }
 
-/// Parse a Compose `command:`/`entrypoint:` value, which may be either a YAML
-/// sequence (already argv) or a single string (shell-style, split on
-/// whitespace honoring quotes — Compose's own "shell form").
+/// Parses a Compose `command:`/`entrypoint:` value, which may be either a YAML sequence (already
+/// argv) or a single string (shell form: split on whitespace honoring quotes, Compose's own rule).
 fn parse_argv(v: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
     match v {
         Some(serde_yaml::Value::Sequence(seq)) => {
@@ -159,10 +139,10 @@ fn parse_argv(v: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
     }
 }
 
-/// Split a shell-form command string into argv, honoring single and double
-/// quotes. MinIO's `--console-address ":9001"` is the motivating case: a naive
-/// `split_whitespace` would hand podman a literal `":9001"` INCLUDING the
-/// quote characters, which the app then fails to parse as an address.
+/// Splits a shell-form command string into argv, honoring single and double quotes; an empty quoted
+/// argument (`""`) is a real, empty argument. MinIO's `--console-address ":9001"` is the motivating
+/// case: a naive `split_whitespace` would hand podman a literal `":9001"` INCLUDING the quote
+/// characters, which the app then fails to parse as an address.
 fn shell_split(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -176,7 +156,7 @@ fn shell_split(s: &str) -> Vec<String> {
             Some(_) => cur.push(c),
             None if c == '\'' || c == '"' => {
                 quote = Some(c);
-                any = true; // `""` is a real, empty argument
+                any = true;
             }
             None if c.is_whitespace() => {
                 if !cur.is_empty() || any {
@@ -206,9 +186,9 @@ pub fn compose_file(dir: &Path) -> Option<PathBuf> {
     .find(|p| p.exists())
 }
 
-/// Parse Compose YAML text into normalized services, sorted by name (deterministic).
-/// Tolerant of the common Compose shapes; ignores keys we don't model (networks,
-/// volumes, depends_on, healthcheck, …) rather than failing the build.
+/// Parses Compose YAML text into normalized services, sorted by name (deterministic). Tolerant of
+/// the common Compose shapes: keys this module does not model (networks, volumes, depends_on,
+/// healthcheck, ...) are ignored rather than failing the build.
 pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
     let root: serde_yaml::Value = serde_yaml::from_str(text)?;
     let services = root
@@ -265,8 +245,8 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
     Ok(out)
 }
 
-/// The single PUBLIC entrypoint service to route `/` to: a conventional web name if
-/// present, else the first service that publishes ports, else the first service.
+/// The single PUBLIC entrypoint service to route `/` to: the first published service with a
+/// conventional web name (`WEB_NAMES`), else the first published service, else the first service.
 pub fn primary_service(services: &[ParsedService]) -> Option<&ParsedService> {
     const WEB_NAMES: &[&str] = &["web", "app", "frontend", "www", "gateway", "api", "server"];
     services
@@ -293,11 +273,6 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
                 .get("dockerfile")
                 .and_then(|c| c.as_str())
                 .map(|s| s.to_string());
-            // `target:` names the build stage to stop at. Dropping it silently
-            // built the Dockerfile's LAST stage instead of the one the compose
-            // file asked for; in docker/awesome-compose/apache-php that is the
-            // difference between the `builder` stage the service declares and
-            // the heavyweight `dev-envs` stage that happens to be last.
 
             let target = v?.get("target").and_then(|c| c.as_str()).map(|s| s.to_string());
             Some(ComposeBuild {
@@ -310,26 +285,23 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
     }
 }
 
-/// The CONTAINER-side port + transport protocol from a `ports:` sequence
-/// ("HOST:CONTAINER", "PORT", "IP:HOST:CONTAINER", "…/udp", or the long-syntax
-/// `{ target: N, protocol: "udp" }`). We want what the app listens on, plus whether
-/// the mapping declared a real transport change — see [`ParsedService::protocol`].
+/// The CONTAINER-side port + transport protocol from a `ports:` sequence (`"HOST:CONTAINER"`,
+/// `"PORT"`, `"IP:HOST:CONTAINER"`, `".../udp"`, or the long syntax `{ target: N, protocol: "udp"
+/// }`): what the app listens on, plus whether the mapping declared a real transport change (see
+/// [`ParsedService::protocol`]).
 fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
     container_ports(ports)
         .first()
         .map(|p| (p.container, p.protocol))
 }
 
-/// EVERY container-side port in a `ports:` sequence, in declaration order, deduped
-/// on (port, protocol). Same per-entry grammar as [`container_port`], which is now
-/// just "the first of these" — see [`ParsedService::all_ports`] for why the rest
-/// must not be dropped on the floor.
+/// EVERY container-side port in a `ports:` sequence, in declaration order, deduped on (port,
+/// protocol) with declaration order winning, as in the primary-port rule. Same per-entry grammar as
+/// [`container_port`], which is just 'the first of these'; see [`ParsedService::all_ports`].
 fn container_ports(ports: &[serde_yaml::Value]) -> Vec<ComposePort> {
     let mut out: Vec<ComposePort> = Vec::new();
     for p in ports {
         if let Some(e) = one_container_port(p) {
-            // Dedup on the container side; declaration order wins, same as the
-            // primary-port rule.
             if !out
                 .iter()
                 .any(|x| x.container == e.container && x.protocol == e.protocol)
@@ -341,21 +313,18 @@ fn container_ports(ports: &[serde_yaml::Value]) -> Vec<ComposePort> {
     out
 }
 
+/// Parses one `ports:` entry. Short syntax is `PORT`, `HOST:CONTAINER` or `IP:HOST:CONTAINER`, each
+/// with an optional `/udp` or `/tcp` suffix: the LAST colon segment is the container side and the
+/// one before it (when numeric) is the publish request's host port. An IP prefix
+/// (`127.0.0.1:8080:80`) is accepted and ignored. Host `0` is docker's 'pick an ephemeral port', a
+/// publish with no specific number, so it normalizes to no publish request (`None`). Long syntax
+/// carries the publish request as `published:` (a number, or a string for ranges, of which only a
+/// plain number is honored per entry).
 fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
     if let Some(s) = p.as_str() {
-        // Short syntax: "PORT", "HOST:CONTAINER", "IP:HOST:CONTAINER", each with
-        // an optional "/udp"/"/tcp" suffix. The LAST colon-segment is the
-        // container side; the one before it (when numeric) is the publish
-        // request's host port. An IP prefix ("127.0.0.1:8080:80") is accepted
-        // and the IP itself ignored — the platform's raw ingress binds fleet
-        // addresses, not the compose author's loopback.
         let (bare, protocol) = split_proto_suffix(s);
         let segs: Vec<&str> = bare.split(':').collect();
         let container = segs.last()?.trim().parse::<u16>().ok()?;
-        // Host `0` is docker's "pick an ephemeral port" — a publish with no
-        // specific number, so it maps to "published, no preference"… which the
-        // platform has no lane for (publish implies a concrete public port), so
-        // it normalizes to internal-only rather than a literal preference of 0.
         let host = if segs.len() >= 2 {
             segs[segs.len() - 2]
                 .trim()
@@ -383,8 +352,6 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
                 }
             })
             .unwrap_or(ServiceProtocol::Http);
-        // Long syntax carries the publish request as `published:` (number, or a
-        // string for ranges — only a plain number can be honored per-entry).
         let host = p
             .get("published")
             .and_then(|v| {
@@ -409,16 +376,12 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
     None
 }
 
-/// Split a compose port string's optional transport suffix, e.g. `"5432:5432/udp"`
-/// -> (`"5432:5432"`, `Udp`). Mirrors the pre-existing `s.split('/').next()`
-/// stripping (any single `/`-delimited suffix), now CLASSIFYING it instead of
-/// silently discarding it: `udp` -> `Udp`, `tcp` -> `Tcp` (both explicit
-/// transport markers are equally unambiguous signal for the raw-splice proxy
-/// path — there is no other way to declare a non-HTTP TCP service, e.g.
-/// Minecraft/Postgres-wire, through plain compose `ports:` syntax, so an
-/// explicit `/tcp` must not collapse into the same bucket as "unspecified");
-/// no suffix (or any other unrecognized value) -> `Http`, Compose's
-/// implicit-default transport, unchanged.
+/// Splits a compose port string's optional transport suffix, e.g. `"5432:5432/udp"` ->
+/// (`"5432:5432"`, `Udp`). The suffix is CLASSIFIED rather than discarded: `udp` -> `Udp` and `tcp`
+/// -> `Tcp` (an explicit `/tcp` is the only way to declare a non-HTTP TCP service, e.g. Minecraft
+/// or Postgres wire, through plain compose `ports:` syntax, so it must not collapse into the bucket
+/// of 'unspecified'), while no suffix (or any other unrecognized value) is `Http`, Compose's
+/// implicit default.
 fn split_proto_suffix(s: &str) -> (&str, ServiceProtocol) {
     match s.split_once('/') {
         Some((bare, proto)) if proto.eq_ignore_ascii_case("udp") => (bare, ServiceProtocol::Udp),
@@ -441,12 +404,12 @@ fn first_port(seq: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
     })
 }
 
-/// Parse the `x-shadw-expose` extension field, if present. Tolerant of both the
-/// boolean shorthand and the full mapping form (any other shape, e.g. a bare
-/// string/number, is ignored — stays internal, matching this module's tolerant-of-
-/// unmodeled-keys convention). An unparseable `protocol` string IS a hard error: this
-/// field toggles PUBLIC exposure, so silently ignoring a typo could leak a service the
-/// user meant to keep locked down, or fail to expose one they meant to open up.
+/// Parses the `x-shadw-expose` extension field, if present. Tolerant of both the boolean shorthand
+/// and the full mapping form (any other shape, e.g. a bare string or number, is ignored and the
+/// service stays internal, matching this module's tolerance of unmodeled keys). An unparseable
+/// `protocol` string IS a hard error: this field toggles PUBLIC exposure, so silently ignoring a
+/// typo could leak a service the user meant to keep locked down, or fail to expose one they meant
+/// to open up.
 fn parse_expose_ext(v: Option<&serde_yaml::Value>) -> anyhow::Result<ComposeExpose> {
     match v {
         None => Ok(ComposeExpose::default()),

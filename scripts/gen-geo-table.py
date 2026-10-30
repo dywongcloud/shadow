@@ -68,12 +68,11 @@ NLON = int(round(360 / DEG))
 NLAT = int(round(180 / DEG))
 assert NLON * NLAT <= UNK, "grid must be addressable in a u16 with 0xFFFF spare"
 
-# v6 rows are keyed on the top 32 bits (a /32 -- one RIR allocation to one ISP).
-# Coverage inside a key is weighted in /48s, so a big sub-block outvotes a small
-# one instead of whichever happened to be listed first.
+KEY_SPACE_TOP = 0xFFFFFFFF
 V6_KEY_BITS = 32
+V6_WEIGHT_PREFIX_BITS = 48
 V6_KEY_SHIFT = 128 - V6_KEY_BITS
-V6_WEIGHT_SHIFT = 128 - 48
+V6_WEIGHT_SHIFT = 128 - V6_WEIGHT_PREFIX_BITS
 V6_UNITS_PER_KEY = 1 << (V6_KEY_SHIFT - V6_WEIGHT_SHIFT)
 
 
@@ -120,14 +119,26 @@ def ip6(s):
     return v
 
 
+def is_unplaceable(country, lat, lon):
+    """DB-IP marks unplaceable space with country ZZ; (0, 0) -- null island -- is its other spelling of "no data"."""
+    return country == "ZZ" or (lat == 0.0 and lon == 0.0)
+
+
+def heaviest_cell(weights):
+    """Cell with the most coverage; ties go to the lower cell id so the output is byte-reproducible."""
+    return max(weights.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+
+
 def parse(path):
     """Stream the CSV into two run lists. Source ranges arrive sorted and
-    disjoint; a hole between two ranges becomes an explicit UNK run."""
+    disjoint; a hole between two ranges becomes an explicit UNK run, and each list
+    closes with a trailing UNK at the top of its key space (otherwise an address
+    above everything the source covers would inherit the LAST row's coordinates)."""
     runs4, runs6 = [], []
     end4 = None
-    cur6 = None       # /32 key currently accumulating
-    dom6 = {}         # cell -> /48s of coverage inside cur6
-    end6 = None       # highest /32 key any range has covered
+    open_key6 = None
+    cell_weights6 = {}
+    top_key6 = None
 
     def emit(runs, start, cell):
         if runs and runs[-1][1] == cell:
@@ -138,24 +149,23 @@ def parse(path):
         runs.append((start, cell))
 
     def flush6():
-        nonlocal cur6
-        if cur6 is None:
+        nonlocal open_key6
+        if open_key6 is None:
             return
-        # Ties break on the lower cell id so the output is byte-reproducible.
-        emit(runs6, cur6, max(dom6.items(), key=lambda kv: (kv[1], -kv[0]))[0])
-        dom6.clear()
-        cur6 = None
+        emit(runs6, open_key6, heaviest_cell(cell_weights6))
+        cell_weights6.clear()
+        open_key6 = None
 
     def take6(key, cell, weight):
-        nonlocal cur6
-        if cur6 is not None and cur6 != key:
-            prev = cur6
+        nonlocal open_key6
+        if open_key6 is not None and open_key6 != key:
+            prev = open_key6
             flush6()
             if key > prev + 1:
                 emit(runs6, prev + 1, UNK)
-        if cur6 is None:
-            cur6 = key
-        dom6[cell] = dom6.get(cell, 0) + weight
+        if open_key6 is None:
+            open_key6 = key
+        cell_weights6[cell] = cell_weights6.get(cell, 0) + weight
 
     with gzip.open(path, "rt", encoding="utf-8", errors="replace") as fh:
         for line in fh:
@@ -167,9 +177,7 @@ def parse(path):
                 lon = float(f[-1])
             except ValueError:
                 continue
-            # DB-IP marks unplaceable space with country ZZ; (0,0) -- null
-            # island -- is its other spelling of "no data", never a real site.
-            cell = UNK if (f[3] == "ZZ" or (lat == 0.0 and lon == 0.0)) else cell_of(lat, lon)
+            cell = UNK if is_unplaceable(f[3], lat, lon) else cell_of(lat, lon)
             start, stop = f[0], f[1]
             if ":" in start:
                 a, b = ip6(start), ip6(stop)
@@ -178,16 +186,16 @@ def parse(path):
                 per_key = V6_UNITS_PER_KEY
                 if ka == kb:
                     take6(ka, cell, wb - wa + 1)
-                    end6 = ka if end6 is None else max(ka, end6)
+                    top_key6 = ka if top_key6 is None else max(ka, top_key6)
                     continue
-                # Only the first and last key of a range can be partly covered;
-                # every key between them belongs to this range outright.
-                take6(ka, cell, ((ka + 1) * per_key) - wa)
+                first_key_weight = ((ka + 1) * per_key) - wa
+                last_key_weight = wb - (kb * per_key) + 1
+                take6(ka, cell, first_key_weight)
                 if kb > ka + 1:
                     flush6()
                     emit(runs6, ka + 1, cell)
-                take6(kb, cell, wb - (kb * per_key) + 1)
-                end6 = kb if end6 is None else max(kb, end6)
+                take6(kb, cell, last_key_weight)
+                top_key6 = kb if top_key6 is None else max(kb, top_key6)
             else:
                 a, b = ip4(start), ip4(stop)
                 if end4 is not None and a > end4 + 1:
@@ -195,13 +203,10 @@ def parse(path):
                 emit(runs4, a, cell)
                 end4 = b if end4 is None else max(b, end4)
     flush6()
-    # Close both tables at the top of their key space. Without a trailing UNK,
-    # an address above everything the source covers would inherit the LAST row's
-    # coordinates -- a confidently wrong answer where "unknown" is the truth.
-    if end4 is not None and end4 < 0xFFFFFFFF:
+    if end4 is not None and end4 < KEY_SPACE_TOP:
         emit(runs4, end4 + 1, UNK)
-    if end6 is not None and end6 < 0xFFFFFFFF:
-        emit(runs6, end6 + 1, UNK)
+    if top_key6 is not None and top_key6 < KEY_SPACE_TOP:
+        emit(runs6, top_key6 + 1, UNK)
     return runs4, runs6
 
 

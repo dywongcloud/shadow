@@ -16,8 +16,6 @@ export function BuildSettings({ paramsPromise }: { paramsPromise: Promise<{ proj
     setB(s.build);
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal await resolves, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
   }, [load]);

@@ -1,13 +1,6 @@
-//! Mock cell backend: a "cell" is a sandboxed child-process build in a temp
-//! directory. This lets the entire control plane run and be exercised on macOS
-//! / Apple Silicon without any virtualization, while presenting the exact same
-//! [`CellBackend`] contract as the real Firecracker backend.
-//!
-//! Isolation here is intentionally lighter than a microVM — a per-tenant work-dir
-//! jail (cells live under `<root>/<tenant>/<cell-id>`, so tenants never share a
-//! subtree), a hard wall-clock timeout, and best-effort `rlimit`s (CPU seconds +
-//! address space) on Unix. Stronger isolation (separate kernels) is the
-//! Firecracker backend's job; tenant tagging flows identically through both.
+//! Mock cell backend: a "cell" is a sandboxed child-process build in a temp directory, so the whole
+//! control plane runs on macOS without virtualization under the same [`CellBackend`] contract.
+//! Isolation is a per-tenant work-dir jail, a wall-clock timeout and best-effort `rlimit`s.
 
 use crate::{
     CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink, SealedRuntimeArtifact,
@@ -35,12 +28,8 @@ pub struct MockConfig {
     pub provision_latency: Duration,
     /// Shared build cache root (cross-cell, like Netlify's shared cache storage).
     pub cache_root: PathBuf,
-    /// Durable directory backing the runtime-artifact receipt sidecar (see
-    /// `RUNTIME_ARTIFACT_RECEIPTS_FILE`). Must survive a `hive-node` restart —
-    /// unlike `root`/`cache_root`, which are disposable cell scratch space.
-    /// Callers should point this at the same durable store the sealed
-    /// artifacts themselves live under (`$HIVE_DATA/runtime-artifacts-v1`),
-    /// not at a tempdir.
+    /// Durable directory backing the runtime-artifact receipt sidecar; must survive a `hive-node`
+    /// restart, so point it at the sealed artifacts' own durable store, never a tempdir.
     pub receipts_dir: PathBuf,
 }
 
@@ -48,7 +37,6 @@ impl Default for MockConfig {
     fn default() -> Self {
         MockConfig {
             root: std::env::temp_dir().join("hive-cells"),
-            // A nod to the blog: cold provisioning is the slow path warm pools hide.
             provision_latency: Duration::from_millis(800),
             cache_root: std::env::temp_dir().join("hive-cache"),
             receipts_dir: std::env::temp_dir().join("hive-cells"),
@@ -91,15 +79,8 @@ struct MockRuntimeArtifactReceipt {
     app_root: PathBuf,
 }
 
-/// File name for the durable sidecar backing `MockBackend::runtime_artifacts`.
-///
-/// The map itself used to be purely in-memory: a `hive-node` restart on any
-/// mock-backend node silently wiped every previously-"ready" deployment's
-/// artifact receipt even though the sealed bytes were still on disk under
-/// `runtime-artifacts-v1/`, surfacing as a permanent NODE_IMAGE_MISSING crash
-/// loop with no operator remedy short of a manual re-deploy. This sidecar
-/// persists the receipts (small: one entry per live image id) so a restart
-/// reloads exactly what it had, instead of orphaning ready deployments.
+/// File name of the durable sidecar backing `MockBackend::runtime_artifacts`, so a restart reloads
+/// every ready deployment's receipt instead of orphaning it as NODE_IMAGE_MISSING.
 const RUNTIME_ARTIFACT_RECEIPTS_FILE: &str = "runtime-artifact-receipts.json";
 
 fn load_runtime_artifact_receipts(
@@ -154,9 +135,8 @@ pub struct MockBackend {
     containers: Arc<AsyncMutex<HashMap<CellId, crate::ContainerLaunch>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2).
     sampler: Arc<crate::CpuSampler>,
-    /// Native macOS litebox: config + per-cell net identity (needed by
-    /// `terminate` to kill the real runner process and by callers that want
-    /// to know a cell's dial target). See `crate::litebox_macos`.
+    /// Native macOS litebox: config + per-cell net identity (`terminate` kills the real runner process
+    /// with it). See `crate::litebox_macos`.
     litebox_macos_cfg: crate::litebox_macos::LiteboxMacosConfig,
     litebox_macos_net: Arc<crate::litebox_macos::NetAllocator>,
     litebox_macos_cells: Arc<AsyncMutex<HashMap<CellId, crate::litebox_macos::MacosNet>>>,
@@ -191,18 +171,9 @@ impl Default for MockBackend {
     }
 }
 
-/// Run a build job as a plain host process — the un-sandboxed build pipeline
-/// shared by [`MockBackend`] and the Litebox backend (`crate::litebox`).
-///
-/// Litebox reuses this VERBATIM rather than wrapping build steps in its own
-/// sandbox: a build script is fundamentally fork/exec-heavy (`git clone`
-/// forks+execs `git`, `npm install` forks+execs dozens of child processes),
-/// and litebox's own `sys_clone` handler explicitly does not support `fork`
-/// yet (`litebox_shim_linux/src/syscalls/process.rs`: "exit_signal is
-/// ignored because we don't support fork yet; we just validate it"). Wrapping
-/// this pipeline in the litebox runner would not work today, so it stays a
-/// plain host process for both backends — litebox's isolation is scoped to
-/// `start_function`'s single long-lived process instead, see `crate::litebox`.
+/// Run a build job as a plain host process — the un-sandboxed build pipeline shared by
+/// [`MockBackend`] and the Litebox backend, since a build is fork/exec-heavy and litebox's
+/// `sys_clone` does not support `fork`; litebox's isolation is scoped to `start_function`.
 pub(crate) async fn run_build_process(
     cell: &CellHandle,
     job: &BuildJob,
@@ -218,11 +189,8 @@ pub(crate) async fn run_build_process(
         ),
     );
 
-    // Assemble the script: optional fetch, then each user command.
     let mut steps: Vec<String> = Vec::new();
     if !job.repo.is_empty() {
-        // `git_ref_clone_arg` is a controlled flag ("" or "--branch <ref>"),
-        // so it is interpolated raw; only the repo URL is quoted.
         steps.push(format!(
             "git clone --depth 1 {} {} . 2>&1 || (echo 'clone failed' && exit 1)",
             job.git_ref_clone_arg(),
@@ -234,8 +202,6 @@ pub(crate) async fn run_build_process(
     let mem_mib = cell.resources.mem_mib;
     let timeout = Duration::from_secs(job.resources.timeout_secs.max(1));
 
-    // Build cache: restore cached paths before the build (the "instant
-    // npm install" trick from Netlify/Hive).
     if let Some(key) = &job.cache_key {
         if !job.cache_paths.is_empty() {
             let summary = restore_cache(cache_root, key, &job.cache_paths, &cell.root);
@@ -243,8 +209,6 @@ pub(crate) async fn run_build_process(
         }
     }
 
-    // Run all steps under one wall-clock budget; `set -e` semantics: stop on
-    // first non-zero exit.
     let run = async {
         let mut last_code = 0i32;
         for (i, step) in steps.iter().enumerate() {
@@ -270,7 +234,6 @@ pub(crate) async fn run_build_process(
         }
     };
 
-    // Save cache after a successful build.
     if exit_code == 0 && !timed_out {
         if let Some(key) = &job.cache_key {
             if !job.cache_paths.is_empty() {
@@ -302,10 +265,8 @@ pub(crate) async fn run_build_process(
     })
 }
 
-/// Is `prog` executable via `path` — the SAME `PATH` string handed to the child,
-/// not this process's own, so a hit here means the child really can exec it.
-/// A program containing a separator is a path, not a PATH lookup (matching
-/// `execvp` semantics), and is tested directly.
+/// Is `prog` executable via `path` — the SAME `PATH` handed to the child; a program containing a
+/// separator is tested directly (`execvp` semantics).
 fn bin_on_path(prog: &str, path: &str) -> bool {
     if prog.contains('/') {
         return std::path::Path::new(prog).is_file();
@@ -412,10 +373,6 @@ impl CellBackend for MockBackend {
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
-        // Per-tenant isolation: every cell's sandbox lives under its tenant's
-        // subtree (`<root>/<tenant>/<cell-id>`), so one tenant's cells can never
-        // see another's working files — the host-level analogue of the
-        // per-microVM rootfs boundary. Empty tenant => "personal".
         let tenant = if spec.tenant.trim().is_empty() {
             "personal"
         } else {
@@ -428,7 +385,6 @@ impl CellBackend for MockBackend {
             .join(spec.id.as_str());
         let mut provision = RootRollback::new(root.clone());
         tokio::fs::create_dir_all(&root).await?;
-        // Simulate the cold-boot + image-load cost the warm pool exists to hide.
         tokio::time::sleep(self.cfg.provision_latency).await;
         provision.commit();
         Ok(CellHandle {
@@ -539,49 +495,21 @@ impl CellBackend for MockBackend {
             );
         }
 
-        // Native macOS litebox: real syscall-level sandboxing for Node
-        // functions (see `crate::litebox_macos`'s module doc). Capability is
-        // PROBED, never assumed — `available` fails fast (no sudoers grant
-        // installed, or on any non-macOS host `cfg!` alone already gates it)
-        // and this falls through to the plain host exec below exactly like
-        // today, so a node without the grant behaves identically to before
-        // this feature existed.
         if crate::litebox_macos::eligible(func.runtime)
             && crate::litebox_macos::available(&self.litebox_macos_cfg).await
         {
             return self.start_function_litebox_macos(cell, func).await;
         }
 
-        // Ensure common tool dirs (podman/docker, homebrew) are on PATH so
-        // container deploys work regardless of how the node was launched.
         let base_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{base_path}");
-        // Containers (podman, or Apple's `container` on macOS) take longer to
-        // publish their port than a plain process, especially on macOS rootless
-        // networking. `"container run "` (not the bare word) avoids false
-        // positives on unrelated start commands that happen to contain "container".
         let joined = func.start_cmd.join(" ");
         let is_container = joined.contains("podman")
             || joined.contains("docker")
             || joined.contains("container run ");
-        // A Wasmer function's FIRST start on a node compiles the whole module
-        // ahead-of-time (Cranelift) before it can listen; only later starts hit
-        // wasmer's on-disk artifact cache. The 40ms cold start measured for this
-        // runtime was a CACHE HIT and says nothing about the uncached compile of
-        // a large module, so the short bucket is the wrong default here — it
-        // would turn a slow first compile into a warm-fail streak and open the
-        // deployment's circuit against an app that is fine.
         let is_wasm = func.runtime == hive_core::Runtime::Wasmer;
         let ready_timeout = if is_container || is_wasm { 60 } else { 15 };
 
-        // The declared interpreter must exist on the filesystem THIS backend
-        // execs against (the host, here) — checked before spawning so the
-        // failure names the node fault and its remedy. Without this the spawn
-        // fails with a bare ENOENT that `classify_lease_error` cannot tell from
-        // an app fault, and the tenant is told to debug an entrypoint that is
-        // correct. Placement's capability filter should make this unreachable;
-        // reaching it means the gossiped capability and the real filesystem
-        // disagree. See `hive_core::fault::NODE_RUNTIME_MISSING`.
         if is_wasm && !bin_on_path(&func.start_cmd[0], &path) {
             anyhow::bail!(
                 "{}: this node has no `{}` binary on PATH, so a runtime=\"wasmer\" \
@@ -592,12 +520,6 @@ impl CellBackend for MockBackend {
             );
         }
 
-        // Same node-fault contract as the Wasmer check above, for the same
-        // reason: placement's `schedule::bun_capable` filter should make this
-        // unreachable, so reaching it means the gossiped capability and the
-        // real filesystem disagree. `func.runtime` — the authoritative
-        // platform discriminator, never the argv[0] text — is the signal,
-        // mirroring `hive-cell-agent`'s own `platform_runtime_program` gate.
         let is_bun = func.runtime == hive_core::Runtime::Bun;
         if is_bun && !bin_on_path(&func.start_cmd[0], &path) {
             anyhow::bail!(
@@ -617,33 +539,7 @@ impl CellBackend for MockBackend {
         tokio::fs::create_dir_all(&runtime_cache).await?;
 
         let mut cmd = Command::new(&func.start_cmd[0]);
-        cmd
-            // CLEARED, NEVER INHERITED. `Command` inherits the parent's whole
-            // environment by default, so without this a tenant's function process
-            // received THIS NODE's env — `HIVE_SECRET_KEY` (the fleet-shared
-            // at-rest key), `HIVE_JWT_SECRET` and `HIVE_INTERNAL_TOKEN` (enough to
-            // mint platform sessions and speak to the internal admin surface AS
-            // the platform), and whatever else the unit sets.
-            //
-            // The "mock is dev-only" premise that made inheriting look acceptable
-            // is FALSE on this fleet: `fc-sanjose`, `fc-sanjose-cvm-1` and
-            // `fc-sanjose-cvm-2` all report `backend: "mock"` in the live node
-            // registry and are ordinary placement candidates carrying real tenant
-            // deployments, and the region catalog additionally advertises the
-            // mock-backed `los-angeles` region as publicly selectable.
-            //
-            // Both sibling backends already do exactly this and say why —
-            // `litebox.rs`'s `.env_clear()` ("would otherwise hand this node's own
-            // process secrets to sandboxed tenant code") and `hive-cell-agent`,
-            // which builds the guest env from nothing. Mock was the only path
-            // left leaking, and it is the one with the WEAKEST isolation, so it
-            // needed the guard most.
-            //
-            // Everything the function legitimately needs is set explicitly below
-            // (PORT/PATH/HOME + the deployment's own `func.env`), plus
-            // NODE_COMPILE_CACHE further down — so this removes only what a
-            // tenant was never entitled to read.
-            .env_clear()
+        cmd.env_clear()
             .args(&func.start_cmd[1..])
             .current_dir(&workdir)
             .env("PORT", func.port.to_string())
@@ -656,17 +552,6 @@ impl CellBackend for MockBackend {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
-        // writable cache dir under the workdir so cold starts reuse precompiled
-        // bytecode (Node >=22.1 auto-loads it). Genuinely Node/V8-only — Bun uses
-        // JavaScriptCore and does not read NODE_COMPILE_CACHE at all, so setting
-        // it for a Bun process used to be a silent no-op (wasted a directory
-        // create, produced zero speedup). Bun's bytecode cache is a build-time
-        // artifact (a `.jsc` sidecar bundled next to the entry file by
-        // `bun build --bytecode`) that `bun run <entry>` auto-loads with NO
-        // runtime env var needed at all — so the Bun path here is correctly a
-        // no-op, not a workaround. Opt-out via HIVE_COMPILE_CACHE=0. Mirrors the
-        // microVM cell-agent.
         let cc_off = func
             .env
             .get("HIVE_COMPILE_CACHE")
@@ -679,15 +564,9 @@ impl CellBackend for MockBackend {
         let child = cmd.spawn()?;
         self.funcs.lock().await.insert(cell.id.clone(), child);
 
-        // Readiness: wait until the function accepts TCP on its port.
         let func_addr = format!("127.0.0.1:{}", func.port);
         wait_tcp_ready(&func_addr, Duration::from_secs(ready_timeout)).await?;
 
-        // Front the function with a multiplexed tunnel server (the mock
-        // equivalent of the in-VM cell agent). The gateway connects ONE tunnel
-        // here and multiplexes all requests over it. A non-HTTP process
-        // function (`func.raw_proxy`) is spliced raw instead — same
-        // per-protocol branch as the container paths.
         let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let tunnel_addr = listener.local_addr()?.to_string();
@@ -702,9 +581,6 @@ impl CellBackend for MockBackend {
                             if raw_proxy {
                                 fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
                             } else {
-                                // serve_maybe_raw: lets edge.rs's local WS splice open a raw
-                                // connection to this same listener (magic-byte-gated), byte-
-                                // identical for every ordinary framed request.
                                 fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc)
                                     .await;
                             }
@@ -757,9 +633,6 @@ impl CellBackend for MockBackend {
     }
 
     async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
-        // The function runs as a direct child process here (the mock analogue of a
-        // microVM); sample its CPU via sysinfo and normalize to the cell's vCPU
-        // budget so the AIMD thresholds mean the same thing regardless of vcpus.
         let pid = {
             let funcs = self.funcs.lock().await;
             funcs.get(&cell.id).and_then(|c| c.id())?
@@ -769,14 +642,9 @@ impl CellBackend for MockBackend {
 }
 
 impl MockBackend {
-    /// Start a Node function inside the native macOS litebox runner instead
-    /// of a bare host process — see `crate::litebox_macos`'s module doc for
-    /// the full mechanism/privilege story. Only called once the caller has
-    /// already confirmed `crate::litebox_macos::available`, so failures past
-    /// this point are real (staged rootfs missing, tar/runner failure) —
-    /// they surface as an ordinary `DEPLOYMENT_START_FAILED`-shaped error,
-    /// never silently fall back (a silent fallback would mean a tenant
-    /// believes their function got real sandboxing when it did not).
+    /// Start a Node function inside the native macOS litebox runner; only called once
+    /// `litebox_macos::available` confirmed the grant, so failures past this point surface as
+    /// `DEPLOYMENT_START_FAILED`, never a silent fallback to an unsandboxed process.
     async fn start_function_litebox_macos(
         &self,
         cell: &CellHandle,
@@ -807,11 +675,6 @@ impl MockBackend {
             .join(format!("{}.tar", cell.id.as_str()));
         crate::litebox_macos::build_combined_tar(&base_rootfs, &workdir, &tar_dest).await?;
 
-        // The guest's own shell (this rootfs ships busybox `sh`) resolves
-        // argv[0] via PATH — mirrors `func.start_cmd.join(" ")` semantics a
-        // real shell would apply, so "npm"/"npx"/a node_modules/.bin tool
-        // all resolve the same way a host process rooted at `workdir` would,
-        // without this code needing to special-case each one.
         let guest_path =
             "/usr/local/bin:/usr/local/lib/node_modules/npm/bin:/bin:/usr/bin:./node_modules/.bin";
         let script = func
@@ -842,10 +705,6 @@ impl MockBackend {
 
         self.funcs.lock().await.insert(cell.id.clone(), child);
 
-        // The runner's own `start()` only returns once the utun device is up
-        // and addressed, so a route to `net.guest_ip` already exists — the
-        // remaining wait is purely for the guest's OWN process to accept a
-        // connection (matches every other backend's readiness contract).
         let func_addr = format!("{}:{}", net.guest_ip, func.port);
         wait_tcp_ready(&func_addr, Duration::from_secs(60)).await?;
 
@@ -885,18 +744,6 @@ pub(crate) async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Res
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = String::from("unknown");
     while tokio::time::Instant::now() < deadline {
-        // Bound EACH individual attempt, not just the overall loop: the
-        // `while` condition is only re-checked BETWEEN iterations, so a
-        // single hung `connect()` can blow through the whole budget before
-        // the loop ever gets a chance to notice. Loopback callers (every
-        // existing one — Mock/Firecracker's container and child-process
-        // paths) never actually hit this, since a closed loopback port
-        // answers with an immediate ECONNREFUSED — but a real network path
-        // (litebox's per-cell TUN address) can have a destination that
-        // silently drops SYNs instead of rejecting them, and the OS's own
-        // default SYN-retry timeout is on the order of a minute, not
-        // milliseconds. Reproduced live on fc-frankfurt (2026-08-08): a
-        // 10s-budget wait_tcp_ready call hung for 60+ seconds.
         let per_attempt = Duration::from_secs(2)
             .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
         match tokio::time::timeout(per_attempt, tokio::net::TcpStream::connect(addr)).await {
@@ -910,11 +757,6 @@ pub(crate) async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Res
             }
         }
     }
-    // The single chokepoint both mock start paths (container + child process)
-    // wait on, so marking it here covers both. An APP fault: the cell started
-    // and the deployment's own process never accepted a connection. Unmarked it
-    // reported CAPACITY_EXHAUSTED until the pool's circuit opened on the third
-    // consecutive failure, blaming the host for the app's boot.
     anyhow::bail!(
         "the deployment's own process never listened on {addr} within {}s — check this \
          deployment's logs, entrypoint and required env; the node started the cell fine ({}). \
@@ -952,11 +794,6 @@ async fn run_step(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
-    // BOUNDED capture — see `hive_core::logcap`. The step is a tenant-supplied
-    // shell command; `lines()` has no length limit, so newline-free output
-    // (a `\r` progress bar, a one-line source map, a binary on stdout) grew a
-    // single String until the host process died. `read_capped_line` keeps
-    // draining the pipe but retains at most MAX_LOG_LINE_BYTES.
     let s_out = sink.clone();
     let out_task = tokio::spawn(async move {
         let mut r = BufReader::new(stdout);
@@ -998,13 +835,10 @@ fn apply_rlimits(cmd: &mut Command, mem_mib: u32) {
     let mem_bytes = (mem_mib as u64).saturating_mul(1024 * 1024);
     unsafe {
         cmd.pre_exec(move || {
-            // Address-space ceiling ~ requested memory (best effort; some
-            // runtimes reserve large virtual space, so this is advisory).
             let lim = libc::rlimit {
                 rlim_cur: mem_bytes,
                 rlim_max: mem_bytes,
             };
-            // Ignore failures: this is a dev sandbox, not the security boundary.
             let _ = libc::setrlimit(libc::RLIMIT_AS, &lim);
             Ok(())
         });
@@ -1088,14 +922,12 @@ fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result
     Ok(())
 }
 
-// Small helper on BuildJob for the clone branch flag.
 trait GitRefArg {
     fn git_ref_clone_arg(&self) -> String;
 }
 impl GitRefArg for BuildJob {
     fn git_ref_clone_arg(&self) -> String {
         if self.git_ref.is_empty() || self.git_ref == "HEAD" {
-            // no explicit branch flag
             String::new()
         } else {
             format!("--branch {}", self.git_ref)

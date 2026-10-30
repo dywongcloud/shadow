@@ -107,7 +107,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .collect(),
         warm_targets,
-        default_warm_target: 0, // only pre-warm explicitly-listed images
+        default_warm_target: 0,
         warm_spec: ResourceSpec::default(),
         warm_idle_ttl: Duration::from_secs(120),
         max_concurrent_builds: args.max_concurrent,

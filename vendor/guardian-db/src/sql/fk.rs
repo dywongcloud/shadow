@@ -166,7 +166,7 @@ pub(crate) fn fk_ripple(
 fn fk_values(fk: &ForeignKey, row: &RowValues) -> Vec<SqlValue> {
     fk.columns
         .iter()
-        .map(|c| row.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| row.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect()
 }
 
@@ -174,7 +174,7 @@ fn fk_values(fk: &ForeignKey, row: &RowValues) -> Vec<SqlValue> {
 fn ref_values(fk: &ForeignKey, row: &RowValues) -> Vec<SqlValue> {
     fk.ref_columns
         .iter()
-        .map(|c| row.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| row.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect()
 }
 
@@ -595,7 +595,7 @@ impl Exec {
                     for (rid, child_row) in self.fk_matching_children(&child_q, &fk, &key)? {
                         let mut new = child_row.clone();
                         for c in &fk.columns {
-                            new.insert(c.clone(), SqlValue::Null);
+                            new.insert(crate::sql::store::intern_column(c), SqlValue::Null);
                         }
                         self.ri_update_child(&child_q, &rid, child_row, new, queue)?;
                     }
@@ -698,7 +698,7 @@ impl Exec {
                             } else {
                                 crate::sql::dml::coerce_to_col(v, &child_meta, c)?
                             };
-                            newc.insert(c.clone(), v);
+                            newc.insert(crate::sql::store::intern_column(c), v);
                         }
                         self.ri_update_child(&child_q, &rid, child_row, newc, queue)?;
                     }
@@ -707,7 +707,7 @@ impl Exec {
                     for (rid, child_row) in self.fk_matching_children(&child_q, &fk, &key)? {
                         let mut newc = child_row.clone();
                         for c in &fk.columns {
-                            newc.insert(c.clone(), SqlValue::Null);
+                            newc.insert(crate::sql::store::intern_column(c), SqlValue::Null);
                         }
                         self.ri_update_child(&child_q, &rid, child_row, newc, queue)?;
                     }
@@ -791,7 +791,7 @@ impl Exec {
             ordered_key(
                 &all_cols
                     .iter()
-                    .map(|c| r.get(c).cloned().unwrap_or(SqlValue::Null))
+                    .map(|c| r.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
                     .collect::<Vec<_>>(),
             )
         };
@@ -799,7 +799,7 @@ impl Exec {
             return Ok(());
         }
         for c in &table.columns {
-            if !c.nullable && new.get(&c.name).map(SqlValue::is_null).unwrap_or(true) {
+            if !c.nullable && new.get(c.name.as_str()).map(SqlValue::is_null).unwrap_or(true) {
                 return Err(SqlError::NotNullViolation {
                     column: c.name.clone(),
                     table: table.name.clone(),
@@ -853,7 +853,7 @@ impl Exec {
             } else {
                 SqlValue::Null
             };
-            new.insert(cname.clone(), value);
+            new.insert(crate::sql::store::intern_column(&cname), value);
         }
         Ok(new)
     }

@@ -1,16 +1,9 @@
 "use client";
 
-/**
- * Web Push client helpers — shared by the notification bell's "Enable push"
- * banner (`components/notifications.tsx`) and the delivery-management section
- * on `/settings/notifications`. All server calls ride the same-origin `/cloud`
- * proxy via `apiGet`/`apiSend`, so the auth cookie + `x-hive-team` tenant
- * header are attached exactly like every other dashboard request.
- */
+/** Web Push client helpers shared by the notification bell's "Enable push" banner and the delivery section of `/settings/notifications`; every server
+ *  call rides the same-origin `/cloud` proxy via `apiGet`/`apiSend`, so the auth cookie and `x-hive-team` header attach like any dashboard request. */
 
 import { apiGet, apiSend } from "@/lib/api";
-
-// ---- API contract types (mirror the backend push routes) ----
 
 export interface PushDevice {
   endpoint: string;
@@ -24,9 +17,7 @@ export interface SmsConfig {
    *  text it — so notifications can never be pointed at an unowned number. */
   verified: boolean;
 }
-/** Response of `PUT /v1/push/sms`: setting a NEW/changed number texts a code
- *  and needs verification (`code_sent`); toggling an already-verified number
- *  returns `verified` immediately. */
+/** Response of `PUT /v1/push/sms`: a NEW or changed number texts a code (`code_sent`); toggling an already-verified number returns `verified` at once. */
 export interface SmsPutResult {
   ok: boolean;
   verified: boolean;
@@ -90,7 +81,6 @@ export function pushSupported(): boolean {
 export function deviceLabel(): string {
   if (typeof navigator === "undefined") return "Unknown device";
   const ua = navigator.userAgent;
-  // Order matters: Edge/Opera embed "Chrome", Chrome embeds "Safari".
   const browser = /Edg\//.test(ua)
     ? "Edge"
     : /OPR\//.test(ua)
@@ -102,7 +92,6 @@ export function deviceLabel(): string {
           : /Safari\//.test(ua)
             ? "Safari"
             : "Browser";
-  // iPadOS 13+ masquerades as macOS; maxTouchPoints tells them apart.
   const os = /iPhone|iPod/.test(ua)
     ? "iOS"
     : /iPad/.test(ua) || (/Mac/.test(ua) && navigator.maxTouchPoints > 1)
@@ -119,10 +108,8 @@ export function deviceLabel(): string {
   return `${browser} · ${os}`;
 }
 
-/** The browser's current PushSubscription (if any) — used by the settings page
- *  to mark "this device" in the registered list. Never throws, never hangs:
- *  uses `getRegistration()` (resolves undefined when no SW is registered)
- *  instead of `.ready` (which waits forever in that case). */
+/** The browser's current PushSubscription (if any), used to mark "this device" in the registered list; never throws and never hangs (`getRegistration()`
+ *  resolves undefined without a service worker, where `.ready` would wait forever). */
 export async function currentPushSubscription(): Promise<PushSubscription | null> {
   if (!pushSupported()) return null;
   try {
@@ -134,28 +121,14 @@ export async function currentPushSubscription(): Promise<PushSubscription | null
   }
 }
 
-/**
- * Full enable-push flow, shared verbatim by the bell banner and the settings
- * page: request permission → wait for the service worker → reuse or create the
- * browser PushSubscription (VAPID key fetched from the backend) → ALWAYS
- * register it server-side. The unconditional POST is deliberate: registration
- * is an idempotent upsert by endpoint scoped to the CURRENT tenant, so calling
- * this again after a team switch re-homes the same browser subscription under
- * the newly-active tenant instead of silently skipping it.
- *
- * Throws on any failure (including permission not granted) — callers branch on
- * `Notification.permission` to distinguish an explicit user denial from a
- * transient error worth retrying.
- */
+/** The full enable-push flow, shared by the bell banner and the settings page: request permission, wait for the service worker, reuse or create the
+ *  PushSubscription (VAPID key from the backend), then ALWAYS register it server-side: registration is an idempotent upsert by endpoint scoped to the
+ *  CURRENT tenant, so calling it again after a team switch re-homes the subscription. Throws on any failure (including permission not granted). */
 export async function subscribePush(): Promise<PushSubscription> {
   if (!pushSupported()) throw new Error("push notifications are not supported in this browser");
   const permission = await window.Notification.requestPermission();
   if (permission !== "granted") throw new Error(`notification permission ${permission}`);
 
-  // `.ready` waits for an ACTIVE registration — normally instant since
-  // pwa-register.tsx registers /sw.js on load, but bound it so a registration
-  // that never activates (e.g. SW blocked by the browser) surfaces as an error
-  // instead of an eternally-pending click handler.
   const reg = await Promise.race([
     navigator.serviceWorker.ready,
     new Promise<never>((_, reject) =>

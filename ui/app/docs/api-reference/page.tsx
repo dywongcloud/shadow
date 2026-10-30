@@ -1,33 +1,19 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { pageMeta } from "@/lib/page-meta";
 import { CodeBlock } from "@/components/code-block";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
-export const metadata: Metadata = {
-  title: "REST API Reference — shadw Docs",
+export const metadata: Metadata = pageMeta({
+  title: "REST API Reference — Docs",
+  socialTitle: "REST API Reference — shadw Docs",
   description:
-    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
-  alternates: { canonical: "/docs/api-reference" },
-  openGraph: {
-    title: "REST API Reference — shadw Docs",
-    description:
-      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
-    url: "/docs/api-reference",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "REST API Reference — shadw Docs",
-    description:
-      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse every endpoint for deploys, projects, domains, and nodes.",
-  },
-};
+    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
+  twitterDescription:
+    "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse the documented endpoints for deployments, projects, domains, DNS, webhooks, teams, tokens and observability.",
+  path: "/docs/api-reference",
+});
 
-
-/* The API Reference overview ("Using the REST API") — intro + API basics +
- * Authentication + team scoping + rate limits + errors + the Endpoints grid, with
- * an "On this page" table of contents on the right (Vercel-style). */
 
 const TOC = [
   { id: "api-basics", label: "API basics" },
@@ -63,8 +49,8 @@ export default function ApiReferencePage() {
         <h1 className="text-4xl font-bold tracking-tight">Using the REST API</h1>
         <p className="mt-6 text-[15px] leading-relaxed text-secondary">
           Interact programmatically with your shadw cloud using direct HTTP requests. You can create
-          deployments, manage custom domains and DNS, configure projects, and wire up webhooks — all
-          over the mesh.
+          deployments, manage custom domains and DNS, configure projects, and wire up webhooks, all
+          over HTTPS.
         </p>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           The API supports any programming language or framework that can send HTTP requests.
@@ -88,10 +74,11 @@ export default function ApiReferencePage() {
           <CodeBlock tabs={[{ label: "Authorization", lang: "bash", code: "Authorization: Bearer hive_…" }]} />
         </div>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
-          Alternatively, mint a short-lived (8&nbsp;hour) JWT with <Code>POST /v1/token</Code> and
-          present it in the same header. Minting requires <Code>HIVE_JWT_SECRET</Code> to be
-          configured on the node; when JWT auth is enforced, mutating requests (POST/PUT/DELETE)
-          must present a JWT.
+          Alternatively, present a short-lived JWT (1&nbsp;hour at most) in the same header.{" "}
+          <Code>POST /v1/token</Code> mints one; it requires <Code>HIVE_JWT_SECRET</Code> to be
+          configured on the node, and once that is set it is server-only (the request must carry
+          the <Code>x-hive-internal</Code> header). When <Code>HIVE_JWT_SECRET</Code> is set,
+          mutating requests (POST/PUT/PATCH/DELETE) must present a JWT or an API key.
         </p>
 
         <H2 id="accessing-team-resources">Accessing team resources</H2>
@@ -110,9 +97,10 @@ export default function ApiReferencePage() {
 
         <H2 id="rate-limits">Rate limits</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          API requests are rate-limited per team. When you exceed the limit the API responds with{" "}
-          <Code>429 Too Many Requests</Code>; back off and retry after the window resets. Burst limits
-          are higher on Pro and Enterprise plans.
+          API requests are limited per client IP address to 600 requests per minute (a sliding
+          window). When you exceed the limit the API responds with{" "}
+          <Code>429 Too Many Requests</Code>; back off and retry, since each request stops counting
+          after one minute.
         </p>
 
         <H2 id="errors">Errors</H2>
@@ -140,14 +128,14 @@ export default function ApiReferencePage() {
 
         <H2 id="endpoints">Endpoints</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          Browse all {totalEndpoints()} available REST API endpoints grouped by category.
+          Browse the {totalEndpoints()} documented REST API endpoints grouped by category.
         </p>
         <div className="mt-5 grid gap-3 sm:grid-cols-2">
           {API_CATEGORIES.map((cat) => (
             <Link
               key={cat.slug}
               href={endpointHref(cat.slug, cat.endpoints[0].slug)}
-              className="flex items-center justify-between rounded-lg border border-border px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-subtle/40"
+              className="tap-44 flex items-center justify-between rounded-lg border border-border px-4 py-3.5 transition-colors hover:border-border-strong hover:bg-subtle/40"
             >
               <span className="text-sm font-medium">{cat.name}</span>
               <span className="text-xs text-muted">
@@ -158,7 +146,6 @@ export default function ApiReferencePage() {
         </div>
       </article>
 
-      {/* On this page */}
       <aside className="sticky top-20 hidden h-fit w-52 shrink-0 xl:block">
         <div className="mb-3 text-xs font-medium text-muted">On this page</div>
         <ul className="space-y-2 border-l border-border">

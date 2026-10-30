@@ -1,22 +1,10 @@
-//! GuardianDB backend — **always on**, in local/dev and production alike.
-//!
-//! [guardian-db] is an iroh-native, content-addressed store (iroh-docs +
-//! iroh-blobs, BLAKE3, QUIC). Every platform snapshot is written into a real
-//! GuardianDB key/value store: persisted on disk under `$HIVE_DATA/guardian` and
-//! replicated across the iroh mesh via Willow range-based reconciliation. This is
-//! NOT a mock — it is the durable, peer-replicated copy of platform state.
-//!
-//! The local file snapshot ([`crate::persist`]) remains the bootstrap source of
-//! truth for fast cold start; GuardianDB adds durability + replication on top.
-//! Init and writes are best-effort: any failure is logged and never breaks the
-//! request path or the on-disk snapshot, so a node always boots and serves.
-//!
-//! State is partitioned by **tenant namespace** ([`crate::persist::namespaced`])
-//! and each namespace is stored under its own key (`ns/<namespace>/state`), so
-//! every org/team's projects, deployments and databases stay scoped and isolated
-//! in the replicated store — never commingled in one global blob.
-//!
-//! [guardian-db]: https://github.com/wmaslonek/guardian-db
+//! GuardianDB backend, always on: every platform snapshot is written into a real iroh-native
+//! GuardianDB key/value store (iroh-docs + iroh-blobs, BLAKE3), persisted under
+//! `$HIVE_DATA/guardian` and replicated over the mesh by Willow range reconciliation. The local
+//! file snapshot ([`crate::persist`]) stays the bootstrap source of truth; init and writes are
+//! best-effort (a failure is logged and never breaks the request path or the on-disk snapshot).
+//! State is partitioned per tenant namespace ([`crate::persist::namespaced`], key
+//! `ns/<namespace>/state`), never one global blob.
 
 use std::sync::{Arc, OnceLock};
 
@@ -30,13 +18,9 @@ use tokio::sync::OnceCell;
 
 use crate::persist::PlatformSnapshot;
 
-/// Live GuardianDB handle: the database (kept alive so its backend / iroh
-/// endpoint stays running), the opened key/value store, and a CLONE of the
-/// iroh client used to seed known-peer addresses after construction (see
-/// `seed_known_peers`). `IrohClient` is `#[derive(Clone)]` over an inner
-/// `Arc<IrohBackend>`, so this clone shares the exact same live endpoint
-/// `GuardianDB` itself uses internally — seeding through it reaches the real
-/// connection the docs/blobs Willow sync dials from.
+/// Live GuardianDB handle: the database (kept alive so its iroh endpoint keeps running), the opened
+/// key/value store, and a clone of the iroh client that shares the same live endpoint, used by
+/// `seed_known_peers` to seed peer addresses after construction.
 struct Handle {
     db: GuardianDB,
     kv: Arc<dyn KeyValueStore<Error = GuardianError>>,
@@ -45,10 +29,8 @@ struct Handle {
 
 static HANDLE: OnceCell<Handle> = OnceCell::const_new();
 
-/// Name of the sole iroh-docs KV namespace this node currently opens (see
-/// `init_handle`). Extracted to a const so the head-CID-exchange RPC
-/// (`namespace_heads`) doesn't repeat the literal — kept open for when a node
-/// opens more than one store.
+/// Name of the sole iroh-docs KV namespace this node opens (`namespace_heads` keys its head map by
+/// it).
 const KV_NAMESPACE: &str = "hive-state";
 
 /// Convenience alias for the native relational/SQL database this handle backs
@@ -58,13 +40,9 @@ pub(crate) type SqlDb =
 
 static SQL_HANDLE: OnceCell<SqlDb> = OnceCell::const_new();
 
-/// Lazily open (once) the native in-process relational/SQL database backed by
-/// this SAME live, relay-patched `GuardianDB` instance `handle()` uses — zero
-/// network hop, NOT the pgwire protocol (that layer is never enabled; see
-/// `crates/hive-cloud/Cargo.toml`'s guardian-db feature comment). Every node
-/// opens the identical named database ("hive"); guardian-db's own iroh-docs
-/// CRDT replication converges each node's local copy of every table within
-/// seconds of a write anywhere in the fleet.
+/// Lazily opens (once) the in-process relational/SQL database on this SAME live `GuardianDB`
+/// instance `handle()` uses (no network hop, never pgwire); every node opens the identical named
+/// database "hive" and iroh-docs CRDT replication converges each node's copy.
 pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
     SQL_HANDLE
         .get_or_try_init(|| async {
@@ -77,26 +55,11 @@ pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
         .cloned()
 }
 
-/// Upper bound on the whole GuardianDB bring-up (iroh endpoint bind, keystore,
-/// docs/blobs spawn). Live evidence (2026-07-06 onward) showed init can wedge
-/// indefinitely with zero error and zero log output — `tokio::sync::OnceCell`
-/// then blocks every future caller forever, since a never-resolving init future
-/// never lets `get_or_try_init` return. A bounded timeout converts that into a
-/// clean, retryable failure so the NEXT call to `handle()` can make progress
-/// instead of joining a wedged wait forever.
-///
-/// This bounds the WAIT, never the work. An earlier version of this comment
-/// claimed the dropped init future released "its owned FsStore/redb/iroh
-/// Endpoint handles ... synchronously on `Drop`, so a retry does not inherit
-/// stuck locks" — that was WRONG, and live evidence contradicted it: the
-/// spawned actor tasks inside guardian-db hold the Arcs, so a cancelled init
-/// kept the redb lock and the next attempt hit "Database already open". See
-/// [`INIT_INFLIGHT`] for what actually happens on expiry now.
-///
-/// `HIVE_GUARDIAN_INIT_TIMEOUT_MS` overrides the 30s default. Tunable because a
-/// slow host legitimately needs longer, and because the expiry path is otherwise
-/// unreachable to exercise on a healthy node — a very low value drives the
-/// park-and-re-await branch on demand.
+/// Upper bound on how long a caller WAITS for the whole bring-up (iroh endpoint bind, keystore,
+/// docs/blobs spawn), never on the work itself: init can wedge with no error and no log, so the
+/// wait fails retryably while the in-flight task is parked ([`INIT_INFLIGHT`]).
+/// `HIVE_GUARDIAN_INIT_TIMEOUT_MS` overrides the 30 s default (a slow host needs longer; a very low
+/// value exercises the expiry path).
 fn guardian_init_timeout() -> std::time::Duration {
     static T: OnceLock<std::time::Duration> = OnceLock::new();
     *T.get_or_init(|| {
@@ -109,78 +72,42 @@ fn guardian_init_timeout() -> std::time::Duration {
     })
 }
 
-/// Minimum spacing between full init attempts after a failure. Every guardian
-/// caller (gossip puts, the anti-entropy loop, the relational mirror loop,
-/// admin SQL reads) retries `handle()` on its own cadence; without this gate
-/// a persistent failure had them collectively re-running `init_handle` —
-/// a FULL iroh endpoint bind + blobs/docs store bring-up — every few seconds.
-/// Live-witnessed on fc-virginia/fc-virginia-3: each failed attempt leaked
-/// the partially-built client (spawned actor tasks keep the Arc alive), and
-/// the retry storm grew hive-cloud to a 96.9GB anon-RSS OOM kill in ~8h,
-/// freezing two hosts into console-reboot territory.
+/// Minimum spacing between full init attempts after a failure: every guardian caller retries
+/// `handle()` on its own cadence, and an ungated persistent failure re-ran a FULL iroh endpoint
+/// bind plus blobs/docs bring-up every few seconds, leaking each partial client.
 const INIT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Set once an init failure proves in-process retries can never succeed. Two
-/// causes latch it:
-///  - redb's "Database already open. Cannot acquire lock." — a PREVIOUS
-///    leaked/timed-out attempt in THIS process still holds the file lock, so
-///    every further attempt is guaranteed to fail, and to leak another full
-///    iroh client doing so.
-///  - a PANIC inside init (see `handle`) — deterministic, so it will panic
-///    identically on every retry.
-///
-/// Once latched, `handle()` fails fast, naming the reason and the only real
-/// recovery (restart the node process).
+/// Set once an init failure proves in-process retries can never succeed: redb's "Database already
+/// open" (a previous attempt of THIS process still holds the lock) or a panic inside init
+/// (deterministic). Once latched, `handle()` fails fast and names the reason; the only recovery is
+/// a node restart.
 static INIT_WEDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Why the wedge latched, so the fail-fast message doesn't misattribute a
 /// panic to redb's lock (which sent an operator down the wrong path once).
 static WEDGE_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static LAST_FAILED_INIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// How many init attempts THIS process has made. Used to tell apart the two very
-/// different causes of redb's "Database already open": a lock held by a prior
-/// attempt of OURS (permanent — latch), versus a lock still held by the OUTGOING
-/// process during a `systemctl restart` overlap (transient — retry). See the
-/// latch site for the incident this distinction fixes.
+/// Init attempts this process has made, to tell a redb lock held by a prior attempt of OURS
+/// (permanent: latch) from one still held by the OUTGOING process during a `systemctl restart`
+/// overlap (transient: retry).
 static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// The in-flight init task, when a previous caller stopped WAITING for it.
-///
-/// `init_handle` already shuts the partial client down on every failure past
-/// `IrohClient::new`, but that code cannot run when the init future is
-/// CANCELLED — and `tokio::time::timeout` cancels by dropping. So a timed-out
-/// init used to strand everything it had built: the iroh endpoint and
-/// blobs/docs stores stayed alive (their spawned actor tasks hold the Arc), the
-/// redb file lock was never released, and `INIT_RETRY_BACKOFF` then started a
-/// SECOND full init 30s later on top of the first. Every subsequent attempt
-/// added another stranded stack, so the node both wedged on redb's "Database
-/// already open" and grew without bound — measured on fc-sanjose-2 at ~7 GB/h
-/// up to a 47.3 GB RSS with guardian permanently unavailable.
-///
-/// The fix is to stop cancelling the WORK when we stop cancelling the WAIT: the
-/// init runs in its own task, and a caller that times out parks the
-/// `JoinHandle` here instead of dropping the future. The next caller awaits the
-/// SAME attempt rather than racing a second one, so at most one init stack can
-/// ever exist, and a slow-but-successful init is adopted instead of thrown away.
+/// The in-flight init task when a previous caller stopped WAITING for it. `timeout` cancels by
+/// dropping, which used to strand the whole built stack (endpoint, stores, redb lock) and start a
+/// second init on top; the init now runs in its own task and a timed-out caller parks its
+/// `JoinHandle` here, so the next caller awaits the SAME attempt: at most one init stack exists and
+/// a slow-but-successful init is adopted.
 static INIT_INFLIGHT: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> =
     std::sync::Mutex::new(None);
 
 fn inflight_slot(
 ) -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
-    // A poisoned lock here must not take guardian down — the slot holds a
-    // JoinHandle, and recovering it is strictly better than failing init.
     INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Holds the in-flight init's `JoinHandle` while one caller awaits it and puts
-/// it back in `INIT_INFLIGHT` on drop unless the attempt has finished (`.0` set
-/// to `None`). Parking only on the timeout branch was not enough: a caller taken
-/// out by cancellation — a client that hung up, a caller-side `timeout`, an
-/// aborted task — dropped the handle it had `take()`n, so the slot read empty
-/// while the init kept running and holding its redb lock. The next caller then
-/// spawned a second init, hit "Database already open" on attempt 2 and latched
-/// the node wedged (witnessed on shadw3, 2026-09-18: the in-flight init had been
-/// re-awaited cleanly every 30 s for 25 minutes, then a second one started 10 s
-/// after one caller took the handle).
+/// Holds the in-flight init's `JoinHandle` while one caller awaits it and puts it back in
+/// `INIT_INFLIGHT` on drop unless the attempt finished (`.0` set to `None`): a caller removed by
+/// cancellation (a hung-up client, an aborted task) must not leave the slot empty while the init
+/// keeps running.
 struct InflightInit(Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>);
 
 impl Drop for InflightInit {
@@ -217,23 +144,6 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     }
     let result = HANDLE
         .get_or_try_init(|| async {
-            // A PANIC inside init must not unwind past this closure. It now runs
-            // in its own task, so the panic arrives as a `JoinError` rather than
-            // needing `catch_unwind` around the future.
-            // Live-witnessed fleet-wide: guardian-db's `IrohClient::new` panics
-            // "Hash table capacity overflow" (hashbrown) on EVERY attempt. A
-            // panic unwinds straight past the failure bookkeeping below, so
-            // `LAST_FAILED_INIT_MS` was never stamped, the backoff gate never
-            // engaged, and every guardian caller re-ran a full init immediately
-            // — ~18 panics/minute on all 7 nodes, indefinitely. Converting the
-            // panic into an `Err` lets the existing throttle apply, and because
-            // a deterministic panic cannot succeed on retry we also latch the
-            // wedge so subsequent calls fail fast instead of re-panicking.
-            // Adopt an init that a previous caller stopped waiting for, rather
-            // than spawning a second one on top of it (see `INIT_INFLIGHT`).
-            // Only a genuinely NEW attempt counts toward `INIT_ATTEMPTS`, which
-            // keeps the "Database already open" discrimination below honest:
-            // attempts > 1 now means we really did start a second full init.
             let mut task = InflightInit(Some(match inflight_slot().take() {
                 Some(existing) => {
                     tracing::info!("guardian init: re-awaiting the init already in flight (not starting a second one)");
@@ -244,9 +154,6 @@ async fn handle() -> anyhow::Result<&'static Handle> {
                     tokio::spawn(init_handle())
                 }
             }));
-            // The timeout bounds only how long we WAIT. On expiry — or when THIS
-            // caller is dropped mid-await — `InflightInit` parks the task,
-            // still running, so nothing it built is stranded.
             let outcome = tokio::time::timeout(
                 guardian_init_timeout(),
                 task.0.as_mut().expect("in-flight init handle is held until completion"),
@@ -263,9 +170,6 @@ async fn handle() -> anyhow::Result<&'static Handle> {
                 )),
                 Ok(Err(join_err)) => {
                     task.0 = None;
-                    // The task panicked (or was aborted, which we never do).
-                    // `JoinError` carries the payload, so the panic no longer has
-                    // to be caught with `catch_unwind` around the future itself.
                     let what = if join_err.is_panic() {
                         let panic = join_err.into_panic();
                         panic
@@ -294,35 +198,14 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     if let Err(e) = &result {
         LAST_FAILED_INIT_MS.store(hive_core::now_ms(), Ordering::Relaxed);
         if e.to_string().contains("Database already open") {
-            // Only OUR OWN leaked attempt makes this permanent. On the FIRST
-            // attempt of a fresh process the lock belongs to somebody else —
-            // in practice the outgoing hive-cloud during a `systemctl restart`
-            // overlap, which releases it moments later.
-            //
-            // Latching on that transient case disabled guardian for the entire
-            // life of the new process: witnessed on fc-bangkok latching 31s
-            // into a FRESH start and then rejecting every mesh/roster put with
-            // "restart hive-cloud to recover" — advice that could not work,
-            // because each restart re-raced the same overlap. Retry instead;
-            // the existing INIT_RETRY_BACKOFF throttles it and a genuinely
-            // stuck lock still latches on the next attempt.
             let attempts = INIT_ATTEMPTS.load(Ordering::Relaxed);
             if attempts <= 1 {
-                // LAST_FAILED_INIT_MS is already stamped just above, so the
-                // normal INIT_RETRY_BACKOFF gate applies and the next caller
-                // retries once the outgoing process has released the lock.
                 tracing::warn!(
                     attempts,
                     "guardian init hit redb 'Database already open' on this process's FIRST attempt — the lock is held by ANOTHER process (typically the outgoing hive-cloud during a restart overlap), not by a leak of ours; retrying after backoff instead of latching"
                 );
             } else {
                 INIT_WEDGED.store(true, Ordering::Relaxed);
-                // Name the real cause. Leaving `WEDGE_REASON` unset made every
-                // caller report the default text — "redb lock held by a leaked
-                // prior init attempt; restart hive-cloud to recover" — which
-                // both misattributed the failure (the trigger is whatever made
-                // the FIRST attempt fail, typically the shared-ticket election
-                // timing out) and gave an operator a remedy that cannot work.
                 if let Ok(mut slot) = WEDGE_REASON.lock() {
                     *slot = Some(format!(
                         "redb still open after {attempts} init attempts; the first attempt's failure is the real cause (see the preceding 'guardian init' / 'GuardianDB init failed' lines)"
@@ -338,26 +221,16 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     result
 }
 
-/// The actual GuardianDB bring-up, run under `handle()`'s timeout. Broken into
-/// its own function (rather than inlined in the `OnceCell` closure) so each
-/// major step logs a distinct marker — on a future stall, the log shows
-/// exactly which sub-step (iroh client vs. GuardianDB open vs. KV open) never
-/// returned, instead of the totally silent gap this replaces.
+/// The actual GuardianDB bring-up, run under `handle()`'s timeout and split out so each major step
+/// logs a distinct marker: a stall shows which sub-step (iroh client, GuardianDB open, KV open)
+/// never returned. The large open futures are `Box::pin`ned (unboxed, their debug-build poll frames
+/// overflowed the tokio worker stack at boot). Any failure past `IrohClient::new` shuts the partial
+/// client down and closes the database first (`shutdown()` does not release its redb keystore),
+/// since spawned tasks hold the Arcs and a leak costs a whole iroh stack per retry.
 async fn init_handle() -> anyhow::Result<Handle> {
     let dir = crate::persist::data_dir().join("guardian");
     std::fs::create_dir_all(&dir).ok();
 
-    // Its own iroh endpoint (random UDP port, n0 discovery for the
-    // INITIAL bind) — independent of the request-routing mesh in
-    // hive-p2p, but NOT independent of the platform's own known peer
-    // set: `seed_known_peers` (called periodically from the gossip
-    // loop, see main.rs) registers every mesh peer's iroh address
-    // directly via `add_node_addr`, so cross-node docs/blobs sync
-    // works from OUR OWN gossip-derived membership instead of
-    // depending on n0's public discovery service ever finding this
-    // node's peers (the same class of unreliable-from-cloud-hosts
-    // discovery the main mesh already moved off of; see hive-p2p's
-    // self-hosted relay/Seer migration history).
     let cfg = ClientConfig {
         data_store_path: Some(dir.join("iroh")),
         enable_discovery_n0: true,
@@ -374,20 +247,8 @@ async fn init_handle() -> anyhow::Result<Handle> {
         .map_err(|e| anyhow::anyhow!("guardian iroh client: {e}"))?;
     let node_id = client.node_id();
     tracing::info!(%node_id, "guardian init: iroh client ready");
-    // Clone BEFORE GuardianDB::new consumes `client` by value — the
-    // clone shares the same underlying Arc<IrohBackend>/endpoint.
     let seed_client = client.clone();
 
-    // Seed known peers BEFORE the KV store opens. `key_value()` below runs
-    // exactly once (cached in the OnceCell `Handle`) and, on that single
-    // call, guardian-db tries automatic DocTicket exchange with whatever
-    // peers are already in `known_peers` (lowest-EndpointId node creates the
-    // namespace, everyone else imports its ticket — see
-    // IrohBackend::resolve_shared_ticket). Miss this window and every node
-    // independently creates its OWN namespace instead. `BOOT_SEED_PEERS`
-    // holds GuardianDB-specific addresses only (never hive-p2p mesh
-    // addresses — see seed_peer's doc comment for why that distinction is
-    // load-bearing, not cosmetic).
     let mut boot_seeded = 0usize;
     if let Some(addrs) = BOOT_SEED_PEERS.get() {
         for addr_json in addrs {
@@ -401,25 +262,11 @@ async fn init_handle() -> anyhow::Result<Handle> {
         "guardian init: seeded known peers pre-open (for automatic DocTicket exchange)"
     );
 
-    // The database must share the client's iroh backend (its endpoint,
-    // blobs + docs stores) — pass it explicitly in the options.
     let opts = NewGuardianDBOptions {
         directory: Some(dir.clone()),
         backend: Some(client.backend().clone()),
         ..Default::default()
     };
-    // On ANY failure past this point the partially-built client MUST be shut
-    // down before returning Err: its iroh endpoint, blobs/docs stores and
-    // spawned actor tasks otherwise outlive the dropped handle (tasks hold
-    // the Arc), leaking the whole stack per retry — the exact mechanism
-    // behind the 96.9GB OOM freeze on the Virginia hosts.
-    // Boxed awaits: the GuardianDB open chain (`new` → store registration →
-    // `key_value` → guardian-core create/open → the KV store constructor →
-    // iroh-docs init + first index sync) is a tower of very large futures.
-    // Unboxed, the sum of their debug-build poll frames overflowed the tokio
-    // worker stack at boot (100%-reproducible abort ~25s in). Vendor-side
-    // awaits are boxed at each level too; these two keep init_handle's own
-    // frame small.
     let db = match Box::pin(GuardianDB::new(client, Some(opts))).await {
         Ok(db) => db,
         Err(e) => {
@@ -431,15 +278,6 @@ async fn init_handle() -> anyhow::Result<Handle> {
     let kv = match Box::pin(db.key_value(KV_NAMESPACE, None)).await {
         Ok(kv) => kv,
         Err(e) => {
-            // `db` owns the RedbKeystore (guardian-db opens a redb database
-            // for it), and `shutdown()` on the client does NOT release it —
-            // so a failed KV open used to leave redb open in this process.
-            // The next init attempt then failed `IrohClient::new` with
-            // "Database already open", `INIT_ATTEMPTS` crossed 1, and
-            // guardian latched itself wedged for the whole process life
-            // (live-witnessed on every node, 2026-09-30: the election
-            // timeout was the real cause; this leak turned a retryable
-            // failure into a permanent one). Close the DB first.
             let _ = db.close().await;
             let _ = seed_client.shutdown().await;
             return Err(anyhow::anyhow!("guardian kv open: {e}"));
@@ -454,22 +292,12 @@ async fn init_handle() -> anyhow::Result<Handle> {
     })
 }
 
-/// Register a peer's iroh address AND explicitly admit it, against a specific
-/// `IrohClient`. `add_node_addr` registers a static `MemoryLookup` entry
-/// (address resolution only). `note_explicit_peer` is the SEPARATE admission that
-/// `IrohBackend::resolve_shared_ticket`'s automatic DocTicket exchange
-/// actually consults — `add_node_addr` alone never touches it. CALLERS MUST
-/// PASS THIS NODE'S GUARDIANDB-SPECIFIC ADDRESS, never its hive-p2p mesh
-/// address: GuardianDB runs its own, separate iroh identity per node (a
-/// different EndpointId — confirmed empirically, logged as a different
-/// node_id than the mesh's peer_id). Feeding a peer's mesh identity here
-/// previously caused a live, reverted retry-storm (endpoint.connect() to a
-/// NodeId nothing is listening as under this ALPN); this exists to prevent a
-/// repeat, not just document one. `addr_json` is a serialized
-/// `iroh::EndpointAddr` (same iroh version as hive-p2p, per Cargo.lock, but
-/// the VALUE must originate from `my_iroh_addr()` — see `NodeInfo.
-/// guardian_iroh_addr`'s doc comment for how it's gossiped). A malformed/
-/// unreachable entry is skipped, never aborts the others.
+/// Registers a peer's iroh address (`add_node_addr`: address resolution only) AND explicitly admits
+/// it (`note_explicit_peer`, the admission `resolve_shared_ticket`'s DocTicket exchange actually
+/// consults). CALLERS MUST PASS THE PEER'S GUARDIANDB-SPECIFIC ADDRESS
+/// (`NodeInfo::guardian_iroh_addr`, from its `my_iroh_addr()`), never its hive-p2p mesh address:
+/// GuardianDB runs its own iroh identity, and a mesh identity here caused a connect retry storm. A
+/// malformed or unreachable entry is skipped, never aborting the others.
 async fn seed_peer(client: &IrohClient, addr_json: &str) -> bool {
     match serde_json::from_str::<iroh::EndpointAddr>(addr_json) {
         Ok(addr) => {
@@ -488,13 +316,10 @@ async fn seed_peer(client: &IrohClient, addr_json: &str) -> bool {
     }
 }
 
-/// Seed known peers (GuardianDB-specific addresses — see `seed_peer`) against
-/// the already-open `Handle`'s client. Best-effort and idempotent — called on
-/// every gossip round so a newly-joined or address-changed peer is picked up
-/// without a restart. The KV store itself only opens once (cached in the
-/// `OnceCell`), so this cannot retroactively fix an already-diverged
-/// namespace on THIS node, but keeps `known_peers` fresh for any future
-/// re-open (retry after a prior init failure, etc).
+/// Seeds known peers (GuardianDB-specific addresses) against the open `Handle`'s client; idempotent
+/// and called every gossip round, so a new or re-addressed peer is picked up without a restart. It
+/// cannot fix an already-diverged namespace on THIS node (the KV store opens once) but keeps
+/// `known_peers` fresh for any re-open.
 pub async fn seed_known_peers(guardian_addr_jsons: &[String]) {
     let Ok(h) = handle().await else { return };
     for addr_json in guardian_addr_jsons {
@@ -502,29 +327,22 @@ pub async fn seed_known_peers(guardian_addr_jsons: &[String]) {
     }
 }
 
-/// Snapshot of peers' GuardianDB-specific addresses to seed the known-peer set
-/// with on the FIRST (only) GuardianDB KV-store open — the one window
-/// `resolve_shared_ticket`'s automatic DocTicket exchange is ever consulted
-/// in (see `init_handle`). Set once, from main.rs, right before
-/// `init_background()`; a second call is a no-op (`OnceLock`). Best-effort:
-/// an empty/stale snapshot just means this node falls back to creating its
-/// own namespace, never a hard failure. Ongoing peer changes after boot are
-/// covered by the periodic `seed_known_peers` above.
+/// Peers' GuardianDB-specific addresses to seed on the FIRST (only) KV-store open, the one window
+/// in which `resolve_shared_ticket`'s automatic DocTicket exchange runs (the lowest EndpointId
+/// creates the namespace and the rest import its ticket; miss the window and every node creates its
+/// OWN namespace). Set once from main.rs before `init_background()` (a second call is a no-op); an
+/// empty or stale snapshot only means this node creates its own namespace.
 static BOOT_SEED_PEERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
-/// Record peers' current GuardianDB-specific addresses for `init_handle` to
-/// seed on the FIRST GuardianDB KV-store open. Call before
-/// `init_background()`. CALLERS MUST PASS `guardian_iroh_addr`, never
-/// `iroh_addr` — see `seed_peer`'s doc comment.
+/// Records peers' current GuardianDB-specific addresses (`guardian_iroh_addr`, never `iroh_addr`)
+/// for `init_handle`'s first KV-store open; call before `init_background()`.
 pub fn set_boot_seed_peers(guardian_addr_jsons: Vec<String>) {
     let _ = BOOT_SEED_PEERS.set(guardian_addr_jsons);
 }
 
-/// This node's OWN GuardianDB-specific dialable address (serialized
-/// `iroh::EndpointAddr`), for the caller to gossip so PEERS can seed it
-/// correctly (see `NodeInfo.guardian_iroh_addr`). `None` until GuardianDB's
-/// client has finished binding — best-effort, never blocks; the caller
-/// re-polls this every gossip round until it resolves.
+/// This node's OWN GuardianDB-specific dialable address (serialized `iroh::EndpointAddr`), gossiped
+/// as `NodeInfo.guardian_iroh_addr`; `None` until the client has finished binding (never blocks;
+/// re-polled each gossip round).
 pub async fn my_iroh_addr() -> Option<String> {
     let h = handle().await.ok()?;
     let endpoint_arc = h.client.backend().get_endpoint().await.ok()?;
@@ -538,11 +356,6 @@ pub async fn my_iroh_addr() -> Option<String> {
 pub fn init_background() {
     tokio::spawn(async move {
         match handle().await {
-            // `keys()` reads the index's key set only (cheap, no fetch) —
-            // `all().len()` would report 0 here by design now: right after
-            // the cold-start rebuild, values are lazily unfetched (see
-            // refresh_kv_index's doc), so `all()`'s cached-only contract
-            // means an empty map even on a fully-populated store.
             Ok(h) => tracing::info!(keys = h.kv.keys().len(), "GuardianDB online"),
             Err(e) => {
                 tracing::warn!(error = %e, "GuardianDB init failed (snapshot kept on disk); will retry")
@@ -564,10 +377,8 @@ fn snapshot_key() -> Option<String> {
     NODE_NAME.get().map(|n| format!("node/{n}/snapshot"))
 }
 
-/// Replicate a snapshot into GuardianDB, one document per tenant namespace, PLUS
-/// the full snapshot under this node's own key (`node/<name>/snapshot`) — the
-/// durable copy the boot-time rollback guard restores from when the local file
-/// regressed. Spawned so persistence is never blocked on replication.
+/// Digest of a prepared value's canonical bytes; an unchanged digest is a `no_op` write (never
+/// PUT).
 type SnapshotDigest = [u8; 32];
 
 #[derive(Clone)]
@@ -579,10 +390,8 @@ struct PreparedValue {
 #[derive(Clone)]
 struct KeyedPreparedValue {
     key: String,
-    /// Bounded write-observability key class (`"full"` or one of
-    /// `SNAPSHOT_PART_FIELDS`) — never a per-tenant/per-key string, so the
-    /// counters this drives (`WRITE_COUNTERS`) stay a fixed small set instead
-    /// of growing per namespace/deployment.
+    /// Bounded write-observability key class (`"full"` or a `SNAPSHOT_PART_FIELDS` name), never a
+    /// per-tenant string, so `WRITE_COUNTERS` stays a fixed small set.
     class: &'static str,
     value: PreparedValue,
 }
@@ -681,12 +490,9 @@ fn set_generation_status(
     record_generation_status(status);
 }
 
-/// Cumulative, monotonic counts of every replication-generation status
-/// transition this process has ever observed. Bounded (six fixed fields,
-/// never grows) — the generation-level half of `/v1/admin/guardian/write-stats`.
-/// `queued_total`/`superseded_total` are what let an operator see churn a
-/// single `Committed`-only view would hide: a generation that gets
-/// superseded before it is ever written never shows up as a write at all.
+/// Cumulative monotonic counts of every replication-generation status transition this process has
+/// seen (six fixed fields; the generation-level half of `/v1/admin/guardian/write-stats`);
+/// `queued_total`/`superseded_total` expose churn a `Committed`-only view would hide.
 #[derive(Default, Clone, serde::Serialize)]
 struct GenerationCounters {
     queued_total: u64,
@@ -717,15 +523,10 @@ fn record_generation_status(status: ReplicationGenerationStatus) {
     }
 }
 
-/// Per-write-class outcome counters — the key-class half of
-/// `/v1/admin/guardian/write-stats`. `attempted` fires once the change digest
-/// is known and compared; `no_op` is the subset that matched the live blob
-/// and was never PUT (the guardian-blob-regrowth-after-cf2b2ba fix's proof
-/// point: a stable no_op count with near-zero committed_bytes across repeat
-/// no-change writes is what shows the fix is holding). `committed` is the
-/// subset that was actually PUT to GuardianDB; `failed` is a PUT that
-/// returned an error (attempted/no_op still count — the digest comparison
-/// still happened).
+/// Per-write-class outcome counters (the key-class half of write-stats): `attempted` once the
+/// change digest is compared, `no_op` the subset matching the live blob (never PUT), `committed`
+/// actually PUT, `failed` a PUT error. A stable `no_op` with near-zero committed bytes across
+/// no-change writes shows the blob-regrowth fix holding.
 #[derive(Default, Clone, serde::Serialize)]
 struct ClassWriteCounters {
     attempted: u64,
@@ -755,12 +556,9 @@ impl ClassWriteCounters {
     }
 }
 
-/// Fixed key-class set: `"namespaces"` (aggregate over every tenant
-/// namespace document — NOT one entry per tenant, which would be unbounded),
-/// `"full"` (this node's own full-snapshot replica), and one entry per
-/// `SNAPSHOT_PART_FIELDS` name. `parts` is a `BTreeMap` keyed by that fixed
-/// field-name set, not by tenant/key, so it stays at exactly
-/// `SNAPSHOT_PART_FIELDS.len()` entries for the life of the process.
+/// Fixed key-class set: `"namespaces"` (aggregate over every tenant document, not one entry per
+/// tenant), `"full"` (this node's full-snapshot replica) and one `parts` entry per
+/// `SNAPSHOT_PART_FIELDS` name, so the map keeps a fixed size for the process life.
 #[derive(Default, Clone, serde::Serialize)]
 struct WriteCounters {
     namespaces: ClassWriteCounters,
@@ -941,21 +739,17 @@ const SNAPSHOT_PARTS_FIELD: &str = "_guardian_parts";
 
 struct CanonicalSnapshot {
     base: Vec<u8>,
-    /// `(key_class, canonical_bytes)` per part key — the class is one of the
-    /// fixed `SNAPSHOT_PART_FIELDS` names, carried through so the write
-    /// chokepoint can attribute observability counters without re-parsing
-    /// the key.
+    /// `(key_class, canonical_bytes)` per part key; the class is one of the fixed
+    /// `SNAPSHOT_PART_FIELDS` names so the write chokepoint can attribute counters without
+    /// re-parsing the key.
     parts: std::collections::BTreeMap<String, (&'static str, Vec<u8>)>,
 }
 
-/// Canonical node backup split into one base plus independently-addressed large
-/// or frequently-changing fields. The base carries a digest manifest and is
-/// written last, making it the commit marker for an exact set of part bytes.
-/// This preserves authoritative deployments, build logs, database data,
-/// metrics and sandbox records without copying every one of them into a new
-/// multi-megabyte blob when only one field changes. Only write-attempt metadata
-/// and non-authoritative SIEM delivery counters are omitted. Every part and the
-/// base use the same canonical bytes for their digest and Guardian payload.
+/// Canonical node backup split into one base plus independently addressed large or frequently
+/// changing parts. The base carries a digest manifest and is written LAST, so it is the commit
+/// marker for an exact set of part bytes (a changed field costs one part, not a new multi-megabyte
+/// blob). Only write-attempt metadata and non-authoritative SIEM delivery counters are omitted;
+/// parts and base use the same canonical bytes for digest and payload.
 fn shared_snapshot_canonical(
     snap: &PlatformSnapshot,
     snapshot_key: &str,
@@ -981,9 +775,6 @@ fn shared_snapshot_canonical(
         wrapper.insert(field.to_string(), part_value);
         let bytes = canonical_json_bytes(serde_json::Value::Object(wrapper))?;
         let digest = hex::encode(sha256(&bytes));
-        // iroh-docs PUT has prefix-replacement semantics. Parts must not be
-        // descendants of the base key (`.../snapshot`), or committing the base
-        // deletes the parts it references in the same operation.
         let part_key = format!("{part_prefix}/{field}/{digest}");
         manifest.insert(
             field.to_string(),
@@ -1415,18 +1206,14 @@ fn guardian_v2_encoded_component_from_head_key(key: &str) -> anyhow::Result<Stri
     Ok(encoded.to_string())
 }
 
-/// Complete-generation marker keys: `snap-v2/node/<enc>/gen/<%016x ms>-<sha>`.
-///
-/// The Phase-1 canonical head (`…/head`) is overwritten in place, so prior
-/// generations need their OWN collision-safe root. Each marker's VALUE is the
-/// exact head bytes it names — the same BLAKE3 blob the head entry roots, so
-/// a marker costs zero additional blob bytes while keeping the prior
-/// generation's head (and, through the vendored GC's descriptor closure, its
-/// six parts) reachable until retention retires the marker. The key embeds
-/// both the generation's `saved_ms` (zero-padded hex, so ascending lexical
-/// order IS ascending age — the retention cursor's ordering) and the head's
-/// SHA-256 (same publish → same key, idempotent; different head in the same
-/// millisecond → different key, collision-impossible).
+/// Complete-generation marker keys: `snap-v2/node/<enc>/gen/<%016x ms>-<sha>`. The canonical head
+/// is overwritten in place, so a prior generation needs its OWN collision-safe root: the marker's
+/// VALUE is the exact head bytes (the same BLAKE3 blob the head roots, so zero extra bytes),
+/// keeping the prior head and its parts reachable until retention retires the marker. The key
+/// embeds the generation's `saved_ms` (zero-padded hex, so ascending lexical order IS ascending
+/// age) and the head's SHA-256 (same publish, same key; a different head in one millisecond, a
+/// different key). A marker is written only after the full generation verified, so it never names
+/// an unverified head.
 const GUARDIAN_V2_GEN_SEGMENT: &str = "gen";
 
 fn guardian_v2_generation_key(
@@ -1443,9 +1230,9 @@ fn guardian_v2_generation_key(
     ))
 }
 
-/// `Some((saved_ms, head_sha256))` when `key` is a well-formed generation
-/// marker under this component. Malformed keys under the gen prefix return
-/// `None` and are never deleted (unknown shapes are never retired).
+/// `Some((saved_ms, head_sha256))` for a well-formed generation marker under this component;
+/// malformed keys under the gen prefix return `None` and are never deleted (unknown shapes are
+/// never retired).
 fn guardian_v2_parse_generation_key(key: &str, encoded_component: &str) -> Option<(u64, String)> {
     let prefix = format!("{GUARDIAN_V2_NODE_PREFIX}{encoded_component}/{GUARDIAN_V2_GEN_SEGMENT}/");
     let suffix = key.strip_prefix(&prefix)?;
@@ -1997,6 +1784,9 @@ fn guardian_v2_prepare_snapshot(
     Ok((parts, head))
 }
 
+/// The part-key prefix for a node's base key: a SIBLING (`.../parts-v3`), never a descendant of the
+/// base key, because iroh-docs PUT and delete have prefix semantics (committing the base would
+/// delete its parts).
 fn snapshot_v3_prefix(base_key: &str) -> anyhow::Result<String> {
     let node_prefix = base_key
         .strip_suffix("/snapshot")
@@ -2312,6 +2102,9 @@ fn prepared_snapshot_keys(
     (parts, bases)
 }
 
+/// Exact-key delete of a snapshot metadata entry: refuses when a descendant key exists (iroh-docs
+/// deletion is prefix-based and would erase it) and verifies the key is gone afterwards;
+/// `Ok(false)` when it was already absent.
 async fn delete_snapshot_key(h: &Handle, key: &str) -> anyhow::Result<bool> {
     let before = h.kv.entry_heads().await?;
     if !before.iter().any(|head| head.key == key) {
@@ -2321,8 +2114,6 @@ async fn delete_snapshot_key(h: &Handle, key: &str) -> anyhow::Result<bool> {
         .iter()
         .find(|head| head.key != key && head.key.as_bytes().starts_with(key.as_bytes()))
     {
-        // iroh-docs deletion is prefix-based. Refuse rather than let an exact
-        // metadata retirement erase an unrelated descendant key.
         anyhow::bail!(
             "Guardian exact metadata delete {key} is blocked by descendant key {}",
             collision.key
@@ -2536,9 +2327,6 @@ async fn snapshot_cleanup_inventory(
             legacy_stale.push(key.clone());
             continue;
         }
-        // A part published after the current base is a preparation, not a stale
-        // generation. The in-process registry additionally covers an old digest
-        // deliberately being prepared for recommit.
         if prepared_parts.contains(key) || head.timestamp > verified.base_head.timestamp {
             continue;
         }
@@ -2557,9 +2345,6 @@ async fn snapshot_cleanup_inventory(
         )));
     }
 
-    // Prove the entire addressed candidate population before selecting a bounded
-    // batch. This is what keeps batching from turning a suspicious global set
-    // into a series of locally-small, unjustified deletes.
     for part in &stale_parts {
         if let Err(error) = verify_addressed_snapshot_part(h, part).await {
             return Err(snapshot_cleanup_refusal(format!(
@@ -2804,9 +2589,6 @@ async fn cleanup_committed_snapshot_parts_locked(
     let (max_keys, max_fraction) = snapshot_cleanup_limits();
     let mut deleted = 0usize;
 
-    // Addressed generations are data descendants and always retire before their
-    // protection-marker bases. The whole candidate population was proven above;
-    // only then is the deterministic oldest/lexical prefix selected.
     if !inventory.stale_parts.is_empty() {
         let limit = snapshot_cleanup_batch_limit(inventory.part_count, max_keys, max_fraction);
         if limit == 0 {
@@ -2825,10 +2607,6 @@ async fn cleanup_committed_snapshot_parts_locked(
         return Ok(deleted);
     }
 
-    // Markers are a separate population. A marker is eligible only when its
-    // digest is neither the current base nor any Drop-guarded preparation and it
-    // predates the current base. Five verified current parts anchor the fraction,
-    // so even a marker-only backlog converges instead of sticking at one item.
     if !inventory.stale_markers.is_empty() {
         let population = inventory.part_count.saturating_add(inventory.marker_count);
         let limit = snapshot_cleanup_batch_limit(population, max_keys, max_fraction);
@@ -2861,23 +2639,17 @@ struct ReplicationWriteStats {
     put_bytes: usize,
 }
 
-// --- Bounded v2 retention -------------------------------------------------
-//
-// The v2 head is overwritten in place, so superseded immutable parts (and the
-// prior heads themselves, rooted by their complete-generation markers) would
-// otherwise accumulate forever — the witnessed post-cf2b2ba growth class.
-// Each pass retires, for THIS node's own component only (single-writer):
-//   1. generation markers beyond the keep window (count AND age must both
-//      pass), oldest-first in lexical order;
-//   2. part metadata keys referenced by NEITHER the current head NOR any
-//      surviving marker NOR any Drop-guarded in-flight preparation, and older
-//      than the grace window — again in lexical order, resuming from an
-//      explicit cursor across passes.
-// Deleting the metadata entry is what un-roots the part's blob; the vendored
-// collector then reclaims the bytes on its next completed pass. Any doubt —
-// absent/malformed head, unreadable marker, empty reference set — is a typed
-// refusal for the whole pass, never a guess.
-
+/// Bounded v2 retention for THIS node's own component only (single writer): the head is overwritten
+/// in place, so superseded immutable parts and prior heads (rooted by their generation markers)
+/// would otherwise accumulate forever. Each pass retires (1) generation markers beyond the keep
+/// window (count AND age must both pass), oldest-first in lexical order, and (2) part metadata keys
+/// referenced by neither the current head, any surviving marker nor a Drop-guarded in-flight
+/// preparation, older than the grace window, resuming from an explicit cursor.
+/// The marker naming the CURRENT head is the anchor: without it the pass refuses, and the writer
+/// creates it on the next verified publication. Deleting the metadata entry un-roots the part's
+/// blob and the vendored collector reclaims the bytes later. Any doubt (absent or malformed head,
+/// unreadable marker, empty reference set) is a typed refusal for the whole pass, never a guess;
+/// the cursor advances only on non-failed passes.
 struct RetentionConfig {
     /// Prior COMPLETE generations kept beyond the current one.
     keep_generations: usize,
@@ -2934,10 +2706,8 @@ struct RetentionReport {
     parts_listed: u64,
     parts_referenced: u64,
     parts_retired: u64,
-    /// Declared entry bytes of retired part metadata — bytes UN-ROOTED this
-    /// pass. Blob bytes are reclaimed later by the vendored collector and
-    /// counted there; the two figures are deliberately separate so neither
-    /// claims the other's work.
+    /// Declared entry bytes of retired part metadata (bytes UN-ROOTED this pass); blob bytes are
+    /// reclaimed later by the vendored collector and counted there, never double-claimed.
     parts_unrooted_bytes: u64,
     parts_skipped_young: u64,
     parts_skipped_inflight: u64,
@@ -2969,9 +2739,9 @@ fn retention_refusal(report: &mut RetentionReport, reason: String) {
     report.reason = Some(reason);
 }
 
-/// One bounded retention pass over THIS node's own v2 subtree. Never
-/// propagates an error: every outcome is a typed report, recorded for the
-/// observability endpoint and returned for the caller's log line.
+/// One bounded retention pass over THIS node's own v2 subtree. Never propagates an error: every
+/// outcome is a typed report, recorded for the observability endpoint and returned for the caller's
+/// log line.
 async fn guardian_v2_retention_pass(h: &Handle) -> RetentionReport {
     guardian_v2_retention_pass_with(h, retention_config()).await
 }
@@ -3002,8 +2772,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
         let head_key = format!("{node_prefix}head");
         let gen_prefix = format!("{node_prefix}{GUARDIAN_V2_GEN_SEGMENT}/");
 
-        // 1. The current head is the primary keep-root. Absent or malformed →
-        // refuse the whole pass (incomplete is never absent).
         let head_bytes = match h.kv.get(&head_key).await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
@@ -3032,8 +2800,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
         };
         let head_sha256 = hex::encode(sha256(&head_bytes));
 
-        // 2. Complete generation-marker inventory (bounded, lexical = oldest
-        // first because the key embeds zero-padded saved_ms).
         let mut markers: Vec<guardian_db::traits::EntryHeadPage> = Vec::new();
         let mut marker_cursor: Option<String> = None;
         loop {
@@ -3075,9 +2841,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
         }
         report.generations_total = markers.len() as u64;
 
-        // 3. Keep/retire split. The marker naming the CURRENT head is the
-        // anchor: without it the keep set is empty and the pass refuses —
-        // the writer creates it on the next verified publication.
         let now_ms = hive_core::now_ms();
         if !markers.iter().any(|row| {
             guardian_v2_parse_generation_key(&row.key, &encoded)
@@ -3098,18 +2861,13 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
             })
             .collect();
         prior.sort_by(|left, right| left.key.cmp(&right.key));
-        // `prior` is oldest-first; everything beyond the newest
-        // `keep_generations` is retire-eligible (age still gates each one).
         let retire_eligible = prior.len().saturating_sub(cfg.keep_generations);
         let mut retire_markers: Vec<&guardian_db::traits::EntryHeadPage> = prior
             .iter()
             .take(retire_eligible)
             .filter(|row| {
-                guardian_v2_parse_generation_key(&row.key, &encoded).is_some_and(|(ms, _)| {
-                    // BOTH conditions: beyond the keep count AND older than
-                    // the grace window.
-                    now_ms.saturating_sub(ms) >= cfg.grace_ms
-                })
+                guardian_v2_parse_generation_key(&row.key, &encoded)
+                    .is_some_and(|(ms, _)| now_ms.saturating_sub(ms) >= cfg.grace_ms)
             })
             .copied()
             .collect();
@@ -3145,8 +2903,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
                 }
                 Ok(false) => {}
                 Err(error) => {
-                    // Partial failure: no completed claim for this delete,
-                    // deterministic retry next pass (lexical order is stable).
                     report.status = "failed".to_string();
                     report.reason = Some(format!(
                         "generation marker delete failed at {}: {error}",
@@ -3160,9 +2916,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
             .generations_total
             .saturating_sub(report.generations_retired);
 
-        // 4. Referenced part keys = current head ∪ every SURVIVING marker.
-        // A surviving marker that cannot be read or parsed is a typed
-        // refusal — a prior complete generation must stay fully reachable.
         let mut referenced = std::collections::BTreeSet::new();
         for kind in GuardianV2PartKind::ALL {
             let Some(reference) = head.references.get(kind.field()) else {
@@ -3230,10 +2983,8 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
         }
         report.parts_referenced = referenced.len() as u64;
 
-        // Drop-guarded in-flight preparations are never candidates.
         let (inflight_parts, _) = prepared_snapshot_keys(&head_key);
 
-        // 5. Part retirement, lexical order, explicit cursor resume.
         let mut cursor = retention_state()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -3258,7 +3009,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
             for row in page {
                 cursor = Some(row.key.clone());
                 let Some(_) = guardian_v2_part_key_fields(&row.key, &encoded) else {
-                    // head, gen markers, unknown shapes: never candidates.
                     continue;
                 };
                 report.parts_listed += 1;
@@ -3318,8 +3068,6 @@ async fn guardian_v2_retention_pass_with(h: &Handle, cfg: RetentionConfig) -> Re
         state.retired_generations_total += report.generations_retired;
         state.retired_parts_total += report.parts_retired;
         state.unrooted_bytes_total += report.parts_unrooted_bytes;
-        // The cursor advances only on non-failed passes; a failed pass
-        // retries the same deterministic candidate.
         if report.status != "failed" {
             state.cursor = report.cursor.clone();
         }
@@ -3338,18 +3086,11 @@ fn guardian_v2_latest_entry<'a>(
         .max_by_key(|head| head.timestamp)
 }
 
-/// Same decision as [`guardian_v2_current_exact`], against an ALREADY-FETCHED
-/// head listing.
-///
-/// `entry_heads()` enumerates EVERY entry in the replicated doc, so it must
-/// never be called once per key: a batch writing 72 namespaces used to pay
-/// ~225 full-document walks per generation (72 x (1 here + 2 in
-/// `guardian_v2_verify_namespace`) plus the part walks). On a node whose walk
-/// is slow that is the difference between a batch that commits in seconds and
-/// one that never returns at all — and the writer that never returns holds the
-/// only replication slot, so the whole guardian subsystem stops advancing
-/// (live-witnessed on fc-sanjose, 2026-09-30). Callers that already hold a
-/// listing pass it in; see `write_replication_batch`.
+/// Same decision as [`guardian_v2_current_exact`] against an ALREADY-FETCHED head listing.
+/// `entry_heads()` walks EVERY entry in the replicated doc, so it must never be called once per key
+/// (a 72-namespace batch cost ~225 full walks per generation, and a writer that never returns holds
+/// the only replication slot): `write_replication_batch` lists once before and once after the batch
+/// and verifies every key against those listings.
 async fn guardian_v2_current_exact_in(
     heads: &[guardian_db::traits::EntryHead],
     h: &Handle,
@@ -3437,10 +3178,6 @@ async fn guardian_v2_verify_namespace(
         anyhow::bail!("Guardian v2 namespace identity mismatch for {key}");
     }
     guardian_v2_parse_namespace(&bytes)?;
-    // A key the batch decided was ALREADY current must not have moved while
-    // the batch was in flight. That is what the old per-key second listing
-    // caught; the two batch-level listings catch it for free. A key this batch
-    // just wrote is expected to differ from `heads_before`, so it is exempt.
     if was_reused {
         let head = SnapshotKeyHead {
             timestamp: source.timestamp,
@@ -3624,8 +3361,6 @@ async fn guardian_v2_diagnostic_remove_local_blob(
         anyhow::bail!("Guardian v2 repair diagnostic has no non-target blobs to protect");
     }
 
-    // Keep the normal Guardian collector behind its write gate while this
-    // disposable-store-only pass removes exactly one current content blob.
     let protection = h
         .client
         .protect_hashes(protected_hashes.iter().copied())
@@ -4097,8 +3832,11 @@ async fn maybe_guardian_v2_diagnostic(
     Ok(())
 }
 
-/// One-shot arming latch for the debug-only final-flush hold (see the block
-/// inside `write_replication_batch`).
+/// Debug-only fault injection on the REAL write path, armed one-shot by the lifecycle diagnostic
+/// right before its terminal replicate: holds the final v2 commit for
+/// `GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS` so `await_final_generation` can be driven into its
+/// timeout (with a short `HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS`) while the previous head stays
+/// untouched. Unarmed it changes nothing; release builds compile it out.
 #[cfg(debug_assertions)]
 static FINAL_FLUSH_HOLD_ARMED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -4113,16 +3851,6 @@ async fn write_replication_batch(
     maybe_guardian_v2_diagnostic(h, desired).await?;
 
     let mut stats = ReplicationWriteStats::default();
-    // ONE head listing for the whole batch. `entry_heads()` enumerates every
-    // entry in the replicated doc, so the old per-key shape cost
-    // `3 * namespaces` full-document walks per generation (one here, two in
-    // `guardian_v2_verify_namespace`) — 72 namespaces meant ~216 walks, plus
-    // one per part. Where a single walk is cheap that is seconds; where it is
-    // not, the batch never returns, and the writer that never returns holds
-    // the only replication slot, so the guardian subsystem stops advancing
-    // (live-witnessed on fc-sanjose, 2026-09-30: batches stopped at 12:14:55
-    // and never logged success or failure again). Two listings per batch is
-    // the same guarantee at 1/108th the cost.
     let heads_before = h.kv.entry_heads().await?;
     let mut reused = std::collections::BTreeSet::new();
     for (key, value) in &desired.namespaces {
@@ -4157,7 +3885,6 @@ async fn write_replication_batch(
         }
     }
 
-    // One listing AFTER the whole batch, then verify every key against it.
     let heads_after = h.kv.entry_heads().await?;
     for (key, value) in &desired.namespaces {
         guardian_v2_verify_namespace(
@@ -4177,15 +3904,6 @@ async fn write_replication_batch(
             guardian_v2_validate_prepared_generation(&desired.parts, head)?;
         let _lifecycle = SNAPSHOT_LIFECYCLE_LOCK.lock().await;
 
-        // Debug-only fault injection ON THE REAL PATH: hold the final flush
-        // so `await_final_generation` can be driven into its timeout with a
-        // short HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS while the previous head
-        // stays untouched (nothing below has run yet). One-shot ARMED
-        // (`FINAL_FLUSH_HOLD_ARMED`, set by the lifecycle diagnostic right
-        // before its terminal replicate) with the duration from the env, so
-        // earlier batches in the same run commit normally. Same pattern as
-        // the vendored GUARDIAN_GC_DIAGNOSTIC_FAULT_ONCE; unarmed/absent env
-        // = zero behavior change; release builds compile it out entirely.
         #[cfg(debug_assertions)]
         if let Some(hold_ms) = std::env::var("GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS")
             .ok()
@@ -4320,14 +4038,6 @@ async fn write_replication_batch(
             }
         }
 
-        // Record this VERIFIED publication as a bounded complete-generation
-        // root. Written only after the full generation verification above —
-        // a marker can never name an unverified head. The marker's value is
-        // the exact head bytes (same blob, zero extra bytes); its key embeds
-        // saved_ms + head SHA-256, so retries are idempotent and collisions
-        // are structurally impossible. Retention (`guardian_v2_retention_pass`)
-        // later retires markers beyond the keep window, which is what finally
-        // un-roots superseded parts.
         {
             let generation_key = guardian_v2_generation_key(
                 &encoded_component,
@@ -4424,14 +4134,8 @@ async fn replication_writer(
     let retention_cadence = guardian_v2_retention_cadence();
     let mut next_retention = tokio::time::Instant::now() + retention_cadence;
     loop {
-        // This deadline is created once and advances only after a pass. Snapshot
-        // notifications cannot reset it: when a change and the deadline become
-        // ready together, the next loop observes the overdue deadline before it
-        // starts another publication. The same task remains the sole writer.
         if tokio::time::Instant::now() >= next_retention {
             run_guardian_v2_retention_pass().await;
-            // Skip missed ticks rather than running a catch-up burst after a slow
-            // store operation. Every pass remains bounded and non-overlapping.
             next_retention = tokio::time::Instant::now() + retention_cadence;
         }
         let desired = receiver.borrow_and_update().clone();
@@ -4493,21 +4197,11 @@ async fn replication_writer(
     }
 }
 
-/// Start the writer on the BULKHEAD runtime, never the serving one.
-///
-/// Measured and adversarially verified 2026-10-01: `write_replication_batch`
-/// re-decompresses, re-parses, re-canonicalizes and fully reconstructs the
-/// whole snapshot TWICE per admitted generation (~6-16 s of synchronous CPU at
-/// the fleet's 40-75 s generation cadence = 10-40 % sustained duty), all as
-/// plain sync code between awaits — no `spawn_blocking`, no yield. It was the
-/// best match for the second CPU-hot worker in the leader's freeze capture.
-///
-/// It holds no lock the request path or timers need, so it never stalled the
-/// runtime on its own (the SQL mirror was the actual freeze mechanism). But a
-/// chronically hot SERVING worker is exactly the class of bug that must not
-/// live there, and moving it costs nothing: `bulkhead::spawn` holds its own
-/// runtime handle, so it also works from the `hive-persister` OS thread, which
-/// has no runtime context — the reason this used to capture the main handle.
+/// Starts the writer on the BULKHEAD runtime, never the serving one: `write_replication_batch`
+/// re-decompresses, re-parses and re-canonicalizes the whole snapshot TWICE per admitted generation
+/// as plain synchronous code (seconds of CPU per generation). `bulkhead::spawn` holds its own
+/// runtime handle, so it also works from the `hive-persister` OS thread, which has no runtime
+/// context.
 fn ensure_replication_writer(
     initial: Arc<DesiredReplication>,
 ) -> &'static tokio::sync::watch::Sender<Arc<DesiredReplication>> {
@@ -4523,8 +4217,10 @@ fn ensure_replication_writer(
     })
 }
 
-/// Admit one exact replication generation. Once shutdown closes admission this
-/// returns `None`; no caller can enqueue work behind the final drain target.
+/// Admits one exact replication generation: one document per tenant namespace PLUS the full
+/// snapshot under this node's own key (`node/<name>/snapshot`), the durable copy the boot-time
+/// rollback guard restores from. Once shutdown closes admission this returns `None`; no caller can
+/// enqueue work behind the final drain target.
 pub fn replicate(snap: &PlatformSnapshot) -> Option<u64> {
     let mut lifecycle = replication_lifecycle()
         .lock()
@@ -4608,9 +4304,9 @@ pub fn close_replication_admission(final_generation: Option<u64>) -> anyhow::Res
     Ok(final_generation)
 }
 
-/// Failure-path close used when the terminal file write itself cannot complete.
-/// It still freezes Guardian at the latest already-admitted generation so the
-/// backend can drain and shut down without accepting work during process exit.
+/// Failure-path close for when the terminal file write cannot complete: freezes Guardian at the
+/// latest already-admitted generation so the backend can drain and shut down without accepting work
+/// during process exit.
 pub fn close_replication_admission_at_latest() -> Option<u64> {
     let mut lifecycle = replication_lifecycle()
         .lock()
@@ -4673,14 +4369,10 @@ async fn await_final_generation(
     }
 }
 
-/// Budget for EACH of `shutdown`'s three sequential waits (final generation,
-/// writer join, backend shutdown). The GuardianDB writer commits one
-/// generation per 40–75 s on this fleet, so the final-generation wait needs a
-/// full commit cadence to succeed and a 60 s budget never did (measured over
-/// 75 stops: it timed out on every one) — it only kept a node whose listener
-/// was already closed and whose state was already flushed alive as a mesh
-/// black hole for a further minute. 10 s bounds that cost to what the graceful
-/// tail can afford under the 75 s hard deadline.
+/// Budget for EACH of `shutdown`'s three sequential waits (final generation, writer join, backend
+/// shutdown): 10 s, because the writer commits one generation per 40-75 s here, so a wait that
+/// needs a full cadence cannot succeed anyway and only keeps a node with a closed listener alive as
+/// a mesh black hole under the 75 s hard deadline.
 fn guardian_shutdown_timeout() -> std::time::Duration {
     std::env::var("HIVE_GUARDIAN_SHUTDOWN_TIMEOUT_MS")
         .ok()
@@ -4690,14 +4382,10 @@ fn guardian_shutdown_timeout() -> std::time::Duration {
         .unwrap_or(std::time::Duration::from_secs(10))
 }
 
-/// Drain the terminal replication generation, stop and join its sole writer,
-/// then durably shut down Docs, Router, blob store, and endpoint in the backend.
-///
-/// `None` means the caller could not name a terminal generation (the terminal
-/// file save failed or never ran). That must NOT skip the drain: admission is
-/// force-closed at the LATEST already-admitted generation and that exact
-/// generation is drained — otherwise a failed terminal save silently
-/// abandoned the last admitted snapshot mid-write.
+/// Drains the terminal replication generation, stops and joins its sole writer, then durably shuts
+/// down Docs, Router, blob store and endpoint. `None` means the caller could not name a terminal
+/// generation (the terminal file save failed): admission is then force-closed at the LATEST
+/// admitted generation and that exact generation is drained, never abandoned mid-write.
 pub async fn shutdown(final_generation: Option<u64>) -> anyhow::Result<()> {
     let final_generation = match final_generation {
         Some(generation) => close_replication_admission(Some(generation))?,
@@ -4898,8 +4586,6 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
     else {
         return SnapshotFetch::Absent;
     };
-    // Each refusal names itself at debug level — an Incomplete here silently
-    // vetoes legacy fallback, which is invisible without the reason.
     macro_rules! incomplete {
         ($($arg:tt)*) => {{
             tracing::debug!(key, $($arg)*);
@@ -4909,9 +4595,6 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
     let Ok(Some(bytes)) = h.kv.get(key).await else {
         incomplete!("legacy fetch: base bytes are absent");
     };
-    // The value index deliberately retains its prior readable bytes when a
-    // newer doc head's blob is unavailable. Bind bytes and freshness to the
-    // same head; never stamp fallback bytes with an unrelated newer timestamp.
     if iroh_blobs::Hash::new(&bytes).to_hex() != head.hash {
         incomplete!("legacy fetch: base bytes do not match the newest head");
     }
@@ -4926,9 +4609,6 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
         .remove(SNAPSHOT_PARTS_FIELD)
         .and_then(|manifest| manifest.as_object().cloned());
 
-    // Old monolithic snapshots have no manifest. The first split format stores
-    // a digest string and resolves the fixed `<base>-part/<field>` key. Current
-    // manifests bind both the immutable content-addressed key and its digest.
     if let Some(manifest) = manifest {
         let mut merged = std::collections::BTreeSet::new();
         for (field, reference) in manifest {
@@ -4983,12 +4663,6 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
                 incomplete!(part_key, "legacy fetch: part is not an exact field wrapper");
             };
             merged.insert(field.clone());
-            // Volatile root fields (`VOLATILE_ROOT_FIELDS`) are extracted as
-            // literal-Null parts by the canonical writer. On read, Null means
-            // "take the serde default" — the same meaning as absence.
-            // Inserting the literal null fails deserialization for
-            // non-nullable defaulted types (witnessed live in this very
-            // diagnostic: `invalid type: null, expected struct DataSnapshot`).
             if part_value.is_null() {
                 continue;
             }
@@ -5012,10 +4686,6 @@ async fn fetch_legacy_snapshot_at_result(key: &str) -> SnapshotFetch {
         }
     };
     let mut snapshot = snapshot;
-    // `saved_ms` is write-attempt volatility and is deliberately absent from
-    // canonical payloads. The iroh-docs head timestamp is the durable commit
-    // time for these exact bytes, so restore freshness remains meaningful
-    // without manufacturing a new content blob on every unchanged attempt.
     snapshot.saved_ms = written_ms;
     SnapshotFetch::Ready(snapshot)
 }
@@ -5103,10 +4773,9 @@ fn guardian_v2_peer_population(
     }
 }
 
-/// The newest replicated snapshot from any OTHER node. Any valid v2 generation
-/// outranks every legacy candidate; an incomplete v2 population suppresses all
-/// legacy peer fallback. The selected candidate is fetched and verified again
-/// immediately before it is returned.
+/// The newest replicated snapshot from any OTHER node: any valid v2 generation outranks every
+/// legacy candidate, an incomplete v2 population suppresses ALL legacy peer fallback, and the
+/// chosen candidate is fetched and verified again right before it is returned.
 pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> {
     let me = NODE_NAME.get()?.as_str();
     let h = handle().await.ok()?;
@@ -5141,8 +4810,6 @@ pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> 
         return None;
     }
 
-    // A second metadata observation is the proof that the entire peer v2
-    // population is truly absent before any legacy bytes may be considered.
     tokio::task::yield_now().await;
     let reprobe_heads = h.kv.entry_heads().await.ok()?;
     let reprobe = guardian_v2_peer_population(&reprobe_heads, me);
@@ -5183,12 +4850,6 @@ fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
     snap.metrics_rollup = Default::default();
     snap.database_data = Default::default();
     snap.builds = Vec::new();
-    // Cron JOBS are durable tenant configuration and must survive peer
-    // adoption — wiping them here silently destroyed every cron job on a
-    // total-loss restore. Only the run-result TELEMETRY is node-local: the
-    // same three fields the v2 canonical transform strips
-    // (`guardian_v2_remove_cron_telemetry`), zeroed rather than removed
-    // because this is a typed struct, not JSON.
     for job in &mut snap.cron {
         job.last_run_ms = None;
         job.next_run_ms = None;
@@ -5197,23 +4858,15 @@ fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
     snap
 }
 
-/// Boot-time restore-on-rollback guard: once GuardianDB is online, compare its
-/// replicated snapshot's `saved_ms` against the CURRENT on-disk snapshot. If the
-/// replica is NEWER, the local file regressed (crash-restored old disk, wiped
-/// data dir, bad copy) — adopt the replica: restore it into the live state and
-/// rewrite the local file. The comparison re-reads the disk at adoption time, so
-/// any post-boot user mutation (which bumps the local `saved_ms` past the
-/// replica's) automatically vetoes adoption — no clobbering live changes.
-///
-/// PEER FALLBACK (audit proposal step 9): when this node has NO replicated
-/// snapshot of its own (guardian dir wiped alongside the local file — total
-/// loss), fall back to the newest PEER snapshot in the replicated store,
-/// adopting only its SHARED tenant/control-plane state (node-local runtime
-/// stripped — see `strip_node_local`). Before this, the guard could never
-/// recover a node's data from a peer's copy, defeating its own stated purpose.
-/// Retries for ~60s: after a wipe, the replicated keys only reappear once the
-/// guardian store has synced with a peer.
-/// Opt-out: `HIVE_GUARDIAN_RESTORE=0`.
+/// Boot-time restore-on-rollback guard: once GuardianDB is online, compares its replicated
+/// snapshot's `saved_ms` with the CURRENT on-disk snapshot and, if the replica is NEWER
+/// (crash-restored old disk, wiped data dir, bad copy), restores it into live state and rewrites
+/// the local file; the comparison re-reads the disk at adoption time, so any post-boot mutation
+/// vetoes adoption. With NO replicated snapshot of its own (total loss) it falls back to the newest
+/// PEER snapshot, adopting only SHARED tenant/control-plane state (`strip_node_local`), and only
+/// after every self retry is exhausted. Retries ~60 s (replicated keys reappear only after a peer
+/// sync); cron stays node-local, so the local cron state survives adoption. Opt-out:
+/// `HIVE_GUARDIAN_RESTORE=0`.
 pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
     if std::env::var("HIVE_GUARDIAN_RESTORE")
         .map(|v| v == "0" || v == "false")
@@ -5250,10 +4903,6 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
                     );
                     let local_cron = cloud.cron.list();
                     crate::persist::restore(&cloud, replica);
-                    // cron is node-local and stripped from the canonical Guardian
-                    // payload (VOLATILE_ROOT_FIELDS) — the replica's cron list is
-                    // always empty. Preserve the local cron state that was live
-                    // before the rollback so scheduled jobs are not lost.
                     cloud.cron.replace_all(local_cron);
                     crate::persist::persist(&cloud);
                     tracing::info!(
@@ -5274,10 +4923,6 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
                 }
             }
 
-            // Re-check self first on every cadence. A peer is only remembered
-            // while the self base is genuinely absent, and is never adopted
-            // until all self retries are exhausted. This gives an independently
-            // arriving self base and its delayed parts the full retry budget.
             if attempt == 1 {
                 continue;
             }
@@ -5303,10 +4948,6 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
                     );
                     let local_cron = cloud.cron.list();
                     crate::persist::restore(&cloud, strip_node_local(snapshot));
-                    // cron is node-local — on total-loss recovery the local
-                    // state may be empty (rebuilt from deployment records on
-                    // the next deployment change), and on rollback the captured
-                    // local state is the authoritative cron schedule.
                     if !local_cron.is_empty() {
                         cloud.cron.replace_all(local_cron);
                     }
@@ -5347,9 +4988,8 @@ pub async fn put(key: &str, bytes: Vec<u8>) {
     }
 }
 
-/// Remove a key from GuardianDB (replicated tombstone). Best-effort, same
-/// failure posture as `put` -- used to retire transient mesh-shared entries
-/// (e.g. a delivered/dead-lettered world_queue job) once no longer needed.
+/// Removes a key from GuardianDB (a replicated tombstone); best-effort like `put`, used to retire
+/// transient mesh-shared entries (a delivered or dead-lettered world_queue job).
 pub async fn delete(key: &str) {
     match handle().await {
         Ok(h) => {
@@ -5361,12 +5001,9 @@ pub async fn delete(key: &str) {
     }
 }
 
-/// Snapshot of all keys currently stored in GuardianDB (durable copy). Uses
-/// `KeyValueStore::keys()`, not `all().into_keys()` — `all()` only returns
-/// values already lazily cached (see `refresh_kv_index`'s doc), so it would
-/// silently under-report the key set for any key never read since the last
-/// index rebuild. `keys()` reads the index's full key set directly and never
-/// triggers a fetch.
+/// Every key currently in GuardianDB (durable copy), via `KeyValueStore::keys()` and not
+/// `all().into_keys()`: `all()` returns only lazily cached values and would silently under-report
+/// keys not read since the last index rebuild.
 pub async fn keys() -> Vec<String> {
     match handle().await {
         Ok(h) => h.kv.keys(),
@@ -5374,13 +5011,10 @@ pub async fn keys() -> Vec<String> {
     }
 }
 
-/// Operator-declared roster of node NAMES that legitimately belong to this
-/// fleet (`HIVE_NODE_ROSTER`, comma-separated). Empty/unset returns `None`,
-/// which makes [`reap_departed_node_snapshots`] refuse to do anything at all.
-///
-/// This is deliberately a NAME list and deliberately its own variable:
-/// `HIVE_TRUSTED_NODE_IDS` carries 64-hex peer IDs, not names, so it cannot
-/// answer "is `node/fc-lax2/snapshot` a key for a node we still run".
+/// Operator-declared roster of node NAMES that belong to this fleet (`HIVE_NODE_ROSTER`,
+/// comma-separated); unset returns `None`, which makes [`reap_departed_node_snapshots`] refuse
+/// everything. A NAME list in its own variable because `HIVE_TRUSTED_NODE_IDS` holds 64-hex peer
+/// IDs, which cannot say whether `node/<name>/snapshot` belongs to a node we still run.
 fn node_roster() -> Option<std::collections::HashSet<String>> {
     let raw = std::env::var("HIVE_NODE_ROSTER").ok()?;
     let set: std::collections::HashSet<String> = raw
@@ -5392,43 +5026,8 @@ fn node_roster() -> Option<std::collections::HashSet<String>> {
     (!set.is_empty()).then_some(set)
 }
 
-/// Reap `node/<name>/snapshot` keys belonging to nodes that have left the fleet.
-///
-/// # The problem this solves
-///
-/// A doc entry (key + content hash) replicates independently of whether any
-/// peer can still serve that hash's BLOB. When a node leaves — renamed, retired,
-/// reprovisioned — its snapshot key lives on forever while its blob becomes
-/// permanently unfetchable, because the only node that ever held those bytes is
-/// gone. `kv_store`'s index sync then retries the fetch on EVERY pass, forever.
-/// Measured live 2026-07-31: ~35 warnings/minute on every one of 14 nodes, for
-/// `node/fc-lax2/snapshot`, `node/fc-cvm-sj-1/snapshot` and
-/// `node/fc-cvm-sj-2/snapshot` — none of which are in the fleet any more. That
-/// volume also MASKS the genuinely transient failures on live nodes' keys,
-/// which is the worse half of the cost.
-///
-/// # Why age comes from the entry head, not the snapshot
-///
-/// The obvious age source — the snapshot's own `saved_ms` — is unreadable by
-/// construction here: the blob cannot be fetched, which is the entire reason
-/// the key is a candidate. [`namespace_heads`] returns iroh-docs'
-/// `Entry::timestamp()` WITHOUT reading any value bytes, so it works precisely
-/// where a content read cannot.
-///
-/// # Refusal conditions (all mirror `gc_rootfs_images`'s blast-radius rules)
-///
-/// Deleting from the replicated store is irreversible and fans out to every
-/// peer, so this refuses rather than guesses:
-/// * no `HIVE_NODE_ROSTER` configured → refuse entirely (fail closed — an
-///   unset roster makes EVERY node look departed, the exact shape of the
-///   empty-keep-set bug that would have deleted every live deployment's disk);
-/// * more than `HIVE_REAP_MAX_FRACTION` of node keys look reapable → refuse,
-///   because that means the roster is wrong, not that the fleet vanished;
-/// * this node's own key is never a candidate, whatever the roster says.
-///
-/// Leader-only by caller contract: this is a replicated-store MUTATION, and the
-/// platform's single-writer discipline for those routes them through the
-/// control-plane leader.
+/// `(node name, is_part)` when `key` belongs to a node's snapshot generation (the base, or a part
+/// under any legacy or current layout), else `None`.
 fn node_snapshot_key_owner(key: &str) -> Option<(&str, bool)> {
     let segments: Vec<_> = key.split('/').collect();
     match segments.as_slice() {
@@ -5462,6 +5061,17 @@ fn node_snapshot_key_owner(key: &str) -> Option<(&str, bool)> {
     }
 }
 
+/// Reaps `node/<name>/snapshot` keys of nodes that left the fleet: a doc entry replicates forever
+/// while its blob becomes permanently unfetchable once its only holder is gone, so `kv_store`'s
+/// index sync retried the fetch on every pass and the noise masked genuine transient failures. Age
+/// comes from the entry head's timestamp (`namespace_heads`, read without fetching bytes), since
+/// the snapshot's own `saved_ms` is unreadable by construction. The delete is irreversible and fans
+/// out to every peer, so it refuses rather than guesses (the `gc_rootfs_images` blast-radius
+/// rules): no `HIVE_NODE_ROSTER` (fail closed: an unset roster makes EVERY node look departed),
+/// more than `HIVE_REAP_MAX_FRACTION` (default 0.34) of node keys reapable (the roster is wrong,
+/// not the fleet), and a node younger than `HIVE_REAP_MIN_AGE_DAYS` (default 30) is withheld; this
+/// node's own key is never a candidate. Leader-only by caller contract (a replicated-store
+/// mutation).
 pub async fn reap_departed_node_snapshots() -> (usize, usize) {
     let Some(me) = NODE_NAME
         .get()
@@ -5514,9 +5124,6 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
         }
     }
 
-    // iroh-docs stamps entries in microseconds; `now_ms` is milliseconds. Age
-    // the whole node prefix by its newest entry, so an in-progress part prepare
-    // cannot be mistaken for an old orphan before its base commit arrives.
     let now_us = hive_core::now_ms().saturating_mul(1000);
     let min_age_us = min_age_days.saturating_mul(24 * 60 * 60 * 1000 * 1000);
     let mut candidates = Vec::new();
@@ -5566,8 +5173,6 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
             }
         }
 
-        // The base is the commit marker and is always last. If any exact part
-        // delete failed, retain it so the next pass can rediscover and finish.
         let mut base_ok = parts_ok;
         if parts_ok {
             for base_key in &keys.bases {
@@ -5592,9 +5197,6 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
         }
     }
 
-    // Report BOTH halves: a reap that withheld everything must be
-    // distinguishable from one with nothing to do (the same "ineffective vs
-    // exhausted" lesson `ensure_disk_headroom` learned the hard way).
     if reaped > 0 || withheld_young > 0 || deleted_keys > 0 {
         tracing::info!(
             reaped,
@@ -5614,8 +5216,6 @@ async fn diagnostic_put_build_part(
     base_key: &str,
     serial: usize,
 ) -> anyhow::Result<(String, String)> {
-    // Semantically-valid `builds: []` wrappers with distinct trailing whitespace
-    // give the real content-addressed path unique immutable generations.
     let bytes = format!("{{\"builds\":[]{} }}", " ".repeat(serial + 1)).into_bytes();
     let digest = hex::encode(sha256(&bytes));
     let key = format!("{}/builds/{digest}", snapshot_v3_prefix(base_key)?);
@@ -5721,9 +5321,9 @@ fn p2_snapshot(tag: &str) -> PlatformSnapshot {
     snapshot
 }
 
-/// Publish one full v2 generation (parts + head, verified) and record its
-/// complete-generation marker at an explicit `marker_ms`. Returns the head
-/// item and the state part's (key, entry bytes) for retirement accounting.
+/// Publishes one full v2 generation (parts + head, verified) and records its complete-generation
+/// marker at an explicit `marker_ms`; returns the head item and the state part's (key, entry bytes)
+/// for retirement accounting.
 #[cfg(debug_assertions)]
 async fn p2_publish_generation(
     h: &Handle,
@@ -5893,12 +5493,11 @@ pub async fn writer_cadence_diagnostic() -> anyhow::Result<String> {
     ))
 }
 
-/// Guardian v2 Phase-2 matrix against the REAL vendored GuardianDB in this
-/// process's disposable HIVE_DATA store: retention keep/grace/budget/cursor,
-/// typed GC refusals (malformed/unknown/missing), confirmed-work byte
-/// accounting, six-parts-missing fetch behavior, legacy fallback only on
-/// true absence, concurrent publish under GC churn, and (env-gated) the
-/// final-flush timeout with previous-head survival.
+/// Guardian v2 Phase-2 diagnostic matrix against the REAL vendored GuardianDB in this process's
+/// disposable HIVE_DATA store: retention keep/grace/budget/cursor, typed GC refusals,
+/// confirmed-work byte accounting, partial-generation fetch behaviour, legacy fallback only on true
+/// absence, concurrent publish under GC churn and (env-gated) the final-flush timeout with
+/// previous-head survival.
 #[cfg(debug_assertions)]
 async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
     let component = NODE_NAME
@@ -5916,7 +5515,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         max_generations: 8192,
     };
 
-    // S0: empty v2 inventory → retention refuses (head absent), deletes nothing.
     let report = guardian_v2_retention_pass_with(h, cfg(2, 0, 8, 0.5)).await;
     if report.status != "refused"
         || !report
@@ -5932,7 +5530,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         );
     }
 
-    // S1: three real generations A/B/C with distinct content + markers.
     let now = hive_core::now_ms();
     let (_head_a, state_a, state_a_len) =
         p2_publish_generation(h, &component, "a", now.saturating_sub(5000)).await?;
@@ -5947,7 +5544,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S1: generation C is not Ready after publish");
     }
 
-    // Collision: different bytes at the SAME SHA-addressed key must refuse.
     let collision = KeyedPreparedValue {
         key: state_c.clone(),
         class: "state",
@@ -5971,7 +5567,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S1: immutable collision was not refused");
     }
 
-    // S2: the WRITER path records a marker for its own verified publication.
     let snap_d = p2_snapshot("d");
     let (_, head_d) = guardian_v2_prepare_snapshot(&snap_d, &component)?;
     let head_d_sha = hex::encode(head_d.value.change_digest);
@@ -5995,7 +5590,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::anyhow!("p2 S2: writer did not commit generation {generation} with its marker")
     })?;
 
-    // S3: anchor rule — no marker naming the current head refuses everything.
     if !delete_snapshot_key(h, &writer_marker).await? {
         anyhow::bail!("p2 S3: could not remove the current marker for the anchor test");
     }
@@ -6022,8 +5616,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
     guardian_v2_publish_immutable(h, &restore_marker, &protection).await?;
     drop(protection);
 
-    // S4: grace holds; then expiry under budget with fraction cap; then
-    // part retirement in lexical order with cursor resume + restart resume.
     let report = guardian_v2_retention_pass_with(h, cfg(1, 365 * 24 * 3600 * 1000, 8, 0.9)).await;
     if report.status != "noop" || report.generations_retired != 0 || report.parts_retired != 0 {
         anyhow::bail!(
@@ -6049,9 +5641,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         );
     }
 
-    // Parts of A/B/C (their unique state parts) are now unreferenced; D's six
-    // parts stay referenced. Retire with budget 1 per pass: lexical order,
-    // cursor resume, exact unrooted-byte accounting.
     let mut unrooted = 0u64;
     let mut retired_parts = 0u64;
     let mut saw_cursor = false;
@@ -6064,9 +5653,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         retired_parts += report.parts_retired;
         saw_cursor |= report.cursor.is_some();
         if pass == 1 {
-            // Restart resume: wipe the in-memory cursor exactly as a process
-            // restart would; the next pass restarts lexically and never
-            // double-retires (delete_snapshot_key is exact).
             retention_state()
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -6109,8 +5695,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S4: current generation D lost readiness after retention");
     }
 
-    // S5: confirmed-work GC accounting. Quiesce to a completed no-op pass,
-    // then reclaim two tombstoned probes of exactly known sizes.
     let baseline = p2_wait_gc(h, "quiescent no-op pass", |health| {
         health
             .last_pass
@@ -6142,9 +5726,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S5: confirmed reclaimed byte accounting {delta} != exact expected 30000");
     }
 
-    // S5b: typed refusals — malformed / unknown-version / missing-part heads
-    // each refuse the WHOLE pass; a collectible probe survives every refusal
-    // and is reclaimed only after the fault is removed.
     let probe_guard = vec![0x53u8; 4_096];
     let probe_guard_hash = iroh_blobs::Hash::new(&probe_guard).to_hex();
     h.kv.put("p2-probe-guard", probe_guard.clone()).await?;
@@ -6223,9 +5804,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S5b: guard probe was never reclaimed after the fault cleared");
     }
 
-    // S6: each of the six parts missing → fetch is Incomplete (never legacy
-    // fallback, though legacy bytes exist under the same base key); restoring
-    // the exact part restores Ready. One GC refusal is witnessed en route.
     let mut missing_part_gc_witnessed = false;
     if !matches!(
         guardian_v2_probe(h, &encoded).await,
@@ -6293,7 +5871,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         }
     }
 
-    // True absence → legacy fallback DOES serve.
     let legacy_only = "node/guardian-diagnostic-legacyonly/snapshot";
     h.kv.put(
         legacy_only,
@@ -6307,9 +5884,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S6: legacy fallback did not serve on TRUE v2 absence");
     }
 
-    // S7: concurrent publish under continuous GC churn — every generation
-    // stays fully verifiable, and the collector never reports the
-    // impossible-under-the-gate mid-pass change.
     for round in 0..3u32 {
         let runs_before = h.client.backend().gc_health().await.successful_runs;
         let (_, _, _) = p2_publish_generation(
@@ -6335,7 +5909,6 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         anyhow::bail!("p2 S7: the exclusive gate leaked a mid-pass inventory change");
     }
 
-    // S8: cancellation mid-preparation — Drop releases every prepared root.
     {
         let registration = PreparedSnapshotRegistration::new(
             &format!("{GUARDIAN_V2_NODE_PREFIX}{encoded}/head"),
@@ -6353,14 +5926,8 @@ async fn guardian_v2_phase2_diagnostic(h: &Handle) -> anyhow::Result<String> {
         }
     }
 
-    // S9: the real replication writer receives changes faster than the cleanup
-    // cadence for several complete intervals. Retention must still advance, and
-    // the last generation admitted after those passes must commit.
     let (writer_cadence, _) = guardian_v2_writer_cadence_diagnostic().await?;
 
-    // S10 (env-gated): final-flush timeout on the REAL writer path. The held
-    // commit must time the drain out while the PREVIOUS verified head stays
-    // readable.
     let mut final_flush = "skipped".to_string();
     if std::env::var("GUARDIAN_FINAL_FLUSH_DIAGNOSTIC_HOLD_MS").is_ok() {
         let pre = match guardian_v2_probe(h, &encoded).await {
@@ -6546,9 +6113,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     let ordinary = "queue/x/snapshot-part-v2/y";
     h.kv.put(ordinary, b"ordinary-root".to_vec()).await?;
 
-    // A malformed reserved child and a stale fixed legacy key each make the
-    // global shape unprovable. Neither refusal may consume a valid addressed
-    // candidate sitting beside it.
     let (refusal_candidate, _) = diagnostic_put_build_part(h, &base_key, 10).await?;
     let malformed = format!("{}/builds/not-a-digest", snapshot_v3_prefix(&base_key)?);
     h.kv.put(&malformed, b"malformed".to_vec()).await?;
@@ -6583,9 +6147,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     cleanup_passes += 1;
 
-    // Five current parts plus six fully-proven addressed generations exceed the
-    // default 0.5 global candidate fraction. The verified population is batched
-    // to five deletes, not refused and not silently truncated before proof.
     let mut historical = Vec::new();
     for serial in 100usize..106 {
         let (key, digest) = diagnostic_put_build_part(h, &base_key, serial).await?;
@@ -6604,9 +6165,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
 
-    // Change the reserved key population after every initial candidate has been
-    // proved but before batching. The exact before/after head maps must refuse
-    // the whole pass without consuming any member of the previously-valid set.
     CLEANUP_DIAGNOSTIC_PAUSE_BEFORE_GLOBAL_RECHECK.store(true, std::sync::atomic::Ordering::SeqCst);
     let paused = cleanup_diagnostic_paused().notified();
     let population_base = base_key.clone();
@@ -6656,9 +6214,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
         );
     }
 
-    // Move the head between bounded passes onto the one generation the first
-    // pass deliberately left. The next pass must preserve it and reap the prior
-    // builds generation instead.
     let promoted_key = remaining_historical
         .iter()
         .next()
@@ -6681,10 +6236,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
         anyhow::bail!("newly committed generation was deleted after the head changed");
     }
 
-    // A Drop-registered preparation protects both an already-addressed part and
-    // its generation marker even after a newer base timestamp would otherwise
-    // classify them as stale. Releasing the guard makes each independently
-    // resumable population converge on the following passes.
     let (prepared_key, _) = diagnostic_put_build_part(h, &base_key, 200).await?;
     let prepared_digest = sha256(b"diagnostic-prepared-base");
     let prepared_marker = format!(
@@ -6713,8 +6264,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     cleanup_passes += 2;
 
-    // Invalid marker grammar is globally ambiguous and must refuse without
-    // nibbling the marker population.
     let malformed_marker = format!(
         "{}/part-reap-v3/not-a-digest",
         base_key.trim_end_matches("/snapshot")
@@ -6729,9 +6278,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     delete_snapshot_key(h, &malformed_marker).await?;
 
-    // 257 exact stale markers used to exceed max_keys forever. They now retire
-    // in fraction- and key-bounded passes, while the marker for the current base
-    // stays protected until a later head makes it stale.
     let marker_root = format!("{}/part-reap-v3", base_key.trim_end_matches("/snapshot"));
     let mut stale_markers = Vec::new();
     for serial in 0usize..257 {
@@ -6780,8 +6326,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     cleanup_passes += 1;
 
-    // Inject a failure after one confirmed exact delete. The first tombstone is
-    // durable progress; the retry resumes from the two remaining keys.
     let mut failure_keys = Vec::new();
     for serial in 300usize..303 {
         failure_keys.push(diagnostic_put_build_part(h, &base_key, serial).await?.0);
@@ -6804,8 +6348,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     cleanup_passes += 1;
 
-    // Cancellation after one confirmed delete has the same restart point. The
-    // lifecycle lock is Drop-released with the aborted future.
     let mut cancellation_keys = Vec::new();
     for serial in 400usize..403 {
         cancellation_keys.push(diagnostic_put_build_part(h, &base_key, serial).await?.0);
@@ -6837,9 +6379,6 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     }
     cleanup_passes += 1;
 
-    // Change the base while a pass is paused between exact delete groups. The
-    // next group re-verifies all six current heads and skips the freshly-current
-    // target; only a following inventory pass discovers the old current key.
     let mut moving = Vec::new();
     for serial in 500usize..503 {
         moving.push(diagnostic_put_build_part(h, &base_key, serial).await?);
@@ -6971,17 +6510,11 @@ pub async fn lifecycle_diagnostic() -> anyhow::Result<String> {
     ))
 }
 
-/// design-head-cid-exchange-rpc's data source: per-namespace HEAD map for
-/// this node's local GuardianDB replica — a (key, content-hash, timestamp)
-/// triple for every live entry, WITHOUT ever reading a value's bytes (see
-/// `guardian_db::traits::KeyValueStore::entry_heads`, backed by iroh-docs'
-/// `Entry::content_hash()`/`timestamp()`). There is no single per-namespace
-/// root hash exposed by iroh-docs' public API, so a namespace's "head" is
-/// represented as the set of its per-key heads. Today there is exactly one
-/// namespace (`KV_NAMESPACE`); the map shape stays open for future stores.
-/// Served over the mesh at `GET /v1/guardian/heads` (see `admin::guardian_heads`
-/// + `gossip::dispatch`) so a peer can diff against its own without pulling
-/// any content.
+/// Per-namespace HEAD map of this node's local GuardianDB replica: a (key, content-hash, timestamp)
+/// triple per live entry, WITHOUT reading any value bytes (`entry_heads`). iroh-docs exposes no
+/// per-namespace root hash, so a head is the set of per-key heads (today one namespace,
+/// `KV_NAMESPACE`). Served at `GET /v1/guardian/heads` (`admin::guardian_heads` +
+/// `gossip::dispatch`) so a peer can diff without pulling content.
 pub async fn namespace_heads(
 ) -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
     let mut out = std::collections::HashMap::new();
@@ -6996,14 +6529,10 @@ pub async fn namespace_heads(
     out
 }
 
-/// implement-reconciliation-trigger: trigger a REAL targeted iroh-docs
-/// range-reconciliation sync of THIS node's `KV_NAMESPACE` document against
-/// one specific peer — never a full-database refresh. `guardian_addr_json`
-/// MUST be that peer's GuardianDB-specific address (`NodeInfo.
-/// guardian_iroh_addr`), never its hive-p2p mesh address — see `seed_peer`'s
-/// doc comment for why that distinction is load-bearing. Returns the real
-/// entries pulled/pushed on success, or the failure reason on error (for
-/// implement-convergence-logging's warn-level path).
+/// Triggers a REAL targeted iroh-docs range reconciliation of THIS node's `KV_NAMESPACE` document
+/// against one peer, never a full-database refresh. `guardian_addr_json` MUST be the peer's
+/// GuardianDB-specific address (see `seed_peer`). Returns the entries pulled/pushed, or the failure
+/// reason.
 pub async fn sync_with_peer(
     guardian_addr_json: &str,
 ) -> Result<guardian_db::traits::SyncOutcomeSummary, String> {
@@ -7013,30 +6542,12 @@ pub async fn sync_with_peer(
     h.kv.sync_with_peer(addr).await.map_err(|e| e.to_string())
 }
 
-// ---------------------------------------------------------------------------
-// guardian-growth-and-gc-observability: bounded, node-local write/GC
-// observability. Every field below is either an in-memory counter updated at
-// the exact write/GC chokepoint (`write_replication_batch`,
-// `set_generation_status`) or a periodically-collected, cached snapshot
-// (`spawn_blob_stats_collector`) — the request handler itself never touches
-// the store tree. Mirrors the `/v1/dns/stats` / `/v1/databases/sqlite-pools`
-// node-local-status precedent: no cross-node aggregation, read per node.
-// ---------------------------------------------------------------------------
-
-/// Bounded on-disk blob-store snapshot, refreshed on a background cadence
-/// (`HIVE_GUARDIAN_STATS_SECS`, default 60s) — never computed on the request
-/// path. **Verified live against a running node, not inferred from reading
-/// `iroh-blobs` source alone**: this vendored build opens the store as
-/// `FsStore::load_with_opts(iroh_store/blobs.db, ..)` (see
-/// `guardian_db::p2p::network::core::mod.rs`'s `init_blobs`/`repo_stat`) — a
-/// single redb-backed file that inlines every small blob (every Guardian
-/// snapshot payload observed so far: a few KB to a few hundred KB). Only a
-/// blob over redb's inline threshold spills to an individual file under
-/// `iroh_store/data/` (with its `temp/` staging directory) — for this
-/// workload those stay empty, so `blobs_db_bytes` is where the real growth
-/// shows up, not `complete_bytes`/`temp_bytes`. `docs_db_bytes` is
-/// `iroh_docs/docs.redb`, the separate document-metadata/entry-history
-/// store this same replica writes to on every commit.
+/// Bounded on-disk blob-store snapshot refreshed on a background cadence
+/// (`HIVE_GUARDIAN_STATS_SECS`, default 60 s), never on the request path. The store is the single
+/// redb-backed `iroh_store/blobs.db` that inlines every small blob (every snapshot payload so far),
+/// so `blobs_db_bytes` is where real growth shows; only blobs over redb's inline threshold spill to
+/// files under `iroh_store/data/` (with `temp/`), and `docs_db_bytes` is the separate
+/// `iroh_docs/docs.redb` entry history.
 #[derive(Default, Clone, serde::Serialize)]
 struct BlobStoreSnapshot {
     collected_at_ms: u64,
@@ -7044,19 +6555,16 @@ struct BlobStoreSnapshot {
     blobs_db_bytes: u64,
     /// `iroh_docs/docs.redb` — entry/metadata history for the KV document.
     docs_db_bytes: u64,
-    /// Individual files under `iroh_store/data/` — blobs too large to
-    /// inline into `blobs.db`. Zero for this workload today; wired for when
-    /// a part payload eventually crosses the inline threshold.
+    /// Individual files under `iroh_store/data/` (blobs too large to inline); zero for this
+    /// workload today.
     complete_bytes: u64,
     complete_count: u64,
     /// `iroh_store/temp/` — in-flight (including partial) large-blob writes
     /// not yet moved into `data/`.
     temp_bytes: u64,
     temp_count: u64,
-    /// This pass hit `HIVE_GUARDIAN_STATS_MAX_FILES` while walking
-    /// `data/`/`temp/` and stopped early — those two totals are then a
-    /// lower bound, not exact, for this one collection (`blobs_db_bytes`/
-    /// `docs_db_bytes` are single `stat()` calls and are never truncated).
+    /// This pass hit `HIVE_GUARDIAN_STATS_MAX_FILES` while walking `data/`/`temp/`, so those two
+    /// totals are a lower bound (the two `stat()` totals are never truncated).
     truncated: bool,
 }
 
@@ -7082,11 +6590,8 @@ fn guardian_stats_interval_secs() -> u64 {
         .unwrap_or(60)
 }
 
-/// Blocking I/O — run on a `spawn_blocking` thread, never on the async
-/// runtime or the request path. The two `stat()` calls (`blobs.db`,
-/// `docs.redb`) are O(1) and never truncate; the `data/`/`temp/` directory
-/// walks are bounded by `guardian_stats_max_files` for the day a payload
-/// crosses redb's inline threshold and starts spilling to individual files.
+/// Blocking I/O: run on `spawn_blocking`, never on the async runtime or request path. The two
+/// `stat()` calls are O(1); the directory walks are bounded by `guardian_stats_max_files`.
 fn collect_blob_store_snapshot() -> BlobStoreSnapshot {
     let max_files = guardian_stats_max_files();
     let mut out = BlobStoreSnapshot {
@@ -7167,9 +6672,8 @@ fn spawn_blob_stats_collector() {
 
 #[derive(Default, serde::Serialize)]
 struct GcStatusView {
-    /// `false` means GuardianDB itself is not reachable right now (init
-    /// failed/wedged) — every other field below is then a meaningless
-    /// zero/false, not "GC is healthy".
+    /// `false` means GuardianDB itself is not reachable (init failed or wedged): every other field
+    /// is then a meaningless zero, not "GC is healthy".
     reachable: bool,
     enabled: bool,
     running: bool,
@@ -7240,9 +6744,8 @@ impl From<guardian_db::p2p::network::core::GcPassReport> for GcPassView {
     }
 }
 
-/// Per-part status of this node's own current v2 generation — sourced from
-/// BOUNDED lookups only (one exact-prefix page per key, one head read), never
-/// a full store scan on the request path.
+/// Per-part status of this node's own current v2 generation from BOUNDED lookups only (one
+/// exact-prefix page per key, one head read), never a full store scan on the request path.
 #[derive(serde::Serialize)]
 struct GuardianV2PartStatusView {
     field: &'static str,
@@ -7256,9 +6759,9 @@ struct GuardianV2PartStatusView {
 #[derive(serde::Serialize)]
 struct GuardianV2StatusView {
     component: Option<String>,
-    /// `ready` | `absent` | `incomplete` | `unreachable` — the same tri-state
-    /// the restore path uses, with reachability made explicit. `absent` only
-    /// when genuinely nothing exists under this node's v2 prefix head key.
+    /// `ready` | `absent` | `incomplete` | `unreachable`: the restore path's tri-state with
+    /// reachability made explicit; `absent` only when nothing exists under this node's v2 prefix
+    /// head key.
     head_status: &'static str,
     /// Generation identity: the committed head's SHA-256 + BLAKE3 + saved_ms.
     head_sha256: Option<String>,
@@ -7310,7 +6813,7 @@ async fn guardian_v2_status_view(h: &Handle) -> GuardianV2StatusView {
         }
     };
     let Some(head_entry) = head_entry else {
-        return view; // absent
+        return view;
     };
     view.head_blake3 = Some(head_entry.hash.clone());
     view.saved_ms = Some(head_entry.timestamp / 1000);
@@ -7357,7 +6860,6 @@ async fn guardian_v2_status_view(h: &Handle) -> GuardianV2StatusView {
     }
     view.head_status = if all_ready { "ready" } else { "incomplete" };
 
-    // Bounded generation-marker count: capped pages, truncation disclosed.
     let gen_prefix = format!("{node_prefix}{GUARDIAN_V2_GEN_SEGMENT}/");
     let mut cursor: Option<String> = None;
     for _ in 0..8 {
@@ -7395,9 +6897,8 @@ struct RetentionView {
 
 #[derive(serde::Serialize)]
 struct ProtectedRootsView {
-    /// Live count of temporarily protected snapshot PART keys (this
-    /// process's own in-flight publications) — `PreparedSnapshotRoots`,
-    /// read as an in-memory map length, never a store scan.
+    /// Live count of temporarily protected snapshot PART keys (this process's in-flight
+    /// publications, `PreparedSnapshotRoots`), read as an in-memory map length.
     part_keys: usize,
     /// Live count of temporarily protected snapshot BASE (full-snapshot)
     /// digests.
@@ -7495,12 +6996,9 @@ async fn guardian_write_stats_handler() -> axum::Json<GuardianWriteStatsResponse
     })
 }
 
-/// Self-contained router merged directly onto the auth-enforced admin router
-/// in `main.rs` (`admin.rs` is a different write surface's exclusive scope
-/// for this change; this stays self-contained so no line there needs to
-/// change) — same `.merge(crate::<module>::routes())` shape as `hrana`,
-/// `drive_api`, `browser_admission`, etc. Node-local, like `/v1/dns/stats`:
-/// read it per node, never aggregated.
+/// Self-contained router merged onto the auth-enforced admin router in `main.rs` (same
+/// `.merge(crate::<module>::routes())` shape as `hrana`, `drive_api` and `browser_admission`).
+/// Node-local, like `/v1/dns/stats`: read per node, never aggregated.
 pub fn routes() -> axum::Router<Arc<crate::state::CloudState>> {
     axum::Router::new().route(
         "/v1/admin/guardian/write-stats",

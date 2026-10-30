@@ -18,8 +18,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
 
   const [err, setErr] = useState("");
 
-  // Plan-tier limits (mirror the backend: billing::plan_max_duration_secs etc.).
-  const planMax = plan === "enterprise" ? 3600 : plan === "pro" ? 800 : 300;
+  const planMaxDurationSecs = plan === "enterprise" ? 3600 : plan === "pro" ? 800 : 300;
   const canFailover = plan === "enterprise";
 
   const load = useCallback(async () => {
@@ -30,10 +29,8 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
       const fallback: FunctionSettings = {
         fluid_enabled: true,
         default_max_duration_secs: 300,
-        // No hard-coded region — real regions come from the live mesh catalog.
         regions: [],
         failover: false,
-        // Standard serverless tier: 1 vCPU / 2 GB.
         vcpus: 1,
         memory_mib: 2048,
         gpu: false,
@@ -47,8 +44,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
     }
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: each of these sets state only after its
-    // own await resolves, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
     apiGet<RegionCatalog>("/v1/regions/catalog").then(setCatalog).catch(() => {});
@@ -69,8 +64,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
     save({ ...fs!, regions });
   }
 
-  // Coordinates for every catalog region, so selected regions plot on the map at
-  // their REAL location (driven by where the backing node actually is).
   const coordById: Record<string, { lat: number; lon: number; label: string }> = {};
   Object.values(catalog).forEach((regions) =>
     regions.forEach((r) => {
@@ -87,7 +80,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
 
   return (
     <div className="flex flex-col gap-6">
-      {/* Fluid Compute */}
       <SettingCard
         title="Fluid Compute"
         desc="Enable Fluid compute for your functions to automatically manage concurrency and optimize performance. OpenEdge handles the defaults to ensure the best experience for your workload."
@@ -99,7 +91,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           <span className="text-sm font-medium">{fs.fluid_enabled ? "Enabled" : "Disabled"}</span>
         </div>
       </SettingCard>
-      {/* Serverless GPU — placement targets GPU nodes and passes the host GPUs through. */}
       <SettingCard
         title="Serverless GPU"
         desc="Run this project's functions on GPU-equipped infrastructure (NVIDIA Tesla T4). Deployments are placed only on nodes with GPUs, and the GPUs are passed through to your function's container."
@@ -110,7 +101,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           <span className="text-sm font-medium">{fs.gpu ? "Enabled" : "Disabled"}</span>
         </div>
       </SettingCard>
-      {/* CPU & Memory tier — one microVM per instance. */}
       <SettingCard
         title="CPU & Memory"
         desc="The resources each function instance (microVM) is allocated. Standard fits most serverless functions; Performance gives latency-sensitive apps and SSR workloads more headroom. A new deployment is required for changes to take effect."
@@ -151,7 +141,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           })}
         </div>
       </SettingCard>
-      {/* Function Max Duration */}
       <SettingCard
         title="Function Max Duration"
         desc={
@@ -160,10 +149,10 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
             optionally override it at the function level. A new deployment is required for changes to take effect.
           </>
         }
-        footer={`Hobby max 300s · Pro max 800s · Enterprise max 3600s (1 hour). Your plan (${plan}) allows up to ${planMax}s.`}
+        footer={`Hobby max 300s · Pro max 800s · Enterprise max 3600s (1 hour). Your plan (${plan}) allows up to ${planMaxDurationSecs}s.`}
         footerAction={
           <Button
-            onClick={() => save({ ...fs, default_max_duration_secs: Math.min(planMax, Math.max(1, parseInt(maxDur || "300", 10))) })}
+            onClick={() => save({ ...fs, default_max_duration_secs: Math.min(planMaxDurationSecs, Math.max(1, parseInt(maxDur || "300", 10))) })}
           >
             Save
           </Button>
@@ -172,7 +161,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
         <div className="rounded-lg border border-border bg-subtle p-4 text-sm text-secondary">
           <span className="font-medium text-fg">Longer functions:</span> {plan === "enterprise"
             ? "your Enterprise plan supports function runtimes up to 1 hour (3600s)."
-            : <>upgrade to <span className="font-medium text-fg">Enterprise</span> for 1-hour (3600s) function runtimes. Your current cap is {planMax}s.</>}
+            : <>upgrade to <span className="font-medium text-fg">Enterprise</span> for 1-hour (3600s) function runtimes. Your current cap is {planMaxDurationSecs}s.</>}
         </div>
         <div className="mt-4">
           <label className="mb-1.5 block text-sm text-secondary">Default Max Duration</label>
@@ -186,14 +175,11 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           </div>
         </div>
       </SettingCard>
-      {/* Deployment Regions */}
       <SettingCard
         title="Deployment Regions"
         desc="The regions on the OpenEdge network where this project is deployed — every deployment (functions, containers, or static) is placed on the nodes in the regions you select, and requests are routed to the nearest one. Leave empty to deploy automatically to the eligible region nearest you. Select up to 5; redeploy for changes to take effect."
         footer={`${fs.regions.length}/5 regions selected${fs.regions.length === 0 ? " — auto (nearest region)" : ""}`}
       >
-        {/* Global region map — dots mark the regions you've selected. Background and
-            land follow the current UI theme (light/dark) rather than being hard-black. */}
         <div className="mx-auto mb-6 w-1/2">
           <div className="relative overflow-hidden rounded-xl border border-border bg-slate-50 dark:bg-[#070b14]">
             <RegionMap markers={mapMarkers} />
@@ -204,8 +190,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           </div>
         </div>
 
-        {/* Selected regions (so any selected-but-offline region is still visible
-            and removable, even when no live node currently backs it). */}
         {fs.regions.length > 0 && (
           <div className="mb-4 flex flex-wrap gap-2">
             {fs.regions.map((id) => (
@@ -281,7 +265,6 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           })}
         </div>
       </SettingCard>
-      {/* Function Failover — automatic multi-region fail-over is Enterprise-only. */}
       <SettingCard
         title="Automatic Region Fail-over"
         desc="Automatically fail functions over to the nearest healthy region when one becomes unavailable. A new deployment is required for changes to take effect."

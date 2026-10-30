@@ -3,15 +3,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { NodeInfo } from "@/lib/api";
 
-/**
- * A real, live-derived event log for the /regions map's "Log" panel — there's
- * no backend join/leave audit trail to read (no `/v1/events`), so this diffs
- * successive `/v1/nodes` poll snapshots and reports only genuinely-observed
- * transitions (first-seen id, healthy flipping either direction, or an id
- * dropping out of the list). Every line corresponds to a real state change
- * this client actually witnessed — never a fabricated placeholder entry.
- */
-
 export interface NodeLogEntry {
   key: string;
   ts: number;
@@ -21,6 +12,8 @@ export interface NodeLogEntry {
 
 const MAX_ENTRIES = 50;
 
+/** Event log for the /regions map's Log panel, derived by diffing successive `/v1/nodes` snapshots (the backend keeps no join/leave audit trail): only observed
+ *  transitions are reported (first seen, healthy flipping either way, dropped from the list), never placeholder entries. */
 export function useNodeEventLog(nodes: NodeInfo[] | null | undefined): NodeLogEntry[] {
   const [log, setLog] = useState<NodeLogEntry[]>([]);
   const knownRef = useRef<Map<string, { name: string; healthy: boolean | undefined }>>(new Map());
@@ -33,8 +26,6 @@ export function useNodeEventLog(nodes: NodeInfo[] | null | undefined): NodeLogEn
     const events: NodeLogEntry[] = [];
     const now = Date.now();
 
-    // First poll only seeds state — a full node list on mount is "already
-    // there", not N simultaneous joins.
     if (!seededRef.current) {
       for (const n of nodes) known.set(n.id, { name: n.name, healthy: n.healthy });
       seededRef.current = true;
@@ -60,10 +51,6 @@ export function useNodeEventLog(nodes: NodeInfo[] | null | undefined): NodeLogEn
     }
 
     if (events.length) {
-      // Genuinely derived from diffing this render's `nodes` against the
-      // ref-held previous snapshot — cannot be a lazy initializer (needs the
-      // cross-render comparison), and only fires when a real transition was
-      // observed. The documented "synchronize with an external system" case.
       // eslint-disable-next-line react-hooks/set-state-in-effect
       setLog((cur) => [...events.reverse(), ...cur].slice(0, MAX_ENTRIES));
     }

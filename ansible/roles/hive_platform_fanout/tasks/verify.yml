@@ -1,8 +1,5 @@
 ---
-# CONTENT verification for the controller+agent release pair. A backend deploy
-# is complete only when hive-node runs the canonical controller and the exact
-# canonical cell-agent bytes plus parseable release fact are installed for the
-# later manual rootfs bake.
+# CONTENT verification for the controller+agent release pair: a backend deploy is complete only when hive-node runs the canonical controller and the exact canonical cell-agent bytes plus a parseable release fact are installed.
 
 - name: Require canonical controller and cell-agent artifacts for this glibc group
   ansible.builtin.assert:
@@ -38,7 +35,6 @@
     checksum_algorithm: sha256
   register: _verify_agent_old
 
-# /proc/<pid>/exe is the running controller image, not merely the current path.
 - name: Checksum the running controller and read its unit start time
   ansible.builtin.shell:
     cmd: |
@@ -80,9 +76,6 @@
       running_pid: "{{ _verify_run.stdout.split()[0] }}"
       running_sha: "{{ _verify_run.stdout.split()[1] }}"
       started_epoch: "{{ _verify_run.stdout.split()[2] | int }}"
-      # A guest-only release is not a no-op merely because controller bytes did
-      # not change. Store yes/no strings because non-native Jinja booleans are
-      # truthy strings under selectattr.
       content_changed: >-
         {{ 'yes' if
            ((hive_pre_deploy_sha | default('')) != hostvars[hive_group_build_host].hive_group_build_sha256 or

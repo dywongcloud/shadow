@@ -4,13 +4,8 @@ import { useEffect, useState } from "react";
 import { RefreshCw, Table2, Play } from "lucide-react";
 import { opsGet, opsSend } from "@/lib/api";
 
-// ---- "View as PostgreSQL" — the relational mirror, real typed tables instead
-// of the document-collection JSON view. Read-only: no edit/create/delete
-// affordances exist here at all (enforced server-side too — see admin.rs).
-// Extracted into its own lazy-loaded chunk (see page.tsx's next/dynamic import):
-// most Data Browser visits stay on the default Documents view, so this SQL
-// client (its own state/effects, syntax-highlighted query box, results table)
-// is pure unused weight in the initial bundle for the common case.
+// "View as PostgreSQL": read-only typed tables over the relational mirror (the server enforces read-only too), lazy-loaded from page.tsx because most Data Browser
+// visits stay on the Documents view.
 interface SqlColumn { name: string; type: string }
 interface SqlTable { name: string; columns: SqlColumn[] }
 interface SqlTablesResp { tables: SqlTable[] }
@@ -42,8 +37,6 @@ export default function SqlTablesView() {
       })
       .catch((e) => setSqlErr(String(e)));
   }
-  // Load the table list once, on mount (this component only mounts when the
-  // Tables view is actually opened -- see page.tsx's conditional dynamic import).
   useEffect(() => { loadSqlTables(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function selectTable(name: string) {
@@ -68,7 +61,6 @@ export default function SqlTablesView() {
       setSqlLoading(false);
     }
   }
-  // Run the default query as soon as the table list arrives with a selection.
   useEffect(() => { if (activeTable && !sqlResult && !sqlLoading) runSqlQuery(); }, [activeTable]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
@@ -79,7 +71,6 @@ export default function SqlTablesView() {
         </button>
       </div>
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-[220px_1fr]">
-        {/* Tables list */}
         <aside className="flex flex-col gap-1">
           {(sqlTables ?? []).map((t) => (
             <button
@@ -94,7 +85,6 @@ export default function SqlTablesView() {
           {sqlTables?.length === 0 && <div className="px-3 py-2 text-sm text-muted">No relational tables.</div>}
         </aside>
 
-        {/* Query + results */}
         <div className="min-w-0">
           <form onSubmit={(e) => { e.preventDefault(); runSqlQuery(); }} className="mb-3 flex items-start gap-2">
             <textarea

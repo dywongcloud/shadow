@@ -1,7 +1,5 @@
 import { Skeleton, SkeletonCard, SkeletonPageHeader } from "@/components/ui";
 
-// Overrides the generic root loading.tsx — shaped like the real page: PageHeader,
-// a 4-up stat row, the mesh-diagram card, then a 3-up architecture row.
 export default function Loading() {
   return (
     <div>

@@ -1,8 +1,6 @@
-//! Output helpers — colorized JSON, and multi-color human tables for list
-//! commands. Color is gated by `owo-colors`' `if_supports_color`, which
-//! degrades to plain text automatically under `NO_COLOR`, `TERM=dumb`, or a
-//! non-tty stream (piped output) — never applied in `--json` mode, which
-//! stays byte-plain so it pipes cleanly into `jq`.
+//! Output helpers: colorized JSON and multi-color tables, gated by `owo-colors`'
+//! `if_supports_color` (plain under `NO_COLOR`, `TERM=dumb`, non-tty); `--json` output stays
+//! byte-plain for `jq`.
 
 use owo_colors::{OwoColorize, Stream};
 use serde_json::Value;
@@ -46,8 +44,6 @@ impl Out {
         }
         let headers: Vec<&str> = cols.iter().map(|(_, h)| *h).collect();
         let keys: Vec<&str> = cols.iter().map(|(k, _)| *k).collect();
-        // Compute column widths from PLAIN text — color escapes must never
-        // enter the width math, or alignment breaks the moment color is on.
         let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
         let cells: Vec<Vec<String>> = rows
             .iter()
@@ -121,14 +117,9 @@ fn cell(row: &Value, key: &str) -> String {
     }
 }
 
-/// A table cell is printed as a single line of raw terminal output, so any
-/// Unicode control character in a server-supplied value (ESC included) would
-/// otherwise reach the terminal unescaped — a compromised/malicious backend
-/// response could inject cursor moves, screen clears, or OSC sequences
-/// (clipboard writes, spoofed hyperlinks) into the user's terminal via what
-/// looks like an ordinary project/deployment name. Strip them; the JSON path
-/// (`colored_json`) is already safe because `serde_json::to_string` escapes
-/// control characters as `\u00XX` per the JSON spec.
+/// Strip Unicode control characters (ESC included) from a server-supplied cell so a malicious
+/// backend cannot inject cursor moves, screen clears or OSC sequences into the terminal; the
+/// JSON path is safe because `serde_json` escapes them.
 fn strip_control_chars(s: &str) -> String {
     s.chars().filter(|c| !c.is_control()).collect()
 }
@@ -154,10 +145,8 @@ const BAD_WORDS: &[&str] = &[
 ];
 const NEUTRAL_WORDS: &[&str] = &["pending", "building", "preview", "unknown", "queued"];
 
-/// Colorize an already-padded cell string by its RAW (unpadded) value's
-/// meaning, matching known status/state vocabulary case-insensitively.
-/// Padding trailing spaces ride along inside the color span, which is
-/// visually identical to uncolored spaces.
+/// Colorize an already-padded cell by its RAW value's status/state vocabulary
+/// (case-insensitive); the padding rides inside the color span.
 fn status_color(raw: &str, padded: String) -> String {
     let lower = raw.trim().to_ascii_lowercase();
     if GOOD_WORDS.contains(&lower.as_str()) {
@@ -177,9 +166,8 @@ fn status_color(raw: &str, padded: String) -> String {
     }
 }
 
-/// Recursive colored JSON pretty-printer: 2-space indent (matching
-/// `serde_json::to_string_pretty`'s layout exactly), keys cyan, strings
-/// green, numbers yellow, `true` green / `false` red, `null` dimmed.
+/// Recursive colored JSON pretty-printer with `serde_json::to_string_pretty`'s exact 2-space
+/// layout: keys cyan, strings green, numbers yellow, `true` green / `false` red, `null` dimmed.
 fn colored_json(v: &Value, indent: usize, out: &mut String) {
     match v {
         Value::Null => {

@@ -1,19 +1,7 @@
-//! Typed model of inert **`vercel.json`** configuration —
-//! the *user-facing* project configuration format, as documented at
-//! <https://vercel.com/docs/project-configuration/vercel-json>.
-//!
-//! This is distinct from [`crate::build_output`] (the Build Output API v3, which
-//! is the *compiled* artifact a framework emits). `vercel.json` is what a user
-//! writes by hand to override build behavior, routing, functions, crons, and
-//! image optimization. Vercel's precedence is:
-//!
-//! ```text
-//! vercel.json  >  Project Settings (dashboard)  >  framework auto-detection
-//! ```
-//!
-//! Model parsing remains tolerant for read-only analysis callers: every field is
-//! optional and unknown keys are ignored. Build admission uses the checked loader,
-//! which rejects malformed JSON and executable JS/TS configuration loudly.
+//! Typed model of inert `vercel.json` (<https://vercel.com/docs/project-configuration/vercel-json>),
+//! the user-facing config, distinct from [`crate::build_output`] (the compiled Build Output API
+//! v3). Precedence: `vercel.json` > Project Settings > framework auto-detection. Every field is
+//! optional and unknown keys are ignored; build admission uses the checked loader.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -23,7 +11,6 @@ use std::path::Path;
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct VercelConfig {
-    // ---- build overrides ----
     pub build_command: Option<String>,
     pub dev_command: Option<String>,
     pub install_command: Option<String>,
@@ -31,23 +18,15 @@ pub struct VercelConfig {
     /// Framework slug, or `null` to mean "Other" (both deserialize to `None`).
     pub framework: Option<String>,
     pub ignore_command: Option<String>,
-    /// Vercel's Bun beta selector — a MAJOR-version-only string (e.g. `"1.x"`),
-    /// never a specific patch. Presence alone means "use Bun" but does not by
-    /// itself pin an exact version (Vercel's own semantics); see [`Self::runtime`]
-    /// for this platform's more explicit native selector.
+    /// Vercel's Bun beta selector, a MAJOR-version-only string (`"1.x"`): presence means "use Bun"
+    /// without pinning a patch; see [`Self::runtime`] for this platform's explicit selector.
     pub bun_version: Option<String>,
-    /// This platform's native, explicit runtime selector — `{"runtime":"bun"}` or
-    /// `{"runtime":"nodejs"}` in `vercel.json`. Deliberately SEPARATE from
-    /// `bun_version`/package-manager detection: selecting Bun as a package
-    /// manager (a `bun.lock` in the repo) must NOT by itself select Bun as the
-    /// RUNTIME — these are orthogonal axes. Precedence when resolving the
-    /// effective runtime (see `hive-cloud/src/git.rs`): this field wins if set,
-    /// else `bun_version` presence means Bun, else Project Settings' explicit
-    /// override, else infer from the detected start command (today's behavior,
-    /// unchanged for every existing Node deployment).
+    /// This platform's explicit runtime selector (`{"runtime":"bun"|"nodejs"}`), orthogonal to
+    /// package-manager detection: a `bun.lock` never selects the Bun RUNTIME by itself. Resolution
+    /// order (hive-cloud `git.rs`): this field, else `bun_version` presence, else Project Settings,
+    /// else the detected start command.
     pub runtime: Option<String>,
 
-    // ---- routing ----
     pub clean_urls: Option<bool>,
     pub trailing_slash: Option<bool>,
     pub redirects: Vec<VercelRedirect>,
@@ -57,14 +36,12 @@ pub struct VercelConfig {
     /// (transforms/mitigate) are deferred. Kept as raw JSON.
     pub routes: Vec<serde_json::Value>,
 
-    // ---- functions / compute ----
     /// Glob pattern -> per-function overrides.
     pub functions: BTreeMap<String, VercelFunction>,
     pub regions: Vec<String>,
     pub function_failover_regions: Vec<String>,
     pub fluid: Option<bool>,
 
-    // ---- scheduled + images ----
     pub crons: Vec<VercelCron>,
     pub images: Option<VercelImages>,
 }
@@ -219,9 +196,8 @@ impl VercelConfig {
 }
 
 impl ConditionValue {
-    /// Match a candidate string against this value (literal equality, or the
-    /// `{pre,suf}` prefix/suffix matcher). `None`-valued conditions match on
-    /// mere presence, so this is only called when a value is specified.
+    /// Match a candidate against this value: literal equality or the `{pre,suf}` matcher; only
+    /// called when a value is specified (`None` conditions match on presence).
     pub fn matches(&self, candidate: &str) -> bool {
         match self {
             ConditionValue::Text(t) => candidate == t,
@@ -240,9 +216,8 @@ impl ConditionValue {
 
 const MAX_VERCEL_CONFIG_BYTES: u64 = 1024 * 1024;
 
-/// Load the inert JSON configuration without executing repository modules.
-/// Malformed, oversized, symlinked, or dynamic JS/TS configuration is a loud
-/// build-input error for callers that execute repository builds.
+/// Load the inert JSON config without executing repository modules; malformed, oversized,
+/// symlinked or JS/TS config is a loud build-input error.
 pub fn load_vercel_config_checked(repo: &Path) -> anyhow::Result<Option<VercelConfig>> {
     use anyhow::{ensure, Context};
     use std::io::Read;

@@ -5,21 +5,14 @@ import { Radio, RadioTower, RotateCw, WifiOff, TriangleAlert } from "lucide-reac
 import { useRunNode } from "@/lib/use-run-node";
 import { lifecycleLabel } from "@/lib/run-node-status";
 
-/** "Run a node" navbar control, immediately beside the notifications bell.
- *  Renders the live SharedWorker-owned status (stopped/starting/online/
- *  degraded/error) and links out to the full /run-node control page — this
- *  button itself never starts/stops the node (that requires the consent flow
- *  on the dedicated page). */
+/** "Run a node" navbar control beside the notifications bell: shows the live run-node status (stopped/starting/online/degraded/error) and links to the full /run-node page;
+ *  it never starts or stops the node itself (that needs the consent flow on that page). */
 export function RunNodeControl() {
   const { status, supported } = useRunNode();
 
-  if (!supported) return null; // no SharedWorker in this browser — nothing to show here
+  if (!supported) return null;
 
   const { icon, tone, label } = visual(status.lifecycle);
-  // Multi-tab dedup UI (bn-ui-sharedworker-owner): surfaced here too, not
-  // just on the full /run-node page — this is the control most users will
-  // actually glance at, and "why does Stop here not really stop it" is
-  // exactly the confusion a tab count heads off.
   const tabSuffix = status.tabCount > 1 ? ` (${status.tabCount} tabs)` : "";
   const fullLabel = `Run a node — ${label}${tabSuffix}`;
 
@@ -38,8 +31,6 @@ export function RunNodeControl() {
       {(status.lifecycle === "degraded" || status.lifecycle === "error") && (
         <span className="absolute right-1 top-1.5 h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden="true" />
       )}
-      {/* Announces lifecycle changes to screen readers even when this control
-          isn't focused — the visible label/icon alone only helps sighted users. */}
       <span className="sr-only" role="status" aria-live="polite">{`Run a node: ${label}${tabSuffix}`}</span>
     </Link>
   );

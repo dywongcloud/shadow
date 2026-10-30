@@ -1,29 +1,25 @@
-//! Runtime stall detector — the process names its own freezes.
+//! Runtime stall detector: the process names its own freezes.
 //!
-//! On 2026-10-01 the control-plane leader had frozen its whole tokio runtime
-//! (both listeners dark, every timer stopped) for 73–763 s at a time, and the
-//! only trace was a silence gap in the journal found a day later. A capture
-//! taken during one freeze showed a single `tokio-rt-worker` with 78 s of user
-//! CPU while every other worker sat parked: a long synchronous computation on
-//! a worker that every other task was waiting on. Nothing inside the process
-//! noticed, because nothing inside the process ever asked whether the runtime
-//! still ran tasks.
+//! The control-plane leader once froze its whole tokio runtime (both listeners dark, every timer
+//! stopped) for minutes at a time, and the only trace was a silence gap in the journal found a day
+//! later. A capture taken during a freeze showed a single `tokio-rt-worker` burning CPU while every
+//! other worker sat parked: a long synchronous computation on a worker that every other task was
+//! waiting on. Nothing inside the process noticed, because nothing inside the process ever asked
+//! whether the runtime still ran tasks.
 //!
-//! This watcher asks, from a dedicated OS thread that no tokio task can block:
-//! every `HIVE_RUNTIME_STALL_PROBE_MS` (1000) it spawns a trivial task onto the
-//! runtime and waits for it to be polled. If the probe is not polled within
-//! `HIVE_RUNTIME_STALL_WARN_MS` (2000) the runtime is stalled — either every
-//! worker is blocked or the scheduler is starved — and the watcher WARNs at
-//! once, then samples `/proc/self/task/*/stat` while the stall lasts to name
-//! the threads that burn CPU through it, and ERRORs the episode length when
-//! the probe finally lands. With `HIVE_RUNTIME_STALL_DUMP=1` it also runs
-//! `gdb -batch -p <tid> -ex bt` on the hottest thread (the release profile
-//! keeps the symbol table for exactly this) so the function is in the journal.
-//! `stats()` serves the counters on the operator endpoint `/v1/admin/runtime`.
+//! This watcher asks, from a dedicated OS thread that no tokio task can block: every
+//! `HIVE_RUNTIME_STALL_PROBE_MS` (1000) it spawns a trivial task onto the runtime and waits for it
+//! to be polled. If the probe is not polled within `HIVE_RUNTIME_STALL_WARN_MS` (2000) the runtime
+//! is stalled (every worker blocked, or the scheduler starved) and the watcher WARNs at once, then
+//! samples `/proc/self/task/*/stat` while the stall lasts to name the threads that burn CPU through
+//! it, and ERRORs the episode length when the probe finally lands. With `HIVE_RUNTIME_STALL_DUMP=1`
+//! it also runs `gdb -batch -p <tid> -ex bt` on the hottest thread (the release profile keeps the
+//! symbol table for exactly this) so the function is in the journal. `stats()` serves the counters
+//! on the operator endpoint `/v1/admin/runtime`.
 //!
-//! A probe landing late is the user's experience of a freeze; a single busy
-//! worker with idle siblings is NOT a stall (the probe lands on a sibling), so
-//! this measures what matters and nothing else.
+//! A probe landing late is the user's experience of a freeze; a single busy worker with idle
+//! siblings is NOT a stall (the probe lands on a sibling), so this measures what matters and
+//! nothing else.
 
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -81,7 +77,7 @@ pub fn spawn(handle: tokio::runtime::Handle) {
             PROBES.fetch_add(1, Ordering::Relaxed);
             match rx.recv_timeout(warn) {
                 Ok(()) => {}
-                Err(RecvTimeoutError::Disconnected) => return, // runtime gone
+                Err(RecvTimeoutError::Disconnected) => return,
                 Err(RecvTimeoutError::Timeout) => stall(&rx, sent, warn, dump),
             }
         })
@@ -139,6 +135,9 @@ fn stall(rx: &std::sync::mpsc::Receiver<()>, sent: Instant, warn: Duration, dump
 }
 
 /// `(tid, comm, utime+stime ticks)` for every thread of this process (Linux).
+///
+/// `comm` may contain spaces, so the stat line is split after the LAST `)`; `utime` and `stime` are
+/// stat fields 14 and 15, indices 11 and 12 once `pid (comm)` and the state are consumed.
 fn cpu_snapshot() -> Vec<(u64, String, u64)> {
     let mut out = Vec::new();
     let Ok(dir) = std::fs::read_dir("/proc/self/task") else {
@@ -151,14 +150,12 @@ fn cpu_snapshot() -> Vec<(u64, String, u64)> {
         let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
             continue;
         };
-        // `pid (comm) state ppid ...` -- comm may contain spaces; split after the last ')'.
         let Some(close) = stat.rfind(')') else { continue };
         let comm = stat[..close]
             .split_once('(')
             .map(|(_, c)| c.to_string())
             .unwrap_or_default();
         let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-        // fields[0] = state; utime is stat field 14, stime 15 -> indices 11 and 12 here.
         let utime: u64 = fields.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
         let stime: u64 = fields.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
         out.push((tid, comm, utime + stime));

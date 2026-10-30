@@ -14,8 +14,6 @@ import { cn } from "@/lib/utils";
 import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
 
-// How long the "Preparing Git Repository" clone animation plays before the view
-// transitions to the live build logs (the build itself runs async on the node).
 const PREPARING_MS = 2800;
 const GIT_SCOPE = "openedge";
 
@@ -38,31 +36,36 @@ interface GhDetail {
   live?: boolean;
 }
 
-interface Template {
+interface TemplateBase {
   name: string;
   desc: string;
-  tag: string; // framework label for the monogram fallback
+  tag: string;
   color: string;
-  icon?: string; // real logo path (in /public/frameworks)
-  // Git-clone template: repo URL (+ optional monorepo subdir/branch). Exactly
-  // one of `repo` or `image` is set per entry — never both.
-  repo?: string;
+  icon?: string;
+}
+
+interface GitTemplate extends TemplateBase {
+  repo: string;
   root?: string;
   branch?: string;
-  // Pre-built container-image template — skips clone + build entirely (the
-  // `/v1/deploy/image` path). `port`/`protocol`/`env`/`memory` seed the
-  // configure screen so a game server or database needs no manual port
-  // entry, while staying fully editable there (real port-mapping support,
-  // not a fixed/hidden value).
-  image?: string;
+  image?: undefined;
+}
+
+interface ImageTemplate extends TemplateBase {
+  image: string;
   port?: number;
   protocol?: string;
   env?: Record<string, string>;
   memory?: string;
+  repo?: undefined;
 }
 
-// Vercel-style starters: official `vercel/vercel` examples (built from the
-// monorepo subdir) plus a few standalone static templates.
+type Template = GitTemplate | ImageTemplate;
+
+function isImageTemplate(t: Template): t is ImageTemplate {
+  return !!t.image;
+}
+
 const TEMPLATES: Template[] = [
   { name: "Next.js Boilerplate", desc: "Get started with Next.js and React in seconds.", repo: "https://github.com/vercel/vercel", root: "examples/nextjs", tag: "N", color: "#000", icon: "/frameworks/nextjs.png" },
   { name: "Vite + React", desc: "A lightning-fast Vite SPA, deployed to the edge.", repo: "https://github.com/vercel/vercel", root: "examples/vite", tag: "V", color: "#646cff", icon: "/frameworks/vite.png" },
@@ -77,19 +80,9 @@ const TEMPLATES: Template[] = [
   { name: "Node.js", desc: "A minimal Node.js server, deployed to Fluid compute.", repo: "https://github.com/vercel/vercel", root: "examples/node", tag: "No", color: "#539e43", icon: "/frameworks/node.png" },
   { name: "Bun", desc: "Incredibly fast all-in-one JavaScript runtime.", repo: "https://github.com/oven-sh/bun", root: "examples/bun-http", tag: "Bu", color: "#fbf0df", icon: "/frameworks/bun.png" },
   { name: "Deno", desc: "Secure runtime for JavaScript and TypeScript.", repo: "https://github.com/denoland/examples", root: "http-server", tag: "De", color: "#000", icon: "/frameworks/deno.png" },
-  // `worker-typescript-template` no longer exists upstream (the repo renamed
-  // its examples to `<name>-template`); pointing at it failed every deploy
-  // with "root directory was not found in the repository". Verified against
-  // the live repo's contents: worker-publisher-template is a real Worker
-  // template (src/index.ts + wrangler.jsonc).
   { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-publisher-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
   { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26", icon: "/frameworks/html5.png" },
   { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
-  // Pre-built image, not a git clone — see `examples/minecraft-server/` in
-  // this repo for the equivalent compose.yaml and the raw-TCP/`/tcp`-suffix
-  // explanation. Real Java Edition server (itzg/minecraft-server), a
-  // world-standard, actively-maintained public image — EULA=TRUE is
-  // Mojang's own required acceptance flag, not a platform invention.
   { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
 ];
 
@@ -102,7 +95,7 @@ function ownerRepo(url: string) {
 
 /** Wrap an imported repo as a Template so it flows through the same configure
  *  screen — letting the user assign a project name before deploying. */
-function repoToTemplate(r: GhRepo): Template {
+function repoToTemplate(r: GhRepo): GitTemplate {
   return {
     name: r.name,
     desc: r.full_name,
@@ -130,43 +123,23 @@ function Monogram({ t, className = "h-10 w-10" }: { t: Template; className?: str
 
 export default function NewProjectPage() {
   const router = useRouter();
-  // Single unified source input: accepts a Git repository URL OR a container image
-  // / registry reference (auto-detected on submit).
   const [url, setUrl] = useState("");
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
-  // Collapsible options for the unified source card: env vars + optional project
-  // name + optional container port (port applies only to a container-image source).
   const [urlEnvOpen, setUrlEnvOpen] = useState(false);
   const [urlEnvRows, setUrlEnvRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
   const [name, setName] = useState("");
   const [port, setPort] = useState("");
-  // Protocol override + resource overrides (container-image source only) — the
-  // backend's ImageDeployReq accepts these as independent optional overrides;
-  // "" means "let the backend auto-detect / use its default". A raw-protocol
-  // image (Postgres, Minecraft, …) needs `protocol` set explicitly since
-  // auto-detection assumes HTTP, and a UDP-only image (e.g. Minecraft Bedrock,
-  // 19132/udp) has no TCP port for auto-detection to find at all.
   const [protocol, setProtocol] = useState("");
   const [memory, setMemory] = useState("");
   const [cpus, setCpus] = useState("");
-  // Extra ports beyond the primary (image source only) — a service that needs
-  // more than one raw port (e.g. a game server's play + query/RCON ports).
-  // Sent as the full `ports` list (primary + extras) only when at least one
-  // extra row is filled in; otherwise the request stays exactly as it was
-  // (plain port/protocol), matching the backend's replace-only-when-non-empty
-  // semantics for ImageDeployReq.ports.
   const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>([]);
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
-  // A reconnect / org-approval prompt shown above the repo list: a dead-but-ACTIVE
-  // token, a connection lacking read:org, or an org restricting the OAuth app.
   const [ghCta, setGhCta] = useState<{ text: string; approveUrl?: string } | null>(null);
   const [repoQ, setRepoQ] = useState("");
   const [selected, setSelected] = useState<Template | null>(null);
   const [tplPage, setTplPage] = useState(0);
-  // Set once Create succeeds: drives the "Preparing Git Repository" animation
-  // shown between Create and the build-logs view.
   const [preparing, setPreparing] = useState<{ template: Template | null; team: string; src: string; dest: string } | null>(null);
 
   const TPL_PER = 5;
@@ -176,22 +149,16 @@ export default function NewProjectPage() {
   useEffect(() => {
     cachedJson<GhDetail>("/api/github/status", 30_000).then(async (s) => {
       setGh({ ...s, configured: !!s.configured, connected: !!s.connected });
-      // Dead-but-ACTIVE token (ACTIVE in Composio but revoked on GitHub): scopes are
-      // known yet the connection isn't live → prompt a reconnect, not a false green.
       if (s.configured && !s.connected && (s.scopes?.length ?? 0) > 0) {
         setGhCta({ text: "Your GitHub authorization is no longer valid. Reconnect to import your repositories." });
         return;
       }
       if (!s.connected) return;
-      // Personal repos (cached 5 min so re-opening "New Project" is instant).
       const personal = await cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000)
         .then((d) => d.repos || [])
         .catch(() => [] as GhRepo[]);
       const merged: GhRepo[] = [...personal];
       const seen = new Set(personal.map((r) => r.full_name));
-      // Only merge org repos when we can enumerate them (read:org). Absent scope is
-      // NOT nagged here — private-repo import already works; org access is offered in
-      // Integrations / the GitOps modal instead (non-disruptive per edge policy).
       if (s.hasOrgScope) {
         const orgs = await cachedJson<{ orgs: { login: string }[] }>("/api/github/orgs", 5 * 60_000)
           .then((d) => d.orgs || [])
@@ -205,8 +172,6 @@ export default function NewProjectPage() {
         );
         let restrictedCta: { text: string; approveUrl?: string } | null = null;
         for (const res of results) {
-          // Surface the FIRST restricting org's approval link (only an org actually
-          // blocking the app warrants a CTA — a live, working connection stays quiet).
           if (res?.restricted && res?.approve_url && !restrictedCta) {
             restrictedCta = { text: "An organization restricts OpenEdge. Approve the app to import its repositories.", approveUrl: res.approve_url };
           }
@@ -220,13 +185,11 @@ export default function NewProjectPage() {
     }).catch(() => {});
   }, []);
 
-  // Build the env map for the quick git-URL deploy from its editor rows.
   function urlEnv(): Record<string, string> {
     const out: Record<string, string> = {};
     for (const r of urlEnvRows) if (r.k.trim()) out[r.k.trim()] = r.v;
     return out;
   }
-  // Paste a `.env` blob into a KEY field → expand into rows.
   function onUrlEnvPaste(e: React.ClipboardEvent, idx: number) {
     const text = e.clipboardData.getData("text");
     if (!text.includes("\n") && !text.includes("=")) return;
@@ -244,8 +207,6 @@ export default function NewProjectPage() {
     setDeploying(true);
     setError("");
     try {
-      // Via the server route so a PRIVATE github repo gets the user's GitHub token
-      // attached server-side (never in the browser) for the clone.
       const res = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url: repoUrl,
         branch,
@@ -254,20 +215,9 @@ export default function NewProjectPage() {
         creator: "you",
         env: env && Object.keys(env).length ? env : undefined,
       });
-      // Show the "Preparing Git Repository" clone animation, then transition to
-      // the live build logs. The build is already running async on the node.
       const src = ownerRepo(repoUrl) + (root ? `/${root}` : "");
       const fallbackName = slug(template?.name || ownerRepo(repoUrl).split("/").pop() || "project");
       const dest = `${GIT_SCOPE}/${project || fallbackName}`;
-      // Install a real GitHub webhook (push + pull_request) on the source repo so
-      // future pushes auto-deploy and PRs / non-prod branches get PREVIEW deploys
-      // (falls back to an Actions workflow; no-ops if GitHub isn't connected).
-      // Previously fire-and-forget: a project imported without a completed GitHub
-      // OAuth connection silently got neither installed, so no future push ever
-      // auto-deployed, with zero visible error anywhere. Now the outcome is
-      // awaited and persisted so the dashboard can surface the gap + offer a
-      // retry — this call must not block navigation to the build logs, so it
-      // runs but is never awaited before the redirect below.
       fetch("/api/gitops/project-ci", {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -278,9 +228,6 @@ export default function NewProjectPage() {
           apiSend("PUT", `/v1/projects/${project || fallbackName}/git-ci`, {
             webhook_installed: !!j.webhookInstalled,
             workflow_installed: !!j.workflowInstalled,
-            // Loud failures (502 {ok:false,error}) are recorded verbatim so the
-            // git-settings CI card shows the REAL reason, not a blank "not
-            // configured" — a silent no-op here is how pushes stop deploying.
             skipped_reason: j.skipped
               ? j.reason || "unknown"
               : j.webhookInstalled || j.workflowInstalled
@@ -297,8 +244,6 @@ export default function NewProjectPage() {
             checked_ms: 0,
           }).catch(() => {}),
         );
-      // Persist the in-flight build so it shows as "Building" in the deployments
-      // lists if the user navigates there before the build finishes.
       addPendingBuild({ id: res.build_id, project: project || fallbackName, team: currentTeam(), env: "production" });
       setPreparing({ template: template ?? null, team: currentTeam(), src, dest });
       setTimeout(() => router.push(`/deploy/${res.build_id}`), PREPARING_MS);
@@ -308,10 +253,7 @@ export default function NewProjectPage() {
     }
   }
 
-  // Classify the unified source input. It's a CONTAINER IMAGE / registry reference
-  // UNLESS it clearly looks like a git URL (a scheme, a known git host, or `.git`).
-  // So `fruitbox12/simplifi:latest`, `quay.io/org/img:tag`, `nginx`, `docker.io/...`
-  // are images; `https://github.com/owner/repo(.git)`, `git@…`, `ssh://…` are git.
+  /** A source is a container image reference unless it clearly looks like a git URL (a scheme, a known git host, or `.git`). */
   function isImageRef(s: string): boolean {
     const v = s.trim();
     if (!v) return false;
@@ -322,11 +264,6 @@ export default function NewProjectPage() {
     return true;
   }
 
-  // Unified submit for the source card. Routes a git URL through the git build
-  // pipeline (clone → build → deploy), or a container image ref through the
-  // registry-image pipeline (CREATE PROJECT → build (pull the image) → DEPLOY) —
-  // a first-class deployment, NOT a bare container run. Both land on the same
-  // build-logs flow.
   async function submit() {
     const v = url.trim();
     if (!v || deploying) return;
@@ -337,14 +274,8 @@ export default function NewProjectPage() {
     }
   }
 
-  // Create a project + build + deployment FROM a registry image. The backend
-  // (/v1/deploy/image → start_named_deploy) creates the project, runs a build that
-  // pulls the image + auto-detects the port (or uses the override) + attaches a
-  // persistent ≥1 GB volume + injects env, and registers a real deployment.
-  // Shared core: both the unified source bar's free-form image deploy AND an
-  // image-based template's configure screen (Minecraft, etc.) POST through
-  // here — one place that actually calls /v1/deploy/image, so the two entry
-  // points can never drift on what fields they send.
+  /** Creates a project + build + deployment from a registry image (`/v1/deploy/image`): the ONE caller shared by the free-form
+   *  image deploy and an image template's configure screen, so the two entry points cannot drift on the fields they send. */
   async function runImageDeploy(opts: {
     image: string;
     project?: string;
@@ -414,8 +345,6 @@ export default function NewProjectPage() {
     else setError(d.error || "Could not start GitHub connection");
   }
 
-  // Drop the current connection then re-run OAuth so re-consent grants the current
-  // scopes (fixes a dead token, or grants read:org for organization repos).
   async function reconnectGithub() {
     await fetch("/api/github/disconnect", { method: "POST" }).catch(() => {});
     await connectGithub();
@@ -423,23 +352,21 @@ export default function NewProjectPage() {
 
   const filteredRepos = repos.filter((r) => r.full_name.toLowerCase().includes(repoQ.toLowerCase()));
 
-  // ----- Preparing Git Repository (after Create, before build logs) -----
   if (preparing) {
     return <PreparingDeployment template={preparing.template} team={preparing.team} src={preparing.src} dest={preparing.dest} />;
   }
 
-  // ----- Configure screen (after a template is selected) -----
   if (selected) {
-    return selected.image ? (
+    return isImageTemplate(selected) ? (
       <ConfigureImageTemplate
         template={selected}
         onBack={() => setSelected(null)}
-        onCreate={(opts) => runImageDeploy({ ...opts, image: selected.image!, template: selected })}
+        onCreate={(opts) => runImageDeploy({ ...opts, image: selected.image, template: selected })}
         deploying={deploying}
         error={error}
       />
     ) : (
-      <ConfigureTemplate template={selected as Template & { repo: string }} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo!, selected.branch, name, selected.root, env, selected)} deploying={deploying} error={error} />
+      <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo, selected.branch, name, selected.root, env, selected)} deploying={deploying} error={error} />
     );
   }
 
@@ -450,9 +377,6 @@ export default function NewProjectPage() {
       </Link>
       <h1 className="mb-6 text-2xl sm:text-3xl font-semibold tracking-tight">Let&apos;s build something new</h1>
 
-      {/* Unified source bar — a Git repository URL OR a container image / registry
-          reference. The source type is auto-detected on submit and routed to the
-          matching build → deploy pipeline. */}
       <Card className="mb-2 p-2">
         <div className="flex items-center gap-2">
           <Input
@@ -471,7 +395,6 @@ export default function NewProjectPage() {
             Detected source: <span className="font-medium text-secondary">{isImageRef(url) ? "container image (build → deploy from registry)" : "Git repository (clone → build → deploy)"}</span>
           </p>
         ) : null}
-        {/* Options: env vars + optional project name + optional container port. */}
         <button
           type="button"
           onClick={() => setUrlEnvOpen((o) => !o)}
@@ -486,12 +409,6 @@ export default function NewProjectPage() {
               <Input className="flex-1 text-xs" placeholder="Project name (optional — derived from the source)"
                 value={name} onChange={(e) => setName(e.target.value)} />
             </div>
-            {/* Container port + protocol (image source only) — a raw-protocol
-                service (Postgres, Minecraft, …) has no Host header to route on
-                and gets its OWN public port instead of the shared HTTP
-                gateway; `protocol` also needs an explicit override for a
-                UDP-only image (e.g. Minecraft Bedrock, 19132/udp — there's no
-                TCP port for auto-detection to find). */}
             <div className="flex items-center gap-2">
               <Input className="w-32 text-xs" placeholder="Port (image only)"
                 value={port} onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))} />
@@ -523,8 +440,6 @@ export default function NewProjectPage() {
                 string expects.
               </p>
             ) : null}
-            {/* Extra ports beyond the primary — a service that needs more than
-                one (e.g. a game server's play + query/RCON ports). */}
             {extraPorts.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
                 <Input className="w-32 text-xs" placeholder="Extra port"
@@ -585,13 +500,11 @@ export default function NewProjectPage() {
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
-        {/* Import Git Repository */}
         <div>
           <h2 className="mb-4 text-lg font-semibold">Import Git Repository</h2>
           <Card className="p-4">
             {gh.connected ? (
               <>
-                {/* Non-blocking org/reconnect prompt (personal + known-org repos still work). */}
                 {ghCta ? (
                   <div className="mb-3 flex flex-col gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
                     <span className="flex items-start gap-1.5"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {ghCta.text}</span>
@@ -649,7 +562,6 @@ export default function NewProjectPage() {
           </Card>
         </div>
 
-        {/* Clone Template */}
         <div>
           <div className="mb-4 flex items-center justify-between">
             <h2 className="text-lg font-semibold">Clone Template</h2>
@@ -688,7 +600,6 @@ export default function NewProjectPage() {
         </div>
       </div>
 
-      {/* Deployment progress placeholder */}
       <Card className="mt-8 overflow-hidden p-6 sm:p-8">
         <h2 className="text-2xl font-semibold tracking-tight">Deployment</h2>
         <p className="mt-1.5 text-sm text-secondary">
@@ -710,23 +621,19 @@ function ConfigureTemplate({
   deploying,
   error,
 }: {
-  // A git-clone template always has `repo` — only ConfigureImageTemplate
-  // (routed by `selected.image` at the call site) handles an image template.
-  template: Template & { repo: string };
+  template: GitTemplate;
   onBack: () => void;
   onCreate: (projectName: string, env: Record<string, string>) => void;
   deploying: boolean;
   error: string;
 }) {
   const [repoName, setRepoName] = useState(slug(template.name));
-  // Environment variables to inject into the build + runtime (collapsible).
   const [envOpen, setEnvOpen] = useState(false);
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
   const setEnvAt = (i: number, patch: Partial<{ key: string; value: string }>) =>
     setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
   const addEnvRow = () => setEnvVars((rows) => [...rows, { key: "", value: "" }]);
   const removeEnvRow = (i: number) => setEnvVars((rows) => (rows.length <= 1 ? [{ key: "", value: "" }] : rows.filter((_, j) => j !== i)));
-  // Paste a `.env` blob: split KEY=VALUE lines into rows.
   const pasteDotenv = (text: string) => {
     const parsed = text
       .split("\n")
@@ -750,9 +657,6 @@ function ConfigureTemplate({
     }
     return out;
   };
-  // Default the Team field to the team/org the user is CURRENTLY viewing (the
-  // navbar breadcrumb selection) instead of always "personal", and keep it in
-  // sync if they switch the active team while this screen is open.
   const [team, setTeam] = useState<string>(() => currentTeam());
   useEffect(() => {
     const sync = () => setTeam(currentTeam());
@@ -770,7 +674,6 @@ function ConfigureTemplate({
       <Card className="p-6 sm:p-8">
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">New Project</h1>
 
-        {/* Template summary */}
         <div className="mb-6 flex items-start gap-4 rounded-xl border border-border bg-subtle/40 p-4">
           <Monogram t={template} />
           <div className="min-w-0 flex-1">
@@ -819,7 +722,6 @@ function ConfigureTemplate({
           <p className="mt-1 text-xs text-muted">The project is created under this team — matches your current view.</p>
         </div>
 
-        {/* Environment Variables (collapsible) — injected into the build & runtime. */}
         <div className="mb-6 rounded-md border border-border">
           <button
             type="button"
@@ -890,14 +792,6 @@ function ConfigureTemplate({
 
         <Button
           onClick={async () => {
-            // Scope the new project to the chosen team. MUST go through
-            // switchTeam (re-mints the hive_jwt cookie and awaits it) rather
-            // than a raw localStorage.setItem — the backend derives the tenant
-            // SOLELY from the cookie under JWT enforcement, so creating the
-            // project before the cookie catches up landed it under whichever
-            // tenant the browser's PREVIOUS cookie still claimed, while the
-            // view believed it was already on the new team (the personal/org
-            // project-list leak).
             if (typeof window !== "undefined") {
               await switchTeam(team === "personal" ? "__personal__" : team);
             }
@@ -917,12 +811,6 @@ function ConfigureTemplate({
   );
 }
 
-/** Configure screen for a pre-built container-image template (Minecraft,
- *  etc.) — the git-clone `ConfigureTemplate` above doesn't fit: there's no
- *  repo/branch to show, and the real per-template surface this needs is
- *  port + protocol + extra ports (RCON, a query port, …) + env, all
- *  pre-filled from the template but fully editable — real port mapping,
- *  not a hidden fixed value. */
 function ConfigureImageTemplate({
   template,
   onBack,
@@ -930,7 +818,7 @@ function ConfigureImageTemplate({
   deploying,
   error,
 }: {
-  template: Template;
+  template: ImageTemplate;
   onBack: () => void;
   onCreate: (opts: {
     project?: string;
@@ -999,11 +887,6 @@ function ConfigureImageTemplate({
           </div>
         </div>
 
-        {/* Port mapping — the container port + protocol this template's
-            primary service listens on. A raw TCP/UDP protocol gets its own
-            dedicated public port allocated at deploy time (shown on the
-            deployment page); HTTP-family protocols ride the shared
-            gateway instead. */}
         <div className="mb-5">
           <label className="mb-1.5 block text-sm text-secondary">Port mapping</label>
           <div className="flex items-center gap-2">
@@ -1059,8 +942,6 @@ function ConfigureImageTemplate({
           </button>
         </div>
 
-        {/* Environment Variables — pre-filled from the template (e.g. this
-            image's required EULA=TRUE) but fully editable/removable. */}
         <div className="mb-6">
           <label className="mb-1.5 flex items-center gap-2 text-sm text-secondary">
             <KeyRound className="h-4 w-4 text-muted" /> Environment Variables

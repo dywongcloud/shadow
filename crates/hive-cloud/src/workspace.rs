@@ -28,10 +28,9 @@ const PRUNED_DIRS: &[&str] = &[
 #[derive(Clone)]
 enum Segment {
     Literal(String),
-    /// A segment containing `*` and/or `?` alongside literal text (e.g.
-    /// `*-template`). Package managers allow these — pnpm's own
-    /// `cloudflare/templates` declares `./*-template` — and rejecting them
-    /// failed the whole build with BUILD_CONTRACT_INVALID_METADATA for a
+    /// A segment containing `*` and/or `?` alongside literal text (for example `*-template`).
+    /// Package managers allow these (pnpm's own `cloudflare/templates` declares `./*-template`),
+    /// and rejecting them failed the whole build with `BUILD_CONTRACT_INVALID_METADATA` for a
     /// repository that is otherwise perfectly deployable.
     Glob(String),
     One,
@@ -327,10 +326,6 @@ fn parse_pattern(raw: &str) -> anyhow::Result<Pattern> {
         } else if value == "**" {
             segments.push(Segment::Many);
         } else {
-            // Bracket/brace expansions stay unsupported: they are a different
-            // grammar (character classes, alternation) and silently guessing at
-            // them would be worse than refusing. `*` and `?` WITHIN a segment
-            // are now supported (see `Segment::Glob`).
             anyhow::ensure!(
                 !value.contains(['[', ']', '{', '}']),
                 "workspace pattern {:?} uses bracket or brace expansion; supported wildcards \
@@ -394,9 +389,6 @@ async fn expand(
                 Segment::One => {
                     next.extend(child_dirs(root, &path, pattern, visited_entries).await?);
                 }
-                // A partial-segment glob enumerates this directory's children
-                // and keeps the ones the pattern matches -- the same expansion
-                // `Segment::One` does, narrowed by name.
                 Segment::Glob(glob) => {
                     for candidate in child_dirs(root, &path, pattern, visited_entries).await? {
                         let Some(name) = candidate.file_name().and_then(|n| n.to_str()) else {
@@ -571,21 +563,20 @@ fn pattern_matches(pattern: &Pattern, path: &Path) -> anyhow::Result<bool> {
     Ok(matches[0][0])
 }
 
-/// Match ONE path segment against a pattern that mixes literal text with `*`
-/// and `?`. `*` matches any run of characters (including none) within the
-/// segment; `?` matches exactly one character. Nothing here crosses a `/`, so a
-/// pattern can never match more path depth than the caller gave it — that is
-/// what keeps this a safe widening rather than a directory-traversal risk.
+/// Matches ONE path segment against a pattern that mixes literal text with `*` and `?`. `*` matches
+/// any run of characters (including none) within the segment; `?` matches exactly one character.
+/// Nothing here crosses a `/`, so a pattern can never match more path depth than the caller gave
+/// it: that is what keeps this a safe widening rather than a directory-traversal risk.
 ///
-/// Deliberately not a full glob: `[`, `]`, `{` and `}` are rejected at parse
-/// time (see `parse_pattern`), so no character-class or alternation grammar has
-/// to be interpreted here.
+/// Deliberately not a full glob: `[`, `]`, `{` and `}` are rejected at parse time (see
+/// `parse_pattern`; they are a different grammar, character classes and alternation, and silently
+/// guessing at them would be worse than refusing), so none has to be interpreted here. The match is
+/// the classic two-pointer wildcard algorithm: linear in the value, and the only backtracking is
+/// the single star position, so long directory names cannot blow up; trailing stars consume
+/// nothing.
 fn glob_segment_matches(pattern: &str, value: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let value: Vec<char> = value.chars().collect();
-    // Classic two-pointer wildcard match: linear in the value, and the only
-    // backtracking is the single star position, so no pathological blowup on
-    // long directory names.
     let (mut p, mut v, mut star, mut star_v) = (0usize, 0usize, None::<usize>, 0usize);
     while v < value.len() {
         match pattern.get(p) {
@@ -612,7 +603,6 @@ fn glob_segment_matches(pattern: &str, value: &str) -> bool {
             },
         }
     }
-    // Trailing stars consume nothing.
     pattern[p..].iter().all(|c| *c == '*')
 }
 

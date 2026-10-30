@@ -22,10 +22,8 @@ const baseSections = [
   { slug: "team", label: "Team & Privacy" },
 ];
 
-/** A function's `browser_ineligible` reason names "container" only for the
- *  `runtime: "container"` case (see git.rs's build pipeline) — the list
- *  endpoint carries no cleaner boolean, so this is the signal the dashboard
- *  already has on hand without an extra request. */
+/** A container-runtime deployment is recognised from its `browser_ineligible` reasons ("runs as container: ...", git.rs): the deployment list carries no cleaner boolean,
+ *  and this needs no extra request. */
 function isContainerDeployment(dep: Deployment | null | undefined): boolean {
   return !!dep?.browser_ineligible?.some((b) => b.reason.includes("container"));
 }
@@ -42,9 +40,6 @@ export function SettingsLayout(props: {
   const name = decodeURIComponent(params.project);
   const base = `/projects/${encodeURIComponent(name)}/settings`;
 
-  // Only meaningful for a container-runtime project — a function/serverless
-  // project has no image, no volume, no port/protocol ceiling to configure
-  // here (that's already Functions + Network's job).
   const { data: deps } = usePoll<Deployment[]>("/deployments", 10000);
   const mine = (deps ?? []).filter((d) => d.project === name);
   const dep = mine.find((d) => d.production) ?? mine.sort((a, b) => b.created_at_ms - a.created_at_ms)[0] ?? null;
@@ -61,8 +56,6 @@ export function SettingsLayout(props: {
           <h1 className="text-xl font-semibold">{name}</h1>
         </div>
       </div>
-      {/* Project sub-tabs now live in the top nav (breadcrumb-tabs model) with
-          Settings active; the settings-section list below is the inner nav. */}
       <div className="grid grid-cols-1 gap-8 md:grid-cols-[200px_1fr]">
         <nav className="flex flex-row gap-1 overflow-x-auto md:flex-col">
           {sections.map((s) => {

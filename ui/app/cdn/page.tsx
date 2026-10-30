@@ -16,13 +16,8 @@ interface Routing {
 }
 interface Cdn { hits: number; misses: number; stale: number; entries: number; hit_ratio: number }
 
-/** CDN routing/redirect/purge endpoints mutate the GLOBAL edge tables (every
- *  hostname of every tenant) and are platform-operator-only on the backend.
- *  Anyone else used to reach the create forms and eat a raw 403 ("platform-level
- *  change requires a platform operator"). Gate the whole page on the
- *  backend-derived session claim instead: `false` = definitely not an operator
- *  (show the boundary honestly), `null` = unknown (render normally; the backend
- *  still enforces). */
+/** The CDN routing/redirect/purge endpoints mutate the GLOBAL edge tables (every hostname of every tenant) and are platform-operator-only on the backend, so the page gates on
+ *  `usePlatformAdmin()`: `false` = definitely not an operator (the boundary is shown), `null` = unknown (render normally, the backend still enforces). */
 export default function CdnPage() {
   const platformAdmin = usePlatformAdmin();
   if (platformAdmin === false) {
@@ -50,7 +45,6 @@ export default function CdnPage() {
   );
 }
 
-/* ----------------------------- Routing Rules ----------------------------- */
 function RoutingSection() {
   const { data, refresh } = usePoll<Routing>("/v1/routing", 4000);
   const [q, setQ] = useState("");
@@ -100,7 +94,6 @@ function RoutingSection() {
   );
 }
 
-/* ------------------------------- Redirects ------------------------------- */
 function RedirectsSection() {
   const { data, refresh } = usePoll<Routing>("/v1/routing", 4000);
   const [q, setQ] = useState("");
@@ -173,7 +166,6 @@ function CreateRedirect({ onClose, onCreated }: { onClose: () => void; onCreated
   );
 }
 
-/* -------------------------------- Caches --------------------------------- */
 type Scope = "tag" | "image" | "all" | "";
 function CachesSection() {
   const { data: cdn, refresh } = usePoll<Cdn>("/v1/cdn", 4000);
@@ -210,7 +202,6 @@ function CachesSection() {
   );
 }
 
-/* ------------------------------- helpers --------------------------------- */
 function SectionHead({ title, desc, count, action }: { title: string; desc: string; count?: string; action?: React.ReactNode }) {
   return (
     <div className="mb-4 flex items-end justify-between gap-3">

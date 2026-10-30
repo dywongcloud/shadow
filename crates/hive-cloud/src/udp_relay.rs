@@ -1,53 +1,41 @@
-//! Public UDP relay — datagram ingress for UDP container deployments
-//! (Minecraft Bedrock `19132/udp`, game servers, DNS, any raw-UDP service).
+//! Public UDP relay: datagram ingress for UDP container deployments (Minecraft Bedrock `19132/udp`,
+//! game servers, DNS, any raw-UDP service).
 //!
-//! The edge entry layer for the UDP half of the raw-port space: every node
-//! binds a public UDP socket on each allocated UDP `public_port`
-//! (`raw_ports.rs` allocations, learned node-locally from the gateway's
-//! deployment records and fleet-wide from the gossiped
-//! `DeploymentInfo::raw_ports` bindings) and relays datagrams to the
-//! deployment's container.
+//! The edge entry layer for the UDP half of the raw-port space: every node binds a public UDP
+//! socket on each allocated UDP `public_port` (`raw_ports.rs` allocations, learned node-locally
+//! from the gateway's deployment records and fleet-wide from the gossiped
+//! `DeploymentInfo::raw_ports` bindings) and relays datagrams to the deployment's container. UDP is
+//! CONNECTIONLESS, with no accept/close to hang a splice on, so `tokio::io::copy_bidirectional`
+//! (the TCP splice of `raw_proxy.rs`, `db_gateway.rs` and `edge::ws_proxy`) does not apply: this
+//! module is UDP's own mechanism.
 //!
-//! UDP is CONNECTIONLESS — there is no accept/close to hang a splice on, so
-//! `tokio::io::copy_bidirectional` (the TCP-splice mechanism `db_gateway.rs`
-//! and `edge::ws_proxy` use) does not apply. This module is UDP's own
-//! mechanism, deliberately separate from the TCP raw-port splice path:
+//! * **NAT-style session table**: the first datagram from a `(src_ip, src_port)` client creates a
+//!   session owning one upstream leg; the table maps the client to that leg so REPLY datagrams
+//!   route back to the right client via the shared public socket (`send_to(client)`), exactly like
+//!   a home router's UDP NAT.
+//! * **Upstream leg**, resolved once per session. **Local** (this node serves the deployment) is a
+//!   connected loopback UDP socket at the container's published `/udp` host port, resolved through
+//!   [`crate::mesh_raw::resolve`] (the SAME path the owner side of a mesh stream uses, so a locally
+//!   hit port and a mesh-hit port behave identically, including cold-starting a scaled-to-zero
+//!   service via `Fluid::lease`, whose lease rides as the session guard). **Mesh** (a peer owns it)
+//!   is `PeerPool::open_raw_to_port` with `proto: udp`: the mesh transport is stream-oriented (an
+//!   iroh QUIC bi stream), so datagrams are framed one `[u32 len][payload]` frame per datagram
+//!   (`hive_p2p::write_raw_datagram`/`read_raw_datagram`, byte-identical to the owner-side pump in
+//!   `hive_p2p::serve_raw_target`), preserving datagram boundaries end to end, and closing the mesh
+//!   stream is the end-of-session signal to the owner.
+//! * **Idle eviction**: UDP has no FIN, so a session table without eviction is an unbounded memory
+//!   (and upstream-socket/mesh-stream) leak. Every session tracks last activity in EITHER direction
+//!   and self-evicts after `HIVE_UDP_IDLE_SECS` (default 60 s) of silence, removing its own table
+//!   entry (generation-guarded, so an old session can never remove its replacement); a later
+//!   datagram from the same client simply creates a fresh session. `HIVE_UDP_MAX_SESSIONS` (default
+//!   4096 per port) bounds the table against spoofed-source floods: at the cap, datagrams from NEW
+//!   clients are dropped while existing sessions keep serving.
 //!
-//! * **NAT-style session table** — the first datagram from a `(src_ip,
-//!   src_port)` client creates a session owning one upstream leg; the table
-//!   maps the client to that leg so REPLY datagrams route back to the right
-//!   client via the shared public socket (`send_to(client)`), exactly like a
-//!   home router's UDP NAT.
-//! * **Upstream leg** — resolved once per session:
-//!   - **Local** (this node serves the deployment): a connected loopback UDP
-//!     socket at the container's published `/udp` host port, resolved through
-//!     [`crate::mesh_raw::resolve`] — the SAME path the owner side of a mesh
-//!     stream uses, so a locally-hit port and a mesh-hit port behave
-//!     identically (including cold-starting a scaled-to-zero service via
-//!     `Fluid::lease`, whose lease rides as the session guard).
-//!   - **Mesh** (a peer owns it): `PeerPool::open_raw_to_port` with `proto:
-//!     udp` — the mesh transport is stream-oriented (an iroh QUIC bi stream),
-//!     so datagrams are framed one `[u32 len][payload]` frame per datagram
-//!     (`hive_p2p::write_raw_datagram`/`read_raw_datagram`, byte-identical to
-//!     the owner-side pump in `hive_p2p::serve_raw_target`), preserving
-//!     datagram boundaries end-to-end. Closing the mesh stream is the
-//!     end-of-session signal to the owner.
-//! * **Idle eviction** — UDP has no FIN: a session table without eviction is
-//!   an unbounded memory (and upstream-socket/mesh-stream) leak. Every session
-//!   tracks last activity in EITHER direction and self-evicts after
-//!   `HIVE_UDP_IDLE_SECS` (default 60s) of silence, removing its own table
-//!   entry (generation-guarded so an old session can never remove its
-//!   replacement). A later datagram from the same client simply creates a
-//!   fresh session. `HIVE_UDP_MAX_SESSIONS` (default 4096 per port) bounds the
-//!   table against spoofed-source floods — at the cap, datagrams from NEW
-//!   clients are dropped (existing sessions keep serving).
-//!
-//! Owner-side counterpart: `mesh_raw::resolve`'s `RawProto::Udp` arm (the
-//! local leg) + `hive_p2p::serve_raw_target`'s UDP pump (the mesh accept
-//! side). The container publishes each declared UDP spec on its own loopback
-//! host port (`-p 127.0.0.1:<host_port>:<container_port>/udp`), chosen by
-//! `fluid_compute`'s cold start and surfaced per-instance via
-//! `Lease::udp_host_port`.
+//! Owner-side counterpart: `mesh_raw::resolve`'s `RawProto::Udp` arm (the local leg) and
+//! `hive_p2p::serve_raw_target`'s UDP pump (the mesh accept side). The container publishes each
+//! declared UDP spec on its own loopback host port (`-p
+//! 127.0.0.1:<host_port>:<container_port>/udp`), chosen by `fluid_compute`'s cold start and
+//! surfaced per instance via `Lease::udp_host_port`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -68,17 +56,17 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Idle-check granularity inside a session (the timeout itself is
 /// [`idle_timeout`]; this only bounds how late past it a session can linger).
 const SWEEP_TICK: Duration = Duration::from_secs(5);
-/// Client→upstream datagrams buffered per session while the upstream leg is
-/// still resolving (lease cold-start, mesh dial). A full queue drops datagrams
-/// — correct UDP semantics (loss, never backpressure on the shared listener).
+/// Client-to-upstream datagrams buffered per session while the upstream leg is still resolving
+/// (lease cold-start, mesh dial). A full queue drops datagrams: correct UDP semantics (loss, never
+/// backpressure on the shared listener).
 const SESSION_QUEUE: usize = 256;
 
 const MAX_IDLE_SECS: u64 = 24 * 60 * 60;
 static IDLE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
-/// Session idle timeout. Parse once because process environment is immutable,
-/// and clamp hostile/mistyped values so `Instant` deadline arithmetic cannot
-/// overflow into an immediate hot loop.
+/// Session idle timeout. Parsed once because the process environment is immutable, and clamped so a
+/// hostile or mistyped value cannot overflow `Instant` deadline arithmetic into an immediate hot
+/// loop.
 fn idle_timeout() -> Duration {
     *IDLE_TIMEOUT.get_or_init(|| {
         let configured = std::env::var("HIVE_UDP_IDLE_SECS")
@@ -98,9 +86,8 @@ fn idle_timeout() -> Duration {
     })
 }
 
-/// Per-port session-table ceiling (`HIVE_UDP_MAX_SESSIONS`, default 4096) — a
-/// spoofed-source datagram flood must not grow the table (and its upstream
-/// sockets/mesh streams) without bound.
+/// Per-port session-table ceiling (`HIVE_UDP_MAX_SESSIONS`, default 4096): a spoofed-source
+/// datagram flood must not grow the table (and its upstream sockets/mesh streams) without bound.
 fn max_sessions() -> usize {
     std::env::var("HIVE_UDP_MAX_SESSIONS")
         .ok()
@@ -109,9 +96,9 @@ fn max_sessions() -> usize {
         .unwrap_or(4096)
 }
 
-/// One public UDP port this node should be relaying, and where its datagrams
-/// go (the stable cross-node identity: project/function/container-port — host
-/// and public ports are derived from it on whichever node serves).
+/// One public UDP port this node should be relaying, and where its datagrams go (the stable
+/// cross-node identity: project/function/container-port; host and public ports are derived from it
+/// on whichever node serves).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct UdpRoute {
     public_port: u16,
@@ -133,9 +120,9 @@ struct RelayHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// A panic/cancellation of the detached manager must not detach every relay and
-/// lose their stop handles. Aborting them drops the bound sockets and each
-/// relay's `JoinSet`, which in turn aborts its sessions.
+/// A panic or cancellation of the detached manager must not detach every relay and lose their stop
+/// handles. Aborting them drops the bound sockets and each relay's `JoinSet`, which in turn aborts
+/// its sessions.
 struct RelayHandles(HashMap<u16, RelayHandle>);
 
 impl std::ops::Deref for RelayHandles {
@@ -163,10 +150,9 @@ impl Drop for RelayHandles {
     }
 }
 
-/// One live client session in a relay's NAT-style table: the channel into its
-/// session task, and a generation stamp so only the CURRENT session for a
-/// client address may remove/replace the entry (an evicted predecessor racing
-/// its own cleanup can never delete its successor).
+/// One live client session in a relay's NAT-style table: the channel into its session task, and a
+/// generation stamp so only the CURRENT session for a client address may remove or replace the
+/// entry (an evicted predecessor racing its own cleanup can never delete its successor).
 struct SessionHandle {
     tx: mpsc::Sender<Vec<u8>>,
     stop: watch::Sender<bool>,
@@ -174,9 +160,9 @@ struct SessionHandle {
     gen: u64,
 }
 
-/// Tokio detaches a `JoinHandle` on drop. Session cancellation or panic must
-/// instead cancel the non-cancel-safe mesh reader so it cannot retain the old
-/// public socket and stream behind a completed session task.
+/// Tokio detaches a `JoinHandle` on drop. Session cancellation or panic must instead cancel the
+/// non-cancel-safe mesh reader, so it cannot retain the old public socket and stream behind a
+/// completed session task.
 struct AbortOnDropTask<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDropTask<T> {
@@ -202,13 +188,11 @@ impl Drop for SessionRegistration {
     }
 }
 
-/// Start the UDP relay manager: reconciles the set of bound public UDP ports
-/// against the deployment records every [`RECONCILE_SECS`]. Supervised like
-/// every other periodic loop on the node: a panic in the reconcile body
-/// otherwise killed all UDP relaying silently until process restart — and
-/// `RelayHandles::drop` aborts every relay on unwind, which is exactly the
-/// fail-closed posture that makes a supervised respawn clean (adversarial
-/// finding).
+/// Starts the UDP relay manager: reconciles the set of bound public UDP ports against the
+/// deployment records every [`RECONCILE_SECS`]. Supervised like every other periodic loop on the
+/// node: a panic in the reconcile body would otherwise kill all UDP relaying silently until process
+/// restart, and `RelayHandles::drop` aborts every relay on unwind, the fail-closed posture that
+/// makes a supervised respawn clean.
 pub fn spawn(cloud: Arc<CloudState>) {
     crate::supervise::spawn_supervised("udp-relay", move || {
         let cloud = cloud.clone();
@@ -219,6 +203,9 @@ pub fn spawn(cloud: Arc<CloudState>) {
     });
 }
 
+/// The relay manager's reconcile loop. Teardown can consume the whole deadline, so the desired set
+/// is re-derived AFTER it and binding never uses the pre-teardown snapshot: the claim may have
+/// moved again while the old socket and sessions drained.
 async fn relay_manager(cloud: Arc<CloudState>) {
     let mut running = RelayHandles(HashMap::new());
     loop {
@@ -277,9 +264,6 @@ async fn relay_manager(cloud: Arc<CloudState>) {
             }
         }
 
-        // Teardown can consume the whole deadline. Never bind from the
-        // pre-teardown snapshot: the claim may have moved again while the
-        // old socket and sessions were draining.
         let desired = desired_routes(&cloud);
         for (port, route) in desired {
             if running.contains_key(&port) || blocked_ports.contains(&port) {
@@ -315,14 +299,13 @@ async fn relay_manager(cloud: Arc<CloudState>) {
     }
 }
 
-/// The desired `public_port → route` set. Sources, most-authoritative first
-/// (mirroring `raw_proxy::resolve_binding`): this node's own durable claim
-/// registry (the allocator node knows a claim before the record is Ready or
-/// has gossiped), then LOCAL Ready deployments' stamped bindings, then the
-/// gossiped fleet records (`DeploymentInfo::raw_ports`) — so every edge node
-/// binds every allocated UDP port, wherever the deployment actually runs.
-/// Bindings for one port are identical across sources by construction (the
-/// claim key is stable across redeploys); first source wins.
+/// The desired `public_port -> route` set. Sources, most-authoritative first (mirroring
+/// `raw_proxy::resolve_binding`): this node's own durable claim registry (the allocator node knows
+/// a claim before the record is Ready or has gossiped), then LOCAL Ready deployments' stamped
+/// bindings, then the gossiped fleet records (`DeploymentInfo::raw_ports`), so every edge node
+/// binds every allocated UDP port, wherever the deployment actually runs. Bindings for one port are
+/// identical across sources by construction (the claim key is stable across redeploys), so the
+/// first source wins.
 fn desired_routes(cloud: &Arc<CloudState>) -> HashMap<u16, UdpRoute> {
     let mut out: HashMap<u16, UdpRoute> = HashMap::new();
     for a in crate::raw_ports::udp_allocations() {
@@ -362,6 +345,11 @@ fn desired_routes(cloud: &Arc<CloudState>) -> HashMap<u16, UdpRoute> {
 
 /// One per-port relay: demux datagrams from an already-bound public socket into
 /// per-client sessions, and hold the session table the reply path routes by.
+/// A datagram from a known client goes to its session task: a `Closed` queue means the task already
+/// exited (idle-evicted, upstream failed), so the session is replaced, and `Full` is plain UDP
+/// loss. A panicking session can only abort its nested mesh reader from `Drop`, so teardown waits
+/// until that cancellation has released every socket clone before telling the manager that a
+/// replacement may bind.
 async fn run_relay(
     cloud: Arc<CloudState>,
     route: UdpRoute,
@@ -398,9 +386,6 @@ async fn run_relay(
                     }
                 };
                 let payload = buf[..n].to_vec();
-                // Existing session? Hand the datagram to its task. `Closed`
-                // means the task already exited (idle-evicted / upstream
-                // failed) — replace it; `Full` is plain UDP loss.
                 let existing = sessions.lock().get(&client).map(|session| {
                     (
                         session.tx.clone(),
@@ -436,7 +421,6 @@ async fn run_relay(
                     let (tx, rx) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
                     let (session_stop, stop_rx) = watch::channel(false);
                     let (activity, activity_rx) = watch::channel(tokio::time::Instant::now());
-                    // First datagram can never fail: the queue is fresh.
                     let _ = tx.try_send(payload);
                     sessions.lock().insert(
                         client,
@@ -475,9 +459,6 @@ async fn run_relay(
             tracing::warn!(port = route.public_port, error = %e, "udp relay: session teardown failed");
         }
     }
-    // A panicking session can only abort its nested mesh reader from Drop; wait
-    // until that cancellation has actually released every socket clone before
-    // telling the manager it is safe to bind a replacement.
     while Arc::strong_count(&sock) > 1 {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -552,29 +533,26 @@ async fn run_session(
     tracing::debug!(port = route.public_port, %client, "udp session closed");
 }
 
-/// Resolve where this session's datagrams go: the container lease owner when
-/// one exists (single-owner containers — never fall back elsewhere on failure,
-/// that would split-brain a stateful server), else locally, else any healthy
-/// peer whose gossiped records carry this binding.
+/// Resolves where this session's datagrams go: the container lease owner when one exists
+/// (single-owner containers: never fall back elsewhere on failure, that would split-brain a
+/// stateful server; the same rule as `edge_pipeline`'s container_owner for HTTP), else locally,
+/// else any healthy peer whose gossiped records carry this binding (a function-runtime UDP service,
+/// or a lease not yet established), ordered by the nearest-first rule the TCP raw proxy uses. The
+/// target's `deployment` stays empty: the owner resolves its CURRENT serving deployment.
 async fn open_upstream(cloud: &Arc<CloudState>, route: &UdpRoute) -> Option<Upstream> {
     let target = RawTarget {
         project: route.project.clone(),
         function: route.function.clone(),
-        deployment: String::new(), // owner resolves its CURRENT serving deployment
+        deployment: String::new(),
         port: route.container_port,
         proto: RawProto::Udp,
     };
-    // CONTAINER single-owner routing: only the lease owner may serve (mirrors
-    // `edge_pipeline`'s container_owner rule for HTTP).
     if let Some(owner) = cloud.leases.owner_of(&route.project) {
         if owner == cloud.node_name {
             return local_upstream(cloud, target, route).await;
         }
         return mesh_upstream(cloud, &owner, &target, route).await;
     }
-    // No lease (function-runtime UDP service, or lease not yet established):
-    // serve locally when we can, else follow the gossiped records to a peer —
-    // ordered by the same nearest-first rule the TCP raw proxy uses.
     if let Some(up) = local_upstream(cloud, target.clone(), route).await {
         return Some(up);
     }
@@ -601,6 +579,11 @@ async fn local_upstream(
     Some(Upstream::Local(conn))
 }
 
+/// Opens the mesh leg to `node`. A connect/open timeout is the strongest dead-peer signal, so, as
+/// in `ws_proxy` and the TCP raw proxy, the node is demoted through the guarded chokepoint
+/// (`health::demote`), NOT `set_health` directly: a timeout on ONE leg is a local transport fact,
+/// while this observer's `healthy` flag drives DNS and placement, so a peer that is still gossiping
+/// stays healthy and is only marked locally cold (see `health.rs`).
 async fn mesh_upstream(
     cloud: &Arc<CloudState>,
     node: &str,
@@ -634,14 +617,7 @@ async fn mesh_upstream(
             Some(Upstream::Mesh(s))
         }
         Err(e) => {
-            // Connect/open timeout = strongest dead-peer signal (#H4), same
-            // handling as ws_proxy / the TCP raw proxy: stop ranking the node.
             if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-                // Through the guarded chokepoint, NOT `set_health` directly: a
-                // connect/open timeout on ONE leg is a local transport fact,
-                // and this observer's `healthy` flag drives DNS and placement.
-                // If the peer is still gossiping it stays healthy and is only
-                // marked locally cold. See health.rs.
                 crate::health::demote(
                     &cloud.registry,
                     node,
@@ -655,9 +631,13 @@ async fn mesh_upstream(
     }
 }
 
-/// Local pump: client datagrams → connected loopback socket at the container's
-/// published `/udp` host port; container replies → `send_to(client)` on the
-/// shared public socket. The lease guard is held for the whole session.
+/// Local pump: client datagrams go to a connected loopback socket at the container's published
+/// `/udp` host port, and container replies go back with `send_to(client)` on the shared public
+/// socket. The lease guard is held for the whole session, which keeps the leased instance's
+/// inflight accounting alive. Receiving a datagram counts as activity even when the best-effort UDP
+/// send is flow-control delayed or reports an ICMP failure; a connected UDP socket surfaces async
+/// ICMP errors on `recv`, so a failed receive pauses briefly instead of letting a dead backend spin
+/// the loop hot.
 async fn pump_local(
     conn: hive_p2p::RawTargetConn,
     route: &UdpRoute,
@@ -677,7 +657,6 @@ async fn pump_local(
         tracing::warn!(port = route.public_port, backend = %conn.addr, error = %e, "udp relay: local connect failed");
         return;
     }
-    // Keeps the leased instance's inflight accounting alive for the session.
     let _guard = conn.guard;
     let idle = idle_timeout();
     let mut last = tokio::time::Instant::now();
@@ -693,10 +672,8 @@ async fn pump_local(
                 }
             }
             d = rx.recv() => match d {
-                None => break, // relay stopped / session replaced
+                None => break,
                 Some(d) => {
-                    // Receiving the datagram is activity even if the best-effort
-                    // UDP send is flow-control delayed or reports ICMP failure.
                     last = tokio::time::Instant::now();
                     let deadline = last.checked_add(idle).unwrap_or(last);
                     tokio::select! {
@@ -723,8 +700,6 @@ async fn pump_local(
                     }
                 }
                 Err(e) => {
-                    // A connected UDP socket surfaces async ICMP errors here;
-                    // pause briefly so a dead backend can't spin this loop hot.
                     tracing::debug!(port = route.public_port, error = %e, "udp relay: local recv error");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -733,12 +708,14 @@ async fn pump_local(
     }
 }
 
-/// Mesh pump: client datagrams → `[u32 len][payload]` frames on the raw-target
-/// stream; owner frames → `send_to(client)`. `read_raw_datagram` is not
-/// cancellation-safe mid-frame, so the inbound direction runs in its own task
-/// (activity reported through a shared timestamp) — mirroring the owner-side
-/// pump in `hive_p2p::serve_raw_target`. Dropping the write half on exit is
-/// the end-of-session signal that tears down the owner's leg + lease.
+/// Mesh pump: client datagrams go as `[u32 len][payload]` frames onto the raw-target stream, and
+/// owner frames go back with `send_to(client)`. `read_raw_datagram` is not cancellation-safe
+/// mid-frame, so the inbound direction runs in its own task (activity reported through a shared
+/// timestamp), mirroring the owner-side pump in `hive_p2p::serve_raw_target`. One ordered frame
+/// stays in flight while the write future is retained across activity notifications, so stop,
+/// reader exit and the idle deadline can end a flow-control-stalled write without waiting forever.
+/// Dropping the write half on exit is the end-of-session signal that tears down the owner's leg and
+/// lease.
 async fn pump_mesh(
     stream: hive_p2p::P2pStream,
     route: &UdpRoute,
@@ -780,10 +757,6 @@ async fn pump_mesh(
             d = rx.recv() => match d {
                 None => break,
                 Some(d) => {
-                    // Keep one ordered frame in flight, but retain ownership of
-                    // the future across activity notifications. Stop, reader
-                    // exit, and the idle deadline can terminate a flow-control-
-                    // stalled write without waiting forever.
                     activity.send_replace(tokio::time::Instant::now());
                     let write = write_raw_datagram(&mut w, &d);
                     tokio::pin!(write);

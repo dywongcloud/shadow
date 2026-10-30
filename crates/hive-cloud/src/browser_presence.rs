@@ -1,25 +1,16 @@
-//! Replicated, TTL-bound coarse presence for admitted browser peers.
+//! Replicated, TTL-bound coarse presence for admitted browser peers. Separate from
+//! `browser_admission` (which gates whether a browser endpoint may serve at all) and from
+//! `NodeInfo`/the fleet registry: a record exists only alongside a live admission for the same
+//! endpoint, is never read by placement/scheduling/DNS/health, and carries no exact location
+//! (coordinates are quantized server-side whatever a client claims, since a client-only step is
+//! bypassed by a direct API call).
 //!
-//! Separate from `browser_admission` (which gates whether a browser endpoint
-//! may serve at all) and from `NodeInfo`/the fleet registry — a presence
-//! record exists only alongside a live admission for the same endpoint, is
-//! never read by placement/scheduling/DNS/health, and carries no exact
-//! location: coordinates are quantized server-side regardless of what a
-//! client claims, because a client-only quantization step is trivially
-//! bypassed by a direct API call.
-//!
-//! Two identity facts on every record are derived SERVER-SIDE and are never
-//! client input, the same discipline as `browser_admission`'s capabilities:
-//!
-//! * [`node_name`] — the browser peer's own map/legend identity, a pure
-//!   function of its PROVEN endpoint id (the QUIC public key the admission
-//!   was minted against). Stable across reconnects of the same identity,
-//!   short enough to render under a cube, and prefixed `bn-` so it can never
-//!   be mistaken for a fleet node name.
-//! * `shard_eligible` — whether this peer may hold fragments of GLOBAL
-//!   platform state (`browser_db`'s shard planner). Stamped from the
-//!   authenticated caller's `platform_admin` claim at upsert; a browser can
-//!   no more assert it than it can assert its own admission.
+//! Two identity facts on every record are derived SERVER-SIDE, never client input: [`node_name`],
+//! the peer's map/legend identity, a pure function of its PROVEN endpoint id (the QUIC public key
+//! the admission was minted against), stable across reconnects and prefixed `bn-` so it is never
+//! mistaken for a fleet node; and `shard_eligible`, whether this peer may hold fragments of GLOBAL
+//! platform state (`browser_db`'s shard planner), stamped from the authenticated caller's
+//! `platform_admin` claim at upsert.
 
 use axum::{
     extract::{Path, State},
@@ -38,10 +29,9 @@ use crate::state::CloudState;
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
-/// Coarse grid step in degrees. ~55km at the equator, tighter near the poles —
-/// enough to place a satellite dot on a world map without revealing a home
-/// address. Applied server-side unconditionally; a client's own precision
-/// claim is never trusted past this floor.
+/// Coarse grid step in degrees (~55 km at the equator, tighter near the poles): enough to place a
+/// satellite dot on a world map without revealing a home address. Applied server-side
+/// unconditionally; a client's own precision claim is never trusted past this floor.
 const GEO_QUANT_DEGREES: f64 = 0.5;
 const MIN_ACCURACY_KM: f64 = 25.0;
 const MAX_ACCURACY_KM: f64 = 20_000.0;
@@ -49,21 +39,18 @@ const PRESENCE_TTL_SECS: u64 = 90;
 const TOMBSTONE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const VALID_STATES: [&str; 4] = ["starting", "online", "degraded", "suspended"];
 
-/// Domain separator for [`node_name`]'s digest. Prefixing the endpoint id
-/// keeps the naming hash from ever colliding with any other digest the
-/// platform computes over the same id.
+/// Domain separator for [`node_name`]'s digest, so the naming hash never collides with any other
+/// digest the platform computes over the same id.
 const NODE_NAME_DOMAIN: &str = "hive-browser-node-name-v1\u{0}";
 
-/// The `bn-` prefix is load-bearing, not decoration: fleet node names are
-/// operator-chosen (`fc-virginia`, `sj2`, `node-b`) and a browser peer's name
-/// must be unmistakable on the same diagram, in the same legend, and in the
-/// same log line. Nothing else in the platform mints a name in this shape.
+/// The `bn-` prefix is load-bearing: fleet node names are operator-chosen (`fc-virginia`, `sj2`,
+/// `node-b`), and a browser peer's name must be unmistakable on the same diagram, legend and log
+/// line. Nothing else in the platform mints a name in this shape.
 const NODE_NAME_PREFIX: &str = "bn-";
 
-/// 32 × 32 = 1024 mnemonic pairs, × 65536 tags = ~67M display names. Kept
-/// short (≤7 chars each) so `bn-<adj>-<noun>-<tag>` still fits under a cube
-/// on the constellation. Both lists are FIXED: changing an entry renames
-/// every browser that hashed to it, which breaks exactly the "stable across
+/// 32 x 32 = 1024 mnemonic pairs, x 65536 tags = ~67M display names, kept short (7 chars or fewer
+/// each) so `bn-<adj>-<noun>-<tag>` fits under a cube on the constellation. Both lists are FIXED:
+/// changing an entry renames every browser that hashed to it, breaking the "stable across
 /// reconnects" property this exists for. Append only.
 const NAME_ADJECTIVES: [&str; 32] = [
     "amber", "azure", "brisk", "calm", "clear", "coral", "crisp", "dusk", "ember", "fern", "flint",
@@ -76,60 +63,38 @@ const NAME_NOUNS: [&str; 32] = [
     "pike", "quail", "raven", "robin", "seal", "shrew", "stork", "swift", "tern", "vole", "wren",
 ];
 
-/// The stable, human-readable map identity of a browser peer, derived only
-/// from its PROVEN endpoint id (`bn-teal-otter-9c1f`).
-///
-/// Properties this must keep, in the order they matter:
-///
-/// * **Server-derived.** The endpoint id is the QUIC public key the admission
-///   was minted against, so the name is a function of proven identity — a
-///   browser cannot pick, spoof or squat one, and there is no field on the
-///   wire for it to try.
-/// * **Stable across reconnects.** Same identity in, same name out, forever;
-///   there is no clock, no counter and no membership input.
-/// * **Distinguishable from a fleet node.** [`NODE_NAME_PREFIX`] plus the
-///   fixed three-part shape.
-/// * **Short.** ≤ 22 characters, renderable under a 9px cube.
-///
-/// It is a DISPLAY name, never an identity key: two endpoint ids can in
-/// principle land on the same mnemonic (birthday-bounded at ~67M), so every
-/// record still carries `endpoint_id` and every lookup still keys on it. The
-/// tag is taken from the endpoint id's own leading hex where possible — an
-/// operator reading `bn-teal-otter-9c1f` off the map can eyeball-match it
-/// against `9c1f…` in the admissions table — and padded from the digest only
-/// for an id too short or too exotic to supply four.
 /// Subject prefix the fleet-hosted headless browser nodes mint under
 /// (`scripts/hive-browser-node-broker.mjs`: `fleet-browser-node:<node>`).
 const FLEET_BROWSER_NODE_SUBJECT_PREFIX: &str = "fleet-browser-node:";
 
-/// Whether this session belongs to one of the FLEET'S OWN headless browser
-/// nodes, which are shard-eligible without being `platform_admin`.
-///
-/// Why this is not a privilege hole: the subject is not client-assertable. That
-/// token is minted only through `admin::mint_token`, which requires
-/// `x-hive-internal == HIVE_INTERNAL_TOKEN` (constant-time compare, FAILS CLOSED
-/// when the token is unconfigured), the broker reads that secret from a
-/// root-only credential file, and the dashboard proxy strips a client-supplied
-/// `x-hive-internal`. So this subject can only be produced by a process already
-/// running as root on a fleet host — an operator, by definition. Anyone able to
-/// forge it already holds the fleet's internal credential and needs no help from
-/// this function.
-///
-/// Why it is NEEDED: shard eligibility was `claims.platform_admin` alone, and the
-/// broker deliberately mints least-privilege (role=member, platform_admin=false —
-/// a hostile mint body asking for `platform_admin:true` is refused). The five
-/// operator-run browser nodes were therefore permanently excluded from
-/// `shard_members`, leaving membership to be whatever human admin tabs happened
-/// to be open. Witnessed on the leader: membership oscillating members=2 -> 1 ->
-/// 0 -> 1 with `under_replicated=65` of 65 fragments, and at members=0,
-/// `unplaced=65 refusals=65` — i.e. dedicated always-on infrastructure existed
-/// and could hold none of it, which is the opposite of "always replicate".
+/// Whether this session belongs to one of the FLEET'S OWN headless browser nodes, which are
+/// shard-eligible without being `platform_admin` (the broker deliberately mints least-privilege,
+/// role=member and platform_admin=false, so `claims.platform_admin` alone left the operator-run
+/// browser nodes permanently out of `shard_members` and membership was whatever human admin tabs
+/// were open). Not a privilege hole: the subject is not client-assertable. It is minted only
+/// through `admin::mint_token`, which requires `x-hive-internal == HIVE_INTERNAL_TOKEN`
+/// (constant-time, FAILS CLOSED when unconfigured); the broker reads that secret from a root-only
+/// file and the dashboard proxy strips a client-supplied `x-hive-internal`, so only a process
+/// already running as root on a fleet host can produce it, and anyone able to forge it already
+/// holds the fleet's internal credential.
 fn is_fleet_browser_node(subject: &str) -> bool {
     subject
         .strip_prefix(FLEET_BROWSER_NODE_SUBJECT_PREFIX)
         .is_some_and(|node| !node.is_empty())
 }
 
+/// The stable, human-readable map identity of a browser peer, derived only from its PROVEN endpoint
+/// id (`bn-teal-otter-9c1f`). **Server-derived**: the endpoint id is the QUIC public key the
+/// admission was minted against, so a browser cannot pick, spoof or squat a name (no field on the
+/// wire for it). **Stable across reconnects**: same identity in, same name out, with no clock,
+/// counter or membership input. **Distinguishable from a fleet node** by [`NODE_NAME_PREFIX`] and
+/// the fixed three-part shape, and short (22 characters or fewer, renderable under a 9px cube).
+///
+/// It is a DISPLAY name, never an identity key: two endpoint ids can land on the same mnemonic
+/// (birthday-bounded at ~67M), so every record keeps `endpoint_id` and every lookup keys on it. The
+/// tag is the endpoint id's own leading hex where possible (an operator can eyeball-match
+/// `bn-teal-otter-9c1f` against `9c1f…` in the admissions table), padded from the digest only for
+/// an id too short or too exotic to supply four.
 pub fn node_name(endpoint_id: &str) -> String {
     let digest = fluid_core::browser_source_digest(&format!("{NODE_NAME_DOMAIN}{endpoint_id}"));
     let nibble = |range: std::ops::Range<usize>| -> usize {
@@ -149,17 +114,13 @@ pub fn node_name(endpoint_id: &str) -> String {
     format!("{NODE_NAME_PREFIX}{adjective}-{noun}-{tag}")
 }
 
-/// Repair a record on the way OUT of the store: fill `node_name` when it is
-/// empty (a record written by a pre-`node_name` leader, or one adopted from
-/// such a peer). Applied on every read path — HTTP list, single get, mesh
-/// list, shard membership — so no consumer ever has to special-case an
-/// anonymous browser peer.
-///
-/// This is a recomputation, not a fallback: the name is a pure function of
-/// `endpoint_id`, so the value written here is exactly the value the issuing
-/// node would have written. `shard_eligible` is deliberately NOT repaired —
-/// it encodes an authorization decision made against a live session, and
-/// there is nothing on the record to re-derive it from.
+/// Repairs a record on the way OUT of the store: fills `node_name` when empty (a record written by
+/// a pre-`node_name` leader, or adopted from such a peer). Applied on every read path (HTTP list,
+/// single get, mesh list, shard membership), so no consumer special-cases an anonymous browser
+/// peer. It is a recomputation, not a fallback: the name is a pure function of `endpoint_id`, so
+/// the value is exactly what the issuing node would have written. `shard_eligible` is deliberately
+/// NOT repaired: it encodes an authorization decision made against a live session, and nothing on
+/// the record can re-derive it.
 fn hydrate(mut record: BrowserPresence) -> BrowserPresence {
     if record.node_name.is_empty() {
         record.node_name = node_name(&record.endpoint_id);
@@ -174,25 +135,18 @@ pub struct BrowserPresence {
     pub subject: String,
     /// Tenant-scoped display token — never the raw platform identity.
     pub display_label: String,
-    /// The peer's own node identity on the constellation ([`node_name`]).
-    ///
-    /// `serde(default)` for the rollout, and EMPTY is repaired rather than
-    /// tolerated: [`hydrate`] recomputes it on every read, so a record
-    /// replicated by a pre-upgrade leader still renders a name. Recomputing
-    /// is not a guess — the name is a pure function of `endpoint_id`, which
-    /// the record already carries, so the repaired value is bit-identical to
-    /// what the issuing node would have written.
+    /// The peer's own node identity on the constellation ([`node_name`]). `serde(default)` for the
+    /// rollout, and EMPTY is repaired rather than tolerated: [`hydrate`] recomputes it on every
+    /// read, so a record replicated by a pre-upgrade leader still renders a name (the repaired
+    /// value is bit-identical to what the issuing node would have written).
     #[serde(default)]
     pub node_name: String,
-    /// May this peer hold fragments of GLOBAL platform state
-    /// (`browser_db::shard_plan`)? Stamped from the authenticated caller's
-    /// `platform_admin` claim at upsert — never from the request body.
-    ///
-    /// `false` is the safe default in every direction: a pre-upgrade record
-    /// carries no field and is therefore ineligible (absent capability, never
-    /// wrong capability), and a non-admin tenant's browser is ineligible by
-    /// construction. See `browser_db`'s shard-trust block for why the bar is
-    /// platform-admin today and what would have to exist to lower it.
+    /// May this peer hold fragments of GLOBAL platform state (`browser_db::shard_plan`)? Stamped
+    /// from the authenticated caller's `platform_admin` claim at upsert, never from the request
+    /// body. `false` is the safe default in every direction: a pre-upgrade record carries no field
+    /// and is ineligible (absent capability, never wrong capability), and a non-admin tenant's
+    /// browser is ineligible by construction. See `browser_db`'s shard-trust block for why the bar
+    /// is platform-admin today and what would have to exist to lower it.
     #[serde(default)]
     pub shard_eligible: bool,
     #[serde(default)]
@@ -246,11 +200,9 @@ pub struct BrowserPresenceCounters {
     pub upserts_total: u64,
     pub clears_total: u64,
     pub expirations_total: u64,
-    /// Live gauge (not cumulative): count of currently-active, non-expired
-    /// records grouped by `state` ("starting"/"online"/"degraded"/
-    /// "suspended") — a fleet-wide aggregate only, never per-tenant, so it
-    /// answers "how many browser peers are online right now" without naming
-    /// any of them.
+    /// Live gauge (not cumulative): currently-active, non-expired records grouped by `state`
+    /// ("starting"/"online"/"degraded"/"suspended"), a fleet-wide aggregate only, never per-tenant,
+    /// answering "how many browser peers are online right now" without naming any.
     pub by_state: BTreeMap<String, u64>,
 }
 
@@ -302,18 +254,13 @@ impl BrowserPresenceStore {
             .collect()
     }
 
-    /// Every live record eligible to hold GLOBAL state fragments, ACROSS
-    /// tenants — the shard planner's membership set
-    /// (`browser_db::shard_members`).
-    ///
-    /// Deliberately not tenant-filtered: platform state is not a tenant's
-    /// data, so its shard membership is fleet-wide. What keeps that sound is
-    /// the `shard_eligible` gate, which only a `platform_admin` session can
-    /// set, plus the caller's own live-admission re-check. `starting`,
-    /// `degraded` and `suspended` are all excluded — a peer that is not
-    /// serving right now must not be planned against, or every transient
-    /// blip reshuffles the map. Sorted by endpoint id so every node derives
-    /// the identical membership list from the identical replicated state.
+    /// Every live record eligible to hold GLOBAL state fragments, ACROSS tenants: the shard
+    /// planner's membership set (`browser_db::shard_members`). Deliberately not tenant-filtered
+    /// (platform state is not a tenant's data); what keeps that sound is the `shard_eligible` gate,
+    /// which only a `platform_admin` session can set, plus the caller's own live-admission
+    /// re-check. `starting`, `degraded` and `suspended` are excluded: a peer not serving right now
+    /// must not be planned against, or every transient blip reshuffles the map. Sorted by endpoint
+    /// id so every node derives the identical membership from the identical replicated state.
     pub(crate) fn shard_candidates(&self, now: u64) -> Vec<BrowserPresence> {
         let mut out: Vec<BrowserPresence> = self
             .inner
@@ -397,30 +344,22 @@ impl BrowserPresenceStore {
         self.inner.lock().clone()
     }
 
-    /// Merge an incoming snapshot into local state **per endpoint id** — never
-    /// as a wholesale replacement.
+    /// Merges an incoming snapshot into local state **per endpoint id**, never as a wholesale
+    /// replacement. A `*state = incoming` behind a version gate silently DESTROYED records:
+    /// versions are wall-clock anchored (`next_version()` is `now_ms()`), so two nodes that each
+    /// admitted a browser hold snapshots whose versions differ by milliseconds and the higher one
+    /// overwrote the other's whole map, making the browser admitted through the losing node vanish
+    /// from the constellation with no error. Presence is a per-endpoint fact owned by whichever
+    /// node the browser admitted through (routinely a different one per browser behind round-robin
+    /// DNS).
     ///
-    /// This used to be `*state = incoming` behind an `incoming.version <=
-    /// state.version` gate, and that silently DESTROYED presence records.
-    /// Every node's `version` is wall-clock anchored (`next_version()` is
-    /// `now_ms()`), so two nodes that each admitted a browser hold snapshots
-    /// whose versions differ by milliseconds; whichever replicated with the
-    /// higher version overwrote the other node's entire map, and the browser
-    /// admitted through the losing node vanished from the constellation with
-    /// no error logged anywhere. Presence is a per-endpoint fact owned by
-    /// whichever node the browser admitted through — with 14 nodes behind
-    /// round-robin DNS that is routinely a different node per browser — so the
-    /// join has to be per endpoint id, not per snapshot.
-    ///
-    /// Rules, applied to the union of both sides: a record wins on the higher
-    /// `revision`; a tombstone at or above a record's revision always beats
-    /// that record (so revocation/expiry still propagates as authoritative
-    /// deletion — the "replicate zero satellites now" property `store_sync`'s
-    /// REGISTRY comment depends on); tombstones union by max revision. A
-    /// record that is dropped WITHOUT a tombstone (a node that lost state)
-    /// can be resurrected by a peer here, which is deliberate and bounded:
-    /// `expires_ms` is a 90s TTL and `list` filters on it, so a genuinely
-    /// dead record ages out on its own rather than being destroyed early.
+    /// Rules over the union: a record wins on the higher `revision`; a tombstone at or above a
+    /// record's revision always beats it (revocation/expiry still propagates as deletion, the
+    /// "replicate zero satellites now" property `store_sync`'s REGISTRY depends on); tombstones
+    /// union by max revision. A record dropped WITHOUT a tombstone (a node that lost state) can be
+    /// resurrected by a peer, deliberately and boundedly: `expires_ms` is a 90 s TTL and `list`
+    /// filters on it. A merge that changed nothing returns `None`, the no-op signal `store_sync`
+    /// reads as "nothing adopted".
     fn adopt(&self, incoming: PresenceSnapshot) -> Option<(PresenceSnapshot, PresenceSnapshot)> {
         let mut state = self.inner.lock();
         let old = state.clone();
@@ -441,8 +380,6 @@ impl BrowserPresenceStore {
             }
             state.active.insert(id, record);
         }
-        // Disjoint field borrows: a tombstone at or above a record's revision
-        // removes it, whichever side each of them arrived from.
         let dead: Vec<String> = {
             let PresenceSnapshot {
                 active, tombstones, ..
@@ -464,9 +401,6 @@ impl BrowserPresenceStore {
         state.version = state.version.max(incoming.version);
         state.prune_tombstones(hive_core::now_ms());
 
-        // Preserve the caller's no-op signal: store_sync treats `None` as
-        // "nothing adopted", and a merge that changed nothing must not be
-        // reported as a change.
         if state.active == old.active && state.tombstones == old.tombstones {
             return None;
         }
@@ -566,6 +500,12 @@ fn require_owned_admission(
     Ok(tenant)
 }
 
+/// Publishes a presence record for an admitted browser endpoint. Both identity facts are computed
+/// HERE, from the proven endpoint id and the verified session, never from `request` (which carries
+/// no field for either): `node_name` is a pure function of the endpoint id, and `shard_eligible`
+/// follows the session's `platform_admin` claim (independently derived by the token minter against
+/// this backend's own `admin_emails`, see `admin::mint_token`) or a fleet browser node's mint
+/// subject. The record is echoed to every healthy peer ([`echo_presence_to_peers`]).
 async fn upsert_presence(
     State(cloud): State<Arc<CloudState>>,
     claims: Claims,
@@ -583,11 +523,6 @@ async fn upsert_presence(
         tenant,
         request.endpoint_id.get(..8).unwrap_or(&request.endpoint_id)
     );
-    // Both identity facts are computed HERE, from the proven endpoint id and
-    // the verified session — never from `request`, which carries no field for
-    // either. `platform_admin` is independently derived by the token minter
-    // against this backend's own `admin_emails` set (see `admin::mint_token`),
-    // so it is not a client assertion either.
     let node_name = node_name(&request.endpoint_id);
     let shard_eligible = claims.platform_admin || is_fleet_browser_node(&claims.sub);
     let record = BrowserPresence {
@@ -612,40 +547,18 @@ async fn upsert_presence(
     Ok(Json(json!({ "presence": record })))
 }
 
-/// Push a freshly-written presence record straight to the control-plane leader.
-///
-/// Presence is written on whichever node the browser posted to, and otherwise
-/// only reaches the rest of the fleet on the periodic `store_sync` snapshot. That
-/// is too slow to be the ONLY path: a record lives 90s, and a browser that
-/// republishes every ~60s can have its record repeatedly miss the snapshot window
-/// on remote nodes, so an operator watching the constellation sees browser nodes
-/// blink in and out — or, for a node whose beat never lands in a snapshot, never
-/// appear at all. Witnessed: fc-bangkok publishing presence 10s earlier, live and
-/// serving, absent from two consecutive dashboard reads.
-///
-/// EVERY healthy peer, not just the leader.
-///
-/// This echoed to the leader alone, reasoning that `list_presence` has followers
-/// merge the leader's view, so a complete leader makes every reader complete at
-/// one rpc per beat. That holds only while the leader does not change — and the
-/// leader changes on every fleet restart, which is exactly when browser nodes
-/// re-admit under fresh identities.
-///
-/// What that produced, measured on three dashboard loads seconds apart: one node
-/// answered with 4 browser nodes, another with 5, and the two sets shared just
-/// ONE member. Each node held whatever it had seen directly plus whatever the
-/// leader-of-the-moment had collected, and `adopt` merges per key rather than
-/// replacing, so the fragments never reconciled — which node round-robin picked
-/// decided what the operator saw, and an unlucky pick showed a single node out
-/// of six that were all `online`, `granted` and `serving`.
-///
-/// Fanning out makes every node's view complete, so any node can answer, and a
-/// leadership change reorganises nothing. The cost is real but small: presence
-/// records are tiny and a browser beats about once a minute, so this is a
-/// handful of small rpcs per minute per node, spawned and never awaited.
-///
-/// Best-effort by construction: an accelerator in front of `store_sync`, never a
-/// correctness dependency. A failed echo costs latency, not data.
+/// Pushes a freshly written presence record to EVERY healthy peer, not just the leader. Presence is
+/// written on whichever node the browser posted to and otherwise reaches the fleet only on the
+/// periodic `store_sync` snapshot, too slow to be the ONLY path (a record lives 90 s and a browser
+/// republishes every ~60 s, so beats repeatedly miss the snapshot window and operators see browser
+/// nodes blink in and out). Echoing to the leader alone holds only while the leader does not
+/// change, and it changes on every fleet restart, exactly when browser nodes re-admit under fresh
+/// identities: each node then holds what it saw directly plus whatever the leader-of-the-moment
+/// collected, and `adopt` merges per key, so the fragments never reconcile and which node
+/// round-robin picks decides what the operator sees. Fanning out makes every node's view complete
+/// (a handful of small rpcs per minute per node, spawned and never awaited). Best-effort: an
+/// accelerator in front of `store_sync`, never a correctness dependency (a failed echo costs
+/// latency, not data).
 fn echo_presence_to_peers(cloud: &Arc<CloudState>, record: &BrowserPresence) {
     let targets: Vec<(String, String)> = cloud
         .registry
@@ -685,16 +598,13 @@ fn echo_presence_to_peers(cloud: &Arc<CloudState>, record: &BrowserPresence) {
     });
 }
 
-/// Receiving side of [`echo_presence_to_peers`], dispatched from
-/// `gossip::dispatch`'s `/v1/browser/presence/mesh-echo` POST arm.
-///
-/// Applies through the same `put` every local write uses, so the store's own
-/// last-writer rule decides: an echo can never overwrite a newer record, and a
-/// replayed or out-of-order echo is inert rather than corrupting. The record is
-/// taken VERBATIM — every field on it was already derived server-side from a
-/// verified session on the originating node (`put_presence` computes
-/// `node_name`, `shard_eligible` and `tenant` itself and never reads them from
-/// the request), and the mesh transport is peer-authenticated.
+/// Receiving side of [`echo_presence_to_peers`], dispatched from `gossip::dispatch`'s
+/// `/v1/browser/presence/mesh-echo` POST arm. Applies through the same `put` every local write
+/// uses, so the store's last-writer rule decides: an echo can never overwrite a newer record, and a
+/// replayed or out-of-order echo is inert. The record is taken VERBATIM: every field was already
+/// derived server-side from a verified session on the originating node (`upsert_presence` computes
+/// `node_name`, `shard_eligible` and `tenant` itself and never reads them from the request), and
+/// the mesh transport is peer-authenticated.
 pub fn mesh_echo(cloud: &Arc<CloudState>, body: &[u8]) -> Vec<u8> {
     let Ok(record) = serde_json::from_slice::<BrowserPresence>(body) else {
         return Vec::new();
@@ -703,30 +613,19 @@ pub fn mesh_echo(cloud: &Arc<CloudState>, body: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
+/// Lists presence for the caller's tenant. A follower consults the leader whenever it is not the
+/// leader, NOT only when its own view is empty: presence replicates on a periodic store_sync
+/// snapshot, so a follower routinely holds a PARTIAL set that looks complete, and round-robin
+/// dashboard DNS showed different subsets of one fleet on consecutive loads. The result is MERGED,
+/// not replaced (a browser posts to its LOCAL node, so this node can hold records the leader lacks
+/// and vice versa): union by endpoint id, newest `issued_ms` wins, the last-writer rule `put`
+/// applies, so a merge never resurrects a record a newer write superseded. An unreachable or empty
+/// leader leaves the local view, the honest best answer, never an error.
 async fn list_presence(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {
     let claims = claims_required(claims)?;
     let tenant = crate::admin::norm(&claims.tenant).to_string();
     let local = cloud.browser_presence.list(&tenant, hive_core::now_ms());
 
-    // A follower consults the leader whenever it is not the leader — NOT only
-    // when its own view is empty.
-    //
-    // The `local.is_empty()` trigger this replaces is the round-robin-reads bug
-    // in its subtlest form: presence is written on whichever node the browser
-    // posted to and then replicates on a periodic store_sync snapshot, so a
-    // follower routinely holds a PARTIAL set. Returning that partial set is
-    // indistinguishable, to the caller, from a complete one — and because the
-    // public dashboard host is round-robin DNS, consecutive loads land on
-    // different followers and show different subsets of the same fleet.
-    // Witnessed: two reads 30s apart returned 4 records then 6, with a live,
-    // serving fc-bangkok browser node absent from both, which reads to an
-    // operator as "my browser nodes disappeared".
-    //
-    // Merged, not replaced: a browser posts to its LOCAL node, so this node can
-    // hold a record the leader has not received yet, while the leader holds the
-    // records this node has not. Union by endpoint id, newest `issued_ms` wins —
-    // the same last-writer rule `put` applies, so a merge can never resurrect a
-    // record that a newer write superseded.
     if let Some(leader) = cloud.leader_forward_target() {
         if let Some(value) =
             crate::admin::fetch_from_host(&cloud, &leader, "/v1/browser/presence", &tenant).await
@@ -749,8 +648,6 @@ async fn list_presence(State(cloud): State<Arc<CloudState>>, claims: Claims) -> 
                 return Ok(Json(json!({ "presence": merged })));
             }
         }
-        // Leader unreachable, or it genuinely knows nothing: the local view is
-        // still the honest best answer, never an error.
         return Ok(Json(json!({ "presence": local })));
     }
     Ok(Json(json!({ "presence": local })))

@@ -6,11 +6,8 @@ import {
 import { Badge } from "@/components/ui";
 import { KIND_LABEL, type UnifiedKind } from "./db-model";
 
-/**
- * One presentation table for every database kind, SQLite included. The page and
- * the detail view both read it, so a SQLite row can never drift into looking
- * like a different class of object than a Postgres row.
- */
+/** One presentation table for every database kind, SQLite included, read by the page and the detail view so a SQLite row never looks like a different class of object than a
+ *  Postgres row. */
 export const KIND_ICON: Record<UnifiedKind, React.ReactNode> = {
   postgres: <DbIcon className="h-5 w-5" />,
   redis: <Zap className="h-5 w-5" />,

@@ -71,12 +71,7 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
   const [open, setOpen] = useState(false);
 
   return (
-    // Full-bleed: break out of the centered max-w-[1400px] main so the sidebar
-    // hugs the viewport's left edge and content fills to the right — no black
-    // gutters. `mx-[calc(50%-50vw)]` spans the full viewport width regardless of
-    // the parent container's width/padding.
     <div className="-my-8 mx-[calc(50%-50vw)] flex min-h-screen">
-      {/* Desktop sidebar */}
       <aside className="sticky top-0 hidden h-screen w-60 shrink-0 flex-col border-r border-border bg-card px-3 py-5 md:flex">
         <SidebarHeader />
         <NavList pathname={pathname} />
@@ -85,7 +80,6 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         </Link>
       </aside>
 
-      {/* Mobile drawer */}
       {open ? (
         <div className="fixed inset-0 z-50 md:hidden">
           <div className="absolute inset-0 bg-black/50" onClick={() => setOpen(false)} />
@@ -102,7 +96,6 @@ export default function AdminLayout({ children }: { children: React.ReactNode })
         </div>
       ) : null}
 
-      {/* Content */}
       <div className="min-w-0 flex-1">
         <div className="flex items-center justify-between gap-2 border-b border-border px-4 py-3 sm:px-6">
           <div className="flex items-center gap-2 text-sm text-secondary">

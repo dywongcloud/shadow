@@ -4,10 +4,18 @@ import Link from "next/link";
 import { Users, ExternalLink } from "lucide-react";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
 import { useOpsPoll, type Team } from "@/lib/api";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 import { timeAgo } from "@/lib/utils";
 
-export function AdminTeamsClient({ initialTeams }: { initialTeams: Team[] | null }) {
-  const { data: teams } = useOpsPoll<Team[]>("/v1/teams", 4000, true, initialTeams);
+export function AdminTeamsClient({
+  initialTeams,
+  initialError,
+}: {
+  initialTeams: Team[] | null;
+  initialError?: string | null;
+}) {
+  const { data: teams, error } = useOpsPoll<Team[]>("/v1/teams", 4000, true, initialTeams);
+  const failure = error ?? initialError ?? null;
   const totalMembers = (teams ?? []).reduce((a, t) => a + t.members.length, 0);
 
   return (
@@ -15,7 +23,7 @@ export function AdminTeamsClient({ initialTeams }: { initialTeams: Team[] | null
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Teams</h1>
-          <p className="mt-1 text-sm text-secondary">{teams?.length ?? 0} teams · {totalMembers} members across the platform.</p>
+          <p className="mt-1 text-sm text-secondary">{failure ? "Unavailable — teams could not be read." : `${teams?.length ?? 0} teams · ${totalMembers} members across the platform.`}</p>
         </div>
         <Link href="/teams" className="inline-flex items-center gap-1.5 rounded-md border border-border-strong px-3 py-1.5 text-sm hover:bg-subtle">
           Manage <ExternalLink className="h-3.5 w-3.5" />
@@ -40,6 +48,7 @@ export function AdminTeamsClient({ initialTeams }: { initialTeams: Team[] | null
           })}
         </tbody>
       </Table>
+      <OpsFetchError error={failure} label="teams" />
     </div>
   );
 }

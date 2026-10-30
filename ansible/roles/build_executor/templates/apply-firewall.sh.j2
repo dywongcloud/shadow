@@ -7,8 +7,68 @@ nft={{ build_executor_nft_binary | quote }}
 policy={{ build_executor_nft_policy_path | quote }}
 inet_table={{ build_executor_nft_table | quote }}
 bridge_table={{ build_executor_nft_bridge_table | quote }}
+bridge={{ build_executor_network_bridge | quote }}
+gateway={{ build_executor_network_gateway | quote }}
 transaction="$(mktemp /run/hive-build-executor-nft.XXXXXX)"
 trap 'rm -f "$transaction"' EXIT
+
+# A host INPUT base chain that runs `policy drop` (a vendor/cloud image -- e.g.
+# Atlantic.Net's `ip filter INPUT`) is evaluated AFTER this table's
+# executor_to_host chain, and an nftables `accept` is NOT final across base
+# chains: the later chain still sees the packet and its drop policy swallows
+# it. Witnessed on fc-orlando 2026-10-09 -- `dns_allowed` counted every query
+# while the container still reported "connection timed out; no servers could be
+# reached", because the vendor chain dropped the very packets this table had
+# just accepted. Re-assert the executor's DNS allowance at the head of every
+# foreign drop-policy input chain so the accept is the last verdict the hook
+# reaches. A host whose INPUT policy is accept -- the fleet norm -- matches no
+# chain here and is left byte-for-byte untouched.
+reassert_dns_in_drop_policy_input_chains() {
+    local commands
+    commands="$(python3 - "$bridge" "$gateway" <<'PY' || printf 'FAILED'
+import json, subprocess, sys
+
+bridge, gateway = sys.argv[1], sys.argv[2]
+comment = "hive-build-executor-dns"
+try:
+    ruleset = json.loads(subprocess.check_output(["nft", "-j", "list", "ruleset"], text=True))
+except Exception:
+    sys.exit("FAILED")
+entries = ruleset.get("nftables", [])
+drop_chains = []
+for item in entries:
+    chain = item.get("chain")
+    if not isinstance(chain, dict):
+        continue
+    if chain.get("family") not in ("ip", "inet"):
+        continue
+    if chain.get("hook") == "input" and chain.get("policy") == "drop":
+        drop_chains.append((chain.get("family"), chain.get("table"), chain.get("name")))
+present = set()
+for item in entries:
+    rule = item.get("rule")
+    if not isinstance(rule, dict):
+        continue
+    if rule.get("comment") == comment:
+        present.add((rule.get("family"), rule.get("table"), rule.get("chain")))
+lines = []
+for family, table, chain in drop_chains:
+    if (family, table, chain) in present:
+        continue
+    for proto in ("udp", "tcp"):
+        lines.append(
+            "insert rule %s %s %s iifname %s ip daddr %s %s dport 53 counter accept comment %s"
+            % (family, table, chain, bridge, gateway, proto, comment)
+        )
+print("\n".join(lines))
+PY
+)" || return 1
+    case "$commands" in
+        FAILED*) return 1 ;;
+        "") return 0 ;;
+    esac
+    printf '%s\n' "$commands" | "$nft" --file -
+}
 
 if "$nft" list table inet "$inet_table" >/dev/null 2>&1; then
     printf 'delete table inet %s\n' "$inet_table" >>"$transaction"
@@ -19,3 +79,4 @@ fi
 cat "$policy" >>"$transaction"
 "$nft" --check --file "$transaction"
 "$nft" --file "$transaction"
+reassert_dns_in_drop_policy_input_chains

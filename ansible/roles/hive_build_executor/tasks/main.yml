@@ -1,9 +1,5 @@
-# Install the reviewed isolated-builder OCI archive and publish the
-# fail-closed capability declaration the hive-cloud BuildExecutor probes at
-# boot. Ordering is load-bearing: every byte is verified BEFORE anything
-# lands at its final path, and the declaration is written LAST via tmp +
-# atomic rename — an aborted run can only leave the node capability-blank,
-# never capability-wrong.
+# Install the reviewed isolated-builder OCI archive and publish the fail-closed capability declaration the BuildExecutor probes at boot:
+# every byte is verified before it lands at its final path and the declaration is written last (tmp + atomic rename), so an aborted run leaves the node capability-blank, never capability-wrong.
 ---
 - name: End host when BuildExecutor install is not opted in
   ansible.builtin.meta: end_host

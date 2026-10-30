@@ -5,11 +5,8 @@ import { ChevronDown, ChevronRight, Copy, Search, Loader2, CircleX, TriangleAler
 import { fmtTime, HighlightLine } from "@/lib/log-format";
 import type { Build } from "@/lib/api";
 
-/**
- * Vercel-style collapsible Build Logs panel: line count + error/warning tallies,
- * find-in-logs, timestamped + syntax-highlighted lines. Auto-scrolls while the
- * build is still running. Reused by the deployment detail page.
- */
+/** Collapsible Build Logs panel: line count with error/warning tallies, find-in-logs and timestamped, syntax-highlighted lines; auto-scrolls while the build is running. Reused by
+ *  the deployment detail page. */
 export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(defaultOpen);
   const [q, setQ] = useState("");
@@ -21,7 +18,6 @@ export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; 
   const errored = state === "error";
   const cancelled = state === "cancelled";
 
-  // Tick a clock while building so the elapsed counter advances live.
   useEffect(() => {
     if (!building) return;
     const t = setInterval(() => setNow(Date.now()), 1000);

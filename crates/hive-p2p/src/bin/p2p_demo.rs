@@ -1,8 +1,5 @@
-//! Demo: route a Fluid function request between two iroh nodes, peer-to-peer.
-//!
-//! Node B hosts a "function" and serves the tunnel protocol over iroh.
-//! Node A dials B *by node id* and sends a request through a TunnelClient.
-//! Proves the whole serving stack works over a P2P QUIC connection.
+//! Demo: node B hosts a function and serves the tunnel protocol over iroh; node A dials B by node
+//! id and sends requests through a `TunnelClient`.
 
 use std::time::Duration;
 
@@ -56,7 +53,6 @@ async fn spawn_function() -> Result<String> {
 async fn main() -> Result<()> {
     tracing_subscriber_init();
 
-    // ---- Node B (the instance host) ----
     let function = spawn_function().await?;
     let ep_b = hive_p2p::bind().await?;
     let node_b_id = ep_b.id();
@@ -67,14 +63,12 @@ async fn main() -> Result<()> {
         ep_b, function, max_conc, None, None,
     ));
 
-    // ---- Node A (the gateway) dials B by endpoint id, over P2P ----
     let ep_a = hive_p2p::bind().await?;
     println!("node A id: {}", ep_a.id());
     println!("dialing node B peer-to-peer over iroh...");
     let stream = hive_p2p::dial(&ep_a, addr_b).await?;
     let client = TunnelClient::new(stream);
 
-    // Fire a handful of concurrent requests over the single P2P tunnel.
     let client = std::sync::Arc::new(client);
     let mut handles = Vec::new();
     for i in 0..5 {
@@ -112,6 +106,5 @@ async fn main() -> Result<()> {
 }
 
 fn tracing_subscriber_init() {
-    // Best-effort; ignore if already set.
     let _ = std::panic::catch_unwind(|| {});
 }

@@ -1,46 +1,40 @@
-//! Storage broker: the single admission point for tenant-facing storage
-//! operations (snapshot create/delete for now — dataset/quota operations join
-//! it here as they're built, not as separate unguarded paths).
+//! Storage broker: the single admission point for tenant-facing storage operations (snapshot create
+//! and delete for now; dataset and quota operations join it here as they are built, not as separate
+//! unguarded paths).
 //!
-//! # Why this exists as its own module rather than inline in the route handler
+//! # Why its own module
 //!
-//! Every one of the checks below is the SAME shape of bug this session already
-//! found and fixed twice: a tenant-controlled string reaching a filesystem
-//! operation without validation. `container_volume_cfg` was safe by
-//! construction (sanitize-then-prefix); `snapshot::safe_component` was built
-//! that way from the start. A storage broker is where those checks compose —
-//! ownership, then identifier safety, then capacity — and it exists as one
-//! module specifically so a THIRD call site (dataset create, quota set,
-//! whatever comes next) inherits the same order of checks by calling this
-//! instead of re-deriving it inline, which is how the first two nearly
-//! diverged from each other.
+//! Every check below is the same shape of bug already found and fixed twice: a tenant-controlled
+//! string reaching a filesystem operation without validation. `container_volume_cfg` is safe by
+//! construction (sanitize, then prefix) and `snapshot::safe_component` was built that way from the
+//! start. The broker is where those checks compose (ownership, then identifier safety, then
+//! capacity), as ONE module so a third call site (dataset create, quota set, whatever comes next)
+//! inherits the same order by calling it instead of re-deriving it inline, which is how the first
+//! two nearly diverged.
 //!
 //! # Order matters
 //!
-//! 1. **Ownership** — is the caller's tenant the deployment's tenant, via the
-//!    same [`crate::admin::project_owned_by`] every other tenant-facing route
-//!    already trusts. Checked FIRST: an attacker probing a real project should
-//!    get the same 403 an attacker probing a nonexistent one gets, not a
-//!    different error that confirms the project exists.
-//! 2. **Identifier safety** — [`hive_backend::snapshot::snapshot_image`]'s own
-//!    `safe_component` gate, invoked here too so a caller of THIS module gets
-//!    the same rejection before any filesystem call, not just inside the
-//!    primitive.
-//! 3. **Quota** — a per-tenant snapshot-count ceiling. Deliberately COUNT, not
-//!    bytes: this fleet has no cheap way to attribute reflink-shared bytes to
-//!    one tenant (the whole point of CoW is that two snapshots share extents,
-//!    so "bytes used by snapshot X" is not well-defined once anything has
-//!    diverged), and an unbounded count is still a real resource-exhaustion
-//!    vector — the podman lock-pool incident is the standing example of what
-//!    an uncapped per-tenant resource does to a shared host.
+//! 1. **Ownership**: is the caller's tenant the deployment's tenant, through the
+//! [`crate::admin::project_owned_by`] every other tenant-facing route trusts. Checked FIRST: an
+//! attacker probing a real project gets the same 403 as one probing a nonexistent one, not a
+//! different error that confirms the project exists.
+//! 2. **Identifier safety**: [`hive_backend::snapshot::snapshot_image`]'s own `safe_component`
+//! gate, invoked here too so a caller of THIS module gets the same rejection before any filesystem
+//! call, not just inside the primitive.
+//! 3. **Quota**: a snapshot-COUNT ceiling per deployment (the caller passes the size of that
+//! deployment's snapshot directory), deliberately not bytes: there is no cheap way to attribute
+//! reflink-shared bytes to one tenant (two snapshots share extents, so "bytes used by a snapshot"
+//! is not well defined once anything has diverged), and an unbounded count is still a real
+//! resource-exhaustion vector (podman lock-pool exhaustion is the standing example of what an
+//! uncapped per-tenant resource does to a shared host).
 
 use std::sync::Arc;
 
 use crate::state::CloudState;
 
-/// Default ceiling on live snapshots per project. `HIVE_SNAPSHOT_QUOTA` tunes
-/// it fleet-wide; there is no per-tenant override yet — add one the same way
-/// `team_plan`-driven limits already work elsewhere before this needs it.
+/// Default ceiling on live snapshots per deployment; `HIVE_SNAPSHOT_QUOTA` tunes it fleet-wide.
+/// There is no per-tenant override yet: add one the way the `team_plan`-driven limits work
+/// elsewhere before it is needed.
 fn snapshot_quota() -> usize {
     std::env::var("HIVE_SNAPSHOT_QUOTA")
         .ok()
@@ -53,9 +47,12 @@ pub enum BrokerError {
     /// Caller's tenant does not own this project. Message is deliberately
     /// generic (see module doc point 1) — do not add detail here.
     NotOwner,
+    /// The deployment is not one of the path project's deployments for this caller (see
+    /// [`authorize_deployment`]); the same answer whether it exists or not.
+    UnknownDeployment,
     /// The snapshot id itself is unsafe (see `snapshot::safe_component`).
     InvalidId(String),
-    /// The project is already at its snapshot ceiling.
+    /// The deployment is already at its snapshot ceiling.
     QuotaExceeded { limit: usize, have: usize },
 }
 
@@ -63,6 +60,7 @@ impl std::fmt::Display for BrokerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BrokerError::NotOwner => write!(f, "project belongs to a different team"),
+            BrokerError::UnknownDeployment => write!(f, "unknown deployment"),
             BrokerError::InvalidId(id) => write!(f, "invalid snapshot id: {id}"),
             BrokerError::QuotaExceeded { limit, have } => {
                 write!(f, "snapshot quota exceeded: {have}/{limit}")
@@ -71,12 +69,55 @@ impl std::fmt::Display for BrokerError {
     }
 }
 
-/// Authorize a snapshot CREATE for `project` on behalf of tenant `caller_tenant`.
-///
-/// Returns `Ok(())` when the caller may proceed; the actual filesystem work
-/// (via `hive_backend::snapshot::snapshot_image`) stays the caller's — this
-/// function only decides whether it's allowed to happen, so it never touches a
-/// disk itself and can be unit-reasoned-about independent of any specific node.
+/// The `(project, tenant tag)` the fleet view records for `deployment_id`: this node's own gateway
+/// first, then every peer's gossiped records.
+fn deployment_owner(cloud: &Arc<CloudState>, deployment_id: &str) -> Option<(String, String)> {
+    if let Some(record) = cloud
+        .gw
+        .deployment_records()
+        .into_iter()
+        .find(|record| record.id == deployment_id)
+    {
+        return Some((record.project, record.tenant));
+    }
+    cloud
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .find(|deployment| deployment.id.to_string() == deployment_id)
+        .map(|deployment| (deployment.project.clone(), deployment.tenant.clone()))
+}
+
+/// Authorizes any snapshot operation on `deployment_id` reached through `project`'s path: the
+/// route authorizes the PROJECT in the path, but the path's `deployment_id` is
+/// attacker-controlled, so without this a tenant reaches another tenant's data image through its
+/// own project. The deployment must be one of `project`'s and, when its record carries a tenant
+/// tag, that tag must be the caller's (an untagged legacy record inherits the project's owner, the
+/// check `require_project` already made). A deployment no node of the fleet view knows is left to
+/// the handlers' own not-found answer.
+pub fn authorize_deployment(
+    cloud: &Arc<CloudState>,
+    caller_tenant: &str,
+    project: &str,
+    deployment_id: &str,
+) -> Result<(), BrokerError> {
+    let Some((deployment_project, deployment_tenant)) = deployment_owner(cloud, deployment_id)
+    else {
+        return Ok(());
+    };
+    let tag = crate::admin::record_tenant(&deployment_tenant);
+    let foreign_tenant = tag != crate::admin::UNTAGGED_TENANT && tag != caller_tenant;
+    if !deployment_project.eq_ignore_ascii_case(project) || foreign_tenant {
+        return Err(BrokerError::UnknownDeployment);
+    }
+    Ok(())
+}
+
+/// Authorizes a snapshot CREATE for `project` on behalf of `caller_tenant`. `Ok(())` means the
+/// caller may proceed; the filesystem work (`hive_backend::snapshot::snapshot_image`) stays the
+/// caller's, since this function only decides and never touches a disk, so it can be reasoned about
+/// independent of any node.
 pub fn authorize_create(
     cloud: &Arc<CloudState>,
     caller_tenant: &str,
@@ -100,12 +141,10 @@ pub fn authorize_create(
     Ok(())
 }
 
-/// Authorize a snapshot DELETE. No quota check (deleting can only reduce
-/// usage), but the same ownership + identifier gates apply — a delete path
-/// that trusts an id less than the create path is a real, exploitable
-/// asymmetry (an attacker who cannot CREATE a traversal id could otherwise
-/// still DELETE via one, if some other component ever wrote a file at that
-/// path for an unrelated reason).
+/// Authorizes a snapshot DELETE: no quota check (deleting only reduces usage), but the same
+/// ownership and identifier gates, because a delete path that trusts an id less than the create
+/// path is a real, exploitable asymmetry (an attacker who cannot CREATE a traversal id could still
+/// DELETE via one if some other component ever wrote a file at that path).
 pub fn authorize_delete(
     cloud: &Arc<CloudState>,
     caller_tenant: &str,
@@ -121,14 +160,11 @@ pub fn authorize_delete(
     Ok(())
 }
 
-/// Mirrors `hive_backend::snapshot::safe_component` exactly. Duplicated rather
-/// than imported across the hive-backend/hive-cloud boundary because the two
-/// crates' dependency direction doesn't currently run that way — but the RULE
-/// must never drift between them, so the doc comment states the invariant
-/// explicitly: any change to `safe_component`'s definition must be mirrored
-/// here in the same commit, or the broker could authorize an id the primitive
-/// then rejects (safe: fails closed) or — the dangerous direction — the
-/// primitive could one day be loosened without the broker noticing.
+/// Mirrors `hive_backend::snapshot::safe_component` exactly, duplicated rather than imported
+/// because the crates' dependency direction does not run that way. The RULE must never drift: any
+/// change to `safe_component` must be mirrored here in the same commit, or the broker could
+/// authorize an id the primitive then rejects (safe: fails closed) or, the dangerous direction, the
+/// primitive could be loosened without the broker noticing.
 fn snapshot_id_is_safe(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128

@@ -6,17 +6,25 @@ import { Card, Badge, Button, Input } from "@/components/ui";
 import { opsGet, opsSend, useOpsPoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { OPEN_LIMIT, OPEN_PATH, RESOLVED_PAGE, resolvedPath } from "@/lib/incident-paths";
+import { OpsFetchError } from "@/components/ops-fetch-error";
 
 const STATUSES: IncidentStatus[] = ["investigating", "identified", "monitoring", "resolved"];
+const TIMELINE_PREVIEW_ENTRIES = 5;
 
 export function IncidentsClient({
   initialOpen,
   initialResolved,
+  initialOpenError,
+  initialResolvedError,
 }: {
   initialOpen: Incident[] | null;
   initialResolved: Incident[] | null;
+  initialOpenError?: string | null;
+  initialResolvedError?: string | null;
 }) {
-  const { data: open, refresh } = useOpsPoll<Incident[]>(OPEN_PATH, 5000, true, initialOpen);
+  const { data: open, error: openError, refresh } = useOpsPoll<Incident[]>(OPEN_PATH, 5000, true, initialOpen);
+  const openFailure = openError ?? initialOpenError ?? null;
+  const resolvedFailure = initialResolvedError ?? null;
   const [resolved, setResolved] = useState<Incident[]>(initialResolved ?? []);
   const [resolvedDone, setResolvedDone] = useState((initialResolved?.length ?? 0) < RESOLVED_PAGE);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -34,8 +42,6 @@ export function IncidentsClient({
   }
 
   async function onChanged() {
-    // A posted update may have resolved an open incident: refresh both lists
-    // from the first page so it moves columns instead of vanishing.
     refresh();
     const page = await opsGet<Incident[]>(resolvedPath(0), { fresh: true }).catch(() => null);
     if (page) {
@@ -64,13 +70,14 @@ export function IncidentsClient({
           {openRows.map((i) => (
             <IncidentCard key={i.id} inc={i} onChange={onChanged} />
           ))}
-          {!openRows.length && (
+          {!openFailure && !openRows.length && (
             <Card className="flex flex-col items-center gap-2 py-12 text-center">
               <Siren className="h-8 w-8 text-muted" />
               <div className="text-sm font-medium">No open incidents</div>
               <p className="text-sm text-secondary">When something breaks, declare an incident to track the response.</p>
             </Card>
           )}
+          <OpsFetchError error={openFailure} label="open incidents" />
         </div>
       </section>
 
@@ -80,7 +87,7 @@ export function IncidentsClient({
           {resolved.map((i) => (
             <IncidentCard key={i.id} inc={i} onChange={onChanged} />
           ))}
-          {!resolved.length && (
+          {!resolvedFailure && !resolved.length && (
             <Card className="py-8 text-center text-sm text-muted">No resolved incidents in the retained history.</Card>
           )}
           {!resolvedDone && (
@@ -88,6 +95,7 @@ export function IncidentsClient({
               {loadingMore ? "Loading…" : `Load ${RESOLVED_PAGE} more`}
             </Button>
           )}
+          <OpsFetchError error={resolvedFailure} label="resolved incidents" />
         </div>
       </section>
 
@@ -107,11 +115,9 @@ function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }
   const [status, setStatus] = useState<IncidentStatus>(inc.status);
   const [msg, setMsg] = useState("");
   const automated = inc.origin === "automated";
-  // The timeline can be long on a condition that flapped for weeks; show the
-  // latest entries and let the operator expand the rest.
   const [showAll, setShowAll] = useState(false);
   const timeline = [...inc.updates].reverse();
-  const shown = showAll ? timeline : timeline.slice(0, 5);
+  const shown = showAll ? timeline : timeline.slice(0, TIMELINE_PREVIEW_ENTRIES);
 
   async function post() {
     if (!msg.trim()) return;

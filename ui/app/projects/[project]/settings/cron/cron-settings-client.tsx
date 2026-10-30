@@ -5,29 +5,8 @@ import { useRouter } from "next/navigation";
 import { ExternalLink } from "lucide-react";
 import { Button, SettingCard, Switch } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type CronJob, type ProjectSettings } from "@/lib/api";
+import { describeSchedule } from "@/lib/cron-schedule";
 import { timeAgo } from "@/lib/utils";
-
-/** Best-effort English label for the common cron shapes; falls back to the
- * raw expression (never lies about a schedule it can't confidently describe). */
-function describeSchedule(expr: string): string | null {
-  const f = expr.trim().split(/\s+/);
-  if (f.length !== 5 && f.length !== 6) return null;
-  // Normalize to 5 fields (min hour dom month dow) — drop a leading seconds
-  // field (this platform's own native format) when present and "0".
-  const [min, hour, dom, month, dow] = f.length === 6 ? f.slice(1) : f;
-  const every = (field: string) => /^\*\/(\d+)$/.exec(field)?.[1];
-  if (dom === "*" && month === "*" && dow === "*") {
-    const everyMin = every(min);
-    if (everyMin && hour === "*") return `Every ${everyMin} minute${everyMin === "1" ? "" : "s"}`;
-    if (min === "*" && hour === "*") return "Every minute";
-    const everyHour = every(hour);
-    if (min !== "*" && !everyMin && everyHour) return `Every ${everyHour} hours, at minute ${min}`;
-    if (min !== "*" && !everyMin && hour !== "*" && !everyHour) {
-      return `Daily at ${hour.padStart(2, "0")}:${min.padStart(2, "0")} UTC`;
-    }
-  }
-  return null;
-}
 
 export function CronSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);

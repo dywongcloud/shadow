@@ -1,27 +1,21 @@
-//! Dedicated public IPv4 (Tencent Cloud EIP) provisioning for the paid
-//! `dedicated_ipv4` project addon.
+//! Dedicated public IPv4 (Tencent Cloud EIP) provisioning for the paid `dedicated_ipv4` project
+//! addon.
 //!
-//! [`provision_from_checkout`] is called from exactly two places —
-//! `admin::billing_confirm` (the browser-redirect confirmation) and
-//! `admin::billing_webhook`'s `checkout.session.completed` handler (the
-//! Stripe-authoritative path, since a user's browser is not guaranteed to
-//! still be present) — and both funnel through the SAME idempotency check
-//! before ever touching the network: does `ProjectSettings::dedicated_ipv4`
-//! already hold a claim for this project? That field IS the durable claim.
-//! `ProjectStore` replicates fleet-wide via `store_sync::REGISTRY`'s
-//! "projects" entry (AGENTS.md's round-robin-reads rule: this must never be
-//! node-local), so a double confirmation firing — Stripe retries webhooks,
-//! and the browser redirect can race the webhook for the same event — is a
-//! no-op read, never a second `AllocateAddresses` purchase. A redeploy reuses
-//! the same claim via `git.rs`'s manifest merge; it never calls this module.
+//! [`provision_from_checkout`] is called from three places: `admin::billing_checkout`'s $0
+//! shortcut, `admin::billing_confirm` (the browser-redirect confirmation) and
+//! `admin::billing_webhook`'s `checkout.session.completed` handler (the Stripe-authoritative path:
+//! the user's browser may be gone). All three funnel through the SAME idempotency check before
+//! touching the network: `ProjectSettings::dedicated_ipv4` IS the durable claim for the project,
+//! and `ProjectStore` replicates fleet-wide through `store_sync::REGISTRY`'s "projects" entry
+//! (never node-local). A double confirmation (Stripe retries webhooks, and the browser redirect can
+//! race the webhook for the same event) is therefore a no-op read, never a second
+//! `AllocateAddresses` purchase. A redeploy reuses the same claim through `git.rs`'s manifest merge
+//! and never calls this module.
 //!
-//! Real Tencent Cloud calls (`AllocateAddresses` + `AssociateAddress`, both
-//! under the `vpc` service, TC3-HMAC-SHA256 signed exactly per Tencent's API
-//! 3.0 spec) are isolated in [`allocate_eip`] — the only place in this
-//! module that touches the network. Per this task's hard constraint, nothing
-//! in this repo's own tooling ever calls it: it is written to be correct by
-//! inspection (and, later, testable against a mocked HTTP layer), meant to
-//! run for real only from a live confirmed checkout in production.
+//! The Tencent Cloud calls (`AllocateAddresses`, `AssociateAddress` and `DescribeAddresses`, all in
+//! the `vpc` service, TC3-HMAC-SHA256 signed exactly per Tencent's API 3.0 spec) are isolated in
+//! [`allocate_eip`], the only place in this module that touches the network. Nothing in this repo's
+//! own tooling calls it: it runs for real only from a live confirmed checkout in production.
 
 use crate::state::CloudState;
 use fluid_core::DedicatedIpv4;
@@ -33,43 +27,33 @@ use std::sync::Arc;
 /// gates on this exact string before ever creating a checkout with `kind == "addon"`.
 pub const SKU: &str = "dedicated_ipv4";
 
-/// Real Stripe recurring price id for the addon, operator-configured —
-/// deliberately NOT a hard-coded `price_...` literal (unlike `plan_spec`'s
-/// tier prices): this repo's own tooling must never be able to charge a real
-/// Stripe price by accident, and there is no real price id to hard-code
-/// until an operator actually creates one in the Stripe dashboard.
+/// The operator-configured Stripe recurring price id for the addon
+/// (`HIVE_DEDICATED_IPV4_PRICE_ID`), deliberately NOT a hard-coded `price_...` literal like
+/// `plan_spec`'s tier prices: this repo's own tooling must never be able to charge a real Stripe
+/// price by accident, and no real price exists until an operator creates one in the Stripe
+/// dashboard.
 pub fn price_id() -> Option<String> {
     std::env::var("HIVE_DEDICATED_IPV4_PRICE_ID")
         .ok()
         .filter(|s| !s.is_empty())
 }
 
-/// Price (USD cents/mo) used for the checkout's own `amount_cents`
-/// bookkeeping and the invoice line — mirrors how `PlanSpec::price_cents` is
-/// the informational amount even though a real charge (once one exists)
-/// would be governed by the Stripe price object once `price_id()` is set.
+/// Price in USD cents per month for the checkout's own `amount_cents` bookkeeping and the invoice
+/// line. Informational, like `PlanSpec::price_cents`: a real charge is governed by the Stripe price
+/// object once `price_id()` is set.
 ///
-/// Temporarily 0 for testing (operator decision, not a permanent price):
-/// `admin::billing_checkout`'s `amount == 0` branch applies ANY $0 purchase
-/// (plan or addon) immediately, no Stripe round-trip — Stripe rejects a $0
-/// line item outright, so this is also the only way to exercise the addon
-/// checkout path at all while the price is zero. Restore a nonzero value
-/// here to re-enable real billing for this addon.
+/// Currently 0, an operator's testing decision rather than a permanent price:
+/// `admin::billing_checkout`'s `amount == 0` branch applies ANY $0 purchase (plan or addon)
+/// immediately with no Stripe round-trip, and Stripe rejects a $0 line item outright, so this is
+/// also the only way to exercise the addon checkout while the price is zero. Restore a nonzero
+/// value to re-enable real billing for this addon.
 pub const PRICE_CENTS: u64 = 0;
 
-/// Idempotent addon provisioning — see the module doc for the full contract.
-/// `co.target` is the project id (validated as tenant-owned by the caller at
-/// checkout-open time, `admin::project_owned_by`); `co.tenant` is the
-/// billing tenant charged.
-/// Can this node actually provision an address RIGHT NOW? Checks exactly the
-/// config `allocate_eip` requires, spending nothing and reserving nothing.
-///
-/// Exists because the purchase path used to discover missing config only
-/// AFTER opening and confirming a checkout, then answered the browser with a
-/// bare 502: the operator saw "HTTP error" on the Buy button with no way to
-/// learn that the fleet simply has no Tencent credentials configured. A
-/// capability this platform cannot perform must say so in words, before it
-/// takes a purchase.
+/// Can this node provision an address RIGHT NOW? Checks exactly the configuration `allocate_eip`
+/// requires, spending nothing and reserving nothing. It exists so a missing configuration is
+/// reported in words BEFORE a purchase is taken: discovered after confirming a checkout, it
+/// surfaced as a bare 502 on the Buy button with no way to learn that the fleet has no Tencent
+/// credentials.
 pub fn preflight() -> Result<(), String> {
     for key in [
         "TENCENTCLOUD_SECRET_ID",
@@ -82,12 +66,11 @@ pub fn preflight() -> Result<(), String> {
     Ok(())
 }
 
-/// Ask the control-plane leader's own `preflight()` verdict when THIS node's
-/// is `Err` — see `admin::billing_addons`'s doc comment for why a node-local
-/// answer alone is wrong for this specific check. Best-effort: `None` means
-/// "could not ask" (leader unreachable, no candidates, bad response) and the
-/// caller must fall back to the local verdict — never turn a reachability
-/// hiccup into a harder "unavailable" than the local check already gave.
+/// Asks the control-plane leader for its `preflight()` verdict, for when THIS node's is `Err` (see
+/// `admin::billing_addons` for why a node-local answer alone is wrong for this check). Best-effort:
+/// `None` means "could not ask" (leader unreachable, no candidates, bad response) and the caller
+/// falls back to the local verdict, never turning a reachability hiccup into a harder "unavailable"
+/// than the local check gave.
 pub async fn leader_preflight(cloud: &Arc<CloudState>) -> Option<Result<(), String>> {
     let api_host = format!("api.{}", cloud.platform_domain);
     for (_name, ip) in crate::leader_forward_candidates(cloud) {
@@ -131,6 +114,9 @@ pub async fn leader_preflight(cloud: &Arc<CloudState>) -> Option<Result<(), Stri
     None
 }
 
+/// Idempotent addon provisioning (see the module doc for the contract). `co.target` is the project
+/// id, validated as tenant-owned by the caller at checkout-open time (`admin::project_owned_by`);
+/// `co.tenant` is the billing tenant charged.
 pub async fn provision_from_checkout(
     c: &Arc<CloudState>,
     co: &crate::billing::Checkout,
@@ -166,21 +152,24 @@ pub async fn provision_from_checkout(
     Ok(alloc)
 }
 
-/// Real `AllocateAddresses` + `AssociateAddress` calls against Tencent
-/// Cloud's `vpc` service. NEVER call this from implementation/verification
-/// tooling in this repo — it spends real money and reserves a real address
-/// the instant a request lands. Requires `TENCENTCLOUD_SECRET_ID`/
-/// `TENCENTCLOUD_SECRET_KEY` (the account's API credentials),
-/// `HIVE_TENCENT_EIP_REGION` (a real Tencent region id, e.g.
-/// "ap-hongkong" — the fleet's own region labels like "sanjose" are NOT
-/// Tencent region ids and must not be guessed into one), and
-/// `HIVE_TENCENT_CVM_INSTANCE_ID` (the Tencent-side CVM instance id THIS
-/// node runs on — distinct from `node_name`, which stamps
-/// `DedicatedIpv4::owner_node` for the fleet-side listener reconcile in
-/// `dedicated_ipv4_listener.rs`: that comparison is against `NodeInfo`'s own
-/// name, never a cloud-provider instance id). Any missing config fails
-/// closed with a named reason — never a silent skip that leaves a paid
-/// checkout with no address.
+/// Allocates a real EIP and associates it with this node's CVM: `AllocateAddresses`,
+/// `AssociateAddress`, then `DescribeAddresses` for the dotted address (on some API versions the
+/// allocate response carries EIP ids, not addresses, so the shape is looked up, never assumed).
+/// NEVER call this from implementation or verification tooling: it spends real money and reserves a
+/// real address the instant a request lands. A failure after `AllocateAddresses` leaves that
+/// address allocated and unclaimed (no release is attempted; the error text carries the
+/// `AddressId`).
+///
+/// Requires `TENCENTCLOUD_SECRET_ID`/`TENCENTCLOUD_SECRET_KEY` (the account's API credentials),
+/// `HIVE_TENCENT_EIP_REGION` (a real Tencent region id such as `ap-hongkong`; the fleet's own
+/// region labels are NOT Tencent region ids and must not be guessed into one) and
+/// `HIVE_TENCENT_CVM_INSTANCE_ID` (the Tencent-side CVM instance THIS node runs on, distinct from
+/// `node_name`, which stamps `DedicatedIpv4::owner_node` for the listener reconcile in
+/// `dedicated_ipv4_listener.rs` and is compared against `NodeInfo`'s own name, never a
+/// cloud-provider instance id). Missing configuration fails closed with a named reason, never a
+/// silent skip that leaves a paid checkout with no address. `Tags` use Tencent's `{Key, Value}`
+/// shape: the `TagKey`/`TagValue` spelling belongs to the filter type and AllocateAddresses rejects
+/// it with `UnknownParameter`.
 async fn allocate_eip(
     http: &reqwest::Client,
     project: &str,
@@ -197,11 +186,6 @@ async fn allocate_eip(
         &serde_json::json!({
             "AddressCount": 1,
             "InternetChargeType": "BANDWIDTH_PACKAGE",
-            // Tencent's VPC `Tag` struct is `{Key, Value}`; the `TagKey`/`TagValue`
-            // spelling belongs to the *filter* type and is rejected by
-            // AllocateAddresses with `UnknownParameter: Tags.0.TagKey`
-            // (witnessed live, 2026-09-01) — which failed every dedicated-IPv4
-            // provision before a single address was purchased.
             "Tags": [{"Key": "hive-project", "Value": project}],
         }),
     )
@@ -230,9 +214,6 @@ async fn allocate_eip(
         return Err(format!("AssociateAddress failed for {eip_id}: {err}"));
     }
 
-    // DescribeAddresses to learn the actual dotted-quad now bound to eip_id
-    // (AllocateAddresses' own AddressSet, on some API versions, returns EIP
-    // ids rather than addresses — never assume the shape, look it up).
     let desc = tc3_request(
         http,
         "vpc",
@@ -267,10 +248,12 @@ fn non_empty_env(key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{key} is not configured on this node"))
 }
 
-/// One TC3-HMAC-SHA256 signed POST against `<service>.tencentcloudapi.com`,
-/// per Tencent Cloud's API 3.0 signature spec — the exact canonical-request /
-/// string-to-sign / derived-key chain, byte for byte, so this is correct by
-/// inspection against the published algorithm rather than approximated.
+/// One TC3-HMAC-SHA256 signed POST against `<service>.tencentcloudapi.com`, following Tencent
+/// Cloud's API 3.0 signature spec exactly (canonical request, string to sign, derived key), so it
+/// is correct by inspection against the published algorithm. Only `content-type` and `host` are
+/// signed, the spec's minimal canonical-header set; `X-TC-Action`, `X-TC-Version` and `X-TC-Region`
+/// still travel as ordinary request headers, since API 3.0 reads the action from `X-TC-Action`, not
+/// from the signature.
 async fn tc3_request(
     http: &reqwest::Client,
     service: &str,
@@ -286,13 +269,6 @@ async fn tc3_request(
     let date = chrono_date_utc(ts);
 
     let hashed_payload = hex::encode(Sha256::digest(payload_str.as_bytes()));
-    // Exactly Tencent's documented minimal canonical-header set
-    // (`content-type` + `host`) — the two REQUIRED headers per the TC3-HMAC-
-    // SHA256 spec's own worked example. `X-TC-Action`/`X-TC-Version`/
-    // `X-TC-Region` are still sent as real request headers (the API 3.0
-    // protocol reads the action from `X-TC-Action`, not the signature), just
-    // not folded into what's cryptographically signed — matching the
-    // published example precisely rather than an unverifiable variant.
     let canonical_headers = format!("content-type:application/json; charset=utf-8\nhost:{host}\n");
     let signed_headers = "content-type;host";
     let canonical_request =
@@ -340,10 +316,9 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// `YYYY-MM-DD` in UTC from a Unix timestamp — Tencent's `CredentialScope`
-/// date component. Hand-rolled (no `chrono` dependency in this crate) using
-/// the standard civil-from-days algorithm (Howard Hinnant's `civil_from_days`),
-/// correct across the whole proleptic Gregorian range this ever needs.
+/// `YYYY-MM-DD` in UTC from a Unix timestamp: the date component of Tencent's `CredentialScope`.
+/// Hand-rolled with Howard Hinnant's `civil_from_days` algorithm because this crate has no `chrono`
+/// dependency.
 fn chrono_date_utc(unix_secs: i64) -> String {
     let days = unix_secs.div_euclid(86_400);
     let z = days + 719_468;

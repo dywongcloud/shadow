@@ -1,464 +1,337 @@
 # AGENTS.md
 
-Working conventions for this repo, present tense — what must be true of the code
-now. History lives in `CHANGELOG.md`.
-
-**Self-maintenance:** this file stays under ~30 KB. When it grows past that,
-recompile it from the code, the git log and the memory files — keep only what is
-still true and load-bearing, drop every incident narrative, and delete the
-memories/notes whose durable content it absorbed.
+Present-tense conventions: what must be true of the code now; history lives in `CHANGELOG.md`. Stay under ~30 KB
+(`wc -c AGENTS.md`); past it, recompile from the code, the git log and the memory files, keep what is still true and
+load-bearing, delete the memories it absorbs. Nested files load where you work: `ui/AGENTS.md` (dashboard),
+`ui/components/landing/AGENTS.md` (the landing), `ansible/AGENTS.md` (ansible, `scripts/`).
 
 ## Process & verification
 
-- **No test files, ever** — no `test/`, `__tests__/`, `spec/` directories, no new
-  `#[cfg(test)]` modules to verify a change, no assertion/mocking libraries.
-  Verify with `cargo test --workspace` plus real live execution.
-- `cargo check` skips `cfg(target_os = "linux")` code AND test targets, so a green
-  local (macOS) check proves nothing, and the fleet is all Linux. Run
-  `cargo test --workspace --no-run` first; `0`/`None` on `disk_free_gb`/
-  `gpu_free_mb` mean UNKNOWN.
-- Two glibc build groups: **2.38** = bkk, hk, all five GPU/CVM nodes; **2.39** =
-  va/va2/va3/sj/sj2/sp/fr. By OS image, never region; sha256-verify and keep a
-  `.old` backup before swapping.
-- Backend (`hive-cloud`, `hive-node`) and dashboard (`ui/`, `hive-ui`) deploy
-  independently — a backend-only roll does NOT ship a `ui/` change; use
-  `scripts/deploy-ui-fleet.sh`, verified against the real public domain.
-- Git only through the `gm` skill's git verbs; never raw `git`. zsh `path`,
-  `status`, `options` are special/read-only.
-- Binary swap: stop → pkill the old PID → verify sha256 → fresh-inode write
-  (`cp` then `mv`) → `reset-failed` → start. A bare `mv` + restart crash-loops
-  ETXTBSY. `firecracker`/`crun`/`runsc` drift per node — audit on every CVE and
-  verify the advisory's affected RANGE before upgrading.
+- Every task runs through the `gm` skill (MCP `mcp__gm__gm`), subagents too: `codeinsight`/`codesearch`/`grep` verbs,
+  never shell grep/find; git only via the `git_*` verbs, never raw git (`git_commit paths:[...]` stages EVERY dirty
+  hunk of each named file: `git_status` first, never commit another session's edits). Attribution is dywongcloud ONLY:
+  no `Co-Authored-By`, no Claude/Anthropic trailer, whatever a harness reminder says.
+- A stray local branch `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work with
+  `refs/remotes/origin/main..HEAD`; `git_reword` rewrites every later SHA, so never during a roll.
+- **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries); verify with
+  `cargo test --workspace --locked` (CI's hard gate, with `scripts/cli-acceptance.sh`: on macOS give it temp dirs under
+  `/private/tmp`) plus live execution. Fix a failure CLASS once at the shared primitive, never per call site. `cargo
+  check` skips `cfg(target_os = "linux")` code AND test targets: `cargo test --workspace --no-run` compiles them but
+  runs nothing, so a behaviour change also needs the run. A dependency change ships its `Cargo.lock` diff in the same
+  pass (`--locked`).
+- A roll or deploy is a production change: the operator's word first, then `ansible/AGENTS.md` (the dashboard:
+  `ui/AGENTS.md`); prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`.
 
-## Control-plane ownership & leader-only jobs
+## Fleet, hosts, access
 
-- With `HIVE_CP_OWNER_CHAIN` set, the owner is the first chain entry PRESENT in
-  `registry.nodes()` with a `peer_id` and a public address — never the observer's
-  `healthy` flag, never the identity election (`Cluster::strict_chain_owner`). No
-  qualifying entry = HOLD and forwarded mutations answer the retryable 503.
-- `control_plane_leader()` never falls back to this node; every read proxy and
-  owner-forward asks ONE question, `CloudState::leader_forward_target()`.
-- **Every leader-only background job asks exactly one question:
-  `leadership::may_act(cloud, Job)`** — owner AND a fresh view AND not isolated
-  AND, for a BACKUP owner only, fresh DIRECT contact with a strict majority of
-  `HIVE_CP_VOTERS`, held continuously for `Job::min_tenure()` (relocate 600s,
-  ACME/HTTP-01 300s, billing 120s, DNS and git poll 60s, others 30s). A new
-  leader-only loop adds a `Job` variant; the chain HEAD acts on presence alone.
-- Take-over work keys on the ownership TERM (`leadership::TERM_LAPSE`, 30s), not a
-  `may_act` edge. An owner present but unable to act is still owner in everyone's
-  view, so every job HOLDS fleet-wide — fix by restoring transport or voters,
-  never by weakening the gate. Verify `HIVE_CP_OWNER_CHAIN`/`HIVE_CP_VOTERS`
-  **in the running process** (`/proc/<pid>/environ`, or `launchctl print` on
-  macOS), since a drop-in or plist overrides the unit file.
-- Node-death self-heal is OFF unless `HIVE_NODE_DEATH_SELF_HEAL=1`. Enabled it
-  needs `may_act(NodeDeathRelocate)`, the host absent from `registry.nodes()` for
-  10 min measured from this node's first observation (never the row's
-  `updated_ms`), no retry for the same (project, host, commit) in 6h, and <3
-  relocations from this node in the trailing hour.
-- **Automated incidents are level-triggered conditions** (`incidents.rs`): the
-  opener calls `IncidentStore::open` EVERY pass with a stable `condition` and a
-  `ttl_ms` of 3 passes (dedup + re-assert), `clear(condition)` on its healthy
-  branch; the leader-only reconciler (`Job::IncidentReconcile`) resolves what
-  lapsed, collapses duplicates and bounds history. Only the operator's
-  `POST /v1/incidents` uses `open_new`. `GET /v1/incidents` is paged + gzip.
+- Live roster = non-`hive_retired` lines of the operator-owned, git-ignored `ansible/inventory/hosts.ini`: fc-orlando
+  209.23.0.183, va, va3, sj (chain head), sj7, phx. `[platform:vars]` templates
+  `HIVE_CP_OWNER_CHAIN=fc-sanjose,fc-phoenix,fc-virginia-3,fc-virginia` and
+  `HIVE_CP_VOTERS=fc-sanjose,fc-phoenix,fc-virginia-3`; a node drop-in overrides the unit: read `/proc/<pid>/environ`.
+- SSH `ssh -i ~/.ssh/billing.pem root@<ip>`. Verify ports from a FLEET vantage, never the laptop. TCP+UDP 20000-29999
+  is SG-open to the internet on every host: never run an ad-hoc file server (`scripts/audit-public-listeners.sh`).
+  `scripts/hive-lockdown.sh` is the only host firewall; its PEERS roster is generated (`gen-hive-lockdown.sh`, then
+  `site.yml --tags lockdown`).
+- fc-orlando SHARES its host with a second hive-cloud (`hive-devhub.service`): stop by MainPID, never
+  `pkill -x hive-cloud`. macOS launchd nodes: recall `macOS launchd nodes`. The Tencent account is SHARED: attribute
+  via CloudAudit before deleting (GAAP proxies `zzhli-*`/`kjh-*` are other tenants'); `tencent_eip::allocate_eip` buys
+  a REAL EIP: never from verification tooling.
+- Seed `HIVE_BOOTSTRAP_PEERS` with ADDRESSED peers (`<64hex>[@ip:port[+ip:port]][|relay-url]`), never bare ids.
+  `HIVE_TRUSTED_NODE_IDS` + `HIVE_PEER_TRUST=1` list every fleet id on every node (missing:
+  `REJECTED mutating gossip: no verified+trusted signer`). Admin JWTs are HS256 on `HIVE_JWT_SECRET`, minted ON the
+  node (`scripts/mint-operator-jwt.sh`; `platform_admin` needs an email in `HIVE_OWNER_EMAIL`/`HIVE_ADMIN_EMAILS`).
+
+## Control plane & leader-only jobs
+
+- With `HIVE_CP_OWNER_CHAIN` set the owner is the first chain entry PRESENT in `registry.nodes()` with a `peer_id` and
+  public address (`Cluster::strict_chain_owner`): never the observer's `healthy` flag, never the identity election; no
+  qualifying entry = HOLD. Every proxy and owner-forward asks `CloudState::leader_forward_target()`.
+- **Every leader-only loop asks one question, `leadership::may_act(cloud, Job)`**: owner AND fresh view AND not
+  isolated AND (backup owner only) fresh DIRECT contact with a strict majority of `HIVE_CP_VOTERS`, held for
+  `Job::min_tenure()` (30 s, up to 600 s for NodeDeathRelocate); take-over keys on the ownership TERM (`TERM_LAPSE`,
+  30 s). An owner present but unable to act is still owner everywhere, so every job HOLDS fleet-wide: restore
+  transport/voters, never weaken the gate. Node-death self-heal is OFF unless `HIVE_NODE_DEATH_SELF_HEAL=1`.
 
 ## State: replication, routing, relational mirror
 
-- `admin_ingress` forwards MUTATIONS to the leader and serves every GET/HEAD
-  LOCALLY; public hosts are round-robin DNS. Any endpoint on NODE-LOCAL data (a
-  file under `persist::data_dir()`, an in-process `Mutex`/`OnceLock`/channel) that
-  a mutation writes and a GET reads will read the wrong node and return
-  empty/404/0 silently. Every new endpoint declares its side: a GET on node-local
-  state needs an owner/leader proxy (`build_get`, `fetch_from_host`,
-  `fetch_bytes_from_host`, `sandboxes_api::proxy_to_owner`) plus a
-  `gossip::dispatch` arm ordered longest-prefix-first, or its state moves into
-  `store_sync::REGISTRY` or fans out (`db_replicate::fanout_all` + a matching
-  `apply_mirrored_write` arm). Verify through the round-robin host with several
-  reads.
-- The stale-epoch 503 is a retryable refusal: the fence answers 503 plus
-  `x-hive-cp-epoch-current`; the forwarder max-merges it via `adopt_epoch`,
-  re-stamps, retries up to `MAX_STALE_EPOCH_RETRIES` (3), then walks candidates.
-- **Store-sync adoption is WHOLESALE-REPLACE, so it happens only from an owner
-  every node agrees on** (`OwnerSource::may_adopt_wholesale_from`): the chain HEAD,
-  or on a chain-less mesh the identity election; from a backup chain owner or a
-  `Fallback` guess only per-row `MERGE_STORES` are pulled. A failed pull is never
-  silent (`StorePullFailures` WARNs per store, incident every 10 failures), and the
-  pull is `store_follower` — its own supervised loops, never behind a GuardianDB
-  await. A critical write must land on EVERY owner-chain candidate, and snapshots
-  must route through `serde_json::Value` with `enc_sorted()`.
-- **The relational index is built by ONE background walker, never on a request
-  path, and nothing writes the catalog before it completes once.** An EMPTY
-  guardian index makes every `Session` load `Catalog::new()` (every table "does not
-  exist", `pg_class`=0) and a `CREATE TABLE IF NOT EXISTS` then overwrites the real
-  catalog. `spawn_index_refresher` walks once under
-  `HIVE_RELATIONAL_INDEX_BUILD_SECS` (900), re-walks every
-  `HIVE_RELATIONAL_REFRESH_SECS` (120); `index_ready()` gates `init_schema` and
-  `ensure_table_exists`, which verifies through `information_schema.tables`, never
-  `SELECT 1 FROM t`. `get`/`scan` fall through to the store's ASYNC `get`.
-  Diagnose with `SELECT count(*) FROM pg_catalog.pg_class` (0 = unbuilt).
-- `GET/POST /v1/admin/sql/*` is read-only by construction
-  (`reject_unless_readonly` scans the whole query); `known_tables()` (15 today) is
-  hand-maintained, and `relational::upsert_billing` wraps a tenant's whole write in
-  ONE `BEGIN; … COMMIT;`.
-- **GuardianDB and its relational SQL mirror must never be an input, a translation
-  layer, or a readiness gate for canonical state — at most a derived read-only
-  projection.** Fix a failure CLASS once at a shared primitive, never per call
-  site. Cron is NODE-LOCAL — keep it out of store_sync and leader-only execution,
-  and restore it with `CronScheduler::replace_all`, never `add()` in a loop.
+- Canonical state is ONE in-memory representation (`state.json` + store_sync), never derived from, translated through
+  or gated on GuardianDB or its SQL mirror (at most a read-only projection; `guardian::spawn_restore_guard` alone
+  adopts a NEWER snapshot after a regressed local file). A deserialize error in `persist::load` is silent total state
+  loss: `ServiceProtocol` is strict in `FromStr` and lenient in serde, and a serde-REQUIRED key is never removed from
+  a persisted struct in one release (empty it first, as `DomainRecord` does).
+- `admin_ingress` forwards MUTATIONS to the leader and serves GET/HEAD LOCALLY; public hosts are round-robin DNS, so a
+  GET over NODE-LOCAL data (a file under `persist::data_dir()`, an in-process `Mutex`/`OnceLock`) answers empty/404
+  from the wrong node. Such a GET needs an owner/leader proxy (`build_get`, `fetch_from_host`; the owner re-checks the
+  bearer and never re-proxies) plus a `gossip::dispatch` arm (longest-prefix-first; an unknown path answers an EMPTY
+  body), or the state moves into `store_sync::REGISTRY` or fans out (`db_replicate::fanout_all`).
+- **Store-sync adoption is WHOLESALE-REPLACE, so only from an owner every node agrees on**
+  (`OwnerSource::may_adopt_wholesale_from`: the chain HEAD, or the identity election on a chain-less mesh) and never
+  from an empty or unparsable payload; from a backup owner or `Fallback` only per-row `MERGE_STORES` merge. A critical
+  write lands on EVERY owner-chain candidate; snapshots route through `serde_json::Value` + `enc_sorted()`.
+  ProjectSettings rows replicate with per-row `updated_ms` + permanent tombstones; absence never erases a row.
+- `ProjectSettings.last_build` is terminal-only: "building" is derived from the live BuildStore, and the ONLY writer
+  of a build's outcome is `BuildCompletionGuard::drop`. Project delete/rename hold
+  `project_settings::lifecycle_write(project)` and cascade to every node; names are unique across the PLATFORM.
+- **The relational index is built by ONE background walker, never on a request path, and nothing writes the catalog
+  before it completes once** (`spawn_index_refresher`, bounded by `HIVE_RELATIONAL_INDEX_BUILD_SECS`): `index_ready()`
+  gates `init_schema` and `ensure_table_exists` (verified via `information_schema.tables`, never `SELECT 1 FROM t`).
+  Cron is NODE-LOCAL: restore via `CronScheduler::replace_all`, never `add()`.
 
 ## Mesh transport, discovery, watchdogs
 
-- `PeerPool` keys trunks by ENDPOINT ID, never the caller's label.
-- **Every inbound accept is bounded, budgeted by its NEGOTIATED ALPN, and never
-  evicts an established trunk.** Each accept runs under
-  `HIVE_P2P_ACCEPT_DEADLINE_MS` (default `IDLE_TIMEOUT`+10s = 40s, above the 30s
-  idle timeout so an abandoned handshake ends as an error, uncounted); past it the
-  connection is CLOSED with `FLEET_CLOSE_OVERLOADED` (8) and counted
-  `accept_stuck`. Pre-handshake the ClientHello picks the budget (browser 128 /
-  fleet 512 / unparseable → `pending`, `HIVE_P2P_PENDING_MAX_CONNS` 256); after the
-  handshake `conn.alpn()` decides. Every hybrid X25519MLKEM768 dial lands in
-  `pending` (its 1216-byte key share does not fit one Initial) — never charge an
-  unparsed ClientHello to the fleet budget. Connections are also capped per remote
-  endpoint (`HIVE_P2P_MAX_CONNS_PER_ENDPOINT`, 16).
-- A refused dial opens a per-endpoint window (1s→30s): `acquire` fails at once with
-  `PeerRefused`, never `DeadPeerTimeout`. A pre-handshake refusal names no
-  identity, so one through a hint's DIRECT addresses opens the window only once an
-  identity-routed path confirms it; `UnknownIssuer` suspends EVERY direct address
-  of that hint for 10 min and retries via the relay — only while the hint HAS one.
-  Never let an address filter empty the set. Gossip bodies read against IDLE
-  (`HIVE_P2P_FIRSTBYTE_MS` 15s, `HIVE_P2P_IDLE_MS` 45s); replies ≥256 KiB are
-  lower priority.
-- Stream mode `0x06` (`STREAM_CORE`) carries signed-log replication (`hive-cores`,
-  feature `cores`, `HIVE_CORES_LISTEN=0` off): trusted peers only, every reply
-  opens with `hive_cores::MAGIC` so an old node's tunnel misparse fails the
-  pull, and readers verify every bundle (`shadw-core`) — never the transport.
-  Cores run only on the PATCHED `vendor/hypercore`; unpatched 0.16 appends over
-  its own data after a reopen. Mode bytes `0x00`–`0x06` are taken.
-- `hive_p2p::establish_stats` is served on operator-only `GET /v1/mesh/establish`,
-  **never on the unauthenticated `/v1/mesh`**. `last_outbound_established_ms`
-  frozen while dials time out and warm trunks still gossip IS the wedge;
-  `accept_stuck` alone is not evidence.
-- Keep the vendored iroh "read before send" patch across pin bumps (`vendor/` is
-  synced by the fanout role — edit vendored crates only between rolls);
-  `Dropping received relay packet: no available capacity` on a NON-leader is news.
-  A failed rebind must be RETRIED (`PendingRebind`): `AddrInUse` otherwise leaves
-  the transport Closed.
-- Address lookup: every source except the public DHT presupposes reachability, so
-  `hive_p2p::dht` stays registered and every failure path leaves it UNREGISTERED
-  with a WARN, never failing `bind()`. Never hand `DhtBuilder` a hostname. DHT
-  records are public forever, default relay-only (`HIVE_DHT_PUBLISH_DIRECT=1`),
-  RFC1918/CGNAT/link-local stripped — filter on the DHT builder, never
-  `Endpoint::builder().addr_filter()`.
-- A relay hint must name the relay the peer is ATTACHED to: keep the relay in the
-  peer's gossiped `iroh_addr`, steering via `hive_edge::select_relay_hint` only
-  when the addr has none. `NodeInfo::relay_url` (`http://<public-ip>:3341`) is
-  TCP-dead across Tencent hosts; `https://*.relay.shadw.app:3343` answers from
-  every vantage.
-- **A gossip round never waits on a dead peer, and one stale reading never
-  withdraws one.** Rounds end at `HIVE_GOSSIP_ROUND_DEADLINE_MS` (8000) using ONE
-  fan-out primitive, `bounded_round::BoundedRound`, never a hand-rolled
-  `join_all`. The deadline alone let ONE slow target pin every round to the full
-  8s, so a target that has missed it `LEASH_AFTER_ROUNDS` (2) times running is
-  waited on only `HIVE_GOSSIP_STRAGGLER_LEASH_MS` (2500) — still dialed every
-  round, and one answer inside the round restores the full deadline. A leash
-  PARKS, never cancels, so it never cuts a dial short mid-discovery; leash
-  state is keyed by ENDPOINT id, never target label. A slow sync is LATE,
-  never absent (`round_contributions`); backoff
-  applies only while this node's view is fresh; `health::demote` withdraws only
-  after `DEMOTE_STALE_ROUNDS` (2) stale rounds and HOLDS while the loop is stalled.
-- meshwatch: total isolation (600s), cumulative degradation, and
-  `establishment_wedge` — which reads transport counters, never peer counts: no
-  fresh connection in either direction for `HIVE_MESH_ESTABLISH_WEDGE_SECS` (300)
-  while dials to ≥2 distinct peers TIMED OUT, or ≥3 accepts closed at the deadline
-  with zero successful accepts. A refusal does not count; stuck accepts alone only
-  WARN.
-- **Every automatic restart passes ONE chokepoint, `ControlledRestart::request` →
-  `RestartReason::admissible`**: refused until `hive_backend::orphan_reap_ran()`
-  confirms this boot's cell reap (false on macOS and with
-  `HIVE_CELL_ORPHAN_REAP=0`, so those nodes only WARN) and rate-capped per reason
-  (wedge 1 per 6h), with the reason stamped into the run marker so the cap counted
-  from `restart_history.json` fails CLOSED when it is unreadable.
+- `PeerPool` keys trunks by ENDPOINT ID, never the caller's label. **Every inbound accept is bounded, budgeted by its
+  NEGOTIATED ALPN, and never evicts an established trunk**: `HIVE_P2P_ACCEPT_DEADLINE_MS` (40 s); pre-handshake the
+  ClientHello picks the budget; `hive_p2p::establish_stats` is served on operator-only `GET /v1/mesh/establish`, never
+  the public `/v1/mesh`.
+- Stream mode `0x06` (`STREAM_CORE`) carries signed-log replication (`hive-cores`, feature `cores`,
+  `HIVE_CORES_LISTEN=0` off): trusted peers only, every reply opens with `hive_cores::MAGIC` so an old node's tunnel
+  misparse fails the pull, and readers verify every bundle (`shadw-core`), never the transport. Cores run only on the
+  PATCHED `vendor/hypercore`; unpatched 0.16 appends over its own data after a reopen. Mode bytes `0x00`-`0x06` are taken.
+- `vendor/iroh` keeps two patches across pin bumps (relay "read before send", `PendingRebind`); a publicly dialable
+  address needs `HIVE_PUBLIC_IP` AND `HIVE_IROH_PORT`.
+- **A gossip round never waits on a dead peer, and one stale reading never withdraws one.** Rounds end at
+  `HIVE_GOSSIP_ROUND_DEADLINE_MS` through ONE primitive, `bounded_round::BoundedRound`; a target that keeps missing
+  the deadline is waited on only `HIVE_GOSSIP_STRAGGLER_LEASH_MS`, PARKED never cancelled, keyed by ENDPOINT id. Every
+  transport-failure writer funnels through `health::demote` (withdraws only after `DEMOTE_STALE_ROUNDS`, HOLDS while
+  stalled).
+- **Every automatic restart passes `ControlledRestart::request` -> `RestartReason::admissible`**: refused until
+  `hive_backend::orphan_reap_ran()`, rate-capped per reason (wedge 1/6 h) from `restart_history.json`, failing CLOSED
+  when unreadable.
 
-## Node bring-up, health, host firewall
+## Containers, podman, process lifecycle
 
-- Seed `HIVE_BOOTSTRAP_PEERS` with ADDRESSED peers
-  (`<64hex>[@ip:port[+ip:port]][|relay-url]`), never bare ids; `peer_iroh.json`
-  holds peers' PRIVATE addrs and cannot seed another node. A node's trust list
-  (`HIVE_TRUSTED_NODE_IDS` + `HIVE_PEER_TRUST=1`) must list every fleet id, and so
-  must every existing node's. Join rides a dedicated `STREAM_JOIN` mode
-  authenticated by the QUIC remote id plus an HMAC over `HIVE_JWT_SECRET`.
-- A health verdict is PER-OBSERVER, and the verdict that decides traffic is the
-  leader's. A successful cross-continent probe measured 7462ms; never trust a TCP
-  probe from a laptop on the VPN (it SYN-proxies).
-- **The published-port range (TCP+UDP 20000–29999) is SG-open to the internet on
-  every platform host** — never run an ad-hoc file server on a fleet node.
-  `scripts/audit-public-listeners.sh` is the check (exits 1 on a finding).
-- `scripts/hive-lockdown.sh` is the fleet's only host firewall and its PEERS roster
-  is generated (`scripts/gen-hive-lockdown.sh` then
-  `ansible-playbook playbooks/site.yml --tags lockdown`), never typed. Do not gate
-  it on the listener's cgroup.
+- **`KillMode=process` on hive-node.service is load-bearing** (rootful podman's conmon inherits the caller's cgroup,
+  so the default SIGTERMs every managed database per roll). Tenant CELLS therefore outlive their process, so every
+  boot reaps its own previous boot's cells (`hive_backend::reap_orphaned_cells`). Ownership is owner + boot
+  (`hive.owner`, `hive.boot`), never boot alone; another owner's cell is never touched.
+- Every container removal is `rm -f -v` (`container_cli::rm_args`): podman takes one lock from a FIXED pool (2048) per
+  container AND per volume; leaks surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume prune`**: reclaim is
+  gated on `is_anonymous_volume` (64 ascii-hex) AND `dangling=true`.
 
-## Containers, podman locks, process lifecycle
+## Isolation backends & Litebox
 
-- **`KillMode=process` on hive-node.service is load-bearing.** Rootful podman's
-  conmon inherits the caller's cgroup, so the default KillMode SIGTERMs every
-  managed database and Supabase stack on each roll; `OOMPolicy=continue` likewise.
-- The price is that tenant CELLS outlive their process, so every boot reaps its own
-  previous boot's cells. `hive_backend::reap_orphaned_cells` runs right after
-  backend selection; boot waits only for its URGENT half (listing + SIGKILL of
-  duplicate writers, ≤20s). **Ownership is owner + boot, never boot alone**
-  (`hive.owner`, `hive.boot`): another owner's cell is never touched; label-less
-  legacy cells only where this process is the host's sole supervised instance or
-  under `HIVE_CELL_ORPHAN_REAP_LEGACY=1`. With ≥2 live writers on a volume every
-  stale one is SIGKILLed (a SIGTERM makes each duplicate flush older state) except,
-  when no current or foreign writer shares it, the NEWEST, which gets
-  `podman stop -t 10`; removal is always `rm -f -v`. `orphan_reap_ran()` is false
-  while the reap runs, when skipped, when a stale cell survived, when opted out,
-  and ALWAYS on macOS.
-- Graceful stop must finish inside systemd's timeout: a `persist()` arriving after
-  `flush_blocking` closed admission is REFUSED, never blocked (a condvar wait there
-  parks a tokio worker and every timer with it);
-  `HIVE_SHUTDOWN_DEADLINE_SECS` (75) lives on a std thread; `TimeoutStopSec=90s`
-  is explicit (TencentOS defaults it to 5s). Any path that removes a container must
-  pass `-v` (`container_cli::rm_args`), since podman allocates one lock from a
-  **fixed pool** (2048) per CONTAINER and per VOLUME — leaked locks starve the
-  whole node and surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume
-  prune`** — reclaim is gated on `is_anonymous_volume` (exactly 64 ascii-hex) AND
-  `dangling=true`.
-- macOS launchd nodes: recall `macos-launchd-fleet-gotchas`.
+- **Capability is PROBED and ADVERTISED, never assumed**, on the filesystem the cell execs against
+  (`NodeInfo::wasm_runtime`/`bun_runtime` from `resources::RuntimeCapabilitySource`; `None` = NOT CAPABLE, unlike
+  `disk_free_gb == 0`). Placement gates through ONE predicate shared by `place`, lease-stickiness and
+  `dispatch_fallbacks` (`schedule::wasm_capable` and its siblings); a missing runtime is a NODE fault
+  (`fault::NODE_RUNTIME_MISSING`).
+- Litebox (third `CellBackend`, Firecracker -> Litebox -> Mock) is NOT Firecracker or gVisor isolation (guest and
+  enforcement share one address space; seccomp-bpf is the only backstop): a node is Litebox only after
+  `hive-cloud --litebox-probe` PASSES on that host with the exact staged runner AND `litebox_verified=true` on its
+  `hosts.ini` line, never the flag alone, never macOS. `litebox-bind-shim.js` and the guest `/etc` files feed
+  `runtime_source_sha256`, so ANY change rebuilds every runtime artifact.
+- A sandbox's live cell exists on ONE node (`SandboxRecord::owner_node`); the leader only routes. PVM kernels:
+  `pti=off` is REQUIRED and `KVM_CREATE_VM` succeeding proves nothing; recall `PVM kernels on the fleet`.
 
-## Isolation backends & capability gating
+## Runtime discipline (the serving runtime never stalls)
 
-- **Capability is PROBED and ADVERTISED, never assumed**, on the filesystem the
-  cell execs against, re-probed on the disk-refresh tick: wasmer on
-  `NodeInfo::wasm_runtime` (`resources::detect_wasm_runtime`); bun on
-  `NodeInfo::bun_runtime` (litebox always `Some(false)`); the build toolchain
-  (probe script inside the builder image for firecracker, host PATH otherwise).
-  `None` means NOT CAPABLE, unlike `disk_free_gb == 0`. Placement gates through ONE
-  predicate shared by `place`, lease-stickiness and `dispatch_fallbacks`
-  (`schedule::wasm_capable`, `bun_capable`, `build_isolation_capable`); a missing
-  runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
-- BUILD-ENV bun and GUEST/RUNTIME bun are independent: a bun PACKAGE-MANAGER choice
-  must NOT gate on `bun_runtime`, and a package manager the manifest selects but
-  the node lacks is substituted (npm first) with a loud log. Exit 127/42 of an
-  explicit repository command maps to typed `BUILD_TOOLCHAIN_MISSING`/`MISMATCH`.
-- PVM kernels: `pti=off` is REQUIRED and `KVM_CREATE_VM` succeeding does NOT mean a
-  microVM boots (can hard-reset the host): recall `pvm-kernel-hard-facts`.
-- Litebox (third `CellBackend`, Firecracker → Litebox → Mock): a node is Litebox
-  only after `hive-cloud --litebox-probe` PASSES on that host with the exact staged
-  runner AND `litebox_verified=true` on its inventory line — never the flag alone,
-  never on macOS. The guest tree is staged via `--initial-files=<tar>` with
-  `tar -h`. Honest posture: seccomp-bpf beats Mock, but guest and enforcement
-  share one address space and JIT syscalls are an unclosed gap. Guest rules
-  (fork-free execve, one TUN owner, exec drains under a deadline): recall
-  `litebox-runtime-contract`.
-
-## Runtime discipline (serving runtime never stalls)
-
-- **Heavy work never runs on a serving tokio worker.** The guardian SQL engine
-  reloads every row of each table it touches PER STATEMENT, so
-  `relational::exec` (the one chokepoint) runs under `block_in_place`; the
-  mirror loop and index walker live on the `bulkhead` runtime
-  (`bulkhead::spawn`, `HIVE_BULKHEAD_THREADS` 2); billing mirrors send only
-  this tick's ledger rows as chunked multi-row INSERTs (`ROWS_PER_INSERT`
-  500), full re-send every 60 ticks; two workers at 94% CPU there froze the
-  leader 73–763 s. A loop whose cost grows with the data is
-  spawned on the bulkhead and bounded. `runtime_watch` probes the runtime
-  every 1 s from an OS thread and names the CPU-hot threads of any stall >2 s
-  (`/v1/admin/runtime`; `HIVE_RUNTIME_STALL_DUMP=1` adds a gdb stack); release
-  keeps the symbol table (`strip = "debuginfo"`). Keep `MemoryHigh` above the
-  charged page cache (leader 112G/128G): memory.high throttles every thread.
+- **Heavy work never runs on a serving tokio worker.** The guardian SQL engine reloads every row of each table per
+  STATEMENT, so `relational::exec` is the one chokepoint and runs under `block_in_place`; the mirror loop, index
+  walker, replication writer and admin mirror reads live on the `bulkhead` runtime (`bulkhead::spawn`).
+- Model downloads share ONE node-wide slot count (`HIVE_INFERENCE_MODEL_DOWNLOADS_MAX` 2), one disk ledger
+  (`DiskClaim`) and a per-tenant slot (`TenantSlot`, 1), and a transfer under `HIVE_INFERENCE_MODEL_MIN_BYTES_PER_SEC`
+  over its rate window is cut: a slow drip never trips a stall timeout, so one tenant's URLs could hold every slot for
+  hours.
+- Anything a request path reserves is released by a `Drop` guard, never only on the `Err` branch (axum drops the
+  future when the client leaves): `ColdStartGuard`, `PooledConn`, `InflightSlot`, litebox guest tars, sandbox drains.
+  A tenant-controlled child pipe is drained only through `hive_core::logcap::read_capped_line`, never
+  `BufReader::lines()`: one newline-free line grows a `String` until the node dies.
 
 ## Builds & deploys
 
-- `git push` auto-deploys through TWO triggers, both deduping on the commit SHA
-  (`CloudState::git_poll_seen`): the webhook and `git::spawn_git_poll_reconcile`.
-- **A single unreachable node never fails a deploy.** On
-  `FanoutOutcome::nothing_ran()` `run_build` walks
-  `schedule::dispatch_fallbacks` one candidate at a time with the same `capable` +
-  `reachable` predicates as `place` (never the region widening), bounded by
-  `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3), stopping when any node RAN it.
-  `node_admins` holds http(s):// URLs only.
-- Isolated BuildExecutor (`build_executor.rs`): recover `HIVE_BUILDAH_SOCKET` from
-  the tenant process's `/proc/<pid>/environ`; never flip `build_isolation_protocol`
-  (main.rs hard-codes `None`). Full gotcha list: recall `build-executor-isolation-gotchas`.
-- Checkouts live in the DURABLE root `git::deploy_root()` (`$HIVE_DATA/deploys`);
-  prefix scanners must cover BOTH roots and BOTH name forms via
-  `git::checkout_prefixes`. ZIP extraction REJECTS symlinks and directory entries.
-  A direct-entry function whose entry does not exist fails the BUILD, never the
-  launch and never as a node fault (`git::preflight_direct_entries`).
-- The relocation reaper is SCOPED: `cleanup_non_targets` runs only for builds
-  provably classified PRODUCTION and removes ONLY superseded production-lane
-  records via `/v1/projects/<p>/reap-deployments`. ProjectSettings rows replicate
-  with per-row `updated_ms` + permanent tombstones; merges never let absence erase
-  a row. A preview's URL is `commit_alias || branch_alias || id_alias`, and the
-  ledger's checksum is verified over the payload bytes AS STORED
-  (`Box<RawValue>`), never over a re-serialization.
+- `git push` auto-deploys through TWO triggers deduping on the commit SHA (`CloudState::git_poll_seen`): the webhook
+  and `git::spawn_git_poll_reconcile`. **A single unreachable node never fails a deploy**: on
+  `FanoutOutcome::nothing_ran()` `run_build` walks `schedule::dispatch_fallbacks` one candidate at a time with
+  `place`'s `capable` + `reachable` predicates, bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3).
+- Isolated BuildExecutor: `NodeInfo::build_isolation_protocol` comes from the boot-time live probe
+  `build_executor::init_installed()`; any fault logs `BUILD_ISOLATION_UNAVAILABLE`, advertises `None` and keeps the
+  node out of repository-build placement: never advertise it from a flag or a literal.
+- Checkouts live in `git::deploy_root()`; prefix scanners cover BOTH roots, BOTH name forms and a renamed project's
+  old names (`git::checkout_prefixes`); a missing direct entry fails the BUILD (`git::preflight_direct_entries`),
+  never the launch; a `fluid.json` lane runs ZERO install/build commands.
+- The default `GET /v1/gitops/projects?view=summary` stays byte-identical (GitOps commits and the CLI depend on it);
+  `project_redeploy` alone rebuilds from `last_build`.
+- Env: legacy scope `""` matches build AND runtime (`env_scope_matches`); build-inlined values (`NEXT_PUBLIC_*`) need
+  `$HIVE_DATA/build-cache/*.tar` cleared before a redeploy of unchanged source: verify the SERVED bundle.
+- **The host build lane's package registry is part of node health**: it inherits the host `/root/.npmrc`, so a dead
+  mirror fails every uncached install; `build_registry::assess` swaps in a 0600 `npm_config_userconfig` with the
+  public registry, only for a dark KNOWN public mirror while registry.npmjs.org answers
+  (`scripts/audit-build-registry.sh` is the fleet check).
 
 ## Placement & capacity
 
-- Disk is a HARD filter, not a score term (`HIVE_PLACEMENT_DISK_FLOOR_GB`, set
-  above the per-cold-start floor). `NodeInfo::disk_free_gb` is gossiped and
-  refreshed on a timer; unknown (`0`) must ADMIT.
-- GPU: container path only; eligible only on `NodeInfo::gpu_count > 0` nodes,
-  including the lease-stickiness path, with no silent CPU fallback. Free VRAM
-  comes from the driver (`gpu_free_mb`) and the pool takes the MINIMUM of measured
-  and estimated. No `--split-mode tensor` on T4; cross-node pooling is `--rpc`.
-  Managed inference elects its coordinator deterministically (FNV(project)); the
-  app reads `HIVE_INFERENCE_URL`. llama.cpp stays on CUDA 12.x.
-- Data images carry a DOUBLE prefix (`dpl-dpl-<hash>.data.ext4`), so a GC keep-set
-  built from raw deployment ids matches nothing. `gc_rootfs_images` matches both
-  forms and refuses an empty keep-set or an orphaned fraction over
-  `HIVE_GC_MAX_REAP_FRACTION`. **Every reclaim path needs the same blast-radius
-  guard** — the same shape guards `browser_artifacts::gc`, `browser_db` GC and the
-  guardian reaper (which also refuses when `HIVE_NODE_ROSTER` is unset).
+- Disk is a HARD filter (`HIVE_PLACEMENT_DISK_FLOOR_GB`), never a score term; unknown free space
+  (`NodeInfo::disk_free_gb` 0) ADMITS; placement requires an actually dialable path. **Every reclaim path needs a
+  blast-radius guard**: `gc_rootfs_images` refuses an empty keep-set or an orphaned fraction over
+  `HIVE_GC_MAX_REAP_FRACTION` (data images carry a DOUBLE `dpl-dpl-` prefix: match both).
 
-## Request-path failure invariants
+## Request path, circuits, cold start
 
-- A deployment fails in two shapes needing separate handling: starts then dies
-  (`crash_streak` + `last_warm_ok_ms`) or never listens (`warm_fail_streak`).
-  Never clear a streak merely because a start succeeded; both the autoscaler AND
-  the request path must record failures.
-- A broken deployment reports `DEPLOYMENT_CIRCUIT_OPEN`, never
-  `CAPACITY_EXHAUSTED`. A circuit's open window (`CIRCUIT_PROBE_INTERVAL_MS`) must
-  outlast the failure it guards.
-- **Anything a request path reserves must be released by a `Drop` guard, never
-  only on the `Err` branch** — axum DROPS the request future when a client gives up
-  and a dropped future never returns `Err`. `ColdStartGuard` is the pattern; it
-  applies to `PooledConn`, litebox guest tars/links and sandbox exec drains. Count
-  failure streaks at the ONE chokepoint every caller funnels through.
-- Tenant tier lives in BOTH `c.teams` and `c.billing`; neither is authoritative
-  alone, so **every tier change goes through `admin::apply_plan_everywhere`** and
-  deletion clears both (`team_delete`, keeping the ledger).
+- A deployment fails in two shapes: starts then dies (`crash_streak` + `last_warm_ok_ms`) or never listens
+  (`warm_fail_streak`); never clear a streak because a start succeeded. A broken deployment reports
+  `DEPLOYMENT_CIRCUIT_OPEN`, never `CAPACITY_EXHAUSTED`; the circuit is keyed on instance HEALTH (`unhealthy_reaps`),
+  never instance count.
 
 ## Managed data lanes
 
-- **Managed SQLite (`DbKind::Sqlite`) and `browser_db` share nothing but the
-  word** — a plain file per DATABASE at
-  `$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db` vs a cr-sqlite CRR
-  replica per PROJECT at
-  `$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db`. **Never point
-  the Hrana handler at a `browser-dbs` file** — a bare `rusqlite` writer
-  (`sqlite_pool`) bypasses the clock tables the CRR merge reads, i.e. silent
-  permanent divergence; `browser_db_rest` is CRR-safe only because it opens via
-  `hive_crsql::open` and applies `set_ts`. The SQLite lane is owner-routed, never
-  leader-routed: the owner re-checks the bearer and refuses to re-proxy, so an
-  unreachable owner is an honest 421.
-- SQLite (Hrana) wire contract is strict (strings for integers, padded base64 blobs,
-  v2+v3 never v3-protobuf, DSN ends in `/`): recall `sqlite-hrana-wire-contract`.
-- `browser_db`: grants ride the admission, server-derived and tenant-pinned (Public
-  scope read-only, only with `public_read`); caps bind BOTH sides (`max_bytes`
-  64 MiB, `max_value_bytes` 1 MiB) and over-cap is a typed refusal + whole-batch
-  rollback — never truncate or evict. Bytes/site-ids/watermarks replicate ONLY
-  through `hive_crsql` ChangeBatch (`Op::CrrSync`), and the fleet re-checks the
-  grant on EVERY request against its own admission view, deriving
-  tenant+project+file server-side, so `db_file` is an identifier, never a path.
-  cr-sqlite v0.17 does not replicate schema, so both halves derive it from the
-  spec's DDL + `crsql_as_crr`. `HIVE_CRSQL_EXTENSION_PATH` must point at the
-  packaged `/var/lib/hive/crsqlite.so`.
+- Managed SQLite (`DbKind::Sqlite`) and `browser_db` share nothing but the word: a file per DATABASE at
+  `$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db` vs a cr-sqlite CRR per PROJECT at
+  `$HIVE_DATA/browser-dbs/`. **Never point the Hrana handler or musql at a `browser-dbs` file**: a bare `rusqlite`
+  writer bypasses the clock tables the CRR merge reads. The SQLite lane is owner-routed, never leader-routed; recall
+  `Managed SQLite (Hrana) wire contract`.
+- `browser_db`: grants ride the admission, server-derived and tenant-pinned, and the fleet re-checks them on EVERY
+  request (tenant+project+file derived server-side; `db_file` is an identifier, never a path); caps (`max_bytes`,
+  `max_value_bytes`) bind with a typed refusal + whole-batch rollback, never truncate/evict; bytes, site ids and
+  watermarks replicate ONLY through `hive_crsql` ChangeBatch (`Op::CrrSync`).
+- A managed database is reachable ONLY through its `<slug>.{db_domain}` record from `host_node`'s address and
+  `db_gateway` splices on that SAME node, so a host that left `registry.nodes()` STRANDS it:
+  `databases::db_host_admissible` only refuses NEW placement; stranded databases are reported, never re-hosted
+  (re-provisioning under the same slug yields an EMPTY database).
+- `db_gateway` bounds a connection while it is UNPROVEN or DRAINING, never proven and idle: proven = its database
+  ACCEPTED AUTHENTICATION (`AuthProof`: Postgres `AuthenticationOk`, Redis `+OK` to `AUTH`/`HELLO`; `-NOAUTH` and
+  `+RESET` prove nothing), within `HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS` before the backend and
+  `HIVE_DB_GATEWAY_AUTH_DEADLINE_MS` (30 s, absolute) after; a full `PendingTable` EVICTS the oldest stuck connection
+  so a few addresses cannot starve the rest; `splice` copies each direction itself, never `copy_bidirectional` or a
+  `select!` over two copies.
 
 ## Browser lane
 
-- `fluid_core::browser_policy_digest` and `policyDigest` in
-  `crates/hive-browser/www/function-runtime.js` are ONE contract with TWO
-  implementations — drift silently breaks every artifact pin. Same for
-  `val_payload_bytes` (hive-crsql and `hcb1.js`). A browser function is eligible
-  only by explicit fluid.json opt-in (which FAILS THE BUILD when ineligible) or
-  build-time auto-detection; ESM syntax is REWRITTEN to CommonJS
-  (`browser_esm.rs`).
-- Bytes stay node-local (`$HIVE_DATA/browser-artifacts/<policy_digest>.js`); only
-  descriptor metadata replicates, delivery re-verifies size and source BLAKE3
-  before serving (404 for a foreign tenant), and admission capabilities are
-  entirely server-derived — `AdmissionRequest.digest` is accepted but never read,
-  and `trusted_callers` comes from the live HEALTHY registry.
-- COOP/COEP: the default is `HIVE_COI=lane` (global `require-corp` breaks the
-  dashboard's Clerk embed and tenants hotlinking CORP-less assets) and
-  `HIVE_COI_COEP=credentialless` (Safari implements neither value). `coi::layer`
-  on the public listener is the ONLY writer. Isolation is DETECTED
-  (`crossOriginIsolated`) and its absence is REPORTED, never waited out.
+- `fluid_core::browser_policy_digest` and `policyDigest` in `crates/hive-browser/www/artifact-policy.js` are ONE
+  contract with TWO implementations (so are `MESH_SIG_DOMAIN` in `hive-browser` and `peer-mesh.js`: drift silently
+  rejects every handshake).
 
 ## DNS: Seer, cutovers/ACME, custom domains
 
-- The delegation boundary is the whole story: Vercel DNS has no geo or health
-  routing, so Seer can only answer for names delegated to it, and
-  `desired_geo_delegation` refuses to publish below TWO nameservers. **A delegated
-  name must never serve NEITHER addresses NOR delegation** — Vercel refuses NS
-  creation while any child record exists, so every cutover runs as a
-  restore-on-failure transaction in `vercel_dns::plan_writes` (creates before
-  deletes) with VERIFIED rollbacks, and `ReconcileGuards`' create circuit skips
-  delete-first steps while creates are broken. `VercelApi::list()` MUST paginate
-  (100/page, `until` cursor).
-- **Advertise only what peers have PROVEN**: `NodeInfo::dns_ns` is necessary and
-  never sufficient, so `dns_probe` (every node) proves reachability and
-  `validate_nameservers` admits only a node attested from TWO distinct REGIONS,
-  never self-attesting. Below two proven nameservers the reconciler HOLDS the
-  published NS set rather than withdrawing and opens an incident. `publishable()`
-  is damped both ways; the ACME orphan sweeper deletes unknown `_acme-challenge.*`
-  TXTs older than 15 min (unknown age means KEEP).
-  **Gotcha:** `dns_ns`/`dns_api` derive from `HIVE_DNS_ADDR` ONLY when its host is
-  a wildcard. **Gotcha:** on Tencent CVMs the "public" IP is on NO interface;
-  where aardvark-dns needs `:53`, bind the PRIVATE IP.
-- Geo tailoring locates by EDNS Client Subnet else source address; the primary
-  source is the LOCAL committed table (`crates/hive-cloud/assets/geoloc.bin`) so no
-  third party sees a client prefix, and `HIVE_DNS_GEO_ENDPOINT` is the only remote
-  call and must stay optional. A tailored answer carries a non-zero ECS scope;
-  health beats proximity. Seer answers are bounded (`MAX_RECORD_VALUE_BYTES` 4096,
-  `MAX_RECORDS_PER_NAME_KIND` 32; UDP >1232 bytes truncated with TC=1).
-- Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s
-  `aliases_full`), checked before any first-label/wildcard lookup. Attachment is
-  gated on observed DNS proof — the activating node itself must observe the
-  `_hive-verify.<domain>` TXT via DoH — and every verified-mark goes through ONE
-  helper (`mark_domain_verified`, which also pins the delegated zone's system apex
-  A/AAAA). Only a VERIFIED record locks to its tenant; detach and activate both
-  require `require_domain_owner_if_exists` AND that the stored challenge's project
-  matches the path project. TLS is HTTP-01 with apex+`www` SANs only (LE never
-  offers HTTP-01 for a wildcard), and the port-80 listener answers
-  `/.well-known/acme-challenge/` from the replicated `Http01Store`, proxying a
-  miss to the leader (LE fetches over plain HTTP within ~1s from random nodes).
+- Seer answers the fleet-served deploy zone affinity-first from the route table (`apps_host_owner`). Vercel DNS has no
+  geo/health routing, so Seer answers only for names delegated to it and `desired_geo_delegation` refuses to publish
+  below TWO nameservers. **A delegated name must never serve NEITHER addresses NOR delegation**: Vercel refuses NS
+  creation while any child record exists, so a cutover is a restore-on-failure transaction in
+  `vercel_dns::plan_writes` (creates before deletes, VERIFIED rollbacks).
+- **Advertise only what peers have PROVEN**: `NodeInfo::dns_ns` is set only when `dns_bind_reaches_internet` holds and
+  is necessary, never sufficient: `dns_probe` proves reachability and `validate_nameservers` admits a node attested
+  from TWO distinct REGIONS, never self-attested.
+- A platform-wide public-DNS question (the `www` SAN, the `_hive-verify` TXT proof) is asked of `dns_quorum::VANTAGES`
+  and admitted by `Tally::admits`: a resolver that errors ABSTAINS (never a "no"), a MAJORITY of the ANSWERING
+  operators is required with a floor of 2, and the fleet's own nameservers are never a vantage (self-attestation).
+- Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s `aliases_full`) before any first-label or
+  wildcard lookup. Attachment needs observed DNS proof (the activating node itself observes `_hive-verify.<domain>`)
+  through ONE helper (`mark_domain_verified`); only a VERIFIED record locks to its tenant; detach and activate require
+  `require_domain_owner_if_exists` AND a stored challenge whose project matches the path. Reserved proof names
+  (`_acme-challenge`, `_hive-verify`) are rejected in add/import/zone-parse.
 
 ## Security gates (never weaken)
 
-- **A tenant string never becomes a host path.** Podman reads `-v <a>:<b>` as a
-  bind mount whenever `<a>` looks like a path, so the left side is always a
-  platform-templated NAME: `container_volume_cfg` builds
-  `hive-vol-{sanitize_tag(project)}`, sanitizing to `[a-z0-9._-]` and prepending
-  the prefix AFTER sanitization. Same rule for DB file names, browser artifact
-  digests (64 lowercase hex, else 400) and snapshot dirs (`sanitize_tag` passes `.`
-  through, so the id is embedded inside a `snaps-<id>` component, never bare). Any
-  future storage feature must preserve this.
-- **Tenancy comes from the cryptographically-bound JWT claim, never the spoofable
-  `x-hive-team` header**; an untagged tenant is a fail-closed sentinel
-  (`__untagged__`/`UNTAGGED_TENANT`), never silently collapsed to "personal".
-  Gossip arms carrying a team token must parse it with `team_claims()`/`qparam()` —
-  a raw `split_once("?team=")` swallows the token and every ownership compare
-  silently misses. API-key-derived claims always have `platform_admin: false`.
-- `HIVE_SECRET_KEY` is the fleet-shared at-rest key: **never introduce or rotate it
-  without carrying the previous key in `HIVE_SECRET_KEY_OLD`** (comma-separated
-  hex) — `decrypt` returns its input unchanged on AEAD failure, so an orphaned
-  value silently hands callers raw `enc:v1:` ciphertext. `try_decrypt` is the
-  honest `Option`-returning variant.
-- `ProjectStore::put_env` force-masks credential-shaped values regardless of the
-  caller's `sensitive` flag (`project_settings::looks_like_secret`) — extend the
-  prefix list, never trust the UI checkbox. Mesh trust is an allowlist enforced at
-  two gates (transport allowlist and the gossip signer check).
-- PQ transport: the mesh QUIC transport offers hybrid X25519MLKEM768 first via an
-  explicit `.crypto_provider(...)` — mandatory, because iroh's `N0`/`Minimal`
-  presets prefer plain `ring` (zero PQ) whenever both TLS backends are compiled in.
-  Report the REAL negotiated group (`hive_p2p::pq_kex_stats`). **Transport
-  IDENTITY stays classical** (`EndpointId` is ed25519) — never claim post-quantum
-  or ML-DSA identity. Public HTTPS/DB-gateway/relay TLS stays `ring`.
-- TLS resumption is fleet-shared (`FleetTicketer` in `acme.rs`, key derived from
-  `HIVE_SECRET_KEY`, 6h rotation, current-or-previous epoch, 0-RTT off, disabled
-  with `HIVE_TLS_SHARED_TICKETS=0`) because rustls defaults to an in-process ticket
-  store. Keep the full 4-cert chain (both ISRG roots are the cross-signing bridge);
-  do not chase OCSP stapling — these leaves carry no OCSP URI.
-- Mesh resource bounds: `HIVE_P2P_MAX_STREAMS` (256) is set explicitly to agree
-  with `max_concurrency`, and the connection semaphore permit is acquired BEFORE
-  the spawn so it bounds live connections rather than accept rate. iroh-relay
-  1.0.2's `accept_conn_limit`/`accept_conn_burst` are unimplemented — setting them
-  would look like a cap while enforcing nothing.
-- Reserved proof names (`_acme-challenge`, `_hive-verify`, any case) are rejected
-  in add/import/zone-parse so the proof channel is unforgeable; wildcards follow
-  RFC 4592 (never at the apex, never over reserved names).
+- **`auth::require_auth` proves only "some valid token"** (a GET never fails for missing auth: it answers
+  `ANON_TENANT`, scoped PER HANDLER); a ROLE is decided once, by `roles::RULES`, which `require_auth` asks
+  (`roles::gate`) for every authenticated request on an enforced node, reads included: viewer < member < admin <
+  owner, a read is viewer and a write NOBODY LISTED is ADMIN, so a new route is admin until listed (billing
+  checkout/charge, DNS, database delete/rotate, WAF, rate limit, bot, SMS providers and the repository link are admin
+  rows). A handler never re-decides a role (`admin::require_team` only binds the path slug; ownership still authorizes
+  inside it) and `ui/lib/team-role.ts` mirrors `RULES` row for row. `owner` owns only the caller's OWN tenant: a gate
+  opens on a tenant match or `platform_admin`, never a role (`edge::claims_open_preview`).
+- A `service` role STRING opens nothing: `auth::verify` accepts a `service` claim only for a FLEET identity
+  (`auth::is_fleet_service`: `mesh-internal` or `mesh-node:<coordinator>`, subject AND role), every other one is no
+  principal; a fleet-wide RPC is `require_mesh_rpc(.., Some("mesh"))`, never `None`. A handler `gossip::dispatch` also
+  calls is mounted publicly ONLY through a gating wrapper (`fleet_deployments_public`; the inner handler authorizes
+  the RESOURCE). A route with its own credential joins `auth::is_open_route` (`admin_ingress` asks it too) AND fails
+  closed itself.
+- The workflow World's queue token (`HIVE_QUEUE_TOKEN`) is the one tenant-held bearer: `auth::verify_queue_client`
+  (subject AND role, never `platform_admin`, `iat` within `HIVE_QUEUE_TOKEN_MAX_AGE_SECS`, 30 d) is resolved by
+  `auth::principal`, the ONE resolution `require_auth` and `admin_ingress` share, and confined by
+  `roles::QUEUE_CLIENT_ROUTES` to enqueue + stats. It sits in a tenant's env, so `world_queue::rotate_queue_tokens`
+  re-issues an aged or sealed one in each local deployment's function env about 90 s after boot and every 6 h
+  (`HIVE_QUEUE_TOKEN_ROTATE_SECS`), as a PLAINTEXT token (a project row's `enc:v1:` copy is no bearer).
+- A project transfer is a MOVE: the settings row is the owner of record (`admin::row_holder`; the copies are evidence
+  only for a row with NO tag), so a read keyed by a DEPLOYMENT ID (integrity chain, build, resources) asks ONE
+  predicate, `admin::deployment_owned_by`, never an inline copy and never a project NAME or team SLUG compared with a
+  tenant (a slug is whatever its creator types; `record_tenant` takes a stored tag). A claim never takes a project
+  (`ProjectStore::claim_team` is a compare-and-set), and deployments follow the row
+  (`Gateway::retag_project`, then every host in `tenancy_reconcile::retag_deployments_to_rows`:
+  `HIVE_DEPLOYMENT_RETAG_SECS` 15, `HIVE_DEPLOYMENT_RETAG=0` disables; its first pass after a roll re-tags earlier
+  transfers). A move needs a destination the caller administers (`caller_administers`) or the operator.
+- Every roster change goes through `TeamStore::set_member_role`/`remove_member_as` (`check_roster_change`: nobody
+  changes, removes or grants above their own role, the last Owner stays), and `remove_checked` authorises EVERY row a
+  removal deletes (`check_roster_removal`), so a ghost row ahead of the Owner cannot carry the Owner away; a directory
+  sync only adds (`add_member_if_absent`) or removes a plain member (`remove_plain_member`).
+- Only the dashboard SERVER writes the identity mirror (`identity_sync` under `mint_allowed`): it feeds `team_create`
+  and `caller_administers`, so a browser-originated sync records nothing.
+- `POST /v1/token` checks the internal token FIRST: only a failing request spends the strict per-peer guess budget
+  (`mint_rate_limiter`, 20/min); a legitimate mint spends a per-USER budget (`HIVE_MINT_USER_PER_MIN` 30) and a
+  peer-wide backstop (`HIVE_MINT_BACKSTOP_PER_MIN` 600), since the dashboard server is one peer for every user. A
+  token carries its role for its whole life: `admin`/`member`/`viewer` live `HIVE_ORG_TOKEN_TTL_SECS` (900 s), the
+  rest 3600 s. Residual: the strict budget changes only the answer (a correct guess still mints; the 600/min
+  admin-router limit is the only bound), and ~20 colluding accounts (30/min each) exhaust the backstop.
+- **Scope at the store primitive, not the handler**: every `WebhookStore` operation takes a `Scope`/`Audience`, a
+  queue consumer may only target its own tenant's app (`queues::consumer_target_owned`, at registration AND every
+  delivery), a deployment reached through a project path is authorized by `storage_broker::authorize_deployment`, an
+  API key's role is capped at its minter's (`apikeys::check_new_role`). Peers answer `?local=true` UNFILTERED, so a
+  tenant-facing fleet aggregation re-scopes merged peer rows (node addressing: `admin::non_operator_node_view`).
+- **Every tenant-influenced URL the node requests goes through `hive-outbound`**, never a bare `reqwest::Client`:
+  `validate_url` (https only, no userinfo, no internal name or non-public address literal) at registration AND before
+  every request; `client()`/`following_client()` refuse non-public addresses at connect time (no proxy, redirects none
+  or re-validated per hop); `same_origin_client` is for calls INTO a tenant app, `internal_client` (no redirect) for
+  peers and platform-built URLs. A failure shown to a tenant is one of `hive_outbound::describe`'s fixed sentences;
+  `HIVE_OUTBOUND_ALLOW_PRIVATE=1` is a developer-only escape, REFUSED when `HIVE_JWT_SECRET` is set.
+- A caller-controlled string never reaches a URL, HTML or a `Location` by interpolation: parse a trusted base, then
+  `Url::set_host`/`set_path` (`state::host_scoped_https_url`, `edge::with_request_target`; `//host` is an authority,
+  so `Url::join` needs a same-origin check, `main::invoke`); `edge::password_page` has NO form `action`, shown text
+  passes `edge::html_escape`, a redirect passes `auth::same_origin_path`.
+- A tenant never names a loopback address: `world::world_config` accepts one only when it equals the REST URL of one
+  of the project's own Redis records on this node (`DatabaseStore::local_redis_rest_urls`).
+- A plan is bought or granted, never self-assigned: `admin::apply_plan_everywhere(.., PlanChange)` (it writes BOTH
+  `c.teams` and `c.billing`) refuses a raise without `Paid` or an operator, a REQUESTED plan resolves via
+  `billing::known_plan` (never `plan_spec`'s Hobby fallback), `BillingStore::confirm_checkout(id, Payment)` completes
+  an unproven payment only where `billing::mock_checkout_allowed()` and a Stripe one only when
+  `billing::session_paid`, and every cents input is bounded by `billing::MAX_AMOUNT_CENTS` (a `u64` cast `as i64` goes
+  NEGATIVE).
+- SAML ACS verifies no assertion signature, so only the path team's owner/admin may post it (`require_team_floor`);
+  SCIM is open at the platform gate, managed by an owner/admin and authenticated ONLY by its per-team bearer
+  (`scim_team_for_token` fails closed); `zkauth::bootstrap` binds the proof's ring to the project's owner
+  (`local_owning_team`).
+- A route that execs tenant commands checks the ACTIVE backend (`/v1/sandbox` refuses on Mock, which runs on the HOST
+  shell), and its per-tenant cap is held by the submitted JOB, never the request's Drop guard.
+- A cookie, token or stored password that DECIDES access is read with `secrets::try_decrypt`, never the passthrough
+  `decrypt`; the password-gate unlock cookie is a server-sealed `v1.<expiry ms>.<HMAC>` over (deployment, expiry,
+  stored hash) (`EnterpriseStore::seal_password_cookie`, `HIVE_PW_COOKIE_TTL_SECS`), `Secure` unless plain-http
+  loopback (`edge::unlock_cookie_header`).
+- A destructive op needs an ASSERTED identity before any tenant is resolved (`has_explicit_caller_identity`: an
+  unenforced node's implicit "personal" would own everything); every secret or MAC comparison is constant-time
+  (`admin::ct_eq`; `==` is for ids and digests).
+- **A tenant string never becomes a host path.** Podman reads `-v <a>:<b>` as a bind mount whenever `<a>` looks like a
+  path, so the left side is always a platform-templated NAME (`container_volume_cfg`); same for DB file names,
+  artifact digests (64 lowercase hex, else 400) and snapshot dirs.
+- **Tenancy comes from the cryptographically-bound JWT claim, never the spoofable `x-hive-team` header**; an untagged
+  tenant is a fail-closed sentinel (`UNTAGGED_TENANT`), never collapsed to "personal". Gossip arms read the tenant
+  with `mesh_tenant()`, never a raw `split_once`.
+- Tenant processes get their env from nothing (`env_clear()` in every backend: the node env holds `HIVE_SECRET_KEY`,
+  `HIVE_JWT_SECRET`, `HIVE_INTERNAL_TOKEN`, and mock-backend nodes serve real tenants). The proxy re-derives
+  `x-forwarded-host`/`-proto`; the edge's client IP is the real TCP peer, never `x-forwarded-for`.
+- `HIVE_SECRET_KEY` is the fleet-shared at-rest key: never introduce or rotate it without the previous key in
+  `HIVE_SECRET_KEY_OLD` (comma-separated hex); `decrypt` returns its input unchanged on AEAD failure, `try_decrypt` is
+  the honest `Option` variant. Key resolution fails CLOSED (`secrets::load_or_create_key`,
+  `IntegritySigner::open_or_create`): a set-but-EMPTY or malformed key, a damaged key file or an unpersistable one
+  refuses to boot, never regenerates; `scripts/audit-secret-keys.sh` (repeats `hex_to_32` against the MainPID environ)
+  is the PRE-ROLL check. Never print a plist, a manifest or `/proc/*/environ` wholesale: they carry this key.
+  `put_env` force-masks credential-shaped values (`project_settings::looks_like_secret`).
+- PQ transport: the mesh QUIC transport offers hybrid X25519MLKEM768 first via an explicit `.crypto_provider(...)` in
+  `hive_p2p::bind_full` (report the REAL group, `pq_kex_stats`); **transport IDENTITY stays classical ed25519.**
+
+## Hashing: content identity vs. security binding
+
+**BLAKE3 mints every NEW content identity** (`fluid_core::content_hash`, `ContentHasher`); `verify_content` accepts a
+stored digest under BLAKE3 or the legacy hex(SHA-256) over the same domain and alone decides which algorithm it came
+from. Pre-domain-separation digests are bare hashes (`raw_content_hash`/`verify_raw_content`), never mixed with a
+domain-separated site. A digest that NAMES stored bytes keeps its writer until every node's `content_verify_stats()`
+reports `accepted_sha256` flat across a full deploy cycle (`runtime_artifact.rs`'s `content_sha256` IS the store
+directory name: a rehash orphans every staged artifact).
+
+**SECURITY BINDINGS, never touch the algorithm**: `IntegritySigner::sign_chain_head` signs `fold_integrity_chain`, a
+SHA-256 fold that LOOKS like content addressing but IS the signed message (every ed25519 signature stays classical);
+every HMAC-SHA256 (`hmac_sha256`, `verify_github_sig`, `verify_webhook_signature`, `sync_one_peer`'s join proof,
+`consumer_signing_secret`, `tc3_request`, `ticket_key`); credential hashes (`sha256_hex` in
+`apikeys.rs`/`browser_db_rest.rs`/`drive_api.rs`/`world.rs`, `password_hash` Argon2id with the legacy
+`sha256(project ":" password)` branch of `password_matches` kept, `derive_secret`, `hive-zkauth`,
+`custom_bundle_name`); handshake and supply chain (`handshake_transcript_sha256`, `sha256_file` for runsc,
+`image_digest`: a literal OCI `sha256:`).
 
 @.gm/next-step.md

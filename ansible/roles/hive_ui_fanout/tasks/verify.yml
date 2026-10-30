@@ -1,25 +1,5 @@
 ---
-# CONTENT verification for the UI half -- same contract as
-# hive_platform_fanout/tasks/verify.yml: prove every host serves the bundle
-# this run BUILT, never trust a task's exit code.
-#
-# The UI has its own version of the non-event, and it was already half-written:
-# restart.yml's build-id check reads
-#
-#   failed_when: hostvars[...].hive_canon_build_id is defined and <mismatch>
-#
-# which PASSES whenever the canonical build id is undefined -- i.e. exactly
-# when the UI build play never ran (`--limit` without the ui_builder, `--tags`
-# without the build, a build that failed earlier in a `strategy: free` play).
-# A check that turns itself off in the failure case it exists to catch is worse
-# than no check, because it reports green. Here the missing fact is the FIRST
-# hard failure.
-#
-# Next/Turbopack builds are not deterministic (that is why this role builds
-# once and fans the artifact out), so unlike the backend binary the BUILD_ID is
-# not a useful "did anything change" signal -- only a "is everyone on the same
-# one" signal. The no-op detector therefore lives on the backend half, and this
-# file's job is uniformity plus proof the running server loaded it.
+# CONTENT verification for the UI half (same contract as hive_platform_fanout/tasks/verify.yml): prove every host serves the bundle this run BUILT. A missing canonical build id is the first hard failure; BUILD_ID only shows uniformity, not change (Next builds are not deterministic), so the no-op detector lives on the backend half.
 
 - name: Require a canonical UI build from this run
   ansible.builtin.assert:
@@ -81,9 +61,6 @@
       different chunk sets is the "mobile endless flicker" incident.
     success_msg: "{{ hive_name }}: .next + wf-console == canonical build"
 
-# The swap happens before the restart in restart.yml, so a start timestamp
-# after this run began is what proves the RUNNING server loaded the new .next
-# rather than still serving the pre-swap one out of memory.
 - name: Assert hive-ui actually restarted during this run
   ansible.builtin.assert:
     that:

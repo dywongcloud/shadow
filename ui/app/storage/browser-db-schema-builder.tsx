@@ -6,11 +6,7 @@ import { Button, Input } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import type { BrowserDbTable } from "@/lib/api";
 
-/** One column in the friendly table builder — generates the `ddl` a
- *  `BrowserDbTable` actually carries over the wire. Not part of the wire
- *  shape itself: the platform only ever sees the generated DDL string
- *  (`fluid_core::BrowserDbTable` is just `{ name, ddl }`), so this shape is
- *  purely a client-side authoring convenience. */
+/** One column in the friendly table builder; only the generated DDL goes on the wire (`fluid_core::BrowserDbTable` is `{ name, ddl }`). */
 export type ColumnDraft = { name: string; type: "TEXT" | "INTEGER" | "REAL" | "BLOB"; pk: boolean };
 
 export function ddlFromColumns(tableName: string, columns: ColumnDraft[]): string {
@@ -26,11 +22,12 @@ const defaultColumns = (): ColumnDraft[] => [
   { name: "value", type: "TEXT", pk: false },
 ];
 
-/** One table row in the schema builder: friendly column editor (default) or
- *  a raw-DDL textarea for anything the column builder can't express
- *  (foreign keys, `CHECK`, `UNIQUE`, generated columns, …). Both modes write
- *  the same `BrowserDbTable` — flipping to raw seeds the textarea from
- *  whatever the column builder had generated so far, never a blank slate. */
+function markSoleKey(columns: ColumnDraft[], keyIndex: number, checked: boolean): ColumnDraft[] {
+  return columns.map((c, j) => ({ ...c, pk: j === keyIndex && checked }));
+}
+
+/** One table row in the schema builder: a column editor (default) or a raw-DDL textarea for what columns cannot express (foreign keys, `CHECK`, `UNIQUE`, generated
+ *  columns); switching to raw keeps the DDL the column builder generated so far. */
 export function SchemaTableEditor({
   table,
   onChange,
@@ -113,14 +110,7 @@ export function SchemaTableEditor({
                 <input
                   type="checkbox"
                   checked={c.pk}
-                  onChange={(e) => {
-                    // At most one PK column: checking one clears every other
-                    // (unchecking just clears this one — the others were
-                    // already false under the same invariant).
-                    const checked = e.target.checked;
-                    const next = columns.map((cc, j) => ({ ...cc, pk: j === i && checked }));
-                    setColumnsAndDdl(next);
-                  }}
+                  onChange={(e) => setColumnsAndDdl(markSoleKey(columns, i, e.target.checked))}
                   className="h-3 w-3"
                 />
                 PK

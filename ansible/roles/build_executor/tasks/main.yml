@@ -49,8 +49,6 @@
     - name: Validate collision-free network and derive canonical policy identity
       ansible.builtin.import_tasks: 30-network.yml
 
-    # iifname/oifname string rules are valid before the bridge exists. Loading
-    # both inet and bridge-family policy first closes the create-before-filter gap.
     - name: Install and activate policy before creating the network
       ansible.builtin.import_tasks: 40-firewall.yml
 

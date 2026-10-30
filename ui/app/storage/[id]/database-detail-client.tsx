@@ -5,7 +5,8 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check, Info } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
-import { apiGet, apiSend, usePoll, type Database } from "@/lib/api";
+import { apiGet, apiSend, usePoll, useCan, type Database } from "@/lib/api";
+import { roleHint } from "@/lib/team-role";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 import { KindBadge } from "../kind";
@@ -21,12 +22,11 @@ type StudioOpenResponse = {
   expires_in_secs: number;
 };
 
-/**
- * One storage detail route for every database. The id decides which backend
- * answers — `sqlite_<project>` is a browser-replicated database (the
- * `browser_db` contract), anything else is a managed engine record from
- * `/v1/databases`. Both render the same shell.
- */
+const PROVISIONING_POLL_MS = 3000;
+const READY_POLL_MS = 20000;
+
+/** One storage detail route for every database: the id decides the backend (`sqlite_<project>` is a browser-replicated database, the `browser_db`
+ *  contract; anything else is a managed engine record from `/v1/databases`), and both render the same shell. */
 export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
   const project = projectFromRouteId(params.id);
@@ -36,25 +36,19 @@ export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id:
 
 function ManagedDatabaseDetail({ id }: { id: string }) {
   const router = useRouter();
-  // ADAPTIVE: a ready database record is essentially static — poll fast (3s)
-  // only while provisioning, 20s once ready (mutations invalidate the cache,
-  // so a delete/redeploy still reflects immediately).
   const [provisioning, setProvisioning] = useState(true);
-  const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, provisioning ? 3000 : 20000);
+  const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, provisioning ? PROVISIONING_POLL_MS : READY_POLL_MS);
   useEffect(() => {
-    // Feeds back into usePoll's own interval above (adaptive polling), so it
-    // must persist as state across renders -- not a pure inline derivation.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (db) setProvisioning(db.status === "provisioning");
   }, [db]);
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
   const [openingStudio, setOpeningStudio] = useState(false);
+  const mayDestroy = useCan()("database.destroy");
 
-  // The list/detail poll returns the connection with secrets MASKED (any key with
-  // url/password/token/secret). Copying that yields "••••" junk. So both Reveal
-  // AND Copy fetch the UNMASKED credentials from the tenant-scoped `/credentials`
-  // endpoint; we cache them so a copy never depends on the user clicking Reveal.
+  /** The UNMASKED credentials from the tenant-scoped `/credentials` endpoint (the list/detail poll masks url/password/token/secret keys), cached so a
+   *  copy never depends on the user clicking Reveal. */
   async function fetchCreds(): Promise<Record<string, string>> {
     if (revealed) return revealed;
     const full = await apiGet<Database>(`/v1/databases/${id}/credentials`, { fresh: true });
@@ -68,9 +62,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
       toast(`Couldn't load credentials: ${String(e).replace(/^Error:\s*/, "")}`, {});
     }
   }
-  // Copy the REAL value (fetches unmasked creds on demand), via a clipboard helper
-  // that falls back to execCommand when the async API is unavailable — so the
-  // button works everywhere, and reports success/failure instead of silently no-op.
   async function copy(k: string) {
     try {
       const conn = await fetchCreds();
@@ -92,8 +83,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
     }
   }
   async function openStudio() {
-    // Open synchronously inside the click gesture; opening after the API await
-    // is treated as an unsolicited popup by browsers.
     const popup = window.open("about:blank", "_blank");
     if (!popup) {
       toast("Your browser blocked the Studio popup. Allow popups and try again.", {});
@@ -112,8 +101,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
       const expectedHost = (db?.db_host || db?.connection?.host || "")
         .trim()
         .toLowerCase();
-      // UI and backend roll independently. Accept the legacy ticket only so the
-      // UI can land first; the v3 issuer binds its immutable consume authority.
       const legacyTicket = /^\d{1,20}\.[0-9a-f]{32}\.[0-9a-f]{64}$/;
       const authorityTicket =
         /^v3\.\d{1,20}\.[0-9a-f]{32}\.[A-Za-z0-9_-]{1,172}\.[0-9a-f]{64}$/;
@@ -131,11 +118,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
       ) {
         throw new Error("the server returned an invalid Studio login exchange");
       }
-      // The dashboard enforces `form-action 'self'`, so an inherited
-      // about:blank document cannot post directly to the database origin. Load
-      // the database host's credential-free bootstrap and deliver the ticket to
-      // that exact origin with postMessage; the bootstrap performs the
-      // same-origin form POST. The ticket never enters a URL.
       await new Promise<void>((resolve, reject) => {
         let postTimer: number | undefined;
         let expiryTimer: number | undefined;
@@ -171,9 +153,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
               { type: "hive-studio-login-ticket", ticket: login.ticket },
               action.origin,
             );
-          } catch {
-            // The initial about:blank document is not the target origin yet.
-          }
+          } catch {}
         };
         window.addEventListener("message", onMessage);
         popup.location.replace(action.toString());
@@ -194,13 +174,15 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
 
   async function destroy() {
     if (!confirm(`Delete ${db?.name}? This tears down the backing service.`)) return;
-    await apiSend("DELETE", `/v1/databases/${id}`);
-    router.push("/storage");
+    try {
+      await apiSend("DELETE", `/v1/databases/${id}`);
+      router.push("/storage");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : String(e), {});
+    }
   }
 
   if (!db) {
-    // Show the fetch error (e.g. slow/unreachable backend) rather than hanging on
-    // "Loading…" forever, which under high latency reads as a broken page.
     if (error) {
       return (
         <div className="flex flex-col items-start gap-2 text-sm">
@@ -211,8 +193,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
     }
     return <div className="text-sm text-secondary">Loading…</div>;
   }
-  // conn may be absent for a still-provisioning or replica record — never let
-  // Object.entries throw (that produced a blank page).
   const conn = revealed ?? db.connection ?? {};
   const endpoint = managedEndpoint(db);
 
@@ -225,7 +205,9 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         action={
           <div className="flex items-center gap-2">
             {db.status === "ready" ? <Badge tone="green">Ready{db.mode === "simulated" ? " · simulated" : " · live"}</Badge> : <Badge tone="amber">{db.status}</Badge>}
-            <Button variant="danger" onClick={destroy}><Trash2 className="h-4 w-4" /> Delete</Button>
+            <span title={mayDestroy ? undefined : roleHint("database.destroy")}>
+              <Button variant="danger" onClick={destroy} disabled={!mayDestroy}><Trash2 className="h-4 w-4" /> Delete</Button>
+            </span>
           </div>
         }
       />
@@ -308,9 +290,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         </Card>
       )}
 
-      {/* Primary connection string — the value most people want to copy, with an
-          honest reachability verdict next to it: a loopback DSN is real but only
-          resolves on the node running the engine. */}
       {(() => {
         const primaryKey = conn["DATABASE_URL"] ? "DATABASE_URL" : conn["REDIS_URL"] ? "REDIS_URL" : conn["endpoint"] ? "endpoint" : "";
         if (!primaryKey) {
@@ -357,9 +336,6 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
             <p className="py-2.5 text-xs text-muted">No connection details yet.</p>
           ) : (
             Object.entries(conn).map(([k, v]) => {
-              // Classify only what we can actually see: a revealed URL by its own
-              // host, and the platform's explicit `INTERNAL_*` naming convention.
-              // A masked value is never guessed at.
               const rowReach: Reach | null = k.startsWith("INTERNAL_")
                 ? "internal"
                 : revealed && /:\/\//.test(v)

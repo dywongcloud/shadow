@@ -12,7 +12,7 @@ use crate::relational::catalog::{Index, Table};
 use crate::relational::{SecondaryIndex, SqlValue, composite_key, ordered_key};
 use crate::sql::error::{Result, SqlError};
 use serde_json::{Map, Value as Json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub const F_ID: &str = "_id";
 pub const F_SCHEMA: &str = "__schema";
@@ -21,7 +21,30 @@ pub const F_VERSION: &str = "__version";
 pub const F_DELETED: &str = "__deleted";
 
 /// A decoded row: column name -> value (internal/system columns excluded).
-pub type RowValues = BTreeMap<String, SqlValue>;
+/// A row's column values, keyed by INTERNED column name.
+///
+/// Keys are `Rc<str>` so that materializing a table clones a refcount instead of
+/// allocating a fresh `String` per column per row — `decode_row_owned` runs once
+/// per row of every `load_table`, which is the measured hot path (~0.47 ms/row on
+/// a 21.5k-row table). `Rc<str>: Borrow<str>`, so every existing `values.get("col")`
+/// keeps working unchanged.
+pub type RowValues = BTreeMap<std::sync::Arc<str>, SqlValue>;
+
+/// Process-wide interner for column names. Bounded by the number of DISTINCT
+/// column names in the catalog (tens), never by row count.
+pub fn intern_column(name: &str) -> std::sync::Arc<str> {
+    use std::collections::HashMap as Map;
+    use std::sync::Arc;
+    static INTERN: std::sync::OnceLock<parking_lot::Mutex<Map<String, Arc<str>>>> =
+        std::sync::OnceLock::new();
+    let mut m = INTERN.get_or_init(Default::default).lock();
+    if let Some(rc) = m.get(name) {
+        return rc.clone();
+    }
+    let rc: Arc<str> = Arc::from(name.to_string());
+    m.insert(name.to_string(), rc.clone());
+    rc
+}
 
 /// A loaded, materialized table view with live indexes.
 #[derive(Clone)]
@@ -30,7 +53,10 @@ pub struct LoadedTable {
     /// row id -> decoded column values
     pub rows: BTreeMap<String, RowValues>,
     /// monotonically increasing version per row id (for `__version`)
-    pub versions: BTreeMap<String, i64>,
+    /// row_id -> MVCC version. Only ever read by key (`version_of`), never
+    /// iterated in order, so a hash map is both correct and cheaper than the
+    /// B-tree it was — one tree insert with a cloned `String` key per row.
+    pub versions: HashMap<String, i64>,
     pub indexes: Vec<LoadedIndex>,
 }
 
@@ -46,7 +72,7 @@ impl LoadedTable {
     /// definitions for the table.
     pub fn build(meta: Table, docs: Vec<(String, Json)>, index_defs: Vec<Index>) -> Result<Self> {
         let mut rows = BTreeMap::new();
-        let mut versions = BTreeMap::new();
+        let mut versions = HashMap::new();
         for (_rid, doc) in docs {
             // `build` already owns the documents, so decode by move to skip a
             // per-column `Json` clone.
@@ -69,6 +95,30 @@ impl LoadedTable {
         };
         table.rebuild_indexes();
         Ok(table)
+    }
+
+    /// Build a row-ids-only view: same shape as `build`, no document decoded.
+    ///
+    /// Correct ONLY for consumers that read no column — `COUNT(*)` and the
+    /// row-id-level RLS / `FOR UPDATE` filters, all of which key on the row id
+    /// alone. Every `RowValues` is empty and every version is 0, so any column
+    /// read through this table returns NULL instead of the stored value. That
+    /// is why the engine takes this path only for a statement it has proven is
+    /// a bare `COUNT(*)`, and only outside an explicit transaction (where a
+    /// later statement could legitimately read the cached table's columns).
+    pub fn build_ids(meta: Table, ids: Vec<String>, index_defs: Vec<Index>) -> Self {
+        LoadedTable {
+            meta,
+            rows: ids.into_iter().map(|id| (id, RowValues::new())).collect(),
+            versions: HashMap::new(),
+            indexes: index_defs
+                .into_iter()
+                .map(|m| LoadedIndex {
+                    data: SecondaryIndex::new(m.unique),
+                    meta: m,
+                })
+                .collect(),
+        }
     }
 
     pub fn rebuild_indexes(&mut self) {
@@ -172,7 +222,7 @@ pub fn index_values(index: &Index, values: &RowValues) -> Vec<SqlValue> {
     index
         .columns
         .iter()
-        .map(|c| values.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| values.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect()
 }
 
@@ -206,7 +256,7 @@ pub fn decode_row_owned(table: &Table, doc: Json) -> Result<Option<(String, RowV
     for col in &table.columns {
         let raw = obj.remove(&col.name).unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;
-        values.insert(col.name.clone(), value);
+        values.insert(intern_column(&col.name), value);
     }
     Ok(Some((id, values, version)))
 }
@@ -222,7 +272,7 @@ pub fn encode_row(table: &Table, row_id: &str, values: &RowValues, version: i64)
     for col in &table.columns {
         // Encode directly from a reference — avoids a `SqlValue` clone per column.
         let v = values
-            .get(&col.name)
+            .get(col.name.as_str())
             .map_or(Json::Null, SqlValue::encode_json);
         obj.insert(col.name.clone(), v);
     }
@@ -238,7 +288,7 @@ pub fn derive_row_id(table: &Table, values: &RowValues) -> Option<String> {
     }
     let parts: Vec<SqlValue> = pk
         .iter()
-        .map(|c| values.get(c).cloned().unwrap_or(SqlValue::Null))
+        .map(|c| values.get(c.as_str()).cloned().unwrap_or(SqlValue::Null))
         .collect();
     if parts.iter().any(|v| v.is_null()) {
         return None;

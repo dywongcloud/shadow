@@ -41,13 +41,8 @@ function join(base: string, name: string): string {
   return base ? `${base}/${name}` : name;
 }
 
-/**
- * A real file browser against `/v1/drive/:project/*` — breadcrumb navigation,
- * folder/file listing, upload, create-folder, delete, plus the WebDAV mount
- * panel. `key={project}` on the caller remounts this component wholesale on
- * project switch, which is what resets `path` and every in-flight UI state
- * with no manual effect needed.
- */
+/** A file browser against `/v1/drive/:project/*`: breadcrumb navigation, folder/file listing, upload, create-folder, delete and the WebDAV mount panel. The caller's
+ *  `key={project}` remounts it on project switch, which resets `path` and every in-flight UI state with no manual effect. */
 export function ProjectDrive({ project }: { project: string }) {
   const [path, setPath] = useState("");
   const { data, error, refresh, loading } = usePoll<DriveListResp>(

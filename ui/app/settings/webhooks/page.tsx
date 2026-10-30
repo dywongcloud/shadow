@@ -4,10 +4,12 @@ import { useState } from "react";
 import Link from "next/link";
 import { Webhook as WebhookIcon, Check, X, Trash2, ArrowLeft } from "lucide-react";
 import { Badge, Button, Card } from "@/components/ui";
-import { apiSend, usePoll, type Webhook, type Delivery, type Deployment } from "@/lib/api";
+import { RoleGate } from "@/components/role-gate";
+import { apiSend, useCan, usePoll, type Webhook, type Delivery } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
+import { roleHint } from "@/lib/team-role";
 import { timeAgo } from "@/lib/utils";
 
-// Grouped event catalog (mirrors Vercel's Add Webhooks picker).
 const GROUPS: { title: string; events: { label: string; slug: string }[] }[] = [
   { title: "Deployment Events", events: [
     { label: "Deployment Created", slug: "deployment.created" },
@@ -59,21 +61,24 @@ const GROUPS: { title: string; events: { label: string; slug: string }[] }[] = [
 export default function WebhooksPage() {
   const { data: hooks, refresh } = usePoll<Webhook[]>("/v1/webhooks", 5000);
   const { data: deliveries } = usePoll<Delivery[]>("/v1/webhooks/deliveries", 5000);
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 8000);
-  const projectNames = Array.from(new Set((deps ?? []).map((d) => d.project))).sort();
+  const projectNames = useProjectNames(8000);
 
   const [scope, setScope] = useState<"all" | "specific">("all");
   const [projects, setProjects] = useState<string[]>([]);
   const [events, setEvents] = useState<string[]>([]);
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const can = useCan();
+  const mayWrite = can("webhooks.write");
 
   function toggle<T>(arr: T[], v: T, set: (a: T[]) => void) {
     set(arr.includes(v) ? arr.filter((x) => x !== v) : [...arr, v]);
   }
 
   async function create() {
-    if (!url.trim() || events.length === 0) { alert("Pick at least one event and an endpoint URL."); return; }
+    setErr("");
+    if (!url.trim() || events.length === 0) { setErr("Pick at least one event and an endpoint URL."); return; }
     setBusy(true);
     try {
       await apiSend("POST", "/v1/webhooks", {
@@ -83,12 +88,15 @@ export default function WebhooksPage() {
       });
       setUrl(""); setEvents([]); setProjects([]); setScope("all");
       refresh();
-    } catch (e) { alert(String(e)); } finally { setBusy(false); }
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); } finally { setBusy(false); }
   }
 
   async function remove(id: string) {
-    await apiSend("DELETE", `/v1/webhooks/${id}`);
-    refresh();
+    setErr("");
+    try {
+      await apiSend("DELETE", `/v1/webhooks/${id}`);
+      refresh();
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)); }
   }
 
   return (
@@ -96,8 +104,8 @@ export default function WebhooksPage() {
       <Link href="/settings" className="mb-3 inline-flex items-center gap-1.5 text-sm text-link hover:underline"><ArrowLeft className="h-4 w-4" /> Team Settings</Link>
       <h1 className="mb-6 text-2xl font-semibold tracking-tight">Add Webhooks</h1>
 
+      <RoleGate action="webhooks.write" note>
       <Card className="p-6">
-        {/* Projects */}
         <div className="mb-2 text-sm font-semibold">Projects</div>
         <p className="mb-3 text-sm text-secondary">Choose which projects should send events to the specified endpoint.</p>
         <div className="mb-6 flex gap-6 text-sm">
@@ -119,7 +127,6 @@ export default function WebhooksPage() {
           </div>
         )}
 
-        {/* Events */}
         <div className="mb-1 text-sm font-semibold">Events</div>
         <p className="mb-4 text-sm text-secondary">Select the events the webhook will listen to. At least one must be selected.</p>
         <div className="grid grid-cols-1 gap-x-8 gap-y-6 rounded-lg border border-border p-5 sm:grid-cols-2 lg:grid-cols-3">
@@ -141,7 +148,6 @@ export default function WebhooksPage() {
           ))}
         </div>
 
-        {/* Endpoint */}
         <div className="mb-1 mt-6 text-sm font-semibold">Endpoint</div>
         <p className="mb-2 text-sm text-secondary">Webhook events will be sent as a <code className="rounded bg-subtle px-1 font-mono text-xs">POST</code> request to this URL.</p>
         <input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://my-app.com/webhooks"
@@ -152,8 +158,9 @@ export default function WebhooksPage() {
           <Button onClick={create} disabled={busy}>Create Webhook</Button>
         </div>
       </Card>
+      </RoleGate>
+      {err ? <p className="mt-3 text-sm text-red-500">{err}</p> : null}
 
-      {/* Existing webhooks */}
       {!!hooks?.length && (
         <div className="mt-8 space-y-3">
           <h2 className="text-lg font-semibold">Active webhooks</h2>
@@ -166,15 +173,20 @@ export default function WebhooksPage() {
                   {h.events.length ? h.events.slice(0, 6).map((e) => <Badge key={e}>{e}</Badge>) : <Badge>all events</Badge>}
                   {h.events.length > 6 ? <Badge>+{h.events.length - 6}</Badge> : null}
                 </div>
-                <div className="mt-2 font-mono text-[11px] text-muted">secret: {h.secret}</div>
+                <div className="mt-2 font-mono text-[11px] text-muted">{h.secret ? `secret: ${h.secret}` : "signing secret: visible to team admins"}</div>
               </div>
-              <button onClick={() => remove(h.id)} className="shrink-0 text-muted hover:text-red-500"><Trash2 className="h-4 w-4" /></button>
+              <button
+                onClick={() => remove(h.id)}
+                disabled={!mayWrite}
+                title={mayWrite ? undefined : roleHint("webhooks.write")}
+                aria-label="Delete webhook"
+                className="shrink-0 text-muted hover:text-red-500 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-muted"
+              ><Trash2 className="h-4 w-4" /></button>
             </div>
           ))}
         </div>
       )}
 
-      {/* Deliveries */}
       {!!deliveries?.length && (
         <div className="mt-8 space-y-2">
           <h2 className="text-lg font-semibold">Recent deliveries</h2>

@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { Link2 } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
@@ -7,13 +8,30 @@ import {
   METHOD_TONE,
   type ApiParam,
   codeExamples,
+  endpointHref,
   endpointUrl,
   findEndpoint,
 } from "@/lib/api-catalog";
+import { pageMeta } from "@/lib/page-meta";
 
-// Statically generate a page for every endpoint in the catalog.
 export function generateStaticParams() {
   return API_CATEGORIES.flatMap((c) => c.endpoints.map((e) => ({ category: c.slug, method: e.slug })));
+}
+
+/** Every generated endpoint page names itself: without this the page inherits the root layout's title, description and canonical (the landing's), and a crawler
+ *  folds all of them into `/`. */
+export async function generateMetadata(props: { params: Promise<{ category: string; method: string }> }): Promise<Metadata> {
+  const { category, method } = await props.params;
+  const found = findEndpoint(category, method);
+  if (!found) return {};
+  const { endpoint: ep } = found;
+  const description = `${ep.method} ${ep.path}: ${ep.summary}`;
+  return pageMeta({
+    title: `${ep.name} — API Reference`,
+    socialTitle: `${ep.name} — shadw API Reference`,
+    description: description.length > 158 ? `${description.slice(0, 155).trimEnd()}...` : description,
+    path: endpointHref(category, method),
+  });
 }
 
 function Section({ id, title, children }: { id?: string; title: string; children: React.ReactNode }) {
@@ -54,12 +72,11 @@ export default async function MethodPage(props: { params: Promise<{ category: st
 
   return (
     <div className="mx-auto flex max-w-6xl flex-col gap-8 lg:flex-row lg:gap-10">
-      {/* Main content */}
       <article className="min-w-0 flex-1 pb-24">
         <div className="mb-6 flex flex-wrap items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
           <span className="text-muted">/</span>
-          <Link href="/docs/api-reference" className="hover:text-fg">shadw REST API</Link>
+          <Link href="/docs/api-reference" className="tap-44 inline-flex items-center hover:text-fg">shadw REST API</Link>
           <span className="text-muted">/</span>
           <span className="font-medium text-fg">{ep.name}</span>
         </div>
@@ -82,9 +99,10 @@ export default async function MethodPage(props: { params: Promise<{ category: st
           </div>
           <p className="mt-1.5 text-sm text-secondary">
             A platform API key (<code className="font-mono text-xs">hive_…</code>, created under
-            Settings → API Keys) or a short-lived JWT minted with{" "}
-            <code className="font-mono text-xs">POST /v1/token</code>. An API key scopes the request
-            to the team it was created under.
+            Settings → API Keys) or a JWT of at most 1 hour from{" "}
+            <code className="font-mono text-xs">POST /v1/token</code>, which is server-only once{" "}
+            <code className="font-mono text-xs">HIVE_JWT_SECRET</code> is set. An API key scopes the
+            request to the team it was created under.
           </p>
         </Section>
 
@@ -107,7 +125,6 @@ export default async function MethodPage(props: { params: Promise<{ category: st
         ) : null}
       </article>
 
-      {/* Right column: request examples + response */}
       <aside className="w-full shrink-0 space-y-4 lg:sticky lg:top-20 lg:h-fit lg:w-[420px]">
         <CodeBlock
           tabs={[

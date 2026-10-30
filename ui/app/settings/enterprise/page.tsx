@@ -14,26 +14,26 @@ import {
   Check,
 } from "lucide-react";
 import { Card, PageHeader, Badge, Button, Input, Switch } from "@/components/ui";
+import { RoleGate } from "@/components/role-gate";
 import { apiGet, apiSend, currentTeam } from "@/lib/api";
+import type { TeamAction } from "@/lib/team-role";
 
-/* --------------------------------------------------------------------------
- * Enterprise settings — one consolidated surface for the enterprise feature
- * suite. Every section is team-scoped and plan-gated server-side (the API
- * returns 403 when the team isn't on the required plan); the UI surfaces those
- * errors inline rather than hiding the controls.
- * ------------------------------------------------------------------------ */
+// Enterprise settings: one consolidated surface for the enterprise suite. Every section is team-scoped and plan-gated server-side (the API answers 403 when the
+// team is not on the required plan); the UI surfaces those errors inline instead of hiding the controls.
 
 function Section({
   icon,
   title,
   desc,
   badge,
+  needs,
   children,
 }: {
   icon: React.ReactNode;
   title: string;
   desc: string;
   badge?: string;
+  needs: TeamAction;
   children: React.ReactNode;
 }) {
   return (
@@ -48,7 +48,9 @@ function Section({
           <p className="mt-0.5 text-sm text-secondary">{desc}</p>
         </div>
       </div>
-      {children}
+      <RoleGate action={needs} note>
+        {children}
+      </RoleGate>
     </Card>
   );
 }
@@ -84,8 +86,6 @@ export default function EnterprisePage() {
   );
 }
 
-/* ============================ IP blocking ============================ */
-
 interface IpBlock {
   id: string;
   prefix: string;
@@ -109,8 +109,6 @@ function IpBlocking() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -127,8 +125,13 @@ function IpBlocking() {
     }
   };
   const remove = async (id: string) => {
-    await apiSend("DELETE", `/v1/enterprise/ip-blocks/${id}`);
-    load();
+    setErr(null);
+    try {
+      await apiSend("DELETE", `/v1/enterprise/ip-blocks/${id}`);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    }
   };
 
   return (
@@ -137,6 +140,7 @@ function IpBlocking() {
       title="Account-level IP Blocking"
       desc="Deny requests from specific IPs or prefixes across every deployment in this team. Enforced at the edge, before compute."
       badge="Enterprise"
+      needs="enterprise.config"
     >
       <div className="flex flex-col gap-2 sm:flex-row">
         <Input placeholder="IP or prefix (e.g. 203.0.113. or 203.0.113.7)" value={prefix} onChange={(e) => setPrefix(e.target.value)} />
@@ -166,8 +170,6 @@ function IpBlocking() {
     </Section>
   );
 }
-
-/* ============================ SAML SSO ============================ */
 
 interface SamlView {
   idp_entity_id: string;
@@ -203,8 +205,6 @@ function SamlSso() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -235,6 +235,7 @@ function SamlSso() {
       title="SAML Single Sign-On"
       desc="Federate sign-in with your identity provider (Okta, Azure AD, Google). Configure the SP metadata in your IdP, then paste the IdP details here."
       badge="Enterprise"
+      needs="enterprise.config"
     >
       <div className="grid gap-3 sm:grid-cols-2">
         <label className="text-sm">
@@ -281,8 +282,6 @@ function SamlSso() {
   );
 }
 
-/* ============================ SCIM ============================ */
-
 interface ScimUser {
   id: string;
   user_name: string;
@@ -310,8 +309,6 @@ function ScimSync() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -327,9 +324,14 @@ function ScimSync() {
     }
   };
   const disable = async () => {
-    await apiSend("DELETE", "/v1/enterprise/scim");
-    setToken(null);
-    load();
+    setErr(null);
+    try {
+      await apiSend("DELETE", "/v1/enterprise/scim");
+      setToken(null);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    }
   };
   const copy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -343,6 +345,7 @@ function ScimSync() {
       title="Directory Sync (SCIM 2.0)"
       desc="Automatically provision and de-provision team members from your identity provider. Point your IdP's SCIM connector at the endpoint below."
       badge="Enterprise"
+      needs="enterprise.config"
     >
       {view?.enabled ? (
         <>
@@ -394,8 +397,6 @@ function ScimSync() {
   );
 }
 
-/* ============================ SIEM ============================ */
-
 interface SiemView {
   format: string;
   endpoint: string;
@@ -426,8 +427,6 @@ function SiemStreaming() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -462,6 +461,7 @@ function SiemStreaming() {
       title="Audit Log Streaming (SIEM)"
       desc="Stream every audit event to your SIEM in real time. Supports generic HTTP JSON, Datadog, and Splunk HEC."
       badge="Enterprise"
+      needs="enterprise.config"
     >
       <div className="grid gap-3 sm:grid-cols-[160px_1fr]">
         <label className="text-sm">
@@ -502,8 +502,6 @@ function SiemStreaming() {
   );
 }
 
-/* ============================ Microfrontends ============================ */
-
 interface MfeChild {
   project: string;
   path_prefix: string;
@@ -534,8 +532,6 @@ function Microfrontends() {
     }
   }, []);
   useEffect(() => {
-    // setState calls inside load() happen after its await, in a later
-    // microtask -- not synchronously during this effect's commit.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
@@ -559,8 +555,13 @@ function Microfrontends() {
     }
   };
   const remove = async (id: string) => {
-    await apiSend("DELETE", `/v1/enterprise/microfrontends/${id}`);
-    load();
+    setErr(null);
+    try {
+      await apiSend("DELETE", `/v1/enterprise/microfrontends/${id}`);
+      load();
+    } catch (e) {
+      setErr(String(e));
+    }
   };
 
   return (
@@ -569,6 +570,7 @@ function Microfrontends() {
       title="Microfrontends"
       desc="Compose multiple projects into one app under a single domain. The host project serves the root; children serve their path prefixes."
       badge="Pro"
+      needs="enterprise.project"
     >
       <div className="grid gap-3 sm:grid-cols-2">
         <Input placeholder="Group name" value={name} onChange={(e) => setName(e.target.value)} />
@@ -619,8 +621,6 @@ function Microfrontends() {
   );
 }
 
-/* ============================ Conformance ============================ */
-
 interface ConfResult {
   rule: string;
   title: string;
@@ -659,6 +659,7 @@ function Conformance() {
       title="Conformance"
       desc="Run governance checks against a project's latest deployment — HTTPS, secret hygiene, firewall, access protection, production readiness, pinned runtime."
       badge="Enterprise"
+      needs="enterprise.project"
     >
       <div className="flex flex-col gap-2 sm:flex-row">
         <Input placeholder="Project name" value={project} onChange={(e) => setProject(e.target.value)} />

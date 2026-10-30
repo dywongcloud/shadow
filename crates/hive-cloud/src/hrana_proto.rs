@@ -1,34 +1,36 @@
-//! Hrana v2/v3 wire codec + execution against a real SQLite connection.
+//! Hrana v2/v3 wire codec and execution against one [`SqlEngine`].
 //!
-//! This is the protocol half of the libsql lane (`crate::hrana` is the HTTP
-//! half). It is a direct implementation of `libsql/docs/HRANA_3_SPEC.md`, and
-//! the parts that look pedantic are the parts a real client breaks on:
+//! The protocol half of the libsql lane (`crate::hrana` is the HTTP half), a direct implementation
+//! of `libsql/docs/HRANA_3_SPEC.md`. The parts that look pedantic are the parts a real client
+//! breaks on:
 //!
-//! * **`integer` and `last_insert_rowid` are STRINGS on the wire.** JSON
-//!   numbers are f64 in every JS client, so an i64 beyond 2^53 would silently
-//!   lose its low bits. The spec makes them strings for exactly that reason and
-//!   `@libsql/client` parses them back with `BigInt`.
-//! * **`float` is a JSON number**, which cannot represent NaN/±Inf. SQLite can
-//!   store them, so a column holding one is a LOUD error naming the column
-//!   rather than a silent `null` (indistinguishable from a real NULL) or a
-//!   silent type change to text.
-//! * **`blob` is base64 WITH padding**: `atob` in a browser requires it, and
-//!   every padded decoder accepts it. Decoding accepts unpadded too.
-//! * **Every request in a pipeline executes, even after one errors** — the
-//!   spec is explicit, and `batch`'s conditions are built on later steps
-//!   observing an earlier step's failure.
+//! * **`integer` and `last_insert_rowid` are STRINGS on the wire.** JSON numbers are f64 in every
+//! JS client, so an i64 beyond 2^53 would silently lose its low bits; `@libsql/client` parses them
+//! back with `BigInt`.
+//! * **`float` is a JSON number**, which cannot represent NaN/+-Inf. SQLite can store them, so a
+//! column holding one is a LOUD error naming the column, never a silent `null` (indistinguishable
+//! from a real NULL) or a silent type change to text. (A musql-backed database cannot hold one at
+//! all: `crate::musql::preflight` refuses to migrate a database that does.)
+//! * **`blob` is base64 WITH padding**: `atob` in a browser requires it and every padded decoder
+//! accepts it. Decoding accepts unpadded too.
+//! * **Every request in a pipeline executes, even after one errors**: the spec is explicit, and
+//! `batch`'s conditions are built on later steps observing an earlier step's failure.
 //!
-//! Everything here is synchronous and runs inside `spawn_blocking` (see
-//! `sqlite_pool::PooledConn::call`): one blocking hop executes a whole
-//! pipeline, so a 2-request `[execute, close]` POST — which is what
-//! `@libsql/client`'s `execute()` sends — costs one hop, not two.
+//! Everything above the engine call is synchronous protocol work; the engine call itself is
+//! awaited, so the rusqlite engine (blocking file IO) is driven to completion inside
+//! `spawn_blocking` by `sqlite_pool::PooledConn` while the musql engine (loopback HTTP) is awaited
+//! on the runtime: one pipeline implementation serves both.
+//!
+//! Statement errors are tagged `SQLITE_ERROR` for EVERY engine. musqld emits richer codes
+//! (`SQLITE_CONSTRAINT_UNIQUE`, `SQLITE_CONSTRAINT_FOREIGNKEY`, `HRANA_PROTO_ERROR`); forwarding
+//! them would change the code every existing tenant sees, so `crate::musql` normalises them before
+//! they reach this file.
 
 use base64::Engine;
-use hive_crsql::rusqlite::types::{Value as SqlValue, ValueRef};
-use hive_crsql::rusqlite::Connection;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+
+use crate::sqlite_engine::{Budget, NamedArg, SqlEngine, SqlValue};
 
 /// Rows buffered for one statement result. Hrana has a cursor endpoint for
 /// unbounded reads; the pipeline endpoint buffers, so it needs a ceiling.
@@ -40,7 +42,7 @@ const MAX_SQL_CACHE: usize = 256;
 const MAX_SQL_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Per-stream `store_sql` cache: `sql_id` -> SQL text.
-pub type SqlCache = HashMap<i32, String>;
+pub type SqlCache = std::collections::HashMap<i32, String>;
 
 pub struct ExecOutput {
     pub results: Vec<Value>,
@@ -59,13 +61,13 @@ struct Stmt {
     #[serde(default)]
     args: Vec<Value>,
     #[serde(default)]
-    named_args: Vec<NamedArg>,
+    named_args: Vec<WireNamedArg>,
     #[serde(default)]
     want_rows: Option<bool>,
 }
 
 #[derive(Deserialize)]
-struct NamedArg {
+struct WireNamedArg {
     name: String,
     value: Value,
 }
@@ -98,14 +100,14 @@ fn result_ok(response: Value) -> Value {
     json!({ "type": "ok", "response": response })
 }
 
-/// Execute a whole pipeline's `requests` array against one connection.
-/// `version` gates the v3-only requests (`get_autocommit`, the `is_autocommit`
-/// batch condition) so a v2 client can never observe a v3 response shape.
-/// `read_only` is an ADDITIONAL, connection-independent enforcement layer —
-/// see [`deny_if_forbidden_read_only_stmt`]'s doc for why a mutable
-/// `PRAGMA query_only` alone is not a sufficient boundary.
-pub fn execute_pipeline(
-    conn: &mut Connection,
+/// Executes a whole pipeline's `requests` array against one engine. `version` gates the v3-only
+/// requests (`get_autocommit`, the `is_autocommit` batch condition), so a v2 client can never
+/// observe a v3 response shape. `read_only` is an ADDITIONAL, connection-independent enforcement
+/// layer; see [`deny_if_forbidden_read_only_stmt`] for why a mutable `PRAGMA query_only` alone is
+/// not a sufficient boundary. A `close` short-circuits nothing: every request runs, and a client
+/// legitimately pipelines `[execute, close]`.
+pub async fn execute_pipeline<E: SqlEngine>(
+    eng: &mut E,
     requests: Vec<Value>,
     mut cache: SqlCache,
     version: u8,
@@ -114,8 +116,6 @@ pub fn execute_pipeline(
     let mut results = Vec::with_capacity(requests.len());
     let mut closed = false;
     for req in requests {
-        // A `close` short-circuits nothing: the spec says every request runs,
-        // and a client legitimately pipelines [execute, close].
         let ty = req.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let out = match ty {
             "close" => {
@@ -125,16 +125,24 @@ pub fn execute_pipeline(
             "execute" => match serde_json::from_value::<Stmt>(
                 req.get("stmt").cloned().unwrap_or(Value::Null),
             ) {
-                Ok(stmt) => resolve_sql(&stmt, &cache)
-                    .and_then(|sql| deny_if_forbidden_read_only_stmt(&sql, read_only).map(|_| sql))
-                    .and_then(|sql| execute_stmt(conn, &sql, &stmt))
-                    .map(|r| json!({ "type": "execute", "result": r })),
+                Ok(stmt) => match resolve_sql(&stmt, &cache) {
+                    Ok(sql) => match deny_if_forbidden_read_only_stmt(&sql, read_only) {
+                        Ok(()) => match wire_args(&stmt) {
+                            Ok(a) => execute_stmt(eng, &sql, &stmt, a).await,
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(e),
+                }
+                .map(|r| json!({ "type": "execute", "result": r })),
                 Err(e) => Err(format!("malformed stmt: {e}")),
             },
             "batch" => match serde_json::from_value::<Batch>(
                 req.get("batch").cloned().unwrap_or(Value::Null),
             ) {
-                Ok(batch) => execute_batch(conn, batch, &cache, version, read_only)
+                Ok(batch) => execute_batch(eng, batch, &cache, version, read_only)
+                    .await
                     .map(|r| json!({ "type": "batch", "result": r })),
                 Err(e) => Err(format!("malformed batch: {e}")),
             },
@@ -144,14 +152,19 @@ pub fn execute_pipeline(
                  (e.g. a PRAGMA) past a leading-keyword check; use \"execute\" instead"
                     .to_string(),
             ),
-            "sequence" => sql_from_req(&req, &cache).and_then(|sql| {
-                conn.execute_batch(&sql)
-                    .map(|_| json!({ "type": "sequence" }))
-                    .map_err(|e| e.to_string())
-            }),
-            "describe" => sql_from_req(&req, &cache)
-                .and_then(|sql| describe(conn, &sql))
-                .map(|r| json!({ "type": "describe", "result": r })),
+            "sequence" => match sql_from_req(&req, &cache) {
+                Ok(sql) => eng
+                    .execute_batch(&sql)
+                    .await
+                    .map(|_| json!({ "type": "sequence" })),
+                Err(e) => Err(e),
+            },
+            "describe" => match sql_from_req(&req, &cache) {
+                Ok(sql) => describe(eng, &sql)
+                    .await
+                    .map(|r| json!({ "type": "describe", "result": r })),
+                Err(e) => Err(e),
+            },
             "store_sql" => store_sql(&req, &mut cache).map(|_| json!({ "type": "store_sql" })),
             "close_sql" => {
                 if let Some(id) = req.get("sql_id").and_then(|v| v.as_i64()) {
@@ -165,7 +178,7 @@ pub fn execute_pipeline(
                 } else {
                     Ok(json!({
                         "type": "get_autocommit",
-                        "is_autocommit": conn.is_autocommit(),
+                        "is_autocommit": eng.is_autocommit().await,
                     }))
                 }
             }
@@ -183,17 +196,15 @@ pub fn execute_pipeline(
     }
 }
 
-/// A read-only session's ONLY enforcement point that isn't a mutable
-/// per-connection PRAGMA. `PRAGMA query_only=ON` is not a real boundary: it
-/// is a session-scoped setting toggled by ordinary SQL text, and SQLite does
-/// not gate PRAGMA execution behind the flag it itself controls, so
-/// `PRAGMA query_only=OFF` sent over the same read-only-scoped connection
-/// silently re-enables writes for the rest of the request. `ATTACH`/`DETACH`
-/// are denied for the same reason (attaching a second database file sidesteps
-/// this file's own `max_bytes` cap and any path-scoping assumption entirely).
-/// Every raw SQL string reaching `conn.execute`/`conn.prepare` from a
-/// read-only-scoped pipeline must pass through here first — never trust
-/// `stmt.readonly()` post hoc, since PRAGMA/ATTACH survive that check too.
+/// A read-only session's ONLY enforcement point that is not a mutable per-connection PRAGMA.
+/// `PRAGMA query_only=ON` is no real boundary: it is a session-scoped setting toggled by ordinary
+/// SQL text, and SQLite does not gate PRAGMA execution behind the flag it controls, so `PRAGMA
+/// query_only=OFF` sent over the same read-only-scoped connection silently re-enables writes for
+/// the rest of the request. `ATTACH`/`DETACH` are denied for the same reason (attaching a second
+/// database file sidesteps this file's own `max_bytes` cap and any path-scoping assumption). Every
+/// raw SQL string reaching an engine's `run`/`execute_batch`/`describe` from a read-only-scoped
+/// pipeline must pass through here first; a post-hoc readonly check is no substitute, since
+/// PRAGMA/ATTACH survive it too.
 fn deny_if_forbidden_read_only_stmt(sql: &str, read_only: bool) -> Result<(), String> {
     if !read_only {
         return Ok(());
@@ -278,9 +289,7 @@ fn sql_from_req(req: &Value, cache: &SqlCache) -> Result<String, String> {
     resolve_sql(&stmt, cache)
 }
 
-// ---- Value codec ----------------------------------------------------------
-
-/// Wire `Value` -> SQLite value. An unknown `type` is an error, never a
+/// Wire `Value` -> engine value. An unknown `type` is an error, never a
 /// best-effort guess: binding the wrong type is a silently wrong query.
 fn decode_value(v: &Value) -> Result<SqlValue, String> {
     let ty = v
@@ -330,175 +339,109 @@ fn decode_b64(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("invalid base64 in blob argument: {e}"))
 }
 
-fn encode_value(v: ValueRef<'_>, col: &str) -> Result<Value, String> {
+/// The one message a non-finite REAL produces, whichever engine produced it. Shared on purpose: the
+/// rusqlite path refuses to ENCODE one here, and the musql path must re-derive it from the engine
+/// after musqld's lossy row encoder turned it into a NULL. Two engines, one message, so a client
+/// cannot tell which engine it is talking to by the error text.
+pub(crate) fn non_finite_message(col: &str, f: f64) -> String {
+    format!(
+        "column {col:?} holds a non-finite float ({f}), which JSON cannot represent — \
+         cast it in the query (e.g. CAST(x AS TEXT))"
+    )
+}
+
+fn encode_value(v: SqlValue, col: &str) -> Result<Value, String> {
     Ok(match v {
-        ValueRef::Null => json!({ "type": "null" }),
-        ValueRef::Integer(i) => json!({ "type": "integer", "value": i.to_string() }),
-        ValueRef::Real(f) => {
-            let n = serde_json::Number::from_f64(f).ok_or_else(|| {
-                format!(
-                    "column {col:?} holds a non-finite float ({f}), which JSON cannot represent — \
-                     cast it in the query (e.g. CAST(x AS TEXT))"
-                )
-            })?;
+        SqlValue::Null => json!({ "type": "null" }),
+        SqlValue::Integer(i) => json!({ "type": "integer", "value": i.to_string() }),
+        SqlValue::Real(f) => {
+            let n = serde_json::Number::from_f64(f)
+                .ok_or_else(|| non_finite_message(col, f))?;
             json!({ "type": "float", "value": n })
         }
-        ValueRef::Text(t) => {
-            let s = std::str::from_utf8(t)
-                .map_err(|_| format!("column {col:?} holds text that is not valid UTF-8"))?;
-            json!({ "type": "text", "value": s })
-        }
-        ValueRef::Blob(b) => json!({
+        SqlValue::Text(t) => json!({ "type": "text", "value": t }),
+        SqlValue::Blob(b) => json!({
             "type": "blob",
             "base64": base64::engine::general_purpose::STANDARD.encode(b),
         }),
     })
 }
 
-// ---- Statement execution --------------------------------------------------
-
-/// Bind every parameter of a prepared statement, or fail naming the one that
-/// could not be bound. Unbound parameters default to NULL in SQLite, which
-/// turns a client-side arity bug into a query that "works" and returns the
-/// wrong rows — so this refuses instead.
-fn bind(stmt: &mut hive_crsql::rusqlite::Statement<'_>, s: &Stmt) -> Result<(), String> {
-    let expected = stmt.parameter_count();
-    if s.args.len() > expected {
-        return Err(format!(
-            "statement takes {expected} parameters but {} positional arguments were supplied",
-            s.args.len()
-        ));
-    }
-    let mut bound = vec![false; expected];
+/// Decode one statement's arguments. Failing here fails the statement with a
+/// named, typed error rather than binding a wrong-typed placeholder.
+fn wire_args(s: &Stmt) -> Result<(Vec<SqlValue>, Vec<NamedArg>), String> {
+    let mut args = Vec::with_capacity(s.args.len());
     for (i, a) in s.args.iter().enumerate() {
-        stmt.raw_bind_parameter(i + 1, decode_value(a)?)
-            .map_err(|e| format!("cannot bind positional argument {}: {e}", i + 1))?;
-        bound[i] = true;
+        args.push(
+            decode_value(a).map_err(|e| format!("cannot decode positional argument {}: {e}", i + 1))?,
+        );
     }
+    let mut named = Vec::with_capacity(s.named_args.len());
     for na in &s.named_args {
-        // Clients send names with or without the SQLite sigil; try the raw
-        // name first, then each sigil, so `:id` / `@id` / `$id` all resolve
-        // from a bare `id`.
-        let idx = ["", ":", "@", "$"]
-            .iter()
-            .find_map(|p| {
-                let key = if na.name.starts_with([':', '@', '$']) {
-                    na.name.clone()
-                } else {
-                    format!("{p}{}", na.name)
-                };
-                stmt.parameter_index(&key).ok().flatten()
-            })
-            .ok_or_else(|| format!("statement has no parameter named {:?}", na.name))?;
-        stmt.raw_bind_parameter(idx, decode_value(&na.value)?)
-            .map_err(|e| format!("cannot bind named argument {:?}: {e}", na.name))?;
-        if idx >= 1 && idx <= expected {
-            bound[idx - 1] = true;
-        }
+        named.push(NamedArg {
+            name: na.name.clone(),
+            value: decode_value(&na.value)
+                .map_err(|e| format!("cannot decode named argument {:?}: {e}", na.name))?,
+        });
     }
-    if let Some(missing) = bound.iter().position(|b| !b) {
-        return Err(format!(
-            "parameter {} of {expected} was not supplied",
-            missing + 1
-        ));
-    }
-    Ok(())
+    Ok((args, named))
 }
 
-fn execute_stmt(conn: &Connection, sql: &str, s: &Stmt) -> Result<Value, String> {
+/// Runs one statement on the engine and renders the Hrana result. `rows_read` is the rows the
+/// statement STEPPED and `rows_written` the rows it changed: libsql-server derives both from
+/// `sqlite3_status` counters, and these are the honest per-statement equivalents, not a
+/// reimplementation of that accounting.
+async fn execute_stmt<E: SqlEngine>(
+    eng: &mut E,
+    sql: &str,
+    s: &Stmt,
+    args: (Vec<SqlValue>, Vec<NamedArg>),
+) -> Result<Value, String> {
     let started = std::time::Instant::now();
-    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    bind(&mut stmt, s)?;
+    let (positional, named) = args;
+    let out = eng
+        .run(
+            sql,
+            s.want_rows.unwrap_or(true),
+            &positional,
+            &named,
+            Budget {
+                max_rows: MAX_ROWS,
+                max_bytes: MAX_RESULT_BYTES,
+            },
+        )
+        .await?;
 
-    // Column metadata is read from the statement itself (immutable borrow)
-    // BEFORE stepping, because `raw_query` takes the statement mutably.
-    let cols: Vec<Value> = stmt
-        .columns()
+    let cols: Vec<Value> = out
+        .cols
         .iter()
-        .map(|c| json!({ "name": c.name(), "decltype": c.decl_type() }))
+        .map(|c| json!({ "name": c.name, "decltype": c.decltype }))
         .collect();
-    let col_names: Vec<String> = stmt
-        .columns()
-        .iter()
-        .map(|c| c.name().to_string())
-        .collect();
-    let want_rows = s.want_rows.unwrap_or(true) && !col_names.is_empty();
-    // `sqlite3_changes` is per-CONNECTION and is only updated by DML, so after
-    // `INSERT` then `SELECT` it still reports the insert's count — which would
-    // make every read claim it wrote a row (and carry the insert's
-    // `last_insert_rowid`). `sqlite3_stmt_readonly` is the exact discriminator,
-    // and it is also true for BEGIN/COMMIT/ROLLBACK, which change no rows.
-    let readonly = stmt.readonly();
-    // `readonly` alone is NOT enough. DDL (`CREATE`/`DROP`/`ALTER`) and most
-    // `PRAGMA` writes are non-readonly yet never touch `sqlite3_changes`, so
-    // they inherit whatever count the last DML on this CONNECTION left behind —
-    // and connections are pooled and reused across requests, so a `CREATE TABLE`
-    // could report another request's insert count and its `last_insert_rowid`.
-    // `sqlite3_total_changes` moves for exactly the statements `sqlite3_changes`
-    // is meaningful for, so its delta is the precise discriminator.
-    let total_before = conn.total_changes();
-
-    let mut rows_json: Vec<Value> = Vec::new();
-    let mut rows_read: u64 = 0;
+    let mut rows_json: Vec<Value> = Vec::with_capacity(out.rows.len());
     let mut bytes: usize = 0;
-    {
-        let mut rows = stmt.raw_query();
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            rows_read += 1;
-            if !want_rows {
-                continue;
-            }
-            let mut out = Vec::with_capacity(col_names.len());
-            for (i, name) in col_names.iter().enumerate() {
-                let v = row.get_ref(i).map_err(|e| e.to_string())?;
-                let enc = encode_value(v, name)?;
-                bytes += estimate_bytes(&enc);
-                out.push(enc);
-            }
-            rows_json.push(Value::Array(out));
-            if rows_json.len() > MAX_ROWS {
-                return Err(format!(
-                    "result set exceeds {MAX_ROWS} rows over the pipeline endpoint — paginate with LIMIT/OFFSET"
-                ));
-            }
-            if bytes > MAX_RESULT_BYTES {
-                return Err(format!(
-                    "result set exceeds {}MiB over the pipeline endpoint — narrow the projection or paginate",
-                    MAX_RESULT_BYTES / (1024 * 1024)
-                ));
-            }
+    for row in &out.rows {
+        let mut out_row = Vec::with_capacity(row.len());
+        for (i, v) in row.iter().enumerate() {
+            let col = out.cols.get(i).map(|c| c.name.as_str()).unwrap_or("");
+            let enc = encode_value(v.clone(), col)?;
+            bytes += estimate_bytes(&enc);
+            out_row.push(enc);
         }
+        rows_json.push(Value::Array(out_row));
     }
-    let wrote_rows = conn.total_changes() != total_before;
-    let changes = if readonly || !wrote_rows {
-        0
-    } else {
-        conn.changes()
-    };
-    // SQLite keeps the connection's last inserted rowid indefinitely, so it is
-    // reported only for a statement that actually wrote — which now excludes
-    // DDL/`PRAGMA`, since `changes` is gated on the `total_changes` delta above.
-    // Deliberately NOT additionally gated on "the rowid moved": re-inserting a
-    // rowid that was just deleted leaves it unchanged, and suppressing a real
-    // insert's rowid is a worse failure than an UPDATE/DELETE echoing the
-    // connection's last one.
-    let last_insert_rowid = if changes > 0 {
-        let id = conn.last_insert_rowid();
-        (id != 0).then(|| id.to_string())
-    } else {
-        None
-    };
+    if bytes > MAX_RESULT_BYTES {
+        return Err(format!(
+            "result set exceeds {}MiB over the pipeline endpoint — narrow the projection or paginate",
+            MAX_RESULT_BYTES / (1024 * 1024)
+        ));
+    }
     Ok(json!({
         "cols": cols,
         "rows": rows_json,
-        "affected_row_count": changes,
-        "last_insert_rowid": last_insert_rowid,
-        // `rows_read` is the rows this statement STEPPED and `rows_written` the
-        // rows it changed. libsql-server derives both from sqlite3_status
-        // counters; these are the honest per-statement equivalents, not a
-        // reimplementation of that accounting.
-        "rows_read": rows_read,
-        "rows_written": changes,
+        "affected_row_count": out.rows_written,
+        "last_insert_rowid": out.last_insert_rowid.map(|id| id.to_string()),
+        "rows_read": out.rows_read,
+        "rows_written": out.rows_written,
         "query_duration_ms": started.elapsed().as_secs_f64() * 1000.0,
     }))
 }
@@ -514,25 +457,25 @@ fn estimate_bytes(v: &Value) -> usize {
     }
 }
 
-fn describe(conn: &Connection, sql: &str) -> Result<Value, String> {
-    let stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
-    let params: Vec<Value> = (1..=stmt.parameter_count())
-        .map(|i| json!({ "name": stmt.parameter_name(i) }))
-        .collect();
-    let cols: Vec<Value> = stmt
-        .columns()
+async fn describe<E: SqlEngine>(eng: &mut E, sql: &str) -> Result<Value, String> {
+    let d = eng.describe(sql).await?;
+    let params: Vec<Value> = d
+        .params
         .iter()
-        .map(|c| json!({ "name": c.name(), "decltype": c.decl_type() }))
+        .map(|n| json!({ "name": n.clone() }))
+        .collect();
+    let cols: Vec<Value> = d
+        .cols
+        .iter()
+        .map(|c| json!({ "name": c.name, "decltype": c.decltype }))
         .collect();
     Ok(json!({
         "params": params,
         "cols": cols,
-        "is_explain": stmt.is_explain() != 0,
-        "is_readonly": stmt.readonly(),
+        "is_explain": d.is_explain,
+        "is_readonly": d.is_readonly,
     }))
 }
-
-// ---- Batch ----------------------------------------------------------------
 
 /// One batch step's observed outcome, which later steps' conditions read.
 #[derive(Clone, Copy, PartialEq)]
@@ -542,10 +485,14 @@ enum StepState {
     Failed,
 }
 
-fn eval_cond(
+/// Evaluates one batch condition against the steps that have run. A condition naming a step that
+/// has not run yet (or does not exist) is FALSE, never an error: the spec allows forward references
+/// and they simply cannot be satisfied. A malformed condition is an `Err` the caller attributes to
+/// ITS step.
+async fn eval_cond<E: SqlEngine>(
     cond: &Value,
     states: &[StepState],
-    conn: &Connection,
+    eng: &mut E,
     version: u8,
 ) -> Result<bool, String> {
     let ty = cond
@@ -558,9 +505,6 @@ fn eval_cond(
                 .get("step")
                 .and_then(|s| s.as_u64())
                 .ok_or("batch condition is missing `step`")? as usize;
-            // A condition referring to a step that has not run yet (or does not
-            // exist) is FALSE, never an error — the spec allows forward
-            // references and they simply cannot be satisfied.
             let state = states.get(step).copied().unwrap_or(StepState::Skipped);
             Ok(match ty {
                 "ok" => state == StepState::Ok,
@@ -571,7 +515,7 @@ fn eval_cond(
             let inner = cond
                 .get("cond")
                 .ok_or("`not` condition is missing `cond`")?;
-            Ok(!eval_cond(inner, states, conn, version)?)
+            Ok(!Box::pin(eval_cond(inner, states, eng, version)).await?)
         }
         "and" | "or" => {
             let conds = cond
@@ -580,7 +524,7 @@ fn eval_cond(
                 .ok_or("`and`/`or` condition is missing `conds`")?;
             let mut acc = ty == "and";
             for c in conds {
-                let v = eval_cond(c, states, conn, version)?;
+                let v = Box::pin(eval_cond(c, states, eng, version)).await?;
                 acc = if ty == "and" { acc && v } else { acc || v };
             }
             Ok(acc)
@@ -589,24 +533,22 @@ fn eval_cond(
             if version < 3 {
                 Err("is_autocommit condition requires protocol version 3".into())
             } else {
-                Ok(conn.is_autocommit())
+                Ok(eng.is_autocommit().await)
             }
         }
         other => Err(format!("unknown batch condition type {other:?}")),
     }
 }
 
-/// The `v3/cursor` endpoint's newline-delimited entry stream for one batch.
-///
-/// The entries are RENDERED from the same buffered batch execution the
-/// pipeline endpoint uses — the wire shape is the spec's, the execution is not
-/// a second implementation. That is a deliberate limit and it is the honest
-/// one: `cursor` exists in Hrana so a huge result set need not be buffered, and
-/// this server still buffers it under [`MAX_ROWS`]/[`MAX_RESULT_BYTES`]. A
-/// client gets correct results and the same ceiling as the pipeline endpoint,
-/// never a truncated stream.
-pub fn execute_cursor(
-    conn: &mut Connection,
+/// The `v3/cursor` endpoint's newline-delimited entry stream for one batch. The entries are
+/// RENDERED from the same buffered batch execution the pipeline endpoint uses: the wire shape is
+/// the spec's, the execution is not a second implementation. That is a deliberate and honest limit:
+/// `cursor` exists in Hrana so a huge result set need not be buffered, and this server still
+/// buffers it under [`MAX_ROWS`]/[`MAX_RESULT_BYTES`], so a client gets correct results and the
+/// same ceiling as the pipeline endpoint, never a truncated stream. A skipped step emits no
+/// entries.
+pub async fn execute_cursor<E: SqlEngine>(
+    eng: &mut E,
     batch: Value,
     cache: &SqlCache,
     version: u8,
@@ -621,7 +563,7 @@ pub fn execute_cursor(
             })]
         }
     };
-    let result = match execute_batch(conn, parsed, cache, version, read_only) {
+    let result = match execute_batch(eng, parsed, cache, version, read_only).await {
         Ok(r) => r,
         Err(e) => {
             return vec![json!({
@@ -640,7 +582,6 @@ pub fn execute_cursor(
             continue;
         }
         let Some(r) = step_results.get(i).filter(|v| !v.is_null()) else {
-            // Skipped step: the spec emits no entries for it.
             continue;
         };
         entries.push(json!({ "type": "step_begin", "step": i, "cols": r["cols"] }));
@@ -656,8 +597,12 @@ pub fn execute_cursor(
     entries
 }
 
-fn execute_batch(
-    conn: &Connection,
+/// Runs a batch's steps in order, each gated by its condition. A step failure never stops the batch
+/// (conditions are what read it), and a malformed condition fails ITS step, not the batch: the
+/// remaining steps still get their conditions evaluated. A skipped step leaves both its result and
+/// its error `null`.
+async fn execute_batch<E: SqlEngine>(
+    eng: &mut E,
     batch: Batch,
     cache: &SqlCache,
     version: u8,
@@ -671,11 +616,9 @@ fn execute_batch(
     for (i, step) in batch.steps.iter().enumerate() {
         let run = match &step.condition {
             None => true,
-            Some(c) => match eval_cond(c, &states, conn, version) {
+            Some(c) => match eval_cond(c, &states, eng, version).await {
                 Ok(v) => v,
                 Err(e) => {
-                    // A malformed condition fails ITS step, not the batch —
-                    // the remaining steps still get their conditions evaluated.
                     states[i] = StepState::Failed;
                     step_errors[i] = err_json(e, Some("SQLITE_ERROR"));
                     continue;
@@ -685,10 +628,17 @@ fn execute_batch(
         if !run {
             continue;
         }
-        match resolve_sql(&step.stmt, cache)
-            .and_then(|sql| deny_if_forbidden_read_only_stmt(&sql, read_only).map(|_| sql))
-            .and_then(|sql| execute_stmt(conn, &sql, &step.stmt))
-        {
+        let res = match resolve_sql(&step.stmt, cache) {
+            Ok(sql) => match deny_if_forbidden_read_only_stmt(&sql, read_only) {
+                Ok(()) => match wire_args(&step.stmt) {
+                    Ok(a) => execute_stmt(eng, &sql, &step.stmt, a).await,
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
+        match res {
             Ok(r) => {
                 states[i] = StepState::Ok;
                 step_results[i] = r;

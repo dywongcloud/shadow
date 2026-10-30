@@ -1,33 +1,28 @@
-//! Deterministic ESM -> CommonJS rewrite for ONE browser-entry source file
-//! (browser-esm-rewrite).
+//! Deterministic ESM -> CommonJS rewrite for ONE browser-entry source file.
 //!
 //! WHY. A browser artifact is ONE `async function (request, ops)` expression
-//! ([`crate::browser_artifacts::bundle`]) with the deployment's entry file
-//! embedded VERBATIM in its body, so a static `import`/`export` STATEMENT is a
-//! hard SyntaxError there — a function body is not a module, in any substrate.
-//! The substrate is now vendored node-worker (Node v25.9.0's own lib
-//! transpiled for a Worker) with a real CommonJS AND ESM loader, but a loader
-//! loads FILES while the artifact is an EXPRESSION. So rather than rejecting
-//! ESM entries — which is what excluded every framework build output
-//! (`dist/server/entry.mjs`, `.output/server/index.mjs`, a SvelteKit
-//! `build/index.js`) from browser nodes — the build rewrites the module syntax
-//! into the CommonJS the envelope and the guest's `require`/`module.exports`
-//! registry (the Node API the guest runtime installs) already supply.
+//! ([`crate::browser_artifacts::bundle`]) with the deployment's entry file embedded VERBATIM in its
+//! body, so a static `import`/`export` STATEMENT is a hard SyntaxError there: a function body is
+//! not a module, in any substrate. The substrate (a vendored node-worker with a real CommonJS AND
+//! ESM loader) loads FILES while the artifact is an EXPRESSION. So rather than rejecting ESM
+//! entries, which excluded every framework build output (`dist/server/entry.mjs`,
+//! `.output/server/index.mjs`, a SvelteKit `build/index.js`) from browser nodes, the build rewrites
+//! the module syntax into the CommonJS the envelope and the guest's `require`/`module.exports`
+//! registry already supply.
 //!
-//! WHAT IT REFUSES. Only what has no equivalent CommonJS: an entry mixing
-//! `export default` with named exports (one artifact resolves ONE handler), an
-//! unrecognized export form, and an unterminated module statement. A module
-//! the SUBSTRATE cannot provide (a relative specifier, `net`, …) is named at
-//! the point of use by the guest runtime's honesty rule — never turned into a
-//! build-time guess here.
+//! WHAT IT REFUSES. Only what has no equivalent CommonJS: an entry mixing `export default` with
+//! named exports (one artifact resolves ONE handler), an unrecognized export form, and an
+//! unterminated module statement. A module the SUBSTRATE cannot provide (a relative specifier,
+//! `net`, ...) is named at the point of use by the guest runtime's honesty rule, never turned into
+//! a build-time guess here.
 //!
-//! DETERMINISM. A pure string transform over LF-normalized input: identical
-//! input always yields identical output, so artifact digests stay stable.
-//! An already-CommonJS entry comes back byte-identical, so artifacts built
-//! before this existed keep their digests and are never rebuilt for nothing.
+//! DETERMINISM. A pure string transform over LF-normalized input: identical input always yields
+//! identical output, so artifact digests stay stable. An already-CommonJS entry comes back
+//! byte-identical, so artifacts built before this existed keep their digests and are never rebuilt
+//! for nothing.
 //!
-//! NO CRATE DEPENDENCIES ON PURPOSE: this is a self-contained scanner, so it
-//! can be exercised standalone against real framework output.
+//! NO CRATE DEPENDENCIES ON PURPOSE: a self-contained scanner, so it can be exercised standalone
+//! against real framework output.
 
 /// One entry file's rewrite outcome.
 pub struct EsmRewrite {
@@ -82,7 +77,6 @@ pub fn rewrite_esm(src: &str) -> Result<EsmRewrite, String> {
         );
     }
     if !saw_module {
-        // Already CommonJS: returned unchanged, byte for byte.
         return Ok(EsmRewrite {
             source: src.to_string(),
             rewritten: false,
@@ -130,9 +124,8 @@ fn module_keyword(t: &str) -> Option<Kw> {
     }
 }
 
-/// Lexer state: bracket depth, string/template state, and comments, so a
-/// `{`/`;`/`from` inside a string, a template or a comment is never mistaken
-/// for syntax.
+/// Lexer state: bracket depth, string and template state, and comments, so a `{`, `;` or `from`
+/// inside a string, a template or a comment is never mistaken for syntax.
 #[derive(Default)]
 struct State {
     depth: i32,
@@ -242,7 +235,6 @@ fn scan(s: &str) -> Scan {
             if depth_before <= 0 {
                 out.words.push((start, chars[start..j].iter().collect()));
             }
-            // Re-feed the whole word so quote/comment state stays correct.
             for k in start..j {
                 st.feed(chars[k], chars.get(k + 1).copied());
             }
@@ -314,9 +306,8 @@ fn first_ident(s: &str) -> Option<String> {
     }
 }
 
-/// Rewrite `import.meta` to the envelope's shim, in CODE only: a mention
-/// inside a string, template or comment is data, not syntax, and must be left
-/// alone.
+/// Rewrites `import.meta` to the envelope's shim, in CODE only: a mention inside a string, template
+/// or comment is data, not syntax, and must be left alone.
 fn replace_import_meta(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let token: Vec<char> = "import.meta".chars().collect();
@@ -367,9 +358,9 @@ fn statement_complete(acc: &str) -> bool {
     )
 }
 
-/// Gather one module statement starting at `lines[start]`, spanning as many
-/// lines as it takes to close (imports and `export default` bodies are
-/// routinely multi-line). Returns (statement, lines consumed).
+/// Gathers one module statement starting at `lines[start]`, spanning as many lines as it takes to
+/// close (imports and `export default` bodies are routinely multi-line). Returns (statement, lines
+/// consumed).
 fn gather(lines: &[&str], start: usize) -> Result<(String, usize), String> {
     let mut st = State::default();
     let mut acc = String::new();
@@ -403,6 +394,10 @@ fn gather(lines: &[&str], start: usize) -> Result<(String, usize), String> {
     ))
 }
 
+/// Rewrites one import statement into `require` calls: `import <clause> from 'm'` becomes the
+/// declaration `import_clause_decl` builds over `require('m')`, and a bare `import 'm'` becomes
+/// `require('m');`. The declaration head never carries the terminator and the statement's own tail
+/// decides it, so exactly one `;` is emitted either way.
 fn rewrite_import(stmt: &str) -> Result<String, String> {
     let s = stmt.trim();
     if let Some(from) = find_word(s, "from") {
@@ -411,8 +406,6 @@ fn rewrite_import(stmt: &str) -> Result<String, String> {
             return Err("an `import ... from ...` statement has no module specifier".to_string());
         };
         let clause = s[6..from].trim();
-        // The head never carries the terminator; the statement's own tail
-        // decides it, so exactly one `;` is emitted either way.
         let head = import_clause_decl(clause, &spec)?
             .trim_end()
             .trim_end_matches(';')
@@ -633,6 +626,9 @@ fn default_export_body(body: &str) -> Option<&str> {
 
 /// A `export default` whose value is a DECLARATION is emitted verbatim and then
 /// assigned; `None` means "treat the body as an expression".
+///
+/// An anonymous declaration (`export default function (req, res) {}`) has no name to reference
+/// afterwards, so the expression is assigned directly.
 fn default_declaration(a: &str) -> Result<Option<(String, String)>, String> {
     let decl = ["async function", "function", "class"];
     for kw in decl {
@@ -641,8 +637,6 @@ fn default_declaration(a: &str) -> Result<Option<(String, String)>, String> {
         };
         let name = first_ident(r);
         let Some(name) = name else {
-            // Anonymous: `export default function (req, res) {}` — assign the
-            // expression directly; there is no name to reference afterwards.
             return Ok(Some((String::new(), format!("module.exports = {a};"))));
         };
         return Ok(Some((

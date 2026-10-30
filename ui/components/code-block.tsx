@@ -3,11 +3,6 @@
 import { useState } from "react";
 import { Copy, Check } from "lucide-react";
 
-/* Lightweight, dependency-free, theme-aware syntax highlighter + code panel
- * (filename header, language tabs, copy button). Good enough for the snippets
- * shown in the docs (ts/js, python, bash/curl, json). Colors use theme tokens so
- * it reads well in light and dark. */
-
 type Lang = "ts" | "tsx" | "js" | "python" | "bash" | "json" | "text";
 
 const KEYWORDS: Record<string, Set<string>> = {
@@ -61,6 +56,8 @@ function highlight(code: string, lang: Lang): React.ReactNode {
 
 export interface Tab { label: string; lang: Lang; filename?: string; code: string }
 
+/** A lightweight, dependency-free, theme-aware code panel (filename header, language tabs, copy button) with its own syntax highlighter for the docs snippets (ts/js, python,
+ *  bash/curl, json); colors use theme tokens. */
 export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: string }) {
   const [active, setActive] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -71,19 +68,18 @@ export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: s
       await navigator.clipboard.writeText(tab.code);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
-    } catch {/* ignore */}
+    } catch {}
   };
 
   return (
     <div className={`overflow-hidden rounded-xl border border-border bg-card ${className}`}>
-      {/* tabs (only when >1) */}
       {tabs.length > 1 && (
         <div className="flex items-center gap-1 border-b border-border px-2 pt-1.5">
           {tabs.map((t, i) => (
             <button
               key={t.label}
               onClick={() => setActive(i)}
-              className={`relative rounded-md px-3 py-1.5 text-[13px] transition-colors ${
+              className={`tap-44 relative inline-flex items-center rounded-md px-3 py-1.5 text-[13px] transition-colors ${
                 i === active ? "text-fg" : "text-secondary hover:text-fg"
               }`}
             >
@@ -93,7 +89,6 @@ export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: s
           ))}
         </div>
       )}
-      {/* filename header + copy */}
       <div className="flex items-center justify-between border-b border-border px-4 py-2">
         <span className="flex items-center gap-2 font-mono text-xs text-secondary">
           {tab.filename && (
@@ -101,11 +96,10 @@ export function CodeBlock({ tabs, className = "" }: { tabs: Tab[]; className?: s
           )}
           {tab.filename ?? tab.lang}
         </span>
-        <button onClick={copy} className="text-muted transition-colors hover:text-fg" aria-label="Copy code">
+        <button onClick={copy} className="tap-44 -m-1.5 inline-flex items-center justify-center p-1.5 text-muted transition-colors hover:text-fg" aria-label="Copy code">
           {copied ? <Check className="h-3.5 w-3.5 text-emerald-500" /> : <Copy className="h-3.5 w-3.5" />}
         </button>
       </div>
-      {/* code */}
       <pre className="no-scrollbar overflow-x-auto p-4 font-mono text-[13px] leading-relaxed text-fg">
         <code>{highlight(tab.code, tab.lang)}</code>
       </pre>

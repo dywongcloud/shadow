@@ -1,7 +1,5 @@
 import { Skeleton, SkeletonCard } from "@/components/ui";
 
-// Overrides the generic root loading.tsx — shaped like the real page: a title
-// + range-picker row, then the 2-up metric-card grid (each card is a chart).
 export default function Loading() {
   return (
     <div>

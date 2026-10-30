@@ -1,12 +1,5 @@
 "use client";
 
-// Platform-owner gating for the Operations Console (/admin) entry points.
-//
-// The ENFORCEMENT lives in middleware.ts (ADMIN_EMAILS — keep the two lists in
-// sync): any non-owner hitting /admin is bounced server-side. This hook only
-// decides whether to SHOW the Ops links in the chrome, so non-owners don't see
-// an entry point that would just redirect them.
-
 import { useUser } from "@clerk/nextjs";
 
 const ADMIN_EMAILS = new Set([
@@ -26,14 +19,9 @@ function useOwnerViaClerk(): boolean {
   return !!user?.emailAddresses?.some((e) => ADMIN_EMAILS.has(e.emailAddress.toLowerCase()));
 }
 
-/**
- * Whether the signed-in user is the platform owner (allow-listed email).
- * Local no-auth mode (Clerk off) returns true — there the middleware gate is
- * inactive too, and hiding Ops would only hurt local development.
- */
+/** Whether the signed-in user is the platform owner (allow-listed email): display gating only, `ui/proxy.ts` enforces `/admin` with its own copy of the list (keep both in sync).
+ *  Local no-auth mode (Clerk off) returns true, since the proxy gate is inactive there too and hiding Ops would only hurt local development. */
 export function useIsPlatformOwner(): boolean {
-  // `clerkOn` is a build-time constant, so this branch is identical on every
-  // render — the hook order can never actually change.
   // eslint-disable-next-line react-hooks/rules-of-hooks
   return clerkOn ? useOwnerViaClerk() : true;
 }

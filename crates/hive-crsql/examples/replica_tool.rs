@@ -1,14 +1,6 @@
-//! Fleet-side replica file tool for the browser↔fleet CRR exchange witness
-//! (bn-browser-fleet-crr-exchange): REAL writes and reads against a fleet
-//! replica file through the exact same `hive_crsql` seam the exchange's
-//! `browser_db` module uses — a fleet-local writer is precisely what sets
-//! the rows the exchange then carries to browsers (merges bind the inbound
-//! change's own ts, so this local-write path is also the only one that must
-//! set `crsql_set_ts` per write transaction, contract §7).
-//!
-//!   replica_tool write <db> <id> <label> <ts>
-//!   replica_tool rows <db>
-//!   replica_tool watermarks <db>
+//! Fleet-side replica file tool for the browser↔fleet CRR exchange witness: real writes and reads
+//! through the same `hive_crsql` seam `browser_db` uses (a local write must `crsql_set_ts` per
+//! transaction). `replica_tool write <db> <id> <label> <ts>` | `rows <db>` | `watermarks <db>`.
 
 use anyhow::Context;
 

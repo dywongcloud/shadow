@@ -1,28 +1,19 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { Check } from "lucide-react";
 
-export const metadata: Metadata = {
-  title: "Pricing — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Pricing",
+  socialTitle: "Pricing — shadw",
   description:
-    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
-  alternates: { canonical: "/pricing" },
-  openGraph: {
-    title: "Pricing — shadw",
-    description:
-      "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
-    url: "/pricing",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Pricing — shadw",
-    description:
-      "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
-  },
-};
+    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read answers to common pricing questions.",
+  twitterDescription:
+    "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read pricing FAQs.",
+  path: "/pricing",
+});
+export const viewport = darkViewport;
 
 
 type Tier = {
@@ -36,6 +27,8 @@ type Tier = {
   featured?: boolean;
 };
 
+/** Every bullet is a line the plan catalog or a plan gate backs (`crates/hive-cloud/src/billing.rs`: `PLANS`, `plan_allows_*`, `plan_max_*`; the
+ *  Enterprise suite is gated in `enterprise_api.rs`): a feature every plan has (preview deployments, HTTPS, domains) is listed once, under Hobby. */
 const TIERS: Tier[] = [
   {
     name: "Hobby",
@@ -45,9 +38,12 @@ const TIERS: Tier[] = [
     features: [
       "1 concurrent build",
       "Community support",
-      "100GB bandwidth",
+      "$5 of included compute / month",
       "Preview deployments",
       "Automatic HTTPS",
+      "Custom domains & DNS",
+      "Build cache",
+      "Cron & workflows",
     ],
     cta: { label: "Start free", href: "/sign-up" },
     variant: "outline",
@@ -60,13 +56,14 @@ const TIERS: Tier[] = [
     features: [
       "Everything in Hobby",
       "Unlimited concurrent builds",
-      "Custom domains & DNS",
-      "Team members & roles",
-      "Build cache",
-      "Cron & workflows",
+      "$20 of included compute / month",
+      "Pay-as-you-go beyond included compute",
+      "Up to 25 team members",
+      "Deployment protection and microfrontends",
+      "30 days of log history",
       "Email support",
     ],
-    cta: { label: "Start Pro trial", href: "/sign-up" },
+    cta: { label: "Start Pro", href: "/sign-up" },
     variant: "primary",
     featured: true,
   },
@@ -74,15 +71,15 @@ const TIERS: Tier[] = [
     name: "Enterprise",
     price: "$1,000",
     period: "/month",
-    tagline: "Self-host across your own global mesh.",
+    tagline: "For organizations with large compute needs.",
     features: [
       "Everything in Pro",
       "$1,000 of included compute / month",
-      "Self-hosted nodes",
-      "Data residency & leases",
-      "SSO/SAML",
-      "Audit logs",
-      "Dedicated support & SLA",
+      "Multi-region fail-over",
+      "SAML SSO, SCIM and SIEM audit-log streaming",
+      "IP blocking",
+      "Functions that run up to an hour",
+      "Priority support",
     ],
     cta: { label: "Start Enterprise", href: "/sign-up" },
     variant: "outline",
@@ -92,7 +89,7 @@ const TIERS: Tier[] = [
 const FAQS: { q: string; a: string }[] = [
   {
     q: "Can I self-host?",
-    a: "Yes. The Enterprise tier lets you run shadw across your own global mesh of self-hosted nodes, with full control over data residency and leases.",
+    a: "Yes. shadw can run on nodes you operate. Self-hosting is not a plan feature: Hobby, Pro and Enterprise differ in included compute, limits and support.",
   },
   {
     q: "What counts as a build?",
@@ -100,18 +97,18 @@ const FAQS: { q: string; a: string }[] = [
   },
   {
     q: "Do you offer a free tier?",
-    a: "The Hobby plan is free forever and includes everything you need for personal projects and experiments, including preview deployments and automatic HTTPS.",
+    a: "Yes. The Hobby plan costs $0 and includes $5 of compute per month, preview deployments and automatic HTTPS. It has no pay-as-you-go overage: once the $5 is used and you have no prepaid credits, new deployments are blocked until the next monthly period, unless you add credits or upgrade to Pro.",
   },
   {
     q: "Can I bring my own domain?",
-    a: "Absolutely. Custom domains and DNS are included on the Pro plan and above, with automatic HTTPS provisioned for every domain you connect.",
+    a: "Yes. Custom domains and DNS are available on every plan, with automatic HTTPS for every verified domain once its DNS points at shadw.",
   },
 ];
 
 const PRIMARY_BTN =
-  "inline-flex w-full items-center justify-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black transition-transform hover:scale-[1.02]";
+  "tap-44 inline-flex w-full items-center justify-center gap-2 rounded-full border border-transparent bg-emerald-400 px-6 py-3 text-sm font-semibold text-black transition-transform hover:scale-[1.02]";
 const OUTLINE_BTN =
-  "inline-flex w-full items-center justify-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10";
+  "tap-44 inline-flex w-full items-center justify-center gap-2 rounded-full border border-white/20 px-6 py-3 text-sm font-medium text-white transition-colors hover:bg-white/10";
 
 export default function PricingPage() {
   return (
@@ -127,7 +124,7 @@ export default function PricingPage() {
             pricing
           </>
         }
-        subtitle="Start free. Scale on your own mesh. No surprises."
+        subtitle="Start free. Scale as you grow. Hobby never bills overage."
       />
 
       <MarketingSection className="pb-20">
@@ -142,7 +139,7 @@ export default function PricingPage() {
               {tier.featured && (
                 <div className="absolute -top-3 left-1/2 -translate-x-1/2">
                   <span className="rounded-full bg-emerald-400 px-3 py-1 text-xs font-semibold text-black">
-                    Most popular
+                    For teams
                   </span>
                 </div>
               )}

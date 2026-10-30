@@ -1,11 +1,9 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState } from "react";
 import { CheckCircle2, AlertTriangle, AlertOctagon, Activity, Clock, ChevronDown } from "lucide-react";
-import { usePoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
-
-// A standalone, public, statuspage-style board. No dashboard chrome (the nav /
-// footer hide on /status). Polls the global incidents feed in real time.
+import type { Incident, Severity, IncidentStatus } from "@/lib/api";
 
 const SEV_RANK: Record<Severity, number> = { minor: 1, major: 2, critical: 3 };
 
@@ -22,8 +20,20 @@ const SEV_STYLE: Record<Severity, { dot: string; text: string; chip: string }> =
   critical: { dot: "bg-red-500", text: "text-red-500", chip: "border-red-500/30 bg-red-500/10 text-red-600 dark:text-red-400" },
 };
 
-// The platform surfaces shown in the components strip.
+/** The public incident feed, through the dashboard's `/cloud` rewrite (public in `proxy.ts`). */
+const PUBLIC_INCIDENTS_URL = "/cloud/v1/status/incidents";
+const INCIDENTS_POLL_MS = 10_000;
+
 const COMPONENTS = ["Edge Network", "Builds & Deployments", "Fluid Compute", "Dashboard", "Admin API", "Storage"];
+
+/** A component row reads like the banner: the worst active incident that names it decides, and a feed that has not answered says "Unknown". */
+const COMPONENT_LEVEL: Record<Severity, { label: string; dot: string; text: string }> = {
+  minor: { label: "Degraded", dot: "bg-amber-400", text: "text-amber-500" },
+  major: { label: "Partial outage", dot: "bg-orange-400", text: "text-orange-500" },
+  critical: { label: "Major outage", dot: "bg-red-500", text: "text-red-500" },
+};
+const COMPONENT_CLEAR = { label: "No incident", dot: "bg-green", text: "text-green" };
+const COMPONENT_UNKNOWN = { label: "Unknown", dot: "bg-border-strong", text: "text-muted" };
 
 function fmtAbs(ms: number) {
   return new Date(ms).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
@@ -38,89 +48,123 @@ function fmtAgo(ms: number) {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export default function StatusPage() {
-  // The public feed: operator-declared incidents only (open + recent
-  // history), served without auth. `/v1/incidents` is operator-gated and
-  // answered this public page 403 for every visitor.
-  const { data } = usePoll<Incident[]>("/v1/status/incidents", 10000);
-  const [now, setNow] = useState(0);
+/** Polls the public feed. It is NOT `usePoll`: that hook waits for a tenant, and an anonymous visitor (everyone this page is for) never has one, so the
+ *  page asked for nothing and printed "operational" forever. `data` stays `null` until the feed has answered once; `error` says the latest read failed. */
+function useIncidentFeed() {
+  const [data, setData] = useState<Incident[] | null>(null);
+  const [error, setError] = useState(false);
   useEffect(() => {
-    // Date.now() is client-only and time-varying -- cannot be computed during
-    // SSR/lazy-init without a hydration mismatch; the `now ? ... : ""` render
-    // guard covers the gap until this effect first fires.
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await fetch(PUBLIC_INCIDENTS_URL, { cache: "no-store" });
+        if (!r.ok) throw new Error(String(r.status));
+        const d: unknown = await r.json();
+        if (alive) {
+          setData(Array.isArray(d) ? (d as Incident[]) : []);
+          setError(false);
+        }
+      } catch {
+        if (alive) setError(true);
+      }
+    };
+    load();
+    const id = setInterval(() => document.visibilityState !== "hidden" && load(), INCIDENTS_POLL_MS);
+    const onVisible = () => document.visibilityState === "visible" && load();
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      alive = false;
+      clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+  return { data, error };
+}
+
+/** Public statuspage-style board over the operator-declared incident feed: no dashboard chrome (the nav and footer hide on /status). It reports what the
+ *  feed says and nothing else: until the feed has answered (or when it cannot) it says so, never "operational". */
+export default function StatusPage() {
+  const { data, error } = useIncidentFeed();
+  const [updated, setUpdated] = useState(0);
+  useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 30_000);
-    return () => clearInterval(id);
+    if (data) setUpdated(Date.now());
   }, [data]);
+  const known = data !== null;
 
   const incidents = data ?? [];
   const active = incidents.filter((i) => i.status !== "resolved").sort((a, b) => b.updated_ms - a.updated_ms);
   const past = incidents.filter((i) => i.status === "resolved").sort((a, b) => b.updated_ms - a.updated_ms);
 
   const worst = active.reduce<Severity | null>((acc, i) => (!acc || SEV_RANK[i.severity] > SEV_RANK[acc] ? i.severity : acc), null);
-  const affectedComponents = new Set(active.flatMap((i) => i.affected));
+  const levelOf = (component: string) =>
+    active.filter((i) => i.affected.includes(component)).reduce<Severity | null>((acc, i) => (!acc || SEV_RANK[i.severity] > SEV_RANK[acc] ? i.severity : acc), null);
 
-  const banner = !worst
-    ? { icon: <CheckCircle2 className="h-7 w-7" />, title: "All Systems Operational", cls: "border-green/30 bg-green/10 text-green" }
+  const banner = !known
+    ? error
+      ? { icon: <AlertTriangle className="h-7 w-7" />, title: "Status unavailable", sub: "The incident feed did not answer, so nothing on this page is current.", cls: "border-border bg-subtle text-secondary" }
+      : { icon: <Clock className="h-7 w-7" />, title: "Checking status", sub: "Reading the incident feed.", cls: "border-border bg-subtle text-secondary" }
+    : !worst
+    ? { icon: <CheckCircle2 className="h-7 w-7" />, title: "No active incidents", sub: "No incident is declared right now.", cls: "border-green/30 bg-green/10 text-green" }
     : worst === "critical"
-    ? { icon: <AlertOctagon className="h-7 w-7" />, title: "Major System Outage", cls: "border-red-500/30 bg-red-500/10 text-red-500" }
+    ? { icon: <AlertOctagon className="h-7 w-7" />, title: "Major System Outage", sub: `${active.length} active incident${active.length === 1 ? "" : "s"}`, cls: "border-red-500/30 bg-red-500/10 text-red-500" }
     : worst === "major"
-    ? { icon: <AlertTriangle className="h-7 w-7" />, title: "Partial System Outage", cls: "border-orange-500/30 bg-orange-500/10 text-orange-500" }
-    : { icon: <AlertTriangle className="h-7 w-7" />, title: "Degraded Performance", cls: "border-amber-500/30 bg-amber-500/10 text-amber-500" };
+    ? { icon: <AlertTriangle className="h-7 w-7" />, title: "Partial System Outage", sub: `${active.length} active incident${active.length === 1 ? "" : "s"}`, cls: "border-orange-500/30 bg-orange-500/10 text-orange-500" }
+    : { icon: <AlertTriangle className="h-7 w-7" />, title: "Degraded Performance", sub: `${active.length} active incident${active.length === 1 ? "" : "s"}`, cls: "border-amber-500/30 bg-amber-500/10 text-amber-500" };
 
   return (
     <div className="min-h-screen bg-bg text-fg">
       <div className="mx-auto max-w-3xl px-5 py-10 sm:py-14">
-        {/* Header */}
         <div className="mb-8 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-fg text-bg">
-              <svg width="13" height="11" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
-            </span>
+            <Link href="/" aria-label="shadw home" className="tap-44 inline-flex items-center justify-center">
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-fg text-bg">
+                <svg width="13" height="11" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
+              </span>
+            </Link>
             <div>
-              <div className="text-base font-semibold leading-tight">OpenEdge Status</div>
-              <div className="text-xs text-muted">Real-time platform health</div>
+              <h1 className="text-base font-semibold leading-tight">shadw Status</h1>
+              <div className="text-xs text-muted">Incidents declared by shadw</div>
             </div>
           </div>
           <div className="flex items-center gap-1.5 text-xs text-muted">
             <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green opacity-60" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-green" />
+              {known && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green opacity-60" />}
+              <span className={`relative inline-flex h-2 w-2 rounded-full ${known ? "bg-green" : "bg-border-strong"}`} />
             </span>
-            Live{now ? ` · ${new Date(now).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}` : ""}
+            {known
+              ? `Updated${updated ? ` ${new Date(updated).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}` : ""}${error ? " · refresh failing" : ""}`
+              : error
+                ? "Unavailable"
+                : "Checking"}
           </div>
         </div>
 
-        {/* Overall banner */}
         <div className={`mb-8 flex items-center gap-4 rounded-xl border p-5 ${banner.cls}`}>
           {banner.icon}
           <div>
             <div className="text-lg font-semibold">{banner.title}</div>
-            <div className="text-sm opacity-80">
-              {active.length ? `${active.length} active incident${active.length === 1 ? "" : "s"}` : "All services are running normally."}
-            </div>
+            <div className="text-sm opacity-80">{banner.sub}</div>
           </div>
         </div>
 
-        {/* Components */}
         <div className="mb-10 overflow-hidden rounded-xl border border-border bg-card">
           <div className="border-b border-border px-4 py-2.5 text-sm font-medium">Components</div>
           {COMPONENTS.map((c) => {
-            const down = affectedComponents.has(c);
+            const level = levelOf(c);
+            const look = !known ? COMPONENT_UNKNOWN : level ? COMPONENT_LEVEL[level] : COMPONENT_CLEAR;
             return (
               <div key={c} className="flex items-center justify-between border-b border-border px-4 py-3 text-sm last:border-0">
                 <span>{c}</span>
-                <span className={`flex items-center gap-1.5 text-xs font-medium ${down ? "text-amber-500" : "text-green"}`}>
-                  <span className={`h-2 w-2 rounded-full ${down ? "bg-amber-400" : "bg-green"}`} />
-                  {down ? "Degraded" : "Operational"}
+                <span className={`flex items-center gap-1.5 text-xs font-medium ${look.text}`}>
+                  <span className={`h-2 w-2 rounded-full ${look.dot}`} />
+                  {look.label}
                 </span>
               </div>
             );
           })}
         </div>
 
-        {/* Active incidents */}
         {active.length > 0 && (
           <section className="mb-10">
             <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-secondary">
@@ -132,14 +176,13 @@ export default function StatusPage() {
           </section>
         )}
 
-        {/* Past incidents */}
         <section>
           <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-secondary">
             <Clock className="h-4 w-4" /> Incident History
           </h2>
           {past.length === 0 ? (
             <div className="rounded-xl border border-border bg-card px-4 py-10 text-center text-sm text-muted">
-              No incidents reported. {active.length === 0 ? "All clear. 🎉" : ""}
+              {known ? "No incidents reported." : "Incident history is unavailable."}
             </div>
           ) : (
             <div className="space-y-4">
@@ -149,7 +192,7 @@ export default function StatusPage() {
         </section>
 
         <div className="mt-12 text-center text-xs text-muted">
-          Powered by OpenEdge · This page refreshes automatically.
+          This page refreshes automatically.
         </div>
       </div>
     </div>
@@ -163,7 +206,7 @@ function IncidentCard({ incident, active }: { incident: Incident; active?: boole
 
   return (
     <div className="overflow-hidden rounded-xl border border-border bg-card">
-      <button onClick={() => setOpen((o) => !o)} className="flex w-full items-start justify-between gap-3 px-4 py-3.5 text-left">
+      <button onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex w-full items-start justify-between gap-3 px-4 py-3.5 text-left">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <span className={`h-2 w-2 shrink-0 rounded-full ${sev.dot}`} />

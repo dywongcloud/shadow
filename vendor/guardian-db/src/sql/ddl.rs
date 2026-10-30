@@ -1034,7 +1034,7 @@ impl Exec {
             let mut renamed_rows = Vec::new();
             for (rid, values) in loaded.rows.iter_mut() {
                 if let Some(v) = values.remove(old) {
-                    values.insert(new.to_string(), v);
+                    values.insert(crate::sql::store::intern_column(new), v);
                 }
                 renamed_rows.push((rid.clone(), values.clone()));
             }

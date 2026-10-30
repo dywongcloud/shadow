@@ -3,13 +3,11 @@
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
-
-// Lightweight global toast system. Mount <Toaster/> once (in the root layout),
-// then fire a toast from anywhere with `toast("message")`. Decoupled via a window
-// CustomEvent so callers don't need context/providers and toasts survive client
-// navigation (the Toaster lives in the persistent layout).
+import { ApiError, ROLE_REFUSED } from "@/lib/api";
 
 export type ToastTone = "blue" | "default";
+
+const DEFAULT_TOAST_MS = 6000;
 
 interface ToastDetail {
   message: string;
@@ -18,15 +16,22 @@ interface ToastDetail {
   duration: number;
 }
 
-/** Fire a toast. Defaults to the blue "info" tone shown bottom-right. */
+/** Fire a toast from anywhere: it dispatches the `hive-toast` window event, so callers need no context or provider and toasts survive client navigation (mount `<Toaster/>` once in
+ *  the persistent root layout). Defaults to the blue "info" tone shown bottom-right. */
 export function toast(message: string, opts: { tone?: ToastTone; duration?: number } = {}) {
   if (typeof window === "undefined") return;
   const detail: ToastDetail = {
     message,
     tone: opts.tone ?? "blue",
-    duration: opts.duration ?? 6000,
+    duration: opts.duration ?? DEFAULT_TOAST_MS,
   };
   window.dispatchEvent(new CustomEvent("hive-toast", { detail }));
+}
+
+/** How a failed action is shown where there is no inline slot for it: a role-matrix refusal is a toast with its sentence ("Your role can't do this. Ask a team admin."), anything else keeps the browser alert. */
+export function reportError(e: unknown) {
+  if (e instanceof ApiError && e.code === ROLE_REFUSED) toast(e.message, { tone: "default" });
+  else alert(String(e));
 }
 
 interface ToastItem extends ToastDetail {

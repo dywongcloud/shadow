@@ -1,14 +1,7 @@
-//! Map a built Next.js app's manifests into platform features — redirects,
-//! rewrites, headers, edge middleware (`middleware.ts` / `proxy.ts`), and the
-//! serverless/edge function split.
-//!
-//! Plain `next build` writes:
-//!   `.next/routes-manifest.json`            — redirects / rewrites / headers / dynamic routes
-//!   `.next/server/middleware-manifest.json` — middleware + edge functions
-//!   `.next/server/pages-manifest.json` / `app-paths-manifest.json` — pages
-//!
-//! When `vercel build` ran instead, `.vercel/output/config.json` carries the same
-//! information in Build Output API form — [`from_build_output`] handles that.
+//! Map a built Next.js app's manifests (`.next/routes-manifest.json`,
+//! `.next/server/middleware-manifest.json`, `pages-manifest.json`/`app-paths-manifest.json`) into
+//! platform features — redirects, rewrites, headers, edge middleware, the serverless/edge split;
+//! a `vercel build` output's `.vercel/output/config.json` is handled by [`from_build_output`].
 
 use serde::Serialize;
 use std::path::Path;
@@ -68,7 +61,6 @@ fn read_json(path: &Path) -> Option<serde_json::Value> {
 pub fn detect_features(repo: &Path) -> BuildFeatures {
     let mut f = BuildFeatures::default();
 
-    // ---- routes-manifest.json: redirects / rewrites / headers ----
     if let Some(rm) = read_json(&repo.join(".next/routes-manifest.json")) {
         for r in rm
             .get("redirects")
@@ -96,7 +88,6 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
                 });
             }
         }
-        // rewrites is either an array or { beforeFiles, afterFiles, fallback }.
         let collect_rewrites = |arr: &serde_json::Value, out: &mut Vec<FeatureRewrite>| {
             for r in arr.as_array().into_iter().flatten() {
                 if let (Some(src), Some(dst)) = (
@@ -123,10 +114,8 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
         }
     }
 
-    // ---- middleware-manifest.json: middleware + edge functions ----
     if let Some(mm) = read_json(&repo.join(".next/server/middleware-manifest.json")) {
         if let Some(mw) = mm.get("middleware").and_then(|v| v.as_object()) {
-            // Usually keyed by "/"; collect matchers across entries.
             let mut matcher = Vec::new();
             for entry in mw.values() {
                 for m in entry
@@ -159,7 +148,6 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
         }
     }
 
-    // ---- app/pages function split + parallel routes ----
     if let Some(pm) = read_json(&repo.join(".next/server/pages-manifest.json")) {
         f.pages += pm.as_object().map(|o| o.len()).unwrap_or(0);
     }
@@ -177,7 +165,6 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
         }
     }
 
-    // ---- Build Output API (vercel build) overrides/augments when present ----
     if let Some(extra) = from_build_output(repo) {
         if f.redirects.is_empty() {
             f.redirects = extra.redirects;

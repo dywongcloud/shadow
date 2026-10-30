@@ -1,18 +1,15 @@
-//! Hive's own native Queue service for the Vercel Workflow SDK `World` interface
-//! -- a first-party, self-hosted, MULTI-REGION replacement for the `Queue`
-//! third of `World = Storage & Queue & Streamer` (no Zeplo, no external
-//! managed-queue dependency of any kind).
+//! Hive's own native Queue service for the Vercel Workflow SDK `World` interface: a first-party,
+//! self-hosted, MULTI-REGION replacement for the `Queue` third of `World = Storage & Queue &
+//! Streamer` (no Zeplo, no external managed-queue dependency of any kind).
 //!
-//! Multi-region model: every enqueue is mirrored into GuardianDB (the
-//! replicated, content-addressed mesh KV already used for the roster/TLS
-//! bundles) under a tenant-scoped key, so any node can see a tenant's pending
-//! jobs. Exactly one node runs the delivery loop for a given tenant at a
-//! time -- the lowest-healthy-peer_id node among those currently hosting that
-//! tenant's deployments (the SAME deterministic election shape as
-//! `Cluster::billing_leader`, scoped to the tenant's hosting set instead of
-//! the whole fleet). On a hosting-node failure, health flips within the probe
-//! interval and the next-lowest-identity hosting node's next tick picks the
-//! job set back up from GuardianDB -- no separate promotion RPC needed.
+//! Multi-region model: every enqueue is mirrored into GuardianDB (the replicated, content-addressed
+//! mesh KV already used for the roster and TLS bundles) under a tenant-scoped key, so any node can
+//! see a tenant's pending jobs. Exactly one node runs the delivery loop for a given tenant at a
+//! time: the lowest-healthy-peer_id node among those currently hosting that tenant's deployments
+//! (the SAME deterministic election shape as `Cluster::billing_leader`, scoped to the tenant's
+//! hosting set instead of the whole fleet). On a hosting-node failure, health flips within the
+//! probe interval and the next-lowest-identity hosting node's next tick picks the job set back up
+//! from GuardianDB: no separate promotion RPC.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -42,13 +39,11 @@ fn guardian_key(team: &str, id: &str) -> String {
     format!("wqueue/pending/{team}/{id}")
 }
 
-/// Python WDK detection: `vercel.json`'s `experimentalServices` declares a
-/// worker whose `topics` includes a `__wkf_*` pattern (the fixed Workflow SDK
-/// queue-name prefix, confirmed against vercel.com/docs/workflows/python --
-/// Python has no build-time `.well-known/workflow/v1/manifest.json` artifact
-/// the way JS/TS does, so this static pre-build config is the only available
-/// signal). Tolerant parse: a malformed/missing vercel.json is simply "not
-/// detected", never a build error.
+/// Python WDK detection: `vercel.json`'s `experimentalServices` declares a worker whose `topics`
+/// include a `__wkf_*` pattern (the fixed Workflow SDK queue-name prefix). Python has no build-time
+/// `.well-known/workflow/v1/manifest.json` artifact the way JS/TS does, so this static pre-build
+/// config is the only available signal. Tolerant parse: a malformed or missing `vercel.json` is
+/// simply "not detected", never a build error.
 pub fn vercel_json_declares_workflow_worker(dir: &std::path::Path) -> bool {
     let Ok(text) = std::fs::read_to_string(dir.join("vercel.json")) else {
         return false;
@@ -70,11 +65,10 @@ pub fn vercel_json_declares_workflow_worker(dir: &std::path::Path) -> bool {
     })
 }
 
-/// Opt-out signals for the managed World Queue auto-wiring: the project
-/// already brought its own Upstash/Redis world config (BYO -- never silently
-/// override or duplicate a tenant's own external connection), or fluid.json
-/// explicitly declares `{"workflow":{"world":"external"}}` (tolerant parse,
-/// same style as the existing container-override block).
+/// Opt-out signals for the managed World Queue auto-wiring: the project already brought its own
+/// Upstash/Redis world config (BYO: never silently override or duplicate a tenant's own external
+/// connection), or `fluid.json` declares `{"workflow":{"world":"external"}}` (tolerant parse, like
+/// the container-override block).
 pub fn workflow_world_opted_out(
     cloud: &Arc<CloudState>,
     project: &str,
@@ -102,10 +96,9 @@ pub fn workflow_world_opted_out(
         == Some("external")
 }
 
-/// Local working set (every node holds a copy once it learns of a job, but
-/// only the current tenant-primary actually dispatches it). `delivered`/`dead`
-/// are small ring-buffered result logs for observability, not a durability
-/// guarantee -- GuardianDB is the durability layer.
+/// Local working set: every node holds a copy of a job once it learns of it, but only the current
+/// tenant primary dispatches it. `delivered` and `dead` are small ring-buffered result logs for
+/// observability, not a durability guarantee (GuardianDB is the durability layer).
 pub struct WorldQueue {
     pending: RwLock<BTreeMap<String, QueueJob>>,
     delivered: RwLock<Vec<String>>,
@@ -121,10 +114,11 @@ impl WorldQueue {
         })
     }
 
-    /// Enqueue locally and kick off the (best-effort, async) GuardianDB mirror
-    /// so every other node hosting `team` can see this job even if THIS node
-    /// never becomes primary for it (e.g. it only received the enqueue call
-    /// because the app's HTTP client happened to resolve here).
+    /// Enqueues locally and kicks off the best-effort, async GuardianDB mirror so every other node
+    /// hosting `team` can see the job even if THIS node never becomes primary for it (for example
+    /// because the app's HTTP client happened to resolve here). The target is tenant-supplied and
+    /// the node makes the request, so it must pass `hive_outbound::validate_url` (https, a public
+    /// host); the delivery loop checks it again.
     pub fn enqueue(
         &self,
         team: String,
@@ -133,7 +127,8 @@ impl WorldQueue {
         payload: Value,
         delay_seconds: u64,
         max_attempts: u32,
-    ) -> String {
+    ) -> Result<String, hive_outbound::Refused> {
+        hive_outbound::validate_url(&target_url)?;
         let id = format!("wq_{}", uuid::Uuid::new_v4().simple());
         let job = QueueJob {
             id: id.clone(),
@@ -150,12 +145,11 @@ impl WorldQueue {
         if let Ok(bytes) = serde_json::to_vec(&job) {
             tokio::spawn(async move { crate::guardian::put(&key, bytes).await });
         }
-        id
+        Ok(id)
     }
 
-    /// Every due job THIS node currently holds, removed from `pending`
-    /// (re-inserted by the caller on a retriable failure). Never holds the
-    /// lock across the network call.
+    /// Every due job THIS node holds, removed from `pending` (the caller re-inserts it on a
+    /// retriable failure). Never holds the lock across the network call.
     fn take_due(&self) -> Vec<QueueJob> {
         let now = now_ms();
         let mut m = self.pending.write();
@@ -167,10 +161,10 @@ impl WorldQueue {
         due_ids.into_iter().filter_map(|id| m.remove(&id)).collect()
     }
 
+    /// Re-queues a failed job with exponential backoff: 2^attempt seconds, the exponent capped at
+    /// 6, then capped at 60 s (the reference Workflow world's documented default).
     fn reschedule(&self, mut job: QueueJob) {
         job.attempt += 1;
-        // Exponential backoff, capped at 60s, matching the base design's
-        // documented default (retryBaseMs-equivalent) for the reference world.
         let backoff_ms = (1000u64.saturating_mul(1 << job.attempt.min(6))).min(60_000);
         job.run_at_ms = now_ms() + backoff_ms;
         let key = guardian_key(&job.team, &job.id);
@@ -198,9 +192,8 @@ impl WorldQueue {
         }
     }
 
-    /// Adopt a job recovered from GuardianDB (another node's mirror, or this
-    /// node's own after a restart) into the local working set if not already
-    /// tracked here. Idempotent.
+    /// Adopts a job recovered from GuardianDB (another node's mirror, or this node's own after a
+    /// restart) into the local working set if not already tracked here. Idempotent.
     fn adopt(&self, job: QueueJob) {
         self.pending.write().entry(job.id.clone()).or_insert(job);
     }
@@ -214,16 +207,13 @@ impl WorldQueue {
     }
 }
 
-/// Deterministic tenant-scoped primary election, scoped to only the nodes
-/// currently hosting `team`'s deployments -- never the whole fleet, since a
-/// queue's delivery target (the app's own callback URL) is only meaningfully
-/// reachable/relevant from a node actually serving that tenant. The vote
-/// itself is `Cluster::elect_among` -- the ONE shared candidate-set election
-/// (lowest healthy peer_id, deterministic name-order fallback when no
-/// electable identity is known yet), so this cannot drift from the
-/// control-plane machinery (audit proposal step 10). Fails open (this node is
-/// primary) when hosting info isn't available yet (fresh gossip, single-node
-/// dev) rather than stranding jobs undelivered.
+/// Deterministic tenant-scoped primary election among only the nodes currently hosting `team`'s
+/// deployments, never the whole fleet: a queue's delivery target (the app's own callback URL) is
+/// only meaningfully reachable from a node actually serving that tenant. The vote is
+/// `Cluster::elect_among`, the ONE shared candidate-set election (lowest healthy peer_id,
+/// deterministic name-order fallback while no electable identity is known), so it cannot drift from
+/// the control-plane machinery. Fails open (this node is primary) when hosting info is not
+/// available yet (fresh gossip, single-node dev) rather than stranding jobs undelivered.
 async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
     let mut candidates: Vec<String> = Vec::new();
     if cloud
@@ -251,10 +241,9 @@ async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
         == Some(cloud.node_name.as_str())
 }
 
-/// Pull every job mirrored in GuardianDB for tenants THIS node currently hosts
-/// (or is otherwise a candidate for) into the local working set. Run
-/// periodically so a newly-elected primary recovers jobs enqueued while
-/// another node held the job (or before this node existed / after a restart).
+/// Pulls every job mirrored in GuardianDB for tenants THIS node hosts into the local working set,
+/// run periodically so a newly elected primary recovers jobs enqueued while another node held them
+/// (or before this node existed, or after a restart).
 async fn sync_from_guardian(cloud: &Arc<CloudState>, queue: &Arc<WorldQueue>) {
     let mut hosted_teams: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in cloud.gw.list() {
@@ -286,31 +275,38 @@ async fn sync_from_guardian(cloud: &Arc<CloudState>, queue: &Arc<WorldQueue>) {
     }
 }
 
-/// The delivery loop: poll for due jobs THIS node currently holds, but only
-/// actually dispatch the ones for a tenant this node is elected primary for
-/// right now (checked per-job, per-tick -- cheap, and correct across a
-/// mid-tick failover since the check is the last thing before the network
-/// call). Non-primary due jobs are simply left in `pending` for the elected
-/// node (which will `adopt` them from GuardianDB on its own next sync) to
-/// pick up -- never dispatched twice by construction of the election being
-/// deterministic over the same live membership view.
+const POLL_MS: u64 = 200;
+/// GuardianDB recovery runs on every Nth poll tick (about 5 s).
+const SYNC_EVERY_TICKS: u32 = 25;
+
+/// The delivery loop: every `POLL_MS` it takes the due jobs THIS node holds and dispatches only
+/// those of a tenant this node is elected primary for right now (checked per job, per tick: cheap,
+/// and correct across a mid-tick failover since the check is the last thing before the network
+/// call). A due job of a tenant this node is NOT primary for is dropped from the local working set
+/// and the elected node re-adopts it from GuardianDB on its next sync, so with the election
+/// deterministic over the same live membership view one node dispatches it. GuardianDB recovery
+/// runs every `SYNC_EVERY_TICKS` ticks (about 5 s).
 pub async fn run_delivery_loop(cloud: Arc<CloudState>, queue: Arc<WorldQueue>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(POLL_MS));
     let mut sync_tick: u32 = 0;
     loop {
         interval.tick().await;
         sync_tick += 1;
-        if sync_tick % 25 == 0 {
-            // ~5s cadence at the 200ms poll interval.
+        if sync_tick % SYNC_EVERY_TICKS == 0 {
             sync_from_guardian(&cloud, &queue).await;
         }
         for job in queue.take_due() {
             if !is_primary_for_team(&cloud, &job.team).await {
-                // Not ours to deliver right now -- leave it out of our local
-                // pending set; the elected node re-adopts it from GuardianDB.
                 continue;
             }
-            let mut req = cloud.http.post(&job.target_url).json(&job.payload);
+            let Ok(target) = hive_outbound::validate_url(&job.target_url) else {
+                tracing::warn!(job_id = %job.id, target = %job.target_url, "world_queue: target refused by the outbound policy, job dead-lettered");
+                queue.mark_dead(&job.id);
+                let key = guardian_key(&job.team, &job.id);
+                tokio::spawn(async move { crate::guardian::delete(&key).await });
+                continue;
+            };
+            let mut req = hive_outbound::client().post(target).json(&job.payload);
             for (k, v) in &job.headers {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -332,4 +328,100 @@ pub async fn run_delivery_loop(cloud: Arc<CloudState>, queue: Arc<WorldQueue>) {
             }
         }
     }
+}
+
+/// Whether a deployment function's `HIVE_QUEUE_TOKEN` is the PLATFORM's and due for a fresh one: a
+/// queue client token this platform signed that is past half its allowed age, expired, or issued with
+/// a lifetime beyond the age cap (the 365-day tokens of earlier builds), or the sealed `enc:v1:` form
+/// an earlier build copied into the env (no bearer at all). A value that is neither (a tenant's own
+/// token for its own queue) is never touched.
+fn queue_token_due(value: &str, now: i64, max_age: i64) -> bool {
+    if value.starts_with("enc:v1:") {
+        return true;
+    }
+    match crate::auth::queue_token_claims_ignoring_age(value) {
+        Some(claims) => {
+            let issued = claims.iat as i64;
+            let expires = claims.exp as i64;
+            now - issued > max_age / 2 || expires - issued > max_age || expires <= now
+        }
+        None => false,
+    }
+}
+
+/// Re-issues the queue client token in the function env of every deployment THIS node holds whose
+/// token is due ([`queue_token_due`]): a token is capped by its age (`auth::queue_token_max_age_secs`),
+/// and a deployment's env is baked at build, so a workflow app that is not rebuilt would otherwise lose
+/// its queue when the token ages out. The new token reaches every FUTURE instance launch
+/// (`Gateway::update_manifest` syncs the pool config, it never orphans a live instance); a running
+/// instance keeps the one it started with until it recycles. Node-local and stateless: every node
+/// rotates its own deployments with a token of its own. Returns how many deployments were rotated.
+pub fn rotate_queue_tokens(cloud: &Arc<CloudState>) -> usize {
+    if !crate::auth::enforced() {
+        return 0;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let max_age = crate::auth::queue_token_max_age_secs();
+    let due = |function: &fluid_core::FunctionConfig| {
+        function
+            .env
+            .get("HIVE_QUEUE_TOKEN")
+            .is_some_and(|value| queue_token_due(value, now, max_age))
+    };
+    let mut rotated = 0usize;
+    for record in cloud.gw.deployment_records() {
+        if !record.manifest.functions.iter().any(due) {
+            continue;
+        }
+        let team = crate::admin::record_tenant(&record.tenant).to_string();
+        if team == crate::admin::UNTAGGED_TENANT {
+            continue;
+        }
+        let Ok(token) = crate::auth::issue_queue_client_token(&team) else {
+            continue;
+        };
+        let swapped = cloud.gw.update_manifest(&record.id, |manifest| {
+            for function in manifest.functions.iter_mut().filter(|f| due(f)) {
+                function
+                    .env
+                    .insert("HIVE_QUEUE_TOKEN".into(), token.clone());
+            }
+        });
+        if swapped.is_some() {
+            tracing::info!(
+                deployment = %record.id,
+                project = %record.project,
+                "queue client token rotated in the deployment's function env"
+            );
+            rotated += 1;
+        }
+    }
+    if rotated > 0 {
+        crate::persist::persist(cloud);
+    }
+    rotated
+}
+
+fn rotation_interval_secs() -> u64 {
+    std::env::var("HIVE_QUEUE_TOKEN_ROTATE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.max(5))
+        .unwrap_or(6 * 3600)
+}
+
+/// Every node, periodic: the first pass runs shortly after boot (so a freshly rolled node retires the
+/// old 365-day tokens at once), then every `HIVE_QUEUE_TOKEN_ROTATE_SECS` (default 6 h).
+pub fn spawn_token_rotation(cloud: Arc<CloudState>) {
+    tokio::spawn(async move {
+        let interval = rotation_interval_secs();
+        tokio::time::sleep(std::time::Duration::from_secs(interval.min(90))).await;
+        loop {
+            let rotated = rotate_queue_tokens(&cloud);
+            if rotated > 0 {
+                tracing::info!(rotated, "queue client token rotation: pass complete");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+        }
+    });
 }

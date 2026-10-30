@@ -1,126 +1,12 @@
-//! Litebox running NATIVELY on macOS (Apple Silicon) — no Linux VM, no
-//! Firecracker, no Apple `container` tool. Backs [`crate::mock::MockBackend`]'s
-//! Node runtime path with a real syscall-level sandbox
-//! (<https://github.com/dywongcloud/litebox>'s `litebox_platform_macos_userland`
-//! fork, checked out locally at `~/litebox` on a macOS shadow node — there is
-//! no ansible role for this the way `ansible/roles/litebox` builds the Linux
-//! runner, because these nodes are personal dev machines, not fleet-managed;
-//! see AGENTS.md's "Bringing a node into the mesh" — `fc-lax`-style dev
-//! nodes are not ansible-inventoried).
-//!
-//! ## Mechanism — genuinely different from the Linux backend, same idea
-//!
-//! [`crate::litebox`]'s Linux backend statically rewrites `syscall` opcodes in
-//! the target ELF before exec (AOT rewriting). This runner does not: it execs
-//! the SAME Linux-ABI ELF binary UNMODIFIED and traps ARM64 `SVC` (syscall)
-//! instructions as they're issued, emulating each one against litebox's
-//! shared `litebox_shim_linux` core — the crate is genuinely named
-//! `litebox_runner_linux_ON_macos_userland`: a Linux guest, a macOS host, no
-//! guest kernel at all. Verified live (2026-08-15): the plain, unmodified,
-//! upstream-built Node 26.7.0 + npm binaries from the provided rootfs tar ran
-//! with zero preprocessing — no `litebox-packager` step needed for this
-//! runner, unlike what its own `--help` text says for the general case.
-//!
-//! ## Networking needs root, narrowly — by the runner's own design, not a workaround
-//!
-//! Opening a `utun` device (`socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL)`)
-//! requires root on Darwin; there is no CAP_NET_ADMIN-style capability grant
-//! for it. The runner's own architecture is built around this rather than
-//! avoiding it: it opens every privileged resource it needs (the utun fd,
-//! reading the `--initial-files` tar) FIRST, then installs a Seatbelt
-//! (`sandbox_init`, deny-by-default) profile BEFORE executing one instruction
-//! of guest/tenant code — see `litebox_platform_macos_userland::seatbelt`'s
-//! module doc for the measured file/network/exec/signal transitions it
-//! denies. So the runner process runs under `sudo -n` for its WHOLE life, and
-//! the actual security boundary for tenant code is the Seatbelt jail, not the
-//! process's UID — the same "root drops into a jail, not a lower UID"
-//! lifecycle Chrome-style sandboxes use, and a deliberate, documented,
-//! tested design choice on the runner's side (App Sandbox, the officially
-//! "supported" replacement for the deprecated `sandbox_init`, cannot express
-//! this lifecycle at all).
-//!
-//! `/etc/sudoers.d/hive-litebox-macos` scopes this to exactly the runner's
-//! absolute path plus a narrowly-globbed `ifconfig utunN <ip> <ip> netmask
-//! ... up`/`destroy` (never touches a real interface like `en0`) — nothing
-//! else on the host is granted passwordless root by this feature. See
-//! [`Self::available`]: this is a probed capability, not one this module
-//! ever installs on its own — granting sudo is a one-way privilege decision
-//! for the operator to make explicitly, once, per machine.
-//!
-//! ## Per-cell network identity
-//!
-//! Unpatched, this litebox fork hardcodes every guest to the identical
-//! `10.0.0.2`/gateway `10.0.0.1` (`litebox/src/net/mod.rs`'s
-//! `INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR`) — exactly the same single-guest
-//! limitation `AGENTS.md`'s Litebox section documents for the pre-patch
-//! Linux backend. The same fix was ported here (`~/litebox`'s own git
-//! history — `Network::new_with_addrs`, `LinuxShimBuilder::
-//! build_with_net_config`), mirroring `ansible/roles/litebox/files/
-//! networking.patch`'s approach — but plumbed through as CLI flags
-//! (`--guest-ip`/`--gateway-ip` on `litebox_runner_linux_on_macos_userland`,
-//! not the Linux runner's env-var convention: a `sudo`-invoked launch under
-//! the default `env_reset` policy strips arbitrary env vars, confirmed live
-//! ("sudo: sorry, you are not allowed to set the following environment
-//! variables"), while argv always passes through — so [`NetAllocator`] can
-//! hand out a distinct `/30` per cell.
-//!
-//! A `utun` interface is not a persistent device the way Linux's
-//! `/dev/net/tun` is — it only exists on the host for as long as the runner
-//! process holds its control socket open, and no address-assignment ioctl
-//! happens inside the runner at all (verified: `litebox_platform_macos_
-//! userland::net` only opens the raw kernel-control socket, nothing else).
-//! So a cell's `/30` cannot be assigned before the runner starts: [`start`]
-//! spawns the runner FIRST, then polls `ifconfig <dev>` until the interface
-//! exists, THEN assigns its point-to-point address. No explicit teardown
-//! command is needed or possible — the device disappears the instant the
-//! runner process exits, so [`crate::mock::MockBackend::terminate`] killing
-//! the child is the whole teardown.
-//!
-//! ## Capability is probed, never assumed
-//!
-//! Mirrors the Wasmer-runtime precedent (AGENTS.md, "capability is PROBED
-//! and ADVERTISED, never assumed") and `container_cli::available`'s "a real
-//! round trip, not `--version` alone" discipline: [`is_supported`] is a cheap
-//! existence check, [`available`] additionally proves the sudoers grant is
-//! actually live. `MockBackend::start_function` falls back to today's bare
-//! host-`node`-exec path whenever either check fails — never a hard
-//! failure, so a node without the sudoers rule installed (the overwhelming
-//! majority, until an operator opts in) keeps working exactly as before.
-//!
-//! ## Known limitation — disclosed, not silently accepted
-//!
-//! Scope is `start_function` only, mirroring `crate::litebox`'s own "run_build
-//! stays a plain unsandboxed host process" precedent — but for a different
-//! reason: litebox's Linux backend can't sandbox `fork`-heavy build scripts at
-//! all (no `fork` support yet), while this rootfs bundle is Node+npm only, no
-//! `git`/`curl`/build toolchain, so builds still run on the bare macOS host
-//! exactly as they do today. That means `node_modules` compiled during the
-//! build is a Darwin (Mach-O) binary; a deployment with NATIVE (compiled)
-//! addons will fail to `dlopen` under this Linux-ABI guest. Pure-JS
-//! deployments (the overwhelming majority of small apps/bots) are unaffected.
-//! Fixing this fully needs a fuller rootfs (git + a toolchain) and routing
-//! `run_build_process` through the guest too — a real follow-up, not a
-//! silently-accepted correctness gap; not attempted here.
-//!
-//! **A second, third-party limitation, also disclosed rather than papered
-//! over: litebox's own TCP stack has an intermittent race under true
-//! concurrency.** Reproduced live (2026-08-15): two cells started genuinely
-//! concurrently (`tokio::join!`) served correctly ~2 of 3 runs; the failing
-//! run's tunnel request got `upstream error: function closed before
-//! headers` even though `wait_tcp_ready` had already proven the guest
-//! accepted a connection moments earlier — a single cell started alone
-//! never reproduced it across repeated runs, so this is specific to two
-//! `litebox_platform_macos_userland` processes' smoltcp-based guest network
-//! stacks running under real concurrency, not this module's own net
-//! allocation (which is atomic and collision-free — verified, no address/
-//! port reuse across the concurrent pair) or `sudo` invocation. This is
-//! upstream behavior in an actively-developed sandbox (its own git history
-//! is dense with exactly this class of fix), not something to patch here.
-//! It is already absorbed for real traffic: `fluid_gateway::proxy_function`
-//! retries a `upstream_silent` failure (tunnel alive, no response — exactly
-//! this shape) up to `MAX_REROUTES` times before surfacing an error, the
-//! same machinery every other backend's transient failures already rely on
-//! — no litebox-macos-specific retry was added here.
+//! Litebox running NATIVELY on macOS (Apple Silicon): the unmodified Linux-ABI ELF runs with its
+//! `SVC` instructions trapped and emulated against `litebox_shim_linux` (no AOT rewrite, no guest
+//! kernel). Opening `utun` needs root, so the runner runs under `sudo -n` for its whole life
+//! (`/etc/sudoers.d/hive-litebox-macos` scopes it to the runner path + `ifconfig utunN`) and the
+//! tenant boundary is its Seatbelt profile, installed before any guest code runs. Per-cell `/30`s
+//! ride CLI flags (`sudo` `env_reset` strips env vars); a `utun` exists only while the runner holds
+//! it, so [`start`] spawns first, then addresses it, and killing the runner is the whole teardown.
+//! Capability is probed ([`available`] does a real `sudo -n` round trip), never assumed. Scope is
+//! `start_function` only — builds stay on the bare host, so native addons fail to `dlopen` here.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -132,12 +18,8 @@ use tokio::process::Command;
 /// Config knobs.
 #[derive(Clone, Debug)]
 pub struct LiteboxMacosConfig {
-    /// Path to the prebuilt `litebox_runner_linux_on_macos_userland` binary.
-    /// Defaults to `HIVE_LITEBOX_MACOS_RUNNER_BIN` if set, else a stable
-    /// per-operator install path — mirrors `LiteboxConfig::runner_bin`'s
-    /// `/usr/local/bin/litebox-runner` convention. There is no fleet rollout
-    /// for this path (these are personal dev machines); an operator builds
-    /// the runner from `~/litebox` and points this at it once.
+    /// Path to the prebuilt `litebox_runner_linux_on_macos_userland` binary
+    /// (`HIVE_LITEBOX_MACOS_RUNNER_BIN`, else a stable per-operator install path).
     pub runner_bin: PathBuf,
 }
 
@@ -156,11 +38,8 @@ pub fn is_supported(cfg: &LiteboxMacosConfig) -> bool {
     cfg!(target_os = "macos") && cfg.runner_bin.exists()
 }
 
-/// Tier 2: a real round trip through `sudo -n` — proves the sudoers grant is
-/// actually live, not just that the binary exists on disk (the
-/// `container_cli::available` / Wasmer-runtime "probed, not assumed"
-/// discipline). `sudo -n` fails immediately (no password prompt hang) when
-/// the grant is missing, so this is safe to call on every cold start.
+/// Tier 2: a real round trip through `sudo -n` proves the sudoers grant is live, not just that the
+/// binary exists; `sudo -n` fails immediately without a prompt when it is missing.
 pub async fn available(cfg: &LiteboxMacosConfig) -> bool {
     if !is_supported(cfg) {
         return false;
@@ -177,10 +56,8 @@ pub async fn available(cfg: &LiteboxMacosConfig) -> bool {
         .unwrap_or(false)
 }
 
-/// Is this function's runtime one the litebox-macos rootfs can serve? Scoped
-/// to Node today — the provided rootfs bundle is Node+npm only (no Python/Bun
-/// binaries), matching `hive_core::Runtime::infer_from_argv`'s own node/npm/
-/// npx/pnpm/yarn/next basename set.
+/// Is this function's runtime one the litebox-macos rootfs can serve? Node only today (the rootfs
+/// bundle is Node+npm).
 pub fn eligible(runtime: hive_core::Runtime) -> bool {
     runtime == hive_core::Runtime::Node
 }
@@ -228,12 +105,8 @@ impl Drop for RunnerRollback {
     }
 }
 
-/// Allocates a fresh `/30` per cell. Deliberately a DIFFERENT address range
-/// (`10.90.x.x`) than `crate::litebox`'s Linux `LiteboxNet` (`10.88.x.x`) —
-/// the two backends never run on the same host, but keeping the ranges
-/// visually distinct avoids any ambiguity reading a packet capture or a log
-/// line. `utun` unit numbers start at 50 to stay clear of the low numbers
-/// (0-6 observed live) macOS/VPN clients already hold on a typical dev Mac.
+/// Allocates a fresh `/30` per cell from `10.90.x.x` (distinct from the Linux backend's
+/// `10.88.x.x`); `utun` unit numbers start at 50, clear of what VPN clients hold.
 pub struct NetAllocator {
     idx: AtomicU32,
 }
@@ -263,22 +136,9 @@ impl NetAllocator {
     }
 }
 
-/// Spawn the runner against `tar_path` (an `--initial-files` archive — the
-/// base rootfs plus the deployment's own files at paths relative to its
-/// root, same "guest cwd IS that root" shape `crate::litebox` uses), then
-/// address the resulting `utun` device.
-///
-/// `program`/`args` run inside the guest (e.g. `/usr/local/bin/node`,
-/// `["/server.js"]`); `env` is the function's OWN declared env plus `PORT` —
-/// nothing from this host process is forwarded (no `--forward-env`), the
-/// same "cleared, never inherited" discipline `mock.rs`'s plain-process path
-/// already applies, so a tenant process never sees `HIVE_SECRET_KEY` /
-/// `HIVE_JWT_SECRET` / etc.
-///
-/// Returns the spawned child (still running — the caller owns its lifetime,
-/// same shape as `MockBackend::funcs`) and the net identity the caller
-/// should dial (`net.guest_ip:<port>`) and later use as this cell's
-/// `wait_tcp_ready` target.
+/// Spawn the runner against `tar_path` (base rootfs + the deployment's files, guest cwd = root),
+/// then address the resulting `utun`. `env` is the function's own env plus `PORT`, nothing from
+/// this host process. Returns the running child and the net identity to dial.
 pub async fn start(
     cfg: &LiteboxMacosConfig,
     net: &MacosNet,
@@ -292,11 +152,6 @@ pub async fn start(
         .arg(&cfg.runner_bin)
         .arg("-Z")
         .arg(format!("--tun-device-name={}", net.tun_dev))
-        // CLI flags, NOT env vars: a `sudo`-invoked launch under the default
-        // `env_reset` policy strips arbitrary env vars ("sudo: sorry, you
-        // are not allowed to set the following environment variables" —
-        // confirmed live) unless the sudoers grant adds `SETENV`, but always
-        // passes argv through untouched.
         .arg(format!("--guest-ip={}", net.guest_ip))
         .arg(format!("--gateway-ip={}", net.host_ip))
         .arg(format!("--initial-files={}", tar_path.display()));
@@ -316,10 +171,6 @@ pub async fn start(
         .map_err(|e| anyhow::anyhow!("failed to spawn litebox-macos runner via sudo: {e}"))?;
     let mut rollback = RunnerRollback::new(cfg.clone(), net.clone());
 
-    // The utun device only exists once the runner's own `open_utun` call has
-    // completed — poll rather than assume a fixed delay. This happens very
-    // early in the runner's startup (before it reads the tar), so this loop
-    // is normally one or two iterations.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let exists = Command::new("ifconfig")
@@ -369,19 +220,9 @@ pub async fn start(
     Ok(child)
 }
 
-/// Build a combined `--initial-files` tar at `dest`: `base_rootfs` (the
-/// Node+npm bundle) plus `workdir`'s file tree at paths relative to its own
-/// root — the same "guest cwd IS that root" shape
-/// `crate::litebox::ensure_combined_tar` uses, so `require()` of local
-/// files/`node_modules` resolves exactly like a host process rooted at
-/// `workdir` would.
-///
-/// Appends via `tar -rf` rather than extract-then-retar: round-tripping the
-/// 400+MB base rootfs through `tar -x` + `tar -c` was measured live to
-/// silently corrupt its packaged symlinks (BSD tar's directory-recursive add
-/// reorders/renormalizes entries), which the runner then can't resolve
-/// (`ENOENT` opening the ELF). Appending never touches an existing byte of
-/// the base archive.
+/// Build a combined `--initial-files` tar at `dest`: `base_rootfs` plus `workdir`'s tree at paths
+/// relative to its root, appended via `tar -rf` (round-tripping the base through extract+retar
+/// corrupts its packaged symlinks under BSD tar).
 pub async fn build_combined_tar(
     base_rootfs: &std::path::Path,
     workdir: &std::path::Path,
@@ -455,16 +296,8 @@ pub async fn build_combined_tar(
     Ok(())
 }
 
-/// Best-effort teardown: kill the runner's OWN process, not just the `sudo`
-/// wrapper `child` — `sudo` forking rather than exec-replacing itself would
-/// otherwise leave the actual root-held runner (and its utun device) running
-/// forever after `child.start_kill()` only reaches the wrapper. Matched by
-/// this runner's own binary BASENAME (the sudoers grant's pattern requires
-/// the `pkill -f` argument to literally START with the bare binary name, no
-/// path prefix — `cfg.runner_bin` is a platform-controlled constant, never
-/// tenant input, so a bare basename match stays exact) AND the cell's unique
-/// `--tun-device-name=` argument, so this can never signal an unrelated
-/// process.
+/// Best-effort teardown: kill the runner's OWN process (not just the `sudo` wrapper, which forks),
+/// matched by its binary basename AND the cell's unique `--tun-device-name=` argument.
 pub async fn kill_runner(cfg: &LiteboxMacosConfig, net: &MacosNet) {
     let basename = cfg
         .runner_bin

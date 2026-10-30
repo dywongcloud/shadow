@@ -1,6 +1,6 @@
 import { Suspense } from "react";
 import { PageSkeleton } from "@/components/page-skeleton";
-import { fetchOpsServer } from "@/lib/ops-data";
+import { fetchOpsResult } from "@/lib/ops-data";
 import type { NodeInfo, AdminOverview } from "@/lib/api";
 import { AdminNodesClient } from "./nodes-client";
 
@@ -14,8 +14,15 @@ export default function AdminNodesPage() {
 
 async function AdminNodesData() {
   const [nodes, ov] = await Promise.all([
-    fetchOpsServer<NodeInfo[]>("/v1/nodes").catch(() => null),
-    fetchOpsServer<AdminOverview>("/v1/admin/overview").catch(() => null),
+    fetchOpsResult<NodeInfo[]>("/v1/nodes"),
+    fetchOpsResult<AdminOverview>("/v1/admin/overview"),
   ]);
-  return <AdminNodesClient initialNodes={nodes} initialOverview={ov} />;
+  return (
+    <AdminNodesClient
+      initialNodes={nodes.data}
+      initialOverview={ov.data}
+      initialNodesError={nodes.error}
+      initialOverviewError={ov.error}
+    />
+  );
 }

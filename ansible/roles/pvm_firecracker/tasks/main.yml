@@ -1,9 +1,4 @@
 ---
-# `pvm_skip` (see defaults/main.yml) is honored BEFORE anything else, including
-# preflight. This role builds kernels and REBOOTS, so an excluded host must be
-# excluded structurally -- expressed once in inventory -- not by remembering to
-# shape a `--limit` correctly on every invocation. A whole-role no-op is the
-# only exclusion that is safe to forget about.
 - name: Note this host is excluded from the PVM role (pvm_skip)
   ansible.builtin.debug:
     msg: >-
@@ -32,15 +27,10 @@
       tags: [guest_kernel]
       when: not (pvm_already_provisioned | default(false))
 
-    # This is the SSH smoke-test image under /root/pvm, not Hive's production
-    # /var/lib/hive/rootfs image. Keep its bring-up-only lifecycle separate.
     - import_tasks: 50-rootfs.yml
       tags: [rootfs]
       when: not (pvm_already_provisioned | default(false))
 
-    # PVM previously had no production-rootfs migration at all. Use the exact
-    # same manual, digest-bound path as hardware KVM; on ordinary runs this only
-    # installs the builder and never replaces a rootfs.
     - name: Install and optionally run the production rootfs migration
       ansible.builtin.include_role:
         name: hive_platform_rootfs
@@ -54,13 +44,6 @@
       tags: [boot]
       when: not (pvm_already_provisioned | default(false))
 
-    # Guarded by `pvm_already_provisioned` like every other stage, which it
-    # previously was NOT. Booting a microVM HARD-RESETS the host on an
-    # unproven PVM kernel (fc-frankfurt, 3 resets, docs/blocked-work.md:76-80),
-    # so an idempotent re-run against a healthy traffic-carrying node -- which
-    # correctly skips 30/40/50/60 as no-ops -- must not then reset it to prove
-    # something already proven. This is bring-up-only work, and on an
-    # already-provisioned host there is nothing left to bring up.
     - import_tasks: 70-smoke-test.yml
       tags: [smoke_test]
       when:

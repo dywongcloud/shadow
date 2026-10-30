@@ -1,121 +1,129 @@
 import { NextRequest, NextResponse } from "next/server";
-
-// Same-origin HLS proxy. hls.js fetches the .m3u8 playlist and every segment
-// over fetch/XHR, which the app's CSP `connect-src` gates — and the stream
-// hosts are arbitrary third parties that can never be allowlisted. Proxying
-// through this route makes every request same-origin ('self'), so the tight
-// CSP is untouched. The playlist's segment/variant URIs are REWRITTEN to point
-// back at this route (absolute-resolved against the playlist's own URL), so
-// hls.js follows them here too; segment responses stream straight through.
-//
-// Safety: only https upstreams are proxied, and the platform node — not the
-// arbitrary host — is the client, so no browser CSP is weakened. This does put
-// viewing bytes on the node's egress; acceptable for a nice-to-have TV feature
-// and the only CSP-clean way to play arbitrary IPTV.
+import { UpstreamError, boundedBody, contentCoding, readBounded, safeGet, type SafeResponse } from "@/lib/safe-fetch";
 
 const SELF_PATH = "/api/tv/hls";
+const KEY_ROLE = "key";
+const KEY_TAG = /^#EXT-X-(?:SESSION-)?KEY:/;
+const UPSTREAM_TIMEOUT_MS = 25_000;
+const PLAYLIST_MAX_BYTES = 2 * 1024 * 1024;
+const KEY_MAX_BYTES = 4096;
+const BODY_MAX_BYTES = 64 * 1024 * 1024;
+const SINGLE_RANGE = /^bytes=\d*-\d*$/;
+const PLAYLIST_PATH = /\.m3u8?$/i;
+const TS_SEGMENT_PATH = /\.ts$/i;
+const MISLABELLED_TS_TYPES = new Set(["text/vnd.trolltech.linguist", "text/plain"]);
+const MEDIA_TYPE = /^(?:video|audio)\/[\w.+-]+$|^(?:application|binary)\/octet-stream$|^application\/mp4$|^text\/vtt$/;
+const BASE_HEADERS = { "cache-control": "no-store", "x-content-type-options": "nosniff" };
 
-function proxied(absUrl: string): string {
-  return `${SELF_PATH}?url=${encodeURIComponent(absUrl)}`;
+function reply(body: BodyInit | null, status: number, headers: Record<string, string> = {}): NextResponse {
+  return new NextResponse(body, { status, headers: { ...BASE_HEADERS, ...headers } });
 }
 
-/** Rewrite every URI line + URI="" attribute in an m3u8 to route through us. */
-function rewritePlaylist(text: string, baseUrl: string): string {
-  const base = new URL(baseUrl);
+function keyReply(bytes: Buffer): NextResponse {
+  return reply(bytes, 200, { "content-type": "application/octet-stream" });
+}
+
+function proxied(absUrl: string, role?: string): string {
+  return `${SELF_PATH}?url=${encodeURIComponent(absUrl)}${role ? `&role=${role}` : ""}`;
+}
+
+/** Rewrite every URI line + URI="" attribute in an m3u8 to route through us, resolving each against the playlist's FINAL url; the URI of an `#EXT-X-KEY` carries `role=key`. */
+function rewritePlaylist(text: string, base: URL): string {
   const resolve = (u: string) => new URL(u, base).toString();
   return text
     .split("\n")
     .map((line) => {
       const t = line.trim();
       if (!t) return line;
-      // Attribute form: URI="..." (EXT-X-KEY, EXT-X-MEDIA, EXT-X-MAP, …).
       if (t.startsWith("#")) {
-        return line.replace(/URI="([^"]+)"/g, (_m, u) => `URI="${proxied(resolve(u))}"`);
+        const role = KEY_TAG.test(t) ? KEY_ROLE : undefined;
+        return line.replace(/URI="([^"]+)"/g, (_m, u) => `URI="${proxied(resolve(u), role)}"`);
       }
-      // A bare URI line (segment or variant playlist).
       return proxied(resolve(t));
     })
     .join("\n");
 }
 
-export async function GET(req: NextRequest) {
-  const url = req.nextUrl.searchParams.get("url");
-  if (!url) return new NextResponse("missing url", { status: 400 });
-  let target: URL;
+async function fetchUpstream(target: URL, headers: Record<string, string>, signal: AbortSignal): Promise<SafeResponse> {
   try {
-    target = new URL(url);
-  } catch {
-    return new NextResponse("bad url", { status: 400 });
+    return await safeGet(target, { headers, timeoutMs: UPSTREAM_TIMEOUT_MS, signal });
+  } catch (e) {
+    if (e instanceof UpstreamError || signal.aborted) throw e;
+    return await safeGet(target, { headers, timeoutMs: UPSTREAM_TIMEOUT_MS, signal });
   }
-  if (target.protocol !== "https:") {
-    return new NextResponse("only https upstreams are proxied", { status: 400 });
+}
+
+async function respond(upstream: SafeResponse, isKey: boolean): Promise<NextResponse> {
+  if (upstream.status < 200 || upstream.status > 299) {
+    upstream.body.destroy();
+    return reply(`upstream ${upstream.status}`, 502);
   }
-  // Forward the client's Range so the video element's own byte-range requests
-  // (and #EXT-X-BYTERANGE segments) are satisfied by the upstream as 206.
-  const range = req.headers.get("range");
-  const fetchUpstream = () =>
-    fetch(target.toString(), {
-      // Some CDNs 403 an empty UA / wrong referer.
-      headers: {
-        "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)",
-        ...(range ? { range } : {}),
-      },
-      cache: "no-store",
-      signal: AbortSignal.timeout(25_000),
-    });
-  let upstream: Response;
-  try {
-    upstream = await fetchUpstream();
-  } catch {
-    // One transient retry before surfacing. Mid-stream, a single failed
-    // segment fetch becomes a FATAL player error, which reads to the user as a
-    // freeze — so a blip must not propagate on the first try.
-    try {
-      upstream = await fetchUpstream();
-    } catch (e) {
-      return new NextResponse(`upstream error: ${String(e)}`, { status: 502 });
+  if (isKey) {
+    const bytes = await readBounded(upstream, KEY_MAX_BYTES);
+    return bytes.length > 0 ? keyReply(bytes) : reply("upstream key is empty", 502);
+  }
+  const ctype = String(upstream.headers["content-type"] ?? "").toLowerCase();
+  const namedPlaylist = PLAYLIST_PATH.test(upstream.url.pathname);
+  const labelledPlaylist = ctype.includes("mpegurl");
+  if (namedPlaylist || labelledPlaylist) {
+    const bytes = await readBounded(upstream, PLAYLIST_MAX_BYTES);
+    const text = bytes.toString("utf8");
+    if (text.trimStart().startsWith("#EXTM3U")) {
+      try {
+        return reply(rewritePlaylist(text, upstream.url), 200, { "content-type": "application/vnd.apple.mpegurl" });
+      } catch {
+        return reply("malformed upstream playlist", 502);
+      }
+    }
+    if (labelledPlaylist && !namedPlaylist && bytes.length > 0 && bytes.length <= KEY_MAX_BYTES) return keyReply(bytes);
+    return reply("upstream is not an HLS playlist", 415);
+  }
+  const declaredType = ctype.split(";")[0].trim() || "application/octet-stream";
+  const mediaType = MISLABELLED_TS_TYPES.has(declaredType) && TS_SEGMENT_PATH.test(upstream.url.pathname) ? "video/mp2t" : declaredType;
+  if (!MEDIA_TYPE.test(mediaType)) {
+    upstream.body.destroy();
+    return reply("unsupported upstream content type", 415);
+  }
+  const declaredLength = Number(upstream.headers["content-length"] ?? 0);
+  if (declaredLength > BODY_MAX_BYTES) {
+    upstream.body.destroy();
+    return reply("upstream body exceeds the size cap", 502);
+  }
+  const segHeaders: Record<string, string> = { "content-type": mediaType };
+  if (contentCoding(upstream.headers) === "") {
+    for (const h of ["content-range", "accept-ranges", "content-length"]) {
+      const v = upstream.headers[h];
+      if (typeof v === "string") segHeaders[h] = v;
     }
   }
-  if (!upstream.ok) {
-    return new NextResponse(`upstream ${upstream.status}`, { status: 502 });
+  return reply(boundedBody(upstream, BODY_MAX_BYTES), upstream.status === 206 ? 206 : 200, segHeaders);
+}
+
+/** Same-origin HLS proxy so hls.js obeys the CSP `connect-src 'self'`: playlists are rewritten to point back here and segments stream through, but only public https hosts are reachable
+ *  (`safeGet`), only `range` is forwarded, and bodies are size- and content-type-bounded (a gzip/deflate body an origin sends despite `accept-encoding: identity` is decoded under the same
+ *  caps). A body is a playlist only if it starts with `#EXTM3U`: an encryption key, whether its rewritten URI says `role=key` or a server labels it as a playlist, is served as at most
+ *  `KEY_MAX_BYTES` of `application/octet-stream`. `role=key` is client-supplied, so it is no authorization: a caller can add it to relabel at most `KEY_MAX_BYTES` of any public body as that
+ *  inert type (`nosniff`, `no-store`), past the media-type allowlist. */
+export async function GET(req: NextRequest) {
+  const raw = req.nextUrl.searchParams.get("url");
+  if (!raw) return reply("missing url", 400);
+  let target: URL;
+  try {
+    target = new URL(raw);
+  } catch {
+    return reply("bad url", 400);
   }
-
-  const ctype = (upstream.headers.get("content-type") || "").toLowerCase();
-  const isPlaylist =
-    target.pathname.endsWith(".m3u8") ||
-    ctype.includes("mpegurl") ||
-    ctype.includes("vnd.apple.mpegurl");
-
-  if (isPlaylist) {
-    const text = await upstream.text();
-    // Resolve relative URIs against the FINAL url after redirects, not the
-    // requested one. iptv-org fronts most streams with a redirector (jmp2.uk),
-    // so the playlist's relative variant/segment URIs belong to the redirected
-    // host — resolving them against the original would 404 every one.
-    const base = upstream.url || target.toString();
-    const rewritten = rewritePlaylist(text, base);
-    return new NextResponse(rewritten, {
-      status: 200,
-      headers: {
-        "content-type": "application/vnd.apple.mpegurl",
-        "cache-control": "no-store",
-      },
-    });
-  }
-
-  // Segment (or key): stream the bytes straight through, preserving type and
-  // any range/length metadata so partial (206) responses reach the player
-  // intact instead of confusing its buffer.
-  const segHeaders: Record<string, string> = {
-    "content-type": ctype || "application/octet-stream",
-    "cache-control": "no-store",
+  const range = req.headers.get("range");
+  const headers = {
+    "user-agent": "Mozilla/5.0 (compatible; shadw-tv/1.0)",
+    accept: "*/*",
+    "accept-encoding": "identity",
+    ...(range && SINGLE_RANGE.test(range) ? { range } : {}),
   };
-  for (const h of ["content-range", "accept-ranges", "content-length"]) {
-    const v = upstream.headers.get(h);
-    if (v) segHeaders[h] = v;
+  try {
+    return await respond(await fetchUpstream(target, headers, req.signal), req.nextUrl.searchParams.get("role") === KEY_ROLE);
+  } catch (e) {
+    if (e instanceof UpstreamError) return reply(e.message, e.status);
+    return reply("upstream error", 502);
   }
-  return new NextResponse(upstream.body, {
-    status: upstream.status === 206 ? 206 : 200,
-    headers: segHeaders,
-  });
 }

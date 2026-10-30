@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, StatusCode},
     routing::{delete, get, patch, post, put},
     Json, Router,
 };
@@ -24,30 +24,54 @@ use tokio::process::Command;
 
 use crate::state::CloudState;
 
+const DEPLOY_ZIP_MAX_BYTES: usize = 10 * 1024 * 1024;
+const DEPLOY_ZIP_BODY_LIMIT_BYTES: usize = DEPLOY_ZIP_MAX_BYTES + 2 * 1024 * 1024;
+
+/// Per-peer budget for GUESSES at the internal token (a mint that fails `mint_allowed`).
+const MINT_ATTEMPTS_PER_WINDOW: u32 = 20;
+/// Per-user budget for legitimate mints (`HIVE_MINT_USER_PER_MIN`): a session mints about every
+/// 15 minutes, so this is a runaway-client bound, never a pacing one.
+const MINT_USER_PER_WINDOW_DEFAULT: u32 = 30;
+/// Peer-wide backstop for legitimate mints, every user together (`HIVE_MINT_BACKSTOP_PER_MIN`): the
+/// dashboard server is the peer of every user, and the admin router's own per-peer budget is the same
+/// order.
+const MINT_BACKSTOP_PER_WINDOW_DEFAULT: u32 = 600;
+const ADMIN_REQUESTS_PER_WINDOW: u32 = 600;
+const RATE_LIMIT_WINDOW_MS: u64 = 60_000;
+const MINTED_TOKEN_TTL_SECS: i64 = 60 * 60;
+/// Lifetime of a minted token for a role a Clerk org assigns (see [`minted_token_ttl`]).
+const ORG_TOKEN_TTL_SECS_DEFAULT: i64 = 15 * 60;
+const DOMAIN_VERIFY_DEFAULT_SECS: u64 = 45;
+const MESH_FORWARD_TIMEOUT_SECS: u64 = 20;
+const PROJECT_DELETE_QUICK_PASS_PEER_BUDGET: Duration = Duration::from_secs(28);
+const FRAMEWORK_OUTPUT_DIRS: [&str; 6] = [
+    ".vercel/output/static",
+    ".next/static",
+    "dist",
+    "build",
+    "out",
+    "public",
+];
+
 pub fn router(cloud: Arc<CloudState>) -> Router {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
-        // Distinct from /healthz: liveness ("is the process serving HTTP") tells
-        // you nothing about mesh MEMBERSHIP — a node can be process-alive,
-        // /healthz-green, and fully isolated from its fleet (the node-a/node-b
-        // incident). Unauthenticated like /healthz, for the same reason: the
-        // watchdog polling it has no JWT.
         .route("/v1/mesh", get(mesh_health))
         .route("/v1/overview", get(overview))
         .route("/v1/tasks/health", get(tasks_health))
         .route("/v1/nodes", get(nodes))
-        .route("/v1/serve-hosts", get(serve_hosts))
+        .route("/v1/serve-hosts", get(serve_hosts_public))
         .route("/v1/resources", get(resources_get))
-        .route("/v1/leases", get(leases_get))
-        .route("/v1/guardian/heads", get(guardian_heads))
+        .route("/v1/leases", get(leases_public))
+        .route("/v1/guardian/heads", get(guardian_heads_public))
         .route("/v1/cluster", get(cluster_status))
-        .route("/v1/anycast", get(anycast_table))
+        .route("/v1/anycast", get(anycast_public))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
         .route("/v1/regions", get(regions))
         .route("/v1/wqueue/enqueue", post(wqueue_enqueue))
         .route("/v1/wqueue/stats", get(wqueue_stats))
         .route("/v1/logs", get(logs))
-        .route("/v1/functions", get(functions))
+        .route("/v1/functions", get(functions_public))
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
         .route("/v1/gpu-pools", get(gpu_pools))
@@ -56,8 +80,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/mesh/establish", get(mesh_establish))
-        // Runtime stall counters (node-local, operator-only): see runtime_watch.
         .route("/v1/admin/runtime", get(admin_runtime))
+        .route("/v1/admin/content-hash", get(admin_content_hash))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -69,9 +93,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/bot", get(bot_get).put(bot_put))
         .route("/v1/cdn", get(cdn_get))
         .route("/v1/cdn/purge", post(cdn_purge))
-        // Runtime Cache (regional data cache for tenant functions). Loopback-only
-        // (admin port), reached by local function cells via the injected
-        // HIVE_RUNTIME_CACHE_URL. Scope = "<project>:<environment>".
         .route("/v1/runtime-cache", get(rc_stats))
         .route(
             "/v1/runtime-cache/entry",
@@ -92,20 +113,11 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/workflows/hooks", get(wf_hooks))
         .route("/v1/workflows/runs", get(wf_runs))
         .route("/v1/workflows/runs/:id", get(wf_run_detail))
-        // Run operations (the upstream console's 3-dots menu): cancel, replay
-        // (recreate), reenqueue, wakeup (cancel active sleeps). Each mutates the
-        // project's world on its HOST node (env decrypts there) — host-routed.
         .route("/v1/workflows/runs/:id/cancel", post(wf_run_cancel))
         .route("/v1/workflows/runs/:id/replay", post(wf_run_replay))
         .route("/v1/workflows/runs/:id/reenqueue", post(wf_run_reenqueue))
         .route("/v1/workflows/runs/:id/wakeup", post(wf_run_wakeup))
-        // Operator-only manual recovery primitives, conformant with the real
-        // `@workflow/world` spec's generic `events.create` /
-        // `experimentalSetAttributes` — see `require_operator_or_internal`.
         .route("/v1/workflows/runs/:id/events", post(wf_run_add_event))
-        // `.post(..)` too: `post_body_to_host` (internal node-to-node forward,
-        // shared with cancel/replay/reenqueue/wakeup) always issues a POST —
-        // the public method stays PATCH, matching the spec's merge semantics.
         .route(
             "/v1/workflows/runs/:id/attributes",
             patch(wf_run_set_attributes).post(wf_run_set_attributes),
@@ -123,30 +135,25 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         )
         .route("/v1/deployments/:id/promote", post(dep_promote))
         .route("/v1/projects/:project", delete(project_delete))
+        .route("/v1/projects/:project/rename", post(project_rename))
         .route(
             "/v1/project-delete/capabilities",
             get(project_delete_capabilities),
         )
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
-        // Versioned receiver for artifact/workdir semantics. New coordinators use
-        // this path so an old node returns 404/NO_HANDLER instead of accepting a
-        // deployment it would launch from the wrong cwd.
         .route("/v1/runtime-artifact/v1/git/deploy", post(git_deploy))
         .route("/v1/git/deploy", post(git_deploy_public))
-        // Zip upload: raw `.zip` body (default 2 MB axum limit raised to 12 MB; the
-        // handler caps the archive at 10 MB and rejects non-zips).
         .route(
             "/v1/deploy/zip",
-            post(deploy_zip).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
+            post(deploy_zip).layer(DefaultBodyLimit::max(DEPLOY_ZIP_BODY_LIMIT_BYTES)),
         )
-        // Run a PRE-BUILT image from any registry (Docker Hub / Quay / arbitrary).
         .route("/v1/deploy/image", post(deploy_image))
-        .route("/v1/fleet-deployments", get(fleet_deployments))
+        .route("/v1/fleet-deployments", get(fleet_deployments_public))
         .route("/v1/builds/:id", get(build_get))
         .route("/v1/builds/:id/cancel", post(build_cancel))
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
-        .route("/v1/nodes/announce", post(node_announce))
+        .route("/v1/nodes/announce", post(node_announce_public))
         .route("/v1/mesh/roster", get(mesh_roster_get))
         .route("/v1/mesh/admit", post(mesh_admit))
         .route("/v1/token", post(mint_token))
@@ -209,16 +216,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/domains/:domain/nameservers",
             put(domain_set_nameservers),
         )
-        .route("/v1/domains/:domain/auto-renew", put(domain_set_auto_renew))
         .route("/v1/domains/:domain/ssl/renew", post(domain_renew_ssl))
-        // ---- Teams ----
         .route("/v1/teams", get(teams_list).post(team_create))
         .route("/v1/teams/:slug", get(team_get).delete(team_delete))
         .route("/v1/teams/:slug/members", post(team_add_member))
         .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
         .route("/v1/teams/:slug/plan", put(team_set_plan))
         .route("/v1/teams/:slug/sso", put(team_set_sso))
-        // ---- GitOps (config repo link + inbound CI webhook) ----
         .route(
             "/v1/gitops",
             get(gitops_get).put(gitops_put).delete(gitops_unlink),
@@ -226,10 +230,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gitops/synced", post(gitops_synced))
         .route("/v1/gitops/projects", get(gitops_projects))
         .route("/v1/git/webhook", post(git_webhook))
-        // ---- API keys (tenant-scoped platform tokens) ----
         .route("/v1/apikeys", get(apikeys_list).post(apikey_create))
         .route("/v1/apikeys/:id", delete(apikey_revoke))
-        // ---- Connected integrations (consumable via the Vercel-compatible SDK) ----
         .route(
             "/v1/integrations",
             get(integrations_list).post(integration_upsert),
@@ -242,7 +244,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/integrations/:id/credentials",
             get(integration_credentials),
         )
-        // ---- Webhooks ----
         .route("/v1/webhooks", get(webhooks_all).post(webhook_create_team))
         .route("/v1/webhooks/events", get(webhook_events))
         .route("/v1/webhooks/deliveries", get(webhook_deliveries))
@@ -251,7 +252,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/webhooks",
             get(webhooks_for_project).post(webhook_create),
         )
-        // ---- Databases / storage ----
         .route("/v1/databases", get(databases_list).post(database_create))
         .route(
             "/v1/internal/databases/provision-local",
@@ -274,9 +274,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/databases",
             get(databases_for_project),
         )
-        // Mesh-internal: register/remove a cross-region replica of a database.
-        .route("/v1/databases/replica", post(database_replica))
-        // Functional storage REST surface (Blob / Queue / Vector).
+        .route("/v1/databases/replica", post(database_replica_public))
         .route("/v1/storage/blob/:bucket", get(blob_list_keys))
         .route("/v1/storage/blob/:bucket/:key", get(blob_get).put(blob_put))
         .route(
@@ -286,19 +284,16 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/storage/queue/:queue/pop", post(queue_pop))
         .route("/v1/storage/vector/:index", post(vector_upsert))
         .route("/v1/storage/vector/:index/query", post(vector_query))
-        // Pub/Sub + Realtime (WebSocket secure streaming)
         .route("/v1/storage/pubsub/:topic", get(pubsub_info))
         .route("/v1/storage/pubsub/:topic/publish", post(pubsub_publish))
         .route("/v1/ws/pubsub/:topic", get(ws_pubsub))
         .route("/v1/ws/realtime/:room", get(ws_realtime))
         .route("/v1/ws/echo", get(ws_echo))
-        // ---- Secure compute (private backend tunnels) ----
         .route(
             "/v1/securelinks",
             get(securelinks_list).post(securelink_create),
         )
         .route("/v1/securelinks/:id", delete(securelink_delete))
-        // ---- Notifications (inbox bell) ----
         .route("/v1/notifications", get(notifications_list))
         .route("/v1/notifications/read", post(notifications_read))
         .route(
@@ -306,7 +301,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             post(notifications_archive_all),
         )
         .route("/v1/notifications/:id/archive", post(notification_archive))
-        // ---- Push delivery (web push + SMS) ----
         .route("/v1/push/vapid-key", get(push_vapid_key))
         .route(
             "/v1/push/subscribe",
@@ -319,14 +313,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/push/sms-direct-mx", put(push_sms_direct_mx))
         .route("/v1/push/sms-key", post(push_sms_key_put))
         .route("/v1/push/test", post(push_test))
-        // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
         .route("/v1/speed-insights", get(speed_insights_get))
-        // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
-        // Placement diagnosis: why each node would or would not accept a build.
-        // Lets an operator see the real constraint instead of a bare
-        // "nothing eligible" refusal (and confirms NAT'd peers are placeable).
         .route("/v1/admin/placement", get(admin_placement))
         .route(
             "/v1/admin/audit",
@@ -346,7 +335,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/admin/sql/query", post(sql_query))
         .route("/v1/admin/guardian", get(guardian_status))
         .route("/v1/identity/sync", post(identity_sync))
-        // ---- Billing & compute credits ----
         .route("/v1/billing", get(billing_get))
         .route("/v1/billing/ledger", get(billing_ledger))
         .route("/v1/billing/invoices", get(billing_invoices))
@@ -362,61 +350,39 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/admin/projects/:project/team",
             post(admin_set_project_team),
         )
-        // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
-        // Paged (`?status=open|resolved|all&limit=&offset=`) and compressed:
-        // the unpaged, uncompressed list reached 10.5 MB per poll (2026-10-01).
         .route(
             "/v1/incidents",
             get(incidents_list)
                 .post(incident_open)
                 .layer(tower_http::compression::CompressionLayer::new()),
         )
-        // Public status board: OPERATOR-declared incidents only (no auth).
         .route("/v1/status/incidents", get(status_incidents))
         .route("/v1/incidents/:id", axum::routing::delete(incident_delete))
         .route("/v1/incidents/:id/updates", post(incident_update))
-        // ---- Low-trust browser serving admissions ----
         .merge(crate::browser_admission::routes())
-        // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
         .merge(crate::browser_artifacts::routes())
-        // ---- Immutable runtime artifact transfer (bounded, durable, mesh-internal) ----
         .merge(crate::runtime_artifact_transfer::routes())
-        // ---- Browser-replicated database exchange (fleet-initiated pull) ----
         .merge(crate::browser_db::routes())
-        // ---- browser_db libsql/Hrana + Upstash REST surface (owner-proxied) ----
         .merge(crate::browser_db_rest::routes())
-        // ---- Coarse browser presence (constellation satellites) ----
         .merge(crate::browser_presence::routes())
-        // ---- Per-tenant browser relay byte metering (operator; metering only, never bills) ----
         .merge(crate::browser_metering::routes())
-        // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,
-        //      deployment protection, microfrontends, conformance) ----
         .merge(crate::enterprise_api::routes())
-        // ---- Platform-native Microfrontends (project-scoped groups/members/config) ----
         .merge(crate::microfrontends_api::routes())
-        // ---- Platform-native Sandboxes (isolated on-demand Linux environments) ----
         .merge(crate::sandboxes_api::routes())
-        // ---- Storage broker: Firecracker cell data-image snapshots ----
         .merge(crate::storage_api::routes())
-        // ---- Cloudflare Queues parity (crate::queues) ----
         .merge(crate::queues_api::routes())
-        // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
         .merge(crate::db_rest::routes())
-        // ---- shadw drive v1: REST + WebDAV (relational metadata, owner-routed bytes) ----
         .merge(crate::drive_api::routes())
         .merge(crate::drive_webdav::routes())
         .with_state(cloud.clone());
-    // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
     let app = app.merge(crate::zkauth::routes(cloud.clone()));
     let _ = &cloud;
     app
 }
-
-// ---- Auth (JWT) ----
 
 #[derive(Deserialize)]
 struct TokenReq {
@@ -424,15 +390,11 @@ struct TokenReq {
     sub: String,
     #[serde(default = "default_tenant")]
     tenant: String,
-    // No default: the caller must explicitly request the role it needs. A
-    // silent "owner" default meant every mint (even one that forgot to specify
-    // a role) came back with the highest tenant-scoped role.
+    /// No default: a mint carries only the role the caller names.
     #[serde(default)]
     role: String,
-    /// The verified account email (from the trusted dashboard server's own
-    /// Clerk session, never client-supplied trust) — used ONLY to
-    /// independently derive `platform_admin` against this backend's own
-    /// `owner_email`. Never trust a client-supplied `platform_admin` boolean.
+    /// The verified account email from the dashboard's Clerk session: the only input to
+    /// `platform_admin`.
     #[serde(default)]
     email: String,
 }
@@ -443,10 +405,7 @@ fn default_tenant() -> String {
     "default".into()
 }
 
-/// Constant-time byte comparison for secret/token equality checks — ordinary
-/// `==` on a `str`/`[u8]` short-circuits on the first mismatched byte, which is
-/// a timing side-channel for comparing a caller-supplied value against a
-/// stored secret (bearer tokens, shared internal secrets, password hashes).
+/// Constant-time equality for secrets and tokens (`==` short-circuits on the first differing byte).
 pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -459,13 +418,8 @@ async fn auth_status() -> Json<Value> {
     Json(json!({ "enforced": crate::auth::enforced() }))
 }
 
-/// Whether a token-mint request is permitted.
-/// * Dev (no `HIVE_JWT_SECRET`): open — minted tokens aren't verified anyway, so
-///   this preserves the current local flow.
-/// * Enforced (`HIVE_JWT_SECRET` set): the mint is a privileged operation (it can
-///   assert ANY tenant), so it MUST come from the trusted dashboard server,
-///   proven by `x-hive-internal == HIVE_INTERNAL_TOKEN`. Fail CLOSED if the
-///   internal token isn't configured — never allow open minting when enforced.
+/// Dev (no `HIVE_JWT_SECRET`) mints freely; when enforced a mint can assert ANY tenant, so it must
+/// present `x-hive-internal == HIVE_INTERNAL_TOKEN` and fails CLOSED when that token is unset.
 fn mint_allowed(headers: &HeaderMap) -> bool {
     if !crate::auth::enforced() {
         return true;
@@ -480,28 +434,60 @@ fn mint_allowed(headers: &HeaderMap) -> bool {
     }
 }
 
-/// Dedicated, tight rate limit on the token-mint endpoint — independent of the
-/// tenant-facing edge pipeline's limiter (which doesn't even run in front of
-/// the admin router, see the separate rate-limiting audit finding). `/v1/token`
-/// is the platform's effective login/credential-mint endpoint, so repeated
-/// guesses of `HIVE_INTERNAL_TOKEN` must be throttled independently of every
-/// other route. 20 attempts / 60s per client IP, shared across the process.
+/// Throttles `/v1/token` GUESSES at `HIVE_INTERNAL_TOKEN` independently of every other route (the
+/// tenant edge limiter never fronts the admin router). Only a request that fails `mint_allowed`
+/// spends it, so guessing never starves the dashboard server's legitimate mints and those mints
+/// never loosen the guess budget. `tls_bundle_mesh` counts every request against it.
 fn mint_rate_limiter() -> &'static hive_edge::RateLimiter {
     static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
-    LIMITER.get_or_init(|| hive_edge::RateLimiter::new(20, 60_000))
+    LIMITER
+        .get_or_init(|| hive_edge::RateLimiter::new(MINT_ATTEMPTS_PER_WINDOW, RATE_LIMIT_WINDOW_MS))
 }
 
-/// Fleet-wide budget for the WHOLE admin/control-plane router — this surface
-/// previously had NO rate limiting of its own at all (the tenant-facing edge
-/// pipeline's WAF/limiter only wraps the deployment-serving router, never this
-/// one), so a compromised dashboard session or a brute-force script could hit
-/// every `/v1/*` admin route unbounded. 600 req/60s per client IP is generous
-/// enough for legitimate dashboard polling (team switches, build/deployment
-/// lists, live logs) while still bounding real abuse. Independent of
-/// `mint_rate_limiter` (tighter, /v1/token-only) and the tenant edge limiter.
+/// A positive per-window limit from the environment, else `default`.
+fn mint_window_limit(var: &str, default: u32) -> u32 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default)
+}
+
+/// The legitimate mints one USER (`sub`) may make per window: every session of the fleet reaches this
+/// route through the one dashboard server, so a per-peer budget alone made all users share it (about
+/// 300 org sessions saturated 20 per minute) and let one runaway client starve the rest.
+fn mint_user_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        hive_edge::RateLimiter::new(
+            mint_window_limit("HIVE_MINT_USER_PER_MIN", MINT_USER_PER_WINDOW_DEFAULT),
+            RATE_LIMIT_WINDOW_MS,
+        )
+    })
+}
+
+/// The legitimate mints one peer address may make per window, all users together: the bound on a
+/// compromised or runaway caller that holds the internal token.
+fn mint_backstop_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| {
+        hive_edge::RateLimiter::new(
+            mint_window_limit(
+                "HIVE_MINT_BACKSTOP_PER_MIN",
+                MINT_BACKSTOP_PER_WINDOW_DEFAULT,
+            ),
+            RATE_LIMIT_WINDOW_MS,
+        )
+    })
+}
+
+/// Per-client-IP budget for the whole admin router, which the tenant edge limiter never fronts;
+/// sized for dashboard polling.
 fn admin_rate_limiter() -> &'static hive_edge::RateLimiter {
     static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
-    LIMITER.get_or_init(|| hive_edge::RateLimiter::new(600, 60_000))
+    LIMITER.get_or_init(|| {
+        hive_edge::RateLimiter::new(ADMIN_REQUESTS_PER_WINDOW, RATE_LIMIT_WINDOW_MS)
+    })
 }
 
 /// Outermost layer on the admin router (see `main.rs`): sheds excess requests
@@ -518,19 +504,10 @@ pub async fn admin_rate_limit(
     next.run(req).await
 }
 
-/// HTTP(S) fallback distribution path for TLS cert bundles — the same payload
-/// `acme::bundle_for_mesh` serves over the iroh mesh, but reachable via a
-/// plain admin URL (e.g. https://api.shadw.cloud). EXISTS BECAUSE of a
-/// bootstrap deadlock in the iroh path: a peer whose relay cert is stale can
-/// have no working relay fallback to the leader (the relay's own hostname is
-/// missing from the very cert it needs to fetch), and direct cloud-VM↔cloud-VM
-/// QUIC is unreliable (NAT/MTU, see the fleet mesh-reliability finding) — so
-/// `mesh_fetch` can spin forever while the fix it needs is one HTTPS GET away.
-///
-/// AUTH: serves a DECRYPTED private key, so this fails CLOSED unconditionally:
-/// a non-empty `HIVE_INTERNAL_TOKEN` must be configured AND presented via
-/// `x-hive-internal` (constant-time compare) — stricter than `mint_allowed`
-/// (no dev-mode open case), and rate-limited by the same tight mint limiter.
+/// HTTPS fallback for the cert bundle `acme::bundle_for_mesh` serves over the mesh: a peer with a
+/// stale relay cert cannot reach the leader to fetch the cert that fixes it. Serves a DECRYPTED
+/// private key, so it fails CLOSED: a non-empty `HIVE_INTERNAL_TOKEN` presented via
+/// `x-hive-internal` (no dev-mode open case), behind the mint rate limiter.
 async fn tls_bundle_mesh(
     State(c): State<Arc<CloudState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
@@ -564,79 +541,75 @@ async fn tls_bundle_mesh(
         .into_response())
 }
 
+/// Lifetime of a minted token, in seconds. A token carries its role for its whole life and nothing
+/// consults the roster per request (the dashboard takes the role from Clerk when it mints), so a
+/// member demoted or removed in Clerk keeps the old role until their token expires. The roles a
+/// Clerk org assigns (`admin`, `member`, and `viewer`) therefore live `HIVE_ORG_TOKEN_TTL_SECS`
+/// (default 900 s, clamped to 60..=3600): the dashboard re-mints from the live Clerk session
+/// whenever its cookie (maxAge from `expires_in`) lapses. `owner` (the dashboard mints it only for
+/// a personal namespace, whose owner nobody can demote), a platform operator and every other role
+/// keep the hour.
+fn minted_token_ttl(role: &str, platform_admin: bool) -> i64 {
+    if platform_admin || !matches!(role, "admin" | "member" | "viewer") {
+        return MINTED_TOKEN_TTL_SECS;
+    }
+    std::env::var("HIVE_ORG_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|secs| secs.clamp(60, MINTED_TOKEN_TTL_SECS))
+        .unwrap_or(ORG_TOKEN_TTL_SECS_DEFAULT)
+}
+
 async fn mint_token(
     State(c): State<Arc<CloudState>>,
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<TokenReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Real TCP peer address — no reverse proxy sits in front of the admin
-    // listener on any fleet node, so a client-supplied `x-forwarded-for` (the
-    // previous source here) is pure attacker-controlled input that lets a
-    // caller reset their own rate-limit bucket at will just by changing it.
-    let ip = peer.ip().to_string();
-    if !mint_rate_limiter().check(&ip, hive_core::now_ms()) {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many token requests".into(),
-        ));
-    }
-    if !mint_allowed(&headers) {
+    let peer_ip = peer.ip().to_string();
+    let now = hive_core::now_ms();
+    let request_is_a_guess_at_the_internal_token = !mint_allowed(&headers);
+    if request_is_a_guess_at_the_internal_token {
+        if !mint_rate_limiter().check(&peer_ip, now) {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many token requests".into(),
+            ));
+        }
         return Err((
             StatusCode::FORBIDDEN,
             "token minting is server-only (x-hive-internal required)".into(),
         ));
     }
-    // Independently derive platform-operator status from THIS backend's own
-    // admin_emails set (owner_email + HIVE_ADMIN_EMAILS) — never trust a
-    // client-supplied claim for it. Case-insensitive membership, mirroring the
-    // owner check's eq_ignore_ascii_case.
+    if !mint_user_limiter().check(req.sub.trim(), now)
+        || !mint_backstop_limiter().check(&peer_ip, now)
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many token requests".into(),
+        ));
+    }
     let email = req.email.trim();
     let platform_admin =
         !email.is_empty() && c.admin_emails.iter().any(|a| email.eq_ignore_ascii_case(a));
-    // Admins are always enterprise (feature: "make all admins automatically
-    // always enterprise plan no matter what"). Set an unbypassable tier FLOOR
-    // on the admin's tenant via the existing lock — the same mechanism
-    // `account()`/`set_plan()` honor at read AND write time, so it survives
-    // every automatic downgrade path (free checkout, Stripe
-    // subscription.deleted). Two guards keep this safe inside the mint path:
-    //   * BILLING WRITER ONLY — /v1/token is exempt from leader-forwarding
-    //     precisely because it writes no state, so any other node writing
-    //     teams/billing here would race the writer's replicated snapshot. The
-    //     gate is the billing store's own single-writer gate
-    //     (`leadership::may_act(BillingMeter)`), never the request-path
-    //     leader test a momentary self-view can pass. The writer is on the
-    //     same round-robin and the dashboard re-mints hourly, so the lock
-    //     lands (and replicates) the first time an admin's mint hits it.
-    //   * IDEMPOTENT — only write when the floor is not already enterprise, so
-    //     the hourly re-mint does not spam the billing ledger with no-op
-    //     plan_change entries.
-    if platform_admin
-        && !req.tenant.trim().is_empty()
-        && crate::leadership::may_act(&c, crate::leadership::Job::BillingMeter)
-    {
-        let already = c
-            .billing
-            .account(req.tenant.trim())
-            .tier_locked_plan
-            .as_deref()
-            == Some("enterprise");
-        if !already {
-            apply_admin_enterprise(&c, req.tenant.trim());
+    let admin_tenant = req.tenant.trim();
+    let is_billing_writer = || crate::leadership::may_act(&c, crate::leadership::Job::BillingMeter);
+    if platform_admin && !admin_tenant.is_empty() && is_billing_writer() {
+        let floor_already_enterprise =
+            c.billing.account(admin_tenant).tier_locked_plan.as_deref() == Some("enterprise");
+        if !floor_already_enterprise {
+            apply_admin_enterprise(&c, admin_tenant);
         }
     }
-    // 1-hour tokens; the dashboard re-mints on load + periodically. Short-lived so
-    // a leaked cookie expires quickly.
-    let ttl = 3600i64;
+    let ttl = minted_token_ttl(&req.role, platform_admin);
     match crate::auth::issue(&req.sub, &req.tenant, &req.role, platform_admin, ttl) {
         Ok(token) => Ok(Json(json!({ "token": token, "expires_in": ttl }))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
 
-/// Echo the verified caller identity (tenant/role/sub) so the dashboard can
-/// confirm its session mapping. Reads the JWT claims bound by `require_auth`
-/// (from Bearer or the `hive_jwt` cookie); returns `authenticated:false` in dev.
+/// Echoes the verified caller identity (tenant/role/sub) from the `require_auth` claims;
+/// `authenticated:false` in dev.
 async fn whoami(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -647,8 +620,6 @@ async fn whoami(
             json!({ "authenticated": true, "sub": cl.sub, "tenant": cl.tenant, "role": cl.role, "enforced": crate::auth::enforced() }),
         );
     }
-    // Not bound by middleware (e.g. called directly, bypassing the layer) —
-    // best-effort resolve either credential so the endpoint is still honest.
     let tok = crate::auth::extract_token(&headers);
     match tok.and_then(|t| {
         crate::auth::verify(&t)
@@ -662,24 +633,10 @@ async fn whoami(
     }
 }
 
-// ---- Project settings (env vars, build config, function settings) ----
-
-/// The function-region catalog is built **from the live mesh** — the actual
-/// regions in which P2P nodes report their longitude/latitude. Each region is
-/// auto-assigned to its real continent (from lat/lon), so a node in Los Angeles
-/// appears under "North America". No hard-coded region table.
-///
-/// `c.registry.nodes()` is node-LOCAL gossip state (see AGENTS.md's
-/// round-robin-reads-vs-leader-forwarded-writes note): a node with a poorer
-/// mesh view (e.g. one still converging, or isolated from part of the fleet)
-/// would otherwise answer this GET with an incomplete region list depending
-/// purely on which node round-robin DNS happened to route to. Proxy to the
-/// CP leader first (its view is the fleet's best-connected), falling back to
-/// the local view only if that proxy fails — never a silent empty catalog.
+/// The function-region catalog built from the live mesh: each node's region under its real
+/// continent (from lat/lon), deduped across co-located nodes with a node count.
 fn build_region_catalog(c: &Arc<CloudState>) -> Value {
     use std::collections::BTreeMap;
-    // continent -> (region id -> entry). Dedupe a region across co-located nodes,
-    // counting how many nodes back it.
     let mut by_continent: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
     for n in c.registry.nodes() {
         let continent = match (n.lat, n.lon) {
@@ -721,16 +678,6 @@ async fn project_settings_get(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // READ-YOUR-WRITES: env/build/settings MUTATIONS are forwarded to the
-    // control-plane leader (admin_ingress), so the leader's copy is always the
-    // freshest. A non-leader serving its own copy is subject to replication
-    // lag — and the dashboard reads through round-robin DNS, so an add on the
-    // leader followed by a read on a lagging follower showed the OLD list
-    // ("I added a var and nothing appeared"). A non-leader therefore fetches
-    // the leader's authoritative copy first, falling back to local only when
-    // the leader is unreachable (never fail a read that local state can
-    // answer). The leader itself serves local (no self-loop: it IS the
-    // leader, so this branch is skipped there).
     let path = format!("/v1/projects/{project}/settings");
     if !c.is_control_plane_leader() {
         if let Some(leader) = c.leader_forward_target() {
@@ -738,10 +685,9 @@ async fn project_settings_get(
                 return Ok(Json(v));
             }
         }
-        // Leader unreachable: for a project this node never hosted (untagged
-        // local row), try the host node before giving up to a possibly-empty
-        // local default.
-        if crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT {
+        let never_hosted_here =
+            crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT;
+        if never_hosted_here {
             if let Some(node) = host_node_for_project(&c, &project) {
                 if let Some(v) = fetch_from_host(&c, &node, &path, &t).await {
                     return Ok(Json(v));
@@ -752,6 +698,19 @@ async fn project_settings_get(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
+/// A save keeps `framework_auto` only when the dashboard round-trips the whole generated framework + command
+/// tuple unchanged; editing any member makes it an explicit user configuration.
+fn is_unchanged_generated_tuple(
+    current: &crate::project_settings::BuildConfig,
+    saved: &crate::project_settings::BuildConfig,
+) -> bool {
+    current.framework_auto
+        && saved.framework.trim() == current.framework.trim()
+        && saved.install_command.trim() == current.install_command.trim()
+        && saved.build_command.trim() == current.build_command.trim()
+        && saved.output_dir.trim() == current.output_dir.trim()
+}
+
 async fn project_build_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -759,48 +718,23 @@ async fn project_build_put(
     Path(project): Path<String>,
     Json(build): Json<crate::project_settings::BuildConfig>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: a settings PUT on a project name that
-    // has no row yet materializes one via set_build's underlying
-    // .entry().or_default(), defaulting to UNTAGGED_TENANT unless claimed
-    // here with the tenant require_project already verified.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
-    // The dashboard round-trips the whole BuildConfig; a save where the user
-    // did NOT change the framework must not promote an auto-detected slug to
-    // an explicit override (which would freeze re-detection). Only an actual
-    // framework CHANGE through this PUT is an explicit user choice.
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let mut build = build;
-    // `framework_auto` also marks the command/output tuple written by older
-    // builders as generated. Preserve that provenance only when the dashboard
-    // round-trips the entire tuple unchanged; editing any member turns the
-    // framework + command set into an explicit user configuration.
-    build.framework_auto = false;
-    if let Some(cur) = c.projects.get_if_set(&project).map(|s| s.build) {
-        if cur.framework_auto
-            && build.framework.trim() == cur.framework.trim()
-            && build.install_command.trim() == cur.install_command.trim()
-            && build.build_command.trim() == cur.build_command.trim()
-            && build.output_dir.trim() == cur.output_dir.trim()
-        {
-            build.framework_auto = true;
-        }
-    }
+    let round_trips_generated_tuple = c
+        .projects
+        .get_if_set(&project)
+        .map(|s| s.build)
+        .is_some_and(|current| is_unchanged_generated_tuple(&current, &build));
+    build.framework_auto = round_trips_generated_tuple;
     c.projects.set_build(&project, build);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// The tier (hobby/pro/enterprise) of the team owning a project.
+/// The tier (hobby/pro/enterprise) of the team owning a project; a personal namespace has no team row,
+/// so its billing plan answers.
 pub(crate) fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
     let team = norm(&c.projects.team_of(project)).to_string();
-    // Fall back to the BILLING plan when there is no team row — a personal
-    // namespace (`u_<uid>`, `personal`) has a billing account but no team, so
-    // `teams.get` returns None there. Without this an admin whose tenant is a
-    // personal namespace read "hobby" for feature-gating (duration cap, etc.)
-    // even while billing correctly held enterprise via the tier lock — the two
-    // halves disagreeing is exactly the drift `apply_plan_everywhere` exists to
-    // prevent. `account()` already applies the enterprise floor, so this
-    // reflects the admin-always-enterprise lock too.
     c.teams
         .get(&team)
         .map(|t| t.plan)
@@ -814,34 +748,19 @@ async fn project_functions_put(
     Path(project): Path<String>,
     Json(mut f): Json<crate::project_settings::FunctionSettings>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
-    // Enforce plan limits: runtime cap (Enterprise = 1h) and Enterprise-only
-    // automatic multi-region fail-over.
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let plan = team_plan(&c, &project);
     let max_dur = crate::billing::plan_max_duration_secs(&plan);
     f.default_max_duration_secs = f.default_max_duration_secs.clamp(1, max_dur);
-    // Persist the user's automatic-region-failover choice as set. (Previously this
-    // was force-reset to false unless the plan was exactly "enterprise", so the
-    // toggle silently never saved. The runtime `order_candidates` already honors
-    // this flag; the setting should reflect what the operator selected.)
     c.projects.set_functions(&project, f);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// `PUT /v1/projects/:project/browser-db` — the Storages page's "Deploy a
-/// replicated SQLite database" flow. Writes ONLY the dashboard-managed
-/// settings mirror (`ProjectSettings::browser_db`); it does not touch
-/// fluid.json/the repo and does not itself rebuild anything — same
-/// "settings apply going forward" contract as `project_functions_put`'s
-/// vcpus/memory/gpu fields (see that handler's plan-limit comment). The
-/// caller is expected to follow a successful save with the existing
-/// `/v1/projects/:project/redeploy` so the block actually lands in a Ready
-/// deployment's manifest (`git.rs`'s merge, right next to the `inference`
-/// sync).
+/// `PUT /v1/projects/:project/browser-db`: saves only the dashboard-managed
+/// `ProjectSettings::browser_db` mirror (no fluid.json, no rebuild), validating table names at save
+/// time because `BrowserDbPolicy::resolve` silently drops invalid entries; follow with `/redeploy`
+/// so the block lands in a Ready manifest.
 async fn project_browser_db_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -849,15 +768,7 @@ async fn project_browser_db_put(
     Path(project): Path<String>,
     Json(policy): Json<fluid_core::BrowserDbPolicy>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
-    // Validate table identifiers at save time so a typo 400s right here.
-    // `BrowserDbPolicy::resolve` clamps/drops invalid entries instead of
-    // failing (correct for a REPLICATED spec another binary might read with
-    // stricter/looser rules), which would otherwise hide a fresh typo from
-    // the person who just typed it into this form.
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     for t in &policy.schema {
         let valid_name = {
             let mut chars = t.name.chars();
@@ -882,10 +793,8 @@ async fn project_browser_db_put(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// `DELETE /v1/projects/:project/browser-db` — clears the dashboard-managed
-/// opt-in. Like the PUT side, this alone changes nothing already deployed;
-/// it stops the NEXT deploy from carrying the block (unless fluid.json
-/// itself still declares one, which always wins).
+/// `DELETE /v1/projects/:project/browser-db`: the NEXT deploy stops carrying the dashboard-managed
+/// block (a fluid.json declaration still wins); nothing deployed changes.
 async fn project_browser_db_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -898,14 +807,9 @@ async fn project_browser_db_delete(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// `PUT /v1/projects/:project/container` — dashboard-managed container config
-/// (port/protocol/memory/cpus/pids/volume mount path) for a project running
-/// the `container` runtime. Same "settings apply going forward" contract as
-/// `project_browser_db_put`: this alone changes nothing already deployed —
-/// git.rs's produce_manifest merges it (fluid.json wins per-field) on the
-/// NEXT deploy; the caller follows a successful save with
-/// `/v1/projects/:project/redeploy` to apply it immediately, same as the
-/// browser-db flow.
+/// `PUT /v1/projects/:project/container`: dashboard-managed container config, applied from the NEXT
+/// deploy (`git.rs` produce_manifest merges it, fluid.json wins per field) or a `/redeploy`;
+/// nothing already deployed changes.
 async fn project_container_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -913,15 +817,7 @@ async fn project_container_put(
     Path(project): Path<String>,
     Json(spec): Json<crate::project_settings::ContainerSettings>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
-    // A deploy-input boundary: an unparseable protocol string must 400 here
-    // with a clear message rather than silently falling back to "http" at
-    // build time, which is exactly the class of mistake that broke the
-    // 'minecwaft' project in production (protocol=udp on a TCP-only port,
-    // accepted with no complaint because nothing ever validated it).
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     if let Some(p) = &spec.protocol {
         if p.parse::<fluid_core::ServiceProtocol>().is_err() {
             return Err((
@@ -935,11 +831,8 @@ async fn project_container_put(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// `DELETE /v1/projects/:project/container` — clears the dashboard-managed
-/// config. Like `project_browser_db_delete`, this alone changes nothing
-/// already deployed; it stops the NEXT deploy from carrying it (unless
-/// fluid.json itself still declares a `container` block, which always wins
-/// per-field).
+/// `DELETE /v1/projects/:project/container`: the NEXT deploy stops carrying the dashboard-managed
+/// config (a fluid.json `container` block still wins per field).
 async fn project_container_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -952,11 +845,9 @@ async fn project_container_delete(
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
-/// One user-editable port row in `PUT /v1/projects/:project/network`.
-/// `protocol` arrives as its wire string and is parsed with the STRICT
-/// `FromStr` — this is a deploy-input boundary, so a malformed value must 400
-/// with a clear message, never silently coerce to http (the lenient serde
-/// impl is reserved for already-stored state).
+/// One user-editable port row of `PUT /v1/projects/:project/network`; `protocol` is parsed with the
+/// STRICT `FromStr` (400 on a bad value), never the lenient serde impl reserved for already-stored
+/// state.
 #[derive(Deserialize)]
 pub(crate) struct NetworkPortIn {
     container_port: u16,
@@ -972,26 +863,37 @@ pub(crate) struct NetworkPutBody {
     ports: Vec<NetworkPortIn>,
 }
 
-/// Edit a project's exposed ports/protocol WITHOUT a redeploy — the write
-/// side of the settings Network page. Rewrites the PRIMARY function's (first
-/// entry — the shape every single-service deploy path produces) `ports` list
-/// on the project's production (else newest Ready) deployment record, syncs
-/// `FunctionConfig::protocol` to the first spec, stamps a public port for
-/// every raw (tcp/udp/grpc) spec via the leader-coordinated allocator
-/// (stable claim keys ⇒ an unchanged spec keeps its public port across
-/// edits, exactly like redeploys do), and persists the record in place
-/// (`Gateway::update_manifest` — same id, no rebuild). The raw proxy/UDP
-/// relay reconcile listeners from the record's stamped bindings within their
-/// ~5s loop, and the updated `DeploymentInfo.raw_ports` gossips fleet-wide
-/// with the deployment list. Claims are released only when the edit leaves
-/// the project with NO ports declared and NO stamped binding on any function
-/// — releasing while any binding survives would free live ports.
-///
-/// Records are node-local: a project placed on a peer node has no local
-/// record here, so the validated edit is FORWARDED (body and all) to that
-/// project's actual hosting node over HTTP admin or the iroh mesh — mirroring
-/// `dep_promote`'s host-node proxy for `/promote` — instead of 404ing (see
-/// `put_to_host` and the matching `/network` arm in `gossip::dispatch`).
+/// A Settings->Network save rebuilds the specs from a form that has no notion of compose publish
+/// requests, so `preferred_public_port` is carried over from the current record's matching spec;
+/// otherwise every compose-published port is unpublished fleet-wide.
+fn carry_over_compose_publish_requests(
+    specs: &mut [fluid_core::PortSpec],
+    recs: &[fluid_core::DeployRecord],
+    project: &str,
+) {
+    let current: Vec<fluid_core::PortSpec> = recs
+        .iter()
+        .filter(|r| r.project == project)
+        .max_by_key(|r| (r.production, r.created_at_ms))
+        .and_then(|r| r.manifest.functions.first())
+        .map(|f| f.ports.clone())
+        .unwrap_or_default();
+    for spec in specs.iter_mut() {
+        if let Some(cur) = current
+            .iter()
+            .find(|cs| cs.container_port == spec.container_port && cs.protocol == spec.protocol)
+        {
+            spec.preferred_public_port = cur.preferred_public_port;
+        }
+    }
+}
+
+/// Edits a project's exposed ports/protocol without a redeploy: rewrites the PRIMARY (first)
+/// function's `ports` on the production (else newest Ready) record in place
+/// (`Gateway::update_manifest`) and stamps raw ports through the leader allocator. Claims are
+/// released only when the edit leaves NO ports declared and NO stamped binding on any function; a
+/// project hosted on a peer has no local record, so the validated edit is FORWARDED to its host
+/// (`put_to_host`, `gossip::dispatch`).
 pub(crate) async fn project_network_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1038,30 +940,7 @@ pub(crate) async fn project_network_put(
         });
     }
     let recs = c.gw.deployment_records();
-    // A Settings→Network save rebuilds the spec list from the FORM, which has
-    // no notion of compose publish requests — leaving `preferred_public_port`
-    // blank here silently UNPUBLISHED every compose-published port fleet-wide
-    // within one reconcile tick (the spec drops out of `raw_targets`, loses
-    // its stamp, and every raw-proxy listener closes). The publish request
-    // belongs to the compose file, not this form: carry it over from the
-    // current record's matching spec.
-    {
-        let current: Vec<fluid_core::PortSpec> = recs
-            .iter()
-            .filter(|r| r.project == project)
-            .max_by_key(|r| (r.production, r.created_at_ms))
-            .and_then(|r| r.manifest.functions.first())
-            .map(|f| f.ports.clone())
-            .unwrap_or_default();
-        for spec in specs.iter_mut() {
-            if let Some(cur) = current
-                .iter()
-                .find(|cs| cs.container_port == spec.container_port && cs.protocol == spec.protocol)
-            {
-                spec.preferred_public_port = cur.preferred_public_port;
-            }
-        }
-    }
+    carry_over_compose_publish_requests(&mut specs, &recs, &project);
     let rec = recs
         .iter()
         .filter(|r| r.project == project && r.production)
@@ -1072,11 +951,6 @@ pub(crate) async fn project_network_put(
                 .max_by_key(|r| r.created_at_ms)
         });
     let Some(rec) = rec else {
-        // Not hosted locally — the placement scheduler put this project on a
-        // peer node. Forward the already-validated edit (body and all) to
-        // that node instead of 404ing; it holds the real deployment record,
-        // so there is no re-proxy loop (mirrors the delete-cascade /
-        // read-view proxy arms in `gossip::dispatch`).
         if let Some(node) = host_node_for_project(&c, &project) {
             let fwd_body = json!({
                 "ports": specs.iter().map(|s| json!({
@@ -1179,13 +1053,9 @@ pub(crate) async fn project_network_put(
     })))
 }
 
-/// Records the outcome of the auto-CI install attempted right after a
-/// project's first git import (`/api/gitops/project-ci`). Called by the
-/// dashboard immediately after that fetch resolves — previously the result
-/// was discarded entirely (fire-and-forget), so a project imported without a
-/// completed GitHub OAuth connection silently got no webhook AND no Actions
-/// fallback installed, with no future push ever auto-deploying and no
-/// visible error anywhere. See [`crate::project_settings::GitCiStatus`].
+/// Records the outcome of the auto-CI install the dashboard attempts right after a project's first
+/// git import ([`crate::project_settings::GitCiStatus`]); a project without a completed GitHub
+/// OAuth connection otherwise silently never auto-deploys.
 async fn project_git_ci_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1193,20 +1063,8 @@ async fn project_git_ci_put(
     Path(project): Path<String>,
     Json(mut status): Json<crate::project_settings::GitCiStatus>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     status.checked_ms = hive_core::now_ms();
-    // `set_git_ci`'s underlying `.entry(project).or_default()` materializes a
-    // row for a project that doesn't have one yet -- and this handler fires
-    // right after a project's FIRST git import, potentially before the
-    // deploy path (which is what normally calls set_team) ever runs for it.
-    // Left unclaimed, that row defaults to UNTAGGED_TENANT and stays that
-    // way forever if the import never leads to a completed deploy (e.g. no
-    // GitHub OAuth connection, as `set_git_ci`'s own doc comment already
-    // describes). require_project already resolved the caller's real tenant
-    // (optimistically trusting it for an unknown project) — claim ownership
-    // with it, the same way the deploy path does, instead of discarding it.
-    // A no-op when the row is already correctly owned.
-    c.projects.set_team(&project, &t);
     c.projects.set_git_ci(&project, status);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -1219,11 +1077,7 @@ async fn project_env_put(
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
-    // Keep-secret + upsert-by-key semantics live in `put_env` (see there).
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -1240,8 +1094,6 @@ async fn project_env_delete(
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
-
-// ---- Domains ----
 
 #[derive(Deserialize)]
 struct AddDomain {
@@ -1260,17 +1112,7 @@ async fn project_domain_add(
     if domain.is_empty() || !domain.contains('.') {
         return Err((StatusCode::BAD_REQUEST, "not a valid domain".into()));
     }
-    // A DomainRecord belongs to its tenant from first verified attach: an
-    // existing record owned by another team 403s here, before any challenge
-    // is issued or state touched (adversarial finding: first-come claims let
-    // a squatter steer a delegated zone's contents — and Seer is the public
-    // resolver for delegated zones, so zone contents ARE the proof channel).
     require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    // Ownership proof is the gate: the challenge is issued now, and the alias
-    // only activates once `_hive-verify.<domain>` answers this exact TXT
-    // (checked independently at every activation, never from a caller's say-
-    // so). Attachments that predate this gate are grandfathered and keep
-    // routing; new attaches route only after proof.
     let verify = match c.domains.ensure_verify(&domain, &team, &project) {
         Ok(v) => v,
         Err(msg) => return Err((StatusCode::CONFLICT, msg)),
@@ -1293,56 +1135,50 @@ async fn project_domain_add(
     })))
 }
 
-/// DoH TXT lookup: does `_hive-verify.<domain>` currently answer `want`?
-/// Returns (matched, human-readable outcome for the record's last_probe).
-/// Cloudflare's public resolver, same client shape as `domain_scan_dns`.
+/// Public TXT lookup: does `_hive-verify.<domain>` currently answer `want`? Returns (matched,
+/// human-readable outcome for the record's last_probe).
+///
+/// Asked of every [`crate::dns_quorum::Vantage`] and decided by a majority of the ones that answer,
+/// never by one resolver: a single resolver's cache lagging the tenant's new TXT record used to
+/// strand verification on a domain the internet had already published (the same single-vantage
+/// defect as the dropped `www` SAN). Majority here is also the STRICTER rule, not a looser one:
+/// today's one-resolver proof is replaced by a requirement that several independent operators see
+/// the exact minted value, so no vantage is trusted alone and none can veto alone.
 async fn doh_txt_match(c: &Arc<CloudState>, qname: &str, want: &str) -> (bool, String) {
-    let url = format!("https://cloudflare-dns.com/dns-query?name={qname}&type=TXT");
-    let resp = c
-        .http
-        .get(&url)
-        .header("accept", "application/dns-json")
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    let Ok(resp) = resp else {
-        return (false, "resolver error (no answer from public DoH)".into());
-    };
-    let Ok(v) = resp.json::<Value>().await else {
-        return (false, "resolver error (bad DoH response)".into());
-    };
-    let status = v.get("Status").and_then(|s| s.as_u64()).unwrap_or(0);
-    let Some(ans) = v.get("Answer").and_then(|a| a.as_array()) else {
+    let answers = crate::dns_probe::public_answers(&c.http, qname, 16).await;
+    let votes = crate::dns_quorum::operator_votes(answers, |v| v.trim_matches('"').trim() == want);
+    let tally = crate::dns_quorum::tally(&votes);
+    let rendered = crate::dns_quorum::render(&votes);
+    if tally.admits() {
+        return (true, format!("TXT matched ({rendered})"));
+    }
+    if tally.yes > 0 {
         return (
             false,
-            if status == 3 {
-                "NXDOMAIN".into()
-            } else {
-                "no TXT answer yet".into()
-            },
+            format!("only {}/{} public resolvers see the record yet ({rendered})", tally.yes, tally.yes + tally.no),
         );
-    };
-    for a in ans {
-        if a.get("type").and_then(|t| t.as_u64()) != Some(16) {
-            continue;
-        }
-        let data = a
-            .get("data")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .trim_matches('"')
-            .trim();
-        if data == want {
-            return (true, "TXT matched".into());
-        }
     }
-    (false, "TXT present but value does not match".into())
+    if tally.abstain > 0 && tally.no == 0 {
+        return (
+            false,
+            format!("resolver error (no public resolver answered) ({rendered})"),
+        );
+    }
+    (
+        false,
+        format!("TXT present but value does not match ({rendered})"),
+    )
 }
 
-/// Pin a delegated zone's apex to the CURRENT healthy edge set (returns true
-/// when the set actually changed — `set_system_address_records` damps no-op
-/// refreshes). Shared by verification (first pin) and the watcher's refresh
-/// sweep (membership drift).
+/// Runs the custom-cert pass now (internally leader-gated), so TLS lands within seconds rather than
+/// at the next loop tick.
+fn kick_custom_cert_pass(c: &Arc<CloudState>) {
+    let kick = c.clone();
+    tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+}
+
+/// Pins a delegated zone's apex to the CURRENT healthy edge set; true when the set changed
+/// (`set_system_address_records` damps no-op refreshes).
 fn pin_zone_addresses(c: &Arc<CloudState>, domain: &str) -> bool {
     let nodes = c.registry.nodes();
     c.domains.set_system_address_records(
@@ -1352,25 +1188,20 @@ fn pin_zone_addresses(c: &Arc<CloudState>, domain: &str) -> bool {
     )
 }
 
-/// Mark the domain verified (rebinding the record to the proving team) AND
-/// pin the delegated zone's apex to the live healthy edge set — one helper
-/// for every activation path (local apply, forward ack, owner arm, watcher)
-/// so they can never drift: without the records write, a domain DELEGATED to
-/// the platform verified clean but its zone served no address records at
-/// all, so it resolved nowhere (adversarial finding).
+/// Marks the domain verified (rebinding the record to the proving team) AND pins the delegated
+/// zone's apex: the one helper for every activation path, since a verified domain whose zone serves
+/// no address records resolves nowhere.
 fn mark_domain_verified(c: &Arc<CloudState>, domain: &str, project: &str) {
     c.domains
         .mark_verified_as(domain, Some(&verify_project_team(c, project)));
     pin_zone_addresses(c, domain);
 }
 
-/// Activate an attached domain's routing alias — self-verifying: the DoH
-/// proof is re-checked HERE, so activation can never be asserted by a caller,
-/// only proven. Runs the alias insert locally when this node hosts the
-/// project, else forwards to the owner's activate arm (the
-/// `project_domain_add` not-local pattern). On a match the leader's
-/// DomainStore marks verified (replicating the status fleet-wide); the
-/// owning node applies the alias and persists.
+/// Activates an attached domain's alias, self-verifying: the DoH proof is re-checked HERE (a caller
+/// can never assert it), and the verified mark lands only after the apply is confirmed (local
+/// `add_alias` or the owner arm's ack), so a failed apply stays pending for the watcher. When
+/// another node hosts the project it forwards to the owner's activate arm and marks the leader's
+/// wholesale-replicated DomainStore itself.
 async fn activate_domain_alias(
     c: &Arc<CloudState>,
     domain: &str,
@@ -1397,13 +1228,6 @@ async fn activate_domain_alias(
             "probe": outcome,
         })));
     }
-    // Proof good at THIS node — now route. The alias applies on the node
-    // that HOSTS the project, and the verified mark lands only after the
-    // apply is confirmed (locally or by the owner arm's ack): a failed apply
-    // must leave the record pending so the watcher keeps retrying instead of
-    // wedging in verified-but-unrouted (adversarial finding). Everywhere
-    // else learns the route via the host's `serve_hosts` gossip (the
-    // `smsrelay.shadw.app` mechanism).
     if c.gw.add_alias(domain, project) {
         mark_domain_verified(c, domain, project);
         crate::persist::persist(&c);
@@ -1417,10 +1241,7 @@ async fn activate_domain_alias(
             project,
         );
         c.record(ev);
-        // Kick the custom-cert pass now (internally leader-gated) so TLS is
-        // issued within seconds instead of at the next loop cadence.
-        let kick = c.clone();
-        tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+        kick_custom_cert_pass(c);
         return Ok(Json(json!({
             "domain": domain,
             "project": project,
@@ -1445,12 +1266,9 @@ async fn activate_domain_alias(
     .await
     {
         if v.get("status").and_then(|s| s.as_str()) == Some("verified") {
-            // The owner arm applied the alias and marked its own copy; mark
-            // the leader's (this store wholesale-replicates from here).
             mark_domain_verified(c, domain, project);
             crate::persist::persist(&c);
-            let kick = c.clone();
-            tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+            kick_custom_cert_pass(c);
         }
         return Ok(Json(v));
     }
@@ -1460,14 +1278,11 @@ async fn activate_domain_alias(
     ))
 }
 
-/// Owner-side activation arm (`POST /v1/projects/:p/domains/:domain/activate`).
-/// Applies the alias ONLY after independently re-proving the TXT — a
-/// forwarded activation carries no authority of its own.
-/// The local half of domain activation, shared by the HTTP arm and the
-/// gossip arm: re-prove the TXT at THIS node, apply the alias, and only then
-/// mark verified — a failed apply must leave the record pending so the
-/// watcher keeps retrying (the stuck-verified-unrouted state the adversarial
-/// review found).
+/// Owner-side activation (`POST /v1/projects/:p/domains/:domain/activate` and the gossip arm):
+/// re-proves the TXT at THIS node (a forwarded activation carries no authority), applies the alias,
+/// and only then marks verified so a failed apply stays pending. An already-verified domain only
+/// has its alias re-applied: the TXT may be gone by then (path-A tenants remove it), so the proof
+/// is never re-demanded.
 pub(crate) async fn domain_activate_local(
     c: &Arc<CloudState>,
     project: &str,
@@ -1482,16 +1297,8 @@ pub(crate) async fn domain_activate_local(
             "error": format!("no verification challenge exists for '{domain}'"),
         });
     };
-    if verify.status == "verified" {
-        // Already proven — this is a re-assert (the watcher re-applying
-        // routing after a cross-node redeploy/relocation, or a verify-now
-        // click). The TXT may legitimately be GONE now: path-A tenants remove
-        // it after success and the Seer arm stops serving it once verified,
-        // so re-demanding the DoH proof would wedge a verified domain
-        // (adversarial finding: a cross-node redeploy darkened the domain
-        // until the new host happened to restart). The proof stands
-        // server-side; only the alias needs re-applying. Ownership is checked
-        // by every caller before this point.
+    let already_proven = verify.status == "verified";
+    if already_proven {
         if c.gw.add_alias(domain, project) {
             return json!({
                 "domain": domain,
@@ -1532,8 +1339,7 @@ pub(crate) async fn domain_activate_local(
     }
     mark_domain_verified(c, domain, project);
     crate::persist::persist(c);
-    let kick = c.clone();
-    tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+    kick_custom_cert_pass(c);
     let ev = c.event(
         c.region.clone().as_str(),
         "DOMAIN",
@@ -1552,10 +1358,8 @@ pub(crate) async fn domain_activate_local(
     })
 }
 
-/// The proving attach's team for the tenant rebind on verification — the
-/// project tag when known, never invented (personal namespaces have no team
-/// row; a rebind to "" would orphan the record, so fall back to the record's
-/// own tenant then).
+/// The proving attach's team for the tenant rebind: the project's tag when known, never invented
+/// (personal namespaces have no team row).
 fn verify_project_team(c: &Arc<CloudState>, project: &str) -> String {
     let t = c.projects.team_of(project);
     if !t.is_empty() {
@@ -1564,9 +1368,8 @@ fn verify_project_team(c: &Arc<CloudState>, project: &str) -> String {
     String::new()
 }
 
-/// Owner-side activation arm (`POST /v1/projects/:p/domains/:domain/activate`).
-/// Applies the alias ONLY after independently re-proving the TXT — a
-/// forwarded activation carries no authority of its own.
+/// Owner-side activation arm (`POST /v1/projects/:p/domains/:domain/activate`): re-proves the TXT
+/// itself, since a forwarded activation carries no authority.
 async fn domain_activate(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1575,11 +1378,6 @@ async fn domain_activate(
     Query(q): Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // The domain being activated must be the caller's AND the stored
-    // challenge must belong to THIS attach: activation applies routing for
-    // whatever challenge is stored, so without the binding a caller could
-    // drive another tenant's proof onto their own project (adversarial
-    // finding — cross-tenant domain theft).
     require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     if !c
         .domains
@@ -1593,20 +1391,10 @@ async fn domain_activate(
     }
     let team = verify_project_team(&c, &project);
     let local = domain_activate_local(&c, &project, &domain).await;
-    // Round-robin rule (AGENTS.md): this arm answers on WHATEVER node the
-    // api host's DNS picked, but the alias applies only where the project
-    // is hosted. A local no-deployment park on a non-host node is not an
-    // answer — the gossiped fleet view knows the real host, so forward
-    // there (the same owner-proxy `activate_domain_alias` already does for
-    // the attach flow). Witnessed live: numo.gg parked "pending" on
-    // fc-sanjose-2 while fc-sanjose-gpu-3 verified the identical call.
     let parked_no_deployment = local.get("attached").and_then(|a| a.as_bool()) == Some(false)
         && local.get("reason").and_then(|r| r.as_str()) == Some("no_local_deployment");
-    // `?local=true` is the no-re-forward guard (the `fetch_artifact_from_host`
-    // precedent): a forwarded activate answers locally, honestly, even if its
-    // own gossip view is stale — two nodes with mutually-stale views must
-    // never bounce a request between each other forever.
-    if parked_no_deployment && q.get("local").map(|s| s.as_str()) != Some("true") {
+    let is_forwarded_hop = q.get("local").map(|s| s.as_str()) == Some("true");
+    if parked_no_deployment && !is_forwarded_hop {
         if let Some(node) = host_node_for_project(&c, &project) {
             if node != c.node_name {
                 let body = json!({ "project": project });
@@ -1622,8 +1410,7 @@ async fn domain_activate(
                     if v.get("status").and_then(|s| s.as_str()) == Some("verified") {
                         mark_domain_verified(&c, &domain, &project);
                         crate::persist::persist(&c);
-                        let kick = c.clone();
-                        tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+                        kick_custom_cert_pass(&c);
                     }
                     return Ok(Json(v));
                 }
@@ -1654,29 +1441,14 @@ async fn domain_verify_now(
     activate_domain_alias(&c, &domain, &verify.project, &team).await
 }
 
-/// `GET /v1/domains-nameserver-roster` — the nameserver hostnames a tenant
-/// points their registrar at when delegating DNS to the platform (the same
-/// roster `dnsserver::apex_ns_names` computes, so the wizard and the served
-/// zone can never disagree). Unauthenticated-ish (tenant-scoped like every
-/// dashboard read): the set is public DNS data anyway.
-/// `GET /v1/domains-nameserver-roster` — the nameserver hostnames a tenant
-/// points their registrar at when delegating DNS to the platform. ONLY
-/// peer-ATTESTED nameservers are named, with the platform's own ≥2 floor:
-/// "advertise only what peers have PROVEN, never what a node claims" — the
-/// rule whose violation once put two dead nameservers into a live
-/// delegation, here applied to the tenant-facing roster the wizard shows
-/// (adversarial finding: it previously fed declared-only names). Below the
-/// floor the response says so honestly instead of inventing a pair.
+/// `GET /v1/domains-nameserver-roster`: the nameserver hostnames a tenant points their registrar
+/// at, ONLY peer-ATTESTED ones under the platform's >=2 floor (below it the response says so
+/// instead of inventing a pair), plus the edge A/AAAA set for path A.
 async fn domain_ns_roster(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // The attested set + live edge addresses double as a real-time
-    // health/attestation signal for the fleet — not public data (the old
-    // "tenant-scoped like every dashboard read" comment was simply false:
-    // GETs pass require_auth). Claims are required whenever auth is
-    // enforced; the nameserver hostnames themselves remain public DNS data.
     if crate::auth::enforced() && claims.is_none() {
         return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
     }
@@ -1694,11 +1466,6 @@ async fn domain_ns_roster(
             )
         })
         .collect();
-    // The address set a tenant points A/AAAA records at when they keep their
-    // own DNS (path A of the wizard): exactly the set this node's DNS would
-    // answer for the apps wildcard right now (`lb_records` — healthy +
-    // public-address, latency-ordered, capped), so the guidance and the wire
-    // can never disagree.
     let nodes = c.registry.nodes();
     let (rr4, _) = crate::dnsserver::lb_records_pub(&nodes, 1);
     let (rr6, _) = crate::dnsserver::lb_records_pub(&nodes, 28);
@@ -1722,10 +1489,9 @@ async fn domain_ns_roster(
     })))
 }
 
-/// `DELETE /v1/projects/:p/domains/:domain` — detach: drop the routing alias
-/// (on the owner, via the same not-local forward as attach) and the settings
-/// entry. The DomainStore record stays (the user may still manage DNS); the
-/// verification state clears so a later re-attach proves again.
+/// `DELETE /v1/projects/:p/domains/:domain`: detach. The alias dies when no project still lists the
+/// domain OR it names a deployment of the DETACHED project (the rebind case) and every hosting peer
+/// is told; the DomainStore record stays and its verification clears so a re-attach proves again.
 async fn project_domain_detach(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -1733,38 +1499,19 @@ async fn project_domain_detach(
     Path((project, domain)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let team = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // The DOMAIN is the revoked resource, so the domain — not just the
-    // project in the path — must be the caller's (adversarial finding: any
-    // tenant could wipe a foreign domain's verification and its TLS
-    // fleet-wide by naming it in a detach against their own project).
     require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    // Only a domain ACTUALLY attached to this project may be detached here —
-    // another project may hold the live verified attach (ensure_verify
-    // re-issues cross-project pendings), and clearing THAT would kill its
-    // routing + TLS (adversarial finding).
-    let attached = c
+    let attached_to_this_project = c
         .projects
         .all_domains()
         .into_iter()
         .any(|(p, d)| p == project && d == domain);
-    if !attached {
+    if !attached_to_this_project {
         return Err((
             StatusCode::NOT_FOUND,
             format!("'{domain}' is not attached to project '{project}'"),
         ));
     }
     c.projects.remove_domain(&project, &domain);
-    // Detach is a revocation: it must reach EVERY node hosting the project,
-    // not the first registry entry (adversarial finding: fanout/static
-    // projects kept serving on the other hosts while the UI said
-    // "detached"). Local first, then every hosting peer; the route dies
-    // everywhere `serve_hosts` stops carrying it. The alias dies whenever it
-    // names a deployment of the DETACHED project — the rebind case, where
-    // "no project still lists the domain" is false but the previous project's
-    // binding must still go (live witness: numo0's stale binding kept
-    // serving the old version on bkk after the re-attach to numo). A second
-    // project's live attach survives: the alias then names THAT project's
-    // deployment, and the watcher re-asserts it within one tick regardless.
     let still_attached = c
         .projects
         .all_domains()
@@ -1775,19 +1522,12 @@ async fn project_domain_detach(
         c.gw.remove_alias(&domain);
     }
     if !still_attached {
-        // Full detach revokes both proof and the certificate claim atomically
-        // with the project-side removal. A second live attachment keeps both:
-        // cert-sync still wants and serves the same domain bundle for it.
         if c.domains
             .verify_of(&domain)
             .is_some_and(|v| v.project == project)
         {
             c.domains.clear_verify(&domain);
         }
-        // A fully-detached domain's zone stops claiming the platform edge —
-        // the pinned system records (apex A/AAAA + www CNAME) would
-        // otherwise keep resolving to the fleet forever, serving 404s on a
-        // domain the tenant believes is detached.
         c.domains
             .set_system_address_records(&domain, vec![], vec![]);
     }
@@ -1803,9 +1543,6 @@ async fn project_domain_detach(
     if alias_revoked {
         for node in hosts {
             let body = json!({});
-            // Best-effort per peer: an unreachable peer stops publishing the host
-            // at its own next serve_hosts tick, and the alias is gone there too
-            // since its table is rebuilt from the same settings + heal rules.
             let _ = post_to_host_json(
                 &c,
                 &node,
@@ -1830,17 +1567,13 @@ async fn domain_detach_owner(
     Path((project, domain)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // This route is reachable directly, not only via the internal forward —
-    // the same domain-side guards as the tenant-facing detach apply (the
-    // domain must be the caller's, the attach must be this project's, and a
-    // second project's live attach must survive).
     require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    let attached = c
+    let attached_to_this_project = c
         .projects
         .all_domains()
         .into_iter()
         .any(|(p, d)| p == project && d == domain);
-    if !attached {
+    if !attached_to_this_project {
         return Err((
             StatusCode::NOT_FOUND,
             format!("'{domain}' is not attached to project '{project}'"),
@@ -1852,12 +1585,6 @@ async fn domain_detach_owner(
         .all_domains()
         .into_iter()
         .any(|(_, d)| d == domain);
-    // The alias dies whenever it names a deployment of the DETACHED project —
-    // "no other project lists the domain" alone misses the rebind case (the
-    // domain was just re-attached elsewhere, and the previous project's
-    // binding kept serving the OLD version on every node that held it; live
-    // witness: numo0's stale binding on bkk). The watcher re-asserts the
-    // alias for any project still attached within one tick.
     if !still_attached || c.gw.alias_points_at_project(&domain, &project) {
         c.gw.remove_alias(&domain);
     }
@@ -1877,16 +1604,14 @@ async fn domain_detach_owner(
     ))
 }
 
-/// Leader-only watcher for pending custom-domain verifications (45s tick).
-/// For each pending challenge it asks the attach's OWNING node to activate —
-/// the owner arm re-proves the TXT itself, so this loop never asserts a
-/// proof, it just polls for one. `HIVE_DOMAIN_VERIFY_SECS` overrides the
-/// cadence; `0` disables (rollout/debug).
+/// Leader-only watcher (`HIVE_DOMAIN_VERIFY_SECS`, default 45 s, `0` disables): asks each pending
+/// challenge's OWNING node to activate (the owner arm re-proves the TXT; this loop never asserts a
+/// proof), re-pins verified apex sets, and re-asserts routing a cross-node relocation drops.
 pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
     let secs = std::env::var("HIVE_DOMAIN_VERIFY_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(45);
+        .unwrap_or(DOMAIN_VERIFY_DEFAULT_SECS);
     if secs == 0 {
         return;
     }
@@ -1899,11 +1624,6 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
                 if !crate::leadership::may_act(&cloud, crate::leadership::Job::DomainVerifyPin) {
                     continue;
                 }
-                // Refresh the pinned apex set for verified attachments:
-                // fleet membership moves under a static zone record (a node
-                // leaves, a closer edge joins), and a delegated domain must
-                // not keep resolving to a dead address. Damped — no store
-                // churn, and no persist, when every set is unchanged.
                 let verified = cloud.domains.verified_attachments();
                 let mut addrs_changed = false;
                 for (domain, _) in &verified {
@@ -1912,13 +1632,6 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
                 if addrs_changed {
                     crate::persist::persist(&cloud);
                 }
-                // Re-assert routing for every verified attachment: a
-                // cross-node redeploy/relocation drops the alias on the old
-                // host and nothing re-applies it on the new one until a
-                // restart (adversarial finding). The owner arm's verified
-                // fast-path re-applies the alias idempotently WITHOUT
-                // re-demanding the (possibly removed) TXT; the proof already
-                // stands server-side.
                 for (domain, project) in &verified {
                     let Some(node) = host_node_for_project(&cloud, project) else {
                         continue;
@@ -1976,9 +1689,8 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Body-carrying POST forward to a specific node's admin surface — the POST
-/// counterpart of `put_to_host` (PUT), same node_admins-then-iroh-mesh
-/// fallback shape.
+/// Body-carrying POST to a node's admin surface: the POST counterpart of `put_to_host`
+/// (`node_admins` first, then the iroh mesh).
 pub(crate) async fn post_to_host_json(
     c: &Arc<CloudState>,
     node: &str,
@@ -1988,12 +1700,6 @@ pub(crate) async fn post_to_host_json(
 ) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
-        // The forwarded call must authenticate like any cross-node mutation:
-        // x-hive-team alone got bounced by the receiver's loopback-forwarder
-        // (adversarial finding: every activate/detach forward returned 401/403
-        // or looped back to the leader). Attach the internal marker and, under
-        // enforced auth, a short service JWT — the
-        // `dispatch_project_delete_with` shape, proven on this same fleet.
         let mut request = c
             .http
             .post(format!("{admin}{path}"))
@@ -2054,19 +1760,10 @@ pub(crate) async fn domains_list(
     Query(q): Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Custom domains live in each project's node-local ProjectSettings (never
-    // gossiped), so a bare list shows ONLY locally-hosted projects' domains —
-    // a member's remotely-placed project's domains were invisible on the node
-    // that answered. Merge this node's domains with each peer hosting the
-    // tenant's projects (the same fan-out /v1/workflows uses). `?local=true`
-    // answers with local-only so a peer never re-fans (no loop).
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<Value> = Vec::new();
     for (p, d) in c.projects.all_domains() {
         if norm(&c.projects.team_of(&p)) == t && seen.insert(format!("{p}\u{0}{d}")) {
-            // The verify status rides every row (fanned-out peers answer from
-            // their own replicated DomainStore, so the badge is consistent
-            // whichever node serves the list).
             let vs = c
                 .domains
                 .verify_of(&d)
@@ -2092,8 +1789,6 @@ pub(crate) async fn domains_list(
     }
     Json(json!(out))
 }
-
-// ---- Deployment resources (functions + static assets, build artifacts) ----
 
 fn asset_kind(path: &str) -> &'static str {
     match path
@@ -2131,9 +1826,9 @@ fn walk_assets(base: &std::path::Path, cap: usize) -> Vec<Value> {
             }
             let p = e.path();
             let name = e.file_name().to_string_lossy().to_string();
-            // Skip dependencies, VCS, and build caches/internals (incl. dotfiles)
-            // so only real shipped assets show up.
-            if name == "node_modules" || name.starts_with('.') || name == "cache" {
+            let not_a_shipped_asset =
+                name == "node_modules" || name.starts_with('.') || name == "cache";
+            if not_a_shipped_asset {
                 continue;
             }
             if p.is_dir() {
@@ -2164,9 +1859,6 @@ pub(crate) async fn deployment_resources(
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let Some(rec) = c.gw.deployment_records().into_iter().find(|r| r.id == id) else {
-        // Not hosted locally — the placement scheduler may have put this deployment
-        // on a peer. Proxy to the hosting node so its build outputs (functions +
-        // static assets, which live on that node's filesystem) are returned.
         if let Some(node) = host_node_for_deployment(&c, &id) {
             if let Some(v) =
                 fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/resources"), &t).await
@@ -2176,13 +1868,7 @@ pub(crate) async fn deployment_resources(
         }
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     };
-    // Ownership judged from the deployment record's OWN tenant tag (authoritative
-    // and present — `rec` is a local record), NOT the node-local project row:
-    // `team_of` is UNTAGGED on a node whose ProjectStore row was GC'd/never synced
-    // (rows aren't gossiped), which used to hand a legit owner empty resources.
-    // Fall back to the project row only when the record's tag was lost.
-    let rec_owner = record_tenant(&rec.tenant);
-    if rec_owner != t && norm(&c.projects.team_of(&rec.project)) != t {
+    if !deployment_owned_by(&c, &rec.project, &id, &t) {
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     }
     let functions: Vec<Value> = rec
@@ -2192,14 +1878,6 @@ pub(crate) async fn deployment_resources(
         .map(|f| {
             json!({
                 "name": f.name,
-                // Resolve through the canonical `Runtime` (config value wins,
-                // else argv basename) instead of comparing raw strings with an
-                // `else "Node"` catch-all — that catch-all reported every
-                // Python and Wasmer function to the dashboard as "Node", a
-                // WRONG label rather than a missing one, on exactly the read
-                // path an operator uses to diagnose why a function will not
-                // start. `Command` keeps the historical label for a bare
-                // binary, which is what the old `else` arm actually meant.
                 "runtime": match hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) {
                     _ if f.runtime == "edge" => "Edge",
                     hive_core::Runtime::Container => "Container",
@@ -2217,23 +1895,14 @@ pub(crate) async fn deployment_resources(
         .collect();
 
     let root = std::path::PathBuf::from(&rec.root);
-    // Walk the build OUTPUT, not the source tree: an explicit static_dir, else a
-    // recognized framework output dir. Avoids listing source files + tool caches.
-    let base = match rec.manifest.static_dir.as_deref() {
+    let build_output_dir = match rec.manifest.static_dir.as_deref() {
         Some(sd) if sd != "." && !sd.is_empty() => Some(root.join(sd)),
-        _ => [
-            ".vercel/output/static",
-            ".next/static",
-            "dist",
-            "build",
-            "out",
-            "public",
-        ]
-        .iter()
-        .map(|c| root.join(c))
-        .find(|p| p.is_dir()),
+        _ => FRAMEWORK_OUTPUT_DIRS
+            .iter()
+            .map(|dir| root.join(dir))
+            .find(|p| p.is_dir()),
     };
-    let (mut assets, total_static) = match base {
+    let (mut assets, total_static) = match build_output_dir {
         Some(b) => {
             let a = walk_assets(&b, 800);
             let n = a.len();
@@ -2251,10 +1920,7 @@ pub(crate) async fn deployment_resources(
     }))
 }
 
-// ---- Domain detail: DNS records, nameservers, SSL ----
-
-/// Full domain record (DNS records, nameservers, free SSL cert, metadata).
-/// Creates a sensible default on first view.
+/// Full domain record (DNS records, nameservers, SSL, metadata) of one that already exists; a GET never creates it.
 async fn domain_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -2262,9 +1928,6 @@ async fn domain_get(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // A GET must never CREATE a DomainRecord — first-come claiming via a
-    // read endpoint is how squatters pre-seeded zones (adversarial finding).
-    // Records come into existence through the verified-attach flow alone.
     let Some(rec) = c.domains.get(&domain) else {
         return Err((StatusCode::NOT_FOUND, "no such domain".into()));
     };
@@ -2274,7 +1937,6 @@ async fn domain_get(
             "domain belongs to a different team".into(),
         ));
     }
-    // Connected projects: projects in this tenant whose domain ends with this one.
     let connected: Vec<Value> = c
         .projects
         .all_domains()
@@ -2306,17 +1968,13 @@ fn default_dns_ttl() -> u32 {
     60
 }
 
-/// Value length bound for any zone record: an unbounded TXT made a tenant
-/// zone a UDP amplifier (adversarial finding — Seer shipped whatever the
-/// store held in one datagram).
+/// Value length bound for any zone record: an unbounded TXT made a tenant zone a UDP amplifier.
 const MAX_RECORD_VALUE_BYTES: usize = 4096;
 /// Per-(name, kind) RR bound — the amplifier needs many answers at one name.
 const MAX_RECORDS_PER_NAME_KIND: usize = 32;
 
-/// Is this record name platform-managed? `_hive-verify` (the ownership
-/// proof) and `_acme-challenge` (LE DNS-01) are answered by the platform
-/// itself — the proof channel MUST NOT be tenant-writable, or a zone holder
-/// could self-answer their own challenge (the circular-verification break).
+/// Platform-managed names (`_hive-verify`, `_acme-challenge`): the proof channel must not be
+/// tenant-writable, or a zone holder could answer their own challenge.
 fn reserved_record_name(name: &str) -> bool {
     let n = name.trim().to_ascii_lowercase();
     n == "_hive-verify"
@@ -2325,10 +1983,9 @@ fn reserved_record_name(name: &str) -> bool {
         || n.starts_with("_acme-challenge.")
 }
 
-/// Shared write-side validation for zone records (add/update/import):
-/// reserved names, MX/SRV/CAA shapes (the encoder must never emit a wrong
-/// answer), value length and per-(name,kind) count (the amplifier bounds).
-/// `replacing_id` excludes the record being updated from the count.
+/// Shared write-side validation for zone records (add/update/import): reserved names, MX/SRV/CAA
+/// shapes, value length and the per-(name, kind) count; `replacing_id` excludes the record being
+/// updated from the count.
 fn validate_record_write(
     c: &Arc<CloudState>,
     domain: &str,
@@ -2354,9 +2011,6 @@ fn validate_record_write(
             format!("record value exceeds {MAX_RECORD_VALUE_BYTES} bytes"),
         ));
     }
-    // Numeric/shape validation at write time (the encoder must never emit a
-    // wrong answer): MX/SRV priority fits u16; SRV value is
-    // `<weight> <port> <target>`; CAA is `<flags> <tag> "<value>"`.
     if (kind_u == "MX" || kind_u == "SRV") && priority.unwrap_or(0) > 65_535 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2474,9 +2128,6 @@ async fn domain_update_record(
     Json(r): Json<AddRecordReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    // The update path enforces the same write-side rules as add/import —
-    // renaming a record to a platform-reserved name or an invalid shape was
-    // previously possible here and only here (adversarial finding).
     validate_record_write(
         &c,
         &domain,
@@ -2524,8 +2175,7 @@ struct ImportReq {
     zone: String,
 }
 
-/// Bulk-import DNS records — the "migrate existing DNS" flow. Accepts a list of
-/// structured records and/or a pasted BIND-style zone file. Idempotent: exact
+/// Bulk-imports DNS records (structured and/or a pasted BIND-style zone file); idempotent, exact
 /// duplicates (type+name+value) are skipped.
 async fn domain_import_records(
     State(c): State<Arc<CloudState>>,
@@ -2535,10 +2185,6 @@ async fn domain_import_records(
     Json(req): Json<ImportReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    // The `_hive-verify`/`_acme-challenge` reservation and the amplifier
-    // bounds apply to bulk imports exactly as to single adds (see
-    // validate_record_write) — over-cap or over-length records are SKIPPED
-    // and named in the response, never silently stored or silently dropped.
     let mut recs: Vec<crate::dns::DnsRecord> = req
         .records
         .into_iter()
@@ -2564,8 +2210,6 @@ async fn domain_import_records(
     }
     let before = recs.len();
     recs.retain(|r| r.value.len() <= MAX_RECORD_VALUE_BYTES);
-    // Per-(name,kind) bound, counting what the zone ALREADY holds — a bulk
-    // import is exactly the vector an amplifier set would arrive by.
     let existing = c.domains.get(&domain);
     let mut counts: std::collections::HashMap<(String, String), usize> =
         std::collections::HashMap::new();
@@ -2608,9 +2252,8 @@ async fn domain_import_records(
     ))
 }
 
-/// Detect a domain's CURRENT public DNS records (via DNS-over-HTTPS) so a user can
-/// migrate them into the console with one click. Best-effort: returns whatever
-/// resolves. Records are NOT added — the client imports the ones it wants.
+/// Detects a domain's current public DNS records over DoH for the one-click migration; best-effort,
+/// and nothing is added (the client imports the ones it wants).
 async fn domain_scan_dns(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -2619,7 +2262,6 @@ async fn domain_scan_dns(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let mut found: Vec<Value> = Vec::new();
-    // (query host suffix, record type) — apex + a few common subdomains.
     let queries: &[(&str, &str)] = &[
         ("", "A"),
         ("", "AAAA"),
@@ -2655,7 +2297,7 @@ async fn domain_scan_dns(
             let rtype = a.get("type").and_then(|x| x.as_u64()).unwrap_or(0);
             let kind = dns_type_name(rtype);
             if kind != *qtype {
-                continue; // skip e.g. CNAME chains returned for an A query
+                continue;
             }
             let raw = a
                 .get("data")
@@ -2668,7 +2310,6 @@ async fn domain_scan_dns(
                 continue;
             }
             let ttl = a.get("TTL").and_then(|x| x.as_u64()).unwrap_or(3600) as u32;
-            // MX (and SRV) prefix a numeric priority in the data field.
             let (priority, value) =
                 if (kind == "MX" || kind == "SRV") && raw.split_whitespace().count() >= 2 {
                     let mut it = raw.splitn(2, char::is_whitespace);
@@ -2684,7 +2325,6 @@ async fn domain_scan_dns(
                 } else {
                     (None, raw.clone())
                 };
-            // Don't suggest records we already have, or shadw's own anycast.
             found.push(json!({
                 "name": *sub,
                 "type": kind,
@@ -2694,7 +2334,6 @@ async fn domain_scan_dns(
             }));
         }
     }
-    // De-dupe identical suggestions.
     found.dedup_by(|a, b| a.to_string() == b.to_string());
     Ok(Json(json!({ "domain": domain, "records": found })))
 }
@@ -2714,21 +2353,20 @@ fn dns_type_name(t: u64) -> &'static str {
     }
 }
 
-/// Tolerant BIND-style zone parser for the "paste your zone file" import. Handles
-/// lines like `www 3600 IN A 76.76.21.21`, `@ IN MX 10 mail.example.com`, and the
-/// minimal `www A 1.2.3.4`. Unknown/blank/comment lines are skipped.
+/// Tolerant BIND-style zone parser for the paste-your-zone import (`www 3600 IN A 76.76.21.21`,
+/// `@ IN MX 10 mail.example.com`, minimal `www A 1.2.3.4`); unknown, blank and comment lines are
+/// skipped.
 fn parse_zone(text: &str, domain: &str) -> Vec<crate::dns::DnsRecord> {
     const TYPES: &[&str] = &[
         "A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "SRV",
     ];
     let mut out = Vec::new();
     for line in text.lines() {
-        let line = line.split(';').next().unwrap_or("").trim(); // strip ; comments
+        let line = line.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
         let toks: Vec<&str> = line.split_whitespace().collect();
-        // Find the record TYPE token; everything before is name/ttl/class, after is value.
         let Some(ti) = toks
             .iter()
             .position(|t| TYPES.contains(&t.to_uppercase().as_str()))
@@ -2736,11 +2374,11 @@ fn parse_zone(text: &str, domain: &str) -> Vec<crate::dns::DnsRecord> {
             continue;
         };
         let kind = toks[ti].to_uppercase();
-        // name = first token if it isn't a ttl/class keyword, else apex.
         let mut name = String::new();
         if ti > 0 {
             let first = toks[0];
-            if !first.eq_ignore_ascii_case("IN") && first.parse::<u32>().is_err() {
+            let first_is_name = !first.eq_ignore_ascii_case("IN") && first.parse::<u32>().is_err();
+            if first_is_name {
                 name = if first == "@" {
                     String::new()
                 } else {
@@ -2751,7 +2389,6 @@ fn parse_zone(text: &str, domain: &str) -> Vec<crate::dns::DnsRecord> {
                 };
             }
         }
-        // ttl = a numeric token before the type, if any.
         let ttl = toks[..ti]
             .iter()
             .find_map(|t| t.parse::<u32>().ok())
@@ -2810,24 +2447,6 @@ async fn domain_set_nameservers(
     Ok(Json(json!(c.domains.get(&domain))))
 }
 
-#[derive(Deserialize)]
-struct AutoRenewReq {
-    on: bool,
-}
-
-async fn domain_set_auto_renew(
-    State(c): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    claims: Option<axum::Extension<crate::auth::Claims>>,
-    Path(domain): Path<String>,
-    Json(r): Json<AutoRenewReq>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    c.domains.set_auto_renew(&domain, r.on);
-    crate::persist::persist(&c);
-    Ok(Json(json!(c.domains.get(&domain))))
-}
-
 async fn domain_renew_ssl(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -2835,10 +2454,7 @@ async fn domain_renew_ssl(
     Path(domain): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
-    // Kick the REAL issuance pass (leader-gated internally); renew_ssl only
-    // reads the current block now — it must never fabricate an issued state.
-    let kick = c.clone();
-    tokio::spawn(async move { crate::acme::custom_cert_pass(&kick).await });
+    kick_custom_cert_pass(&c);
     let cert = c.domains.renew_ssl(&domain);
     c.audit.record(
         &t,
@@ -2851,25 +2467,22 @@ async fn domain_renew_ssl(
     Ok(Json(json!(cert)))
 }
 
-// ---- Git deploy (Import Git Repository) ----
-
-/// Pick a globally-unique project name. Deployment aliases are `<project>.localhost`
-/// (global), so two projects can't share a name. A genuine redeploy (same name +
-/// same repo + same tenant) keeps its name; anything else gets a `-N` suffix.
+/// Picks a globally-unique project name (aliases are global): a genuine redeploy (same name, repo
+/// and tenant) keeps it, anything else gets a `-N` suffix.
 fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenant: &str) -> String {
     let base = if desired.trim().is_empty() {
         crate::git::project_name_from_url(repo_url)
     } else {
         desired.trim().to_string()
     };
-    // Case-insensitive collision check: `<project>.localhost` aliases are global
-    // and host routing is case-insensitive, so "Foo" and "foo" must not coexist.
-    // Uses find_key_ci (key-only, no full-map clone) on this hot deploy path.
-    let existing_ci = |name: &str| c.projects.find_key_ci(name);
-    let Some(hit) = existing_ci(&base) else {
-        return base; // free — use it
+    let taken_key_ci = |name: &str| {
+        c.projects
+            .find_key_ci(name)
+            .or_else(|| c.projects.renamed_away(name).map(|_| name.to_string()))
     };
-    // Redeploy of the same project (same repo + tenant) → keep the name.
+    let Some(hit) = taken_key_ci(&base) else {
+        return base;
+    };
     let same_tenant = norm(&c.projects.team_of(&hit)) == tenant;
     let same_repo =
         c.gw.git_for_project(&hit)
@@ -2878,18 +2491,23 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     if same_tenant && same_repo {
         return hit;
     }
-    // Otherwise find the next free `-N`.
     for i in 2..1000 {
         let cand = format!("{base}-{i}");
-        if existing_ci(&cand).is_none() {
+        if taken_key_ci(&cand).is_none() {
             return cand;
         }
     }
     format!("{base}-{}", now_ms())
 }
 
+fn clear_internal_orchestration_fields(req: &mut fluid_core::GitDeployRequest) {
+    req.project_incarnation = None;
+    req.no_fanout = false;
+    req.fanout_secondary = false;
+}
+
 fn mesh_deploy_authority(claims: Option<&crate::auth::Claims>) -> bool {
-    claims.is_some_and(|claims| claims.sub == "mesh-internal" && claims.role == "service")
+    claims.is_some_and(crate::auth::is_mesh_internal)
 }
 
 pub(crate) async fn git_deploy(
@@ -2923,9 +2541,6 @@ async fn git_deploy_public(
     Json(mut req): Json<fluid_core::GitDeployRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let claims = claims.as_ref().map(|extension| &extension.0);
-    // Rolling compatibility: an older coordinator can still send its signed
-    // internal request to the legacy path. Its service claim, not the path or a
-    // caller-controlled request flag, is the authority boundary.
     if mesh_deploy_authority(claims) {
         let expected = req.project_incarnation.take().ok_or_else(|| {
             (
@@ -2938,81 +2553,91 @@ async fn git_deploy_public(
         return start_named_deploy(&c, &t, req, Some(expected)).await;
     }
 
-    // These fields are internal orchestration data, never public authority.
-    req.project_incarnation = None;
-    req.no_fanout = false;
-    req.fanout_secondary = false;
+    clear_internal_orchestration_fields(&mut req);
     let t = tenant(&c, &headers, claims);
     start_named_deploy(&c, &t, req, None).await
 }
 
-/// Shared deploy entry: assign the project to the tenant (unique name, conflict
-/// check, root-dir persist) then kick off the async build. Used by BOTH the git
-/// deploy (`/v1/git/deploy`) and the zip upload (`/v1/deploy/zip`) so naming +
-/// placement behave identically regardless of source.
+/// Shared deploy entry for the git (`/v1/git/deploy`) and zip (`/v1/deploy/zip`) paths: assigns the
+/// project to the tenant (unique name, conflict check, root-dir persist) then starts the async
+/// build, so naming and placement do not depend on the source.
 pub(crate) async fn start_named_deploy(
     c: &Arc<CloudState>,
     t: &str,
     mut req: fluid_core::GitDeployRequest,
     expected_incarnation: Option<fluid_core::ProjectIncarnation>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Assign the (new) project to the requesting tenant so it shows under their
-    // team only — with a globally-unique name (auto-generated when none given).
     let t = t.to_string();
     let requested = req.project.clone().unwrap_or_default();
-    // A fanout / capability re-home dispatch (`no_fanout`) carries the coordinator's
-    // already-resolved CANONICAL project name — use it verbatim, never uniquify.
-    // Otherwise a target that happens to hold a stale same-named project would get
-    // a `-N` suffix, so the deployment serves under the wrong host alias (the
-    // container re-home → `container-dockerfile-3` bug).
-    // A "New Deployment" from a project's own page (`redeploy`) targets an EXISTING
-    // project the same tenant owns — keep its name verbatim regardless of source,
-    // so a new deployment is never misread as a colliding new-project create.
+    let carries_canonical_name = req.no_fanout;
     let redeploy_existing = req.redeploy
         && !requested.trim().is_empty()
         && c.projects
             .find_key_ci(requested.trim())
             .map(|k| norm(&c.projects.team_of(&k)) == t)
             .unwrap_or(false);
+    let reuse = if carries_canonical_name || requested.trim().is_empty() || redeploy_existing {
+        None
+    } else {
+        c.projects.find_key_ci(requested.trim()).map(|key| {
+            let verdict = crate::project_inventory::name_reuse(c, &key, &t, &req.repo_url);
+            (key, verdict)
+        })
+    };
+    if let Some((key, crate::project_inventory::NameReuse::InFlight { build_id })) = &reuse {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("A build ({build_id}) for project \"{key}\" is still running. Wait for it or cancel it first."),
+        ));
+    }
+    let reuse_empty = matches!(
+        reuse,
+        Some((_, crate::project_inventory::NameReuse::ReuseEmpty))
+    );
+    let redeploy_existing = redeploy_existing || reuse_empty;
     if req.redeploy && expected_incarnation.is_none() && !redeploy_existing {
         return Err((
             StatusCode::NOT_FOUND,
             "the project no longer exists; start a new deployment instead of redeploying it".into(),
         ));
     }
-    let project = if (req.no_fanout || redeploy_existing) && !requested.trim().is_empty() {
+    if !requested.trim().is_empty() {
+        if let Some(tomb) = c.projects.renamed_away(requested.trim()) {
+            return Err(renamed_away_refusal(requested.trim(), &tomb.new));
+        }
+    }
+    let project = if (carries_canonical_name || redeploy_existing) && !requested.trim().is_empty() {
         c.projects
             .find_key_ci(requested.trim())
             .unwrap_or_else(|| requested.trim().to_string())
     } else {
         unique_project_name(c, &requested, &req.repo_url, &t)
     };
-    // Reject an EXPLICIT name the user typed that's already taken by a different
-    // project (Issue #4) — don't silently rename to `<name>-2`. Fanout deploys
-    // (no_fanout), redeploys of an existing project, and auto-named deploys (empty
-    // requested) are exempt: those must resolve to a concrete name without erroring.
-    if !req.no_fanout
+    let explicit_name_taken = !carries_canonical_name
         && !redeploy_existing
         && !requested.trim().is_empty()
-        && project != requested.trim()
-    {
-        // Say WHOSE name it is, honestly. Project names are unique across the
-        // PLATFORM, not per tenant, because the name becomes a real identifier
-        // downstream: the podman volume `hive-vol-{sanitize_tag(project)}`, the
-        // deploy checkout dir, `hive-browserdb-{tag}.db`. So a name can be taken
-        // by a project the caller cannot see, and the old wording ("already
-        // exists. Choose a different name.") read as "you already have this",
-        // sending the owner hunting for a project that was never in their list.
-        // Witnessed: `smsrelay` was orphaned and invisible, so the owner made
-        // `smsrelay2`.
+        && project != requested.trim();
+    if explicit_name_taken {
         let taken_by_caller = c
             .projects
             .find_key_ci(requested.trim())
             .map(|k| project_owned_by(c, &k, &t))
             .unwrap_or(false);
+        let own_never_deployed = taken_by_caller
+            && c.projects
+                .get_if_set(requested.trim())
+                .is_some_and(|row| row.first_deployed_ms == 0 && !row.last_build_id.is_empty());
         return Err((
             StatusCode::CONFLICT,
-            if taken_by_caller {
+            if own_never_deployed {
+                format!(
+                    "You already have a project named \"{0}\" whose builds have not produced a \
+                     deployment yet. Retry it from its project page (it is listed in Projects), \
+                     delete it there, or choose a different name. Importing the same repository \
+                     under this name retries it automatically.",
+                    requested.trim()
+                )
+            } else if taken_by_caller {
                 format!(
                     "You already have a project named \"{}\". Choose a different name.",
                     requested.trim()
@@ -3028,22 +2653,16 @@ pub(crate) async fn start_named_deploy(
             },
         ));
     }
-    // ---- Business locking (plan quotas + credit gate) ----
-    // Only enforced on the COORDINATOR path (a `no_fanout` per-target dispatch has
-    // already passed the gate on the coordinator; re-checking would double-reject or
-    // block a legitimate placement). Redeploys of an existing project don't count
-    // against the project cap.
-    if !req.no_fanout {
+    let is_coordinator_path = !carries_canonical_name;
+    if is_coordinator_path {
         let is_new_project = !c
             .projects
             .snapshot()
             .iter()
             .any(|(k, _)| k.eq_ignore_ascii_case(&project));
-        // Credit / included-compute lock: an exhausted Hobby account can't deploy.
         if let Err(e) = c.billing.can_deploy(&t) {
             return Err((StatusCode::PAYMENT_REQUIRED, e));
         }
-        // Project-count quota for the plan.
         if is_new_project {
             let plan = c.billing.account(&t).plan;
             let max = crate::billing::plan_max_projects(&plan);
@@ -3058,12 +2677,19 @@ pub(crate) async fn start_named_deploy(
                     ));
                 }
             }
+            let empty = crate::project_inventory::empty_project_count(c, &t);
+            let max_empty = crate::project_inventory::max_empty_projects();
+            if empty >= max_empty {
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "You have {empty} projects whose first build never produced a deployment \
+                         (limit {max_empty}). Retry or delete some of them before creating another."
+                    ),
+                ));
+            }
         }
     }
-    // Ownership check: a project already owned by a DIFFERENT tenant must never be
-    // silently reassigned here. Capture or upgrade the server-issued incarnation
-    // while holding the lifecycle writer; deletion after this point tombstones
-    // that exact identity, so build admission fails instead of recreating it.
     let existing_key = c.projects.find_key_ci(&project);
     if let Some(existing_key) = existing_key.as_deref() {
         if norm(&c.projects.team_of(existing_key)) != t {
@@ -3091,6 +2717,18 @@ pub(crate) async fn start_named_deploy(
             None => None,
         },
     };
+    if reuse_empty {
+        if let Some(incarnation) = admitted_incarnation {
+            c.projects
+                .reset_for_reuse_exact(
+                    &project,
+                    incarnation,
+                    req.root_dir.as_deref().map(str::trim).unwrap_or(""),
+                    req.branch.as_deref().map(str::trim).unwrap_or(""),
+                )
+                .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        }
+    }
     req.project = Some(project.clone());
     let build_id = crate::git::start_build(c.clone(), req, admitted_incarnation, Some(t.clone()))
         .await
@@ -3098,33 +2736,30 @@ pub(crate) async fn start_named_deploy(
     Ok(Json(json!({ "build_id": build_id, "project": project })))
 }
 
-/// Zip-upload deploy: an alternative SOURCE to a git URL. The raw request body is
-/// the uploaded `.zip`; metadata (project name, env, production) rides as a base64
-/// JSON `x-hive-deploy-meta` header. We base64 the archive into the GitDeployRequest
-/// so the SAME placement + fanout path ships it to the chosen region node, where the
-/// build extracts it instead of cloning. Capped well under the 16 MB gossip frame —
-/// upload SOURCE only; dependencies install during the build.
+/// Zip-upload deploy, an alternative SOURCE to a git URL: the raw body is the `.zip` and metadata
+/// rides as a base64 JSON `x-hive-deploy-meta` header. The archive is base64'd into the
+/// `GitDeployRequest` so the same placement + fanout path ships it, capped under the 16 MB gossip
+/// frame (SOURCE only, dependencies install during the build).
 pub(crate) async fn deploy_zip(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    const MAX_ZIP: usize = 10 * 1024 * 1024;
     if body.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             "Empty upload — choose a .zip file.".into(),
         ));
     }
-    if body.len() > MAX_ZIP {
+    if body.len() > DEPLOY_ZIP_MAX_BYTES {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
             "Zip too large (max 10 MB). Upload your SOURCE only — dependencies install during the build.".into(),
         ));
     }
-    // Cheap sanity check that this is actually a zip (PK\x03\x04 / empty-archive magic).
-    if !(body.starts_with(b"PK\x03\x04") || body.starts_with(b"PK\x05\x06")) {
+    let looks_like_zip = body.starts_with(b"PK\x03\x04") || body.starts_with(b"PK\x05\x06");
+    if !looks_like_zip {
         return Err((
             StatusCode::BAD_REQUEST,
             "That doesn't look like a .zip archive.".into(),
@@ -3140,11 +2775,8 @@ pub(crate) async fn deploy_zip(
         env: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default)]
         production: Option<bool>,
-        /// Same semantics as the git path's `redeploy`: the upload targets an
-        /// EXISTING same-tenant project, so its name is kept verbatim instead
-        /// of 409ing. Without this flag a same-named re-upload could never
-        /// satisfy the conflict guard (zip has no git index, so `same_repo`
-        /// is always false and both escape hatches were hardcoded off).
+        /// Same as the git path's `redeploy`: the upload targets an EXISTING same-tenant project
+        /// and keeps its name instead of 409ing.
         #[serde(default)]
         redeploy: Option<bool>,
     }
@@ -3157,13 +2789,22 @@ pub(crate) async fn deploy_zip(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let zip_b64 = base64::engine::general_purpose::STANDARD.encode(body.as_ref());
     let filename = meta.filename.unwrap_or_else(|| "archive.zip".into());
-    let redeploy = meta.redeploy.unwrap_or(false);
+    let names_own_project = || {
+        meta.project
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .and_then(|n| c.projects.find_key_ci(n))
+            .map(|k| norm(&c.projects.team_of(&k)) == t)
+            .unwrap_or(false)
+    };
+    let redeploy = meta.redeploy.unwrap_or(false) && names_own_project();
     let req = fluid_core::GitDeployRequest {
         source_deployment_ids: Vec::new(),
         repo_url: format!("upload://{filename}"),
         branch: None,
-        commit: None,        // zip upload: no git history, nothing to pin to
-        head_repo_url: None, // zip upload has no git clone, let alone a fork
+        commit: None,
+        head_repo_url: None,
         project: meta.project,
         project_incarnation: None,
         creator: Some("you".into()),
@@ -3172,8 +2813,8 @@ pub(crate) async fn deploy_zip(
         use_cache: true,
         root_dir: None,
         env: meta.env,
-        no_fanout: false, // coordinator deploy → schedule + fanout (ships the zip to the region node)
-        fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
+        no_fanout: false,
+        fanout_secondary: false,
         build_config: None,
         function_settings: None,
         redeploy,
@@ -3181,11 +2822,11 @@ pub(crate) async fn deploy_zip(
         image_ref: None,
         image_port: None,
         image_protocol: None,
-        image_memory: None, // zip upload has no image_ref, so no container override to carry
+        image_memory: None,
         image_cpus: None,
         image_pids: None,
         image_ports: None,
-        git_token: None, // zip upload has no git clone
+        git_token: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -3200,31 +2841,22 @@ pub(crate) struct ImageDeployReq {
     /// omitted (see `image_container_manifest` in `git.rs`).
     #[serde(default)]
     port: Option<u16>,
-    /// Explicit protocol override (Railway-style; see `fluid_core::ServiceProtocol`).
-    /// Independent of `port` — either may be given without the other. Needed for any
-    /// image whose auto-detected default (http) is wrong, and REQUIRED for a
-    /// UDP-only image (e.g. Minecraft Bedrock, port 19132/udp, no TCP port at all —
-    /// there is no TCP port for auto-detection to find, let alone default to http).
+    /// Explicit protocol override (see `fluid_core::ServiceProtocol`), independent of `port`;
+    /// REQUIRED for a UDP-only image (e.g. Minecraft Bedrock), where auto-detection finds no TCP
+    /// port.
     #[serde(default)]
     protocol: Option<fluid_core::ServiceProtocol>,
-    /// Memory ceiling override for the container, e.g. "4g", "2048m", "512" —
-    /// same format/semantics as a Dockerfile-build project's fluid.json
-    /// `container.memory`. Omitted/None = the node's generous env-tunable
-    /// default. Always clamped to a fleet-wide ceiling
-    /// (`ContainerLimits::for_container`) so a request can never remove the
-    /// ceiling entirely — gives registry-image deploys (e.g.
-    /// `itzg/minecraft-server`) the same resource-override parity the
-    /// Dockerfile-build path already has via fluid.json.
+    /// Memory ceiling override (e.g. "4g", "2048m", "512"), same format as fluid.json
+    /// `container.memory`; None = the node's default, always clamped to a fleet-wide ceiling
+    /// (`ContainerLimits::for_container`).
     #[serde(default)]
     memory: Option<String>,
-    /// CPU quota override for the container, e.g. "2.0", "0.5" — same format as
-    /// fluid.json `container.cpus`. Omitted/None = the node's default. Clamped
-    /// fleet-wide.
+    /// CPU quota override (e.g. "2.0", "0.5"), same format as fluid.json `container.cpus`; None =
+    /// the node's default, clamped fleet-wide.
     #[serde(default)]
     cpus: Option<String>,
-    /// Max-PIDs override for the container's cgroup (fork-bomb guard) — same as
-    /// fluid.json `container.pids`. Omitted/None = the node's default. Clamped
-    /// fleet-wide.
+    /// Max-PIDs override for the container's cgroup (fork-bomb guard), same as fluid.json
+    /// `container.pids`; None = the node's default, clamped fleet-wide.
     #[serde(default)]
     pids: Option<u32>,
     /// Full multi-port override — see `fluid_core::GitDeployRequest::image_ports`'s
@@ -3240,10 +2872,9 @@ pub(crate) struct ImageDeployReq {
     redeploy: Option<bool>,
 }
 
-/// Deploy a PRE-BUILT container image from any registry. Skips clone + build: the
-/// target node pulls the image, auto-detects its port, attaches a persistent volume,
-/// and runs it with the project's env — riding the normal placement/fanout so it
-/// lands on a container-capable region node.
+/// Deploys a PRE-BUILT container image from any registry: no clone or build, the target node pulls
+/// it, auto-detects its port, attaches a persistent volume and runs it with the project's env
+/// through the normal placement/fanout.
 pub(crate) async fn deploy_image(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3260,12 +2891,10 @@ pub(crate) async fn deploy_image(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let req = fluid_core::GitDeployRequest {
         source_deployment_ids: Vec::new(),
-        // A synthetic source URL so the deployment record reads sensibly; the actual
-        // source is `image_ref` (no clone happens).
         repo_url: format!("image://{image}"),
         branch: None,
-        commit: None,        // prebuilt image deploy: no git clone, nothing to pin to
-        head_repo_url: None, // prebuilt image deploy has no git clone, let alone a fork
+        commit: None,
+        head_repo_url: None,
         project: body.project,
         project_incarnation: None,
         creator: Some("you".into()),
@@ -3274,8 +2903,8 @@ pub(crate) async fn deploy_image(
         use_cache: true,
         root_dir: None,
         env: body.env,
-        no_fanout: false, // coordinator deploy → schedule + fanout to a container node
-        fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
+        no_fanout: false,
+        fanout_secondary: false,
         build_config: None,
         function_settings: None,
         redeploy: body.redeploy.unwrap_or(false),
@@ -3287,7 +2916,7 @@ pub(crate) async fn deploy_image(
         image_cpus: body.cpus,
         image_pids: body.pids,
         image_ports: body.ports,
-        git_token: None, // prebuilt image deploy has no git clone
+        git_token: None,
     };
     start_named_deploy(&c, &t, req, None).await
 }
@@ -3302,17 +2931,6 @@ pub(crate) async fn build_get(
     let b = match c.builds.get(&id) {
         Some(b) => b,
         None => {
-            // Not built here — a deploy mutation (POST /v1/git/deploy) is always
-            // leader-forwarded (admin_ingress), so a fresh build this node never
-            // ran locally almost always lives on the CURRENT control-plane leader
-            // instead. Reads are NOT leader-forwarded ("best-effort local" —
-            // admin_ingress's own comment), so without this fallback a dashboard
-            // poll landing on a non-leader node 404'd forever: the deploy
-            // genuinely succeeded (on the leader), but its status could never be
-            // read back from whichever node the browser happened to hit — the
-            // exact "Deployment started 0s ago…, 0 lines, Waiting for logs…"
-            // stuck-forever bug. Mirrors deployment_build's identical fallback
-            // (see its comment) for the sibling /v1/deployments/:id/build route.
             if let Some(leader) = c.leader_forward_target() {
                 if let Some(v) = fetch_from_host(&c, &leader, &format!("/v1/builds/{id}"), &t).await
                 {
@@ -3322,44 +2940,27 @@ pub(crate) async fn build_get(
             return Err(StatusCode::NOT_FOUND);
         }
     };
-    // Team-scoped — this route previously had no ownership check at all, so
-    // any caller (even unauthenticated, since GET bypasses the JWT gate) who
-    // knew/guessed a build id could read another tenant's full build log.
     if !build_owned_by(&c, &b, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(json!(b)))
 }
 
-/// Whether tenant `t` owns build `b` — the project row is node-local (never
-/// gossiped) and `Build` carries no tenant tag of its own, so `team_of` alone
-/// 404'd a member's OWN build log/cancel on any node whose row was GC'd/never
-/// synced. Fall back to the build's deployment record tenant tag (local `gw`
-/// record or gossiped peer copy) — the same authority `deployment_build`/
-/// `dep_list` trust. Shared by `build_get` and `build_cancel`.
+/// Whether tenant `t` owns build `b`: `deployment_owned_by` for a build that produced a deployment
+/// (the project row decides, else that deployment's own tag), else the project row alone, since
+/// `Build` carries no tenant tag of its own and a build in flight or failed has no record to speak
+/// for it. Shared by `build_get` and `build_cancel`.
 fn build_owned_by(c: &Arc<CloudState>, b: &crate::git::Build, t: &str) -> bool {
-    norm(&c.projects.team_of(&b.project)) == norm(t)
-        || b.deployment_id.as_deref().is_some_and(|did| {
-            c.gw.deployment_records()
-                .iter()
-                .any(|r| r.id == did && record_tenant(&r.tenant) == norm(t))
-                || c.peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(t))
-        })
+    match b.deployment_id.as_deref() {
+        Some(did) => deployment_owned_by(c, &b.project, did, t),
+        None => row_holder(c, &b.project).is_some_and(|holder| holder == norm(t)),
+    }
 }
 
-/// Cancel an in-flight build: stop the ACTUAL OS process (git clone / npm
-/// install / npm run build / a remote fanout target's own build) — not just
-/// relabel the record while the process keeps running — and mark it
-/// `Cancelled`. A build already in a terminal state is a no-op (idempotent:
-/// returns the current record rather than erroring, so a UI double-click or a
-/// race with the build finishing naturally is harmless). Not found locally →
-/// best-effort proxy to the current control-plane leader, mirroring
-/// `build_get`'s read fallback (mutations aren't leader-forwarded for an id
-/// this node has never heard of; the leader is the next-most-likely holder).
+/// Cancels an in-flight build: kills the ACTUAL OS process (clone/install/build, or a remote fanout
+/// target's own build) and marks the record `Cancelled`; a terminal build is a no-op (idempotent,
+/// so a double-click or a race with completion is harmless). An id this node has never heard of is
+/// proxied best-effort to the current control-plane leader, mirroring `build_get`.
 pub(crate) async fn build_cancel(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3379,11 +2980,11 @@ pub(crate) async fn build_cancel(
     if !build_owned_by(&c, &b, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
-    if !matches!(
+    let in_flight = matches!(
         b.state,
         fluid_core::DeployState::Queued | fluid_core::DeployState::Building
-    ) {
-        // Already terminal (ready/error/already-cancelled) — nothing to stop.
+    );
+    if !in_flight {
         return Ok(Json(json!(b)));
     }
     c.builds.update(&id, |b| {
@@ -3395,11 +2996,6 @@ pub(crate) async fn build_cancel(
         });
     });
     crate::persist::persist(&c);
-    // Kill the real process (local process group and/or a mirrored remote
-    // build's own host) — see `BuildCancelRegistry::cancel`. The record above
-    // is already updated regardless of how this resolves, so the dashboard
-    // reflects the cancel immediately even if the kill itself is still racing
-    // the build's own natural completion.
     c.build_cancels.cancel(&c, &id).await;
     let ev = c.event(
         &c.region,
@@ -3413,19 +3009,16 @@ pub(crate) async fn build_cancel(
     c.record(ev);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &t,
         &b.project,
-        // Matches `webhooks::ALL_EVENTS`'s catalogued spelling exactly — a
-        // webhook's subscription list is built from that catalog, so any
-        // other spelling here would silently match zero subscribers forever.
         "deployment.canceled",
         json!({ "id": id, "project": b.project }),
     );
     Ok(Json(json!(c.builds.get(&id).unwrap_or(b))))
 }
 
-/// The build behind a deployment — its status, timing, and full log lines — so the
-/// deployment detail page can show build logs (incl. a failed build's error). Newest
-/// matching build wins; scoped to the requesting team.
+/// The build behind a deployment (status, timing, full log lines, a failed build's error); the
+/// newest matching build wins, scoped to the requesting team (`deployment_owned_by`).
 pub(crate) async fn deployment_build(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3433,45 +3026,17 @@ pub(crate) async fn deployment_build(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Tenant gate with the same fallback dep_list uses: `team_of` is NODE-LOCAL
-    // (ProjectStore rows are never gossiped) and returns UNTAGGED for a project
-    // this node has no row for — which used to 404 a build that IS in the local
-    // map whenever the answering node lacked the project row (leader-forwarded
-    // dashboard reads, post-restore nodes). Fall back to the DEPLOYMENT
-    // record's own tenant tag (local gw record or the gossiped peer copy) —
-    // the same authority dep_list trusts for exactly this reason.
-    let dep_record_tenant: Option<String> =
-        c.gw.deployment_records()
-            .into_iter()
-            .find(|r| r.id == id)
-            .map(|r| record_tenant(&r.tenant).to_string())
-            .or_else(|| {
-                c.peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .find(|d| d.id.as_str() == id)
-                    .map(|d| record_tenant(&d.tenant).to_string())
-            });
-    let team_ok = |b: &crate::git::Build| {
-        norm(&c.projects.team_of(&b.project)) == norm(&t)
-            || dep_record_tenant.as_deref() == Some(norm(&t))
-    };
-    // Local build record (newest matching, team-scoped).
     let mut builds: Vec<_> = c
         .builds
         .list()
         .into_iter()
         .filter(|b| b.deployment_id.as_deref() == Some(id.as_str()))
-        .filter(team_ok)
+        .filter(|b| deployment_owned_by(&c, &b.project, &id, &t))
         .collect();
     builds.sort_by_key(|b| b.started_ms);
     if let Some(b) = builds.pop() {
         return Ok(Json(json!(b)));
     }
-    // Not built here — the build (and its logs) live on the node that hosts this
-    // deployment. Proxy to it, exactly like deployment_resources does. The host has
-    // the record locally, so it answers directly and there's no re-proxy loop.
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) =
             fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/build"), &t).await
@@ -3482,14 +3047,11 @@ pub(crate) async fn deployment_build(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`) — build
-/// acceptance, publish, and execution facts, each entry's fold hashed into
-/// `chain_head_sha256`, the whole chain signed by this node's per-node key
-/// (`integrity_signer.rs`). A caller re-derives `chain_head_sha256` from
-/// `chain` with `hive_core::fold_integrity_chain` and checks the signature
-/// against `public_key_hex` — no trust in this response beyond the raw
-/// bytes returned. See `hive_core::integrity`'s module doc for exactly what
-/// this does and does not prove (tamper-evidence, never tamper-prevention).
+/// A deployment's tamper-EVIDENCE chain (`hive_core::integrity`): each entry's fold is hashed into
+/// `chain_head_sha256`, signed by this node's per-node key (`integrity_signer.rs`); a caller
+/// re-derives the head with `hive_core::fold_integrity_chain` and checks `public_key_hex`.
+/// Tamper-evidence, never tamper-prevention (see the module doc). Served only to the team that owns
+/// the deployment (`deployment_owned_by`); a foreign id answers the same 404 as an unknown one.
 pub(crate) async fn deployment_integrity(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -3498,9 +3060,7 @@ pub(crate) async fn deployment_integrity(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(acceptance) = c.deployment_ledger.acceptance(&id) {
-        let team_ok = norm(&c.projects.team_of(&acceptance.input.project)) == norm(&t)
-            || norm(&record_tenant(&acceptance.input.project)) == norm(&t);
-        if !team_ok {
+        if !deployment_owned_by(&c, &acceptance.input.project, &id, &t) {
             return Err(StatusCode::NOT_FOUND);
         }
         let chain_head_sha256 = hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
@@ -3529,14 +3089,12 @@ pub(crate) async fn deployment_integrity(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// Publish the host subdomains this node serves + its gateway URL, so peers can
-/// build their cross-node routing tables (the mesh routes requests to wherever a
-/// deployment actually lives).
 #[derive(serde::Deserialize)]
 pub(crate) struct ServeHostsQ {
     since: Option<u64>,
 }
 
+/// The host subdomains this node serves plus its gateway URL: the input to peers' cross-node routing tables.
 pub(crate) async fn serve_hosts(
     State(c): State<Arc<CloudState>>,
     q: Option<Query<ServeHostsQ>>,
@@ -3544,34 +3102,25 @@ pub(crate) async fn serve_hosts(
     Json(serve_hosts_with(&c, q.and_then(|q| q.0.since)))
 }
 
-/// This node's served hosts, or — when the caller already holds generation
-/// `since` — just its generation.
+fn digest_of_sorted_hosts(hosts: &[String]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for s in hosts {
+        h.write(s.as_bytes());
+        h.write_u8(0xff);
+    }
+    h.finish()
+}
+
+/// This node's served hosts, or just its generation when the caller already holds `since`, so
+/// steady-state gossip costs O(changes) instead of O(hosts ever deployed): any change to the host
+/// set bumps `gen` and the next caller gets the full list once.
 ///
-/// WHY: every peer used to fetch this node's COMPLETE host list on every gossip
-/// round. The leader publishes 2,592 hosts (56 KB), 1,501 of them immutable
-/// `dpl-<id>` urls, so steady-state gossip cost scaled with the total number of
-/// deployments ever made rather than with what actually changed. A caller that
-/// already has generation `gen` gets a few hundred bytes and keeps the routes it
-/// has; any change to the host set bumps `gen` and the next caller gets the full
-/// list once. Cost becomes O(changes), not O(hosts).
-///
-/// `containers` is always sent: it is tiny (10 on the leader) and drives lease
-/// election, so it is not worth a second round trip to discover.
+/// `containers` is always sent: it is tiny and drives lease election.
 pub(crate) fn serve_hosts_with(c: &Arc<CloudState>, since: Option<u64>) -> Value {
-    // served_hosts() iterates a HashMap, so its ORDER is not stable across
-    // calls — hash a sorted copy or the generation would bump every pass and
-    // every peer would re-fetch the full list forever.
     let mut hosts = c.gw.served_hosts();
     hosts.sort();
-    let digest = {
-        use std::hash::Hasher;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        for s in &hosts {
-            h.write(s.as_bytes());
-            h.write_u8(0xff); // separator: "ab"+"c" != "a"+"bc"
-        }
-        h.finish()
-    };
+    let digest = digest_of_sorted_hosts(&hosts);
     let gen = {
         let mut last = c.route_pub_hash.write();
         if *last != digest {
@@ -3588,38 +3137,32 @@ pub(crate) fn serve_hosts_with(c: &Arc<CloudState>, since: Option<u64>) -> Value
         "region": c.region,
         "gateway": c.public_base,
         "gen": gen,
-        // Container deployments this node holds → feeds mesh lease election.
         "containers": c.gw.container_projects(),
     });
     if since == Some(gen) {
-        return out; // unchanged: no host list to ship
+        return out;
     }
     out["hosts"] = json!(hosts);
     out
 }
 
-/// Current container placement leases across the mesh (owner + fencing epoch +
-/// expiry). The single owner of each stateful container, for visibility + the
-/// edge router (container requests go to the owner).
+/// Current container placement leases across the mesh (owner, fencing epoch, expiry): the single
+/// owner of each stateful container, for visibility and the edge router.
 pub(crate) async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.leases.list()))
 }
 
-/// design-head-cid-exchange-rpc: `{namespace: [{key, hash, timestamp}, ...]}`
-/// for every GuardianDB namespace this node's local replica currently holds —
-/// content-addressed HEAD metadata only, never value bytes. The anti-entropy
-/// loop (`spawn_anti_entropy_loop` in main.rs) fetches this from one random
-/// healthy peer each round and diffs it against its own local
-/// `guardian::namespace_heads()` to decide whether a real reconciliation sync
-/// is needed. Unauthenticated like `/v1/serve-hosts`/`/v1/leases` (mesh
-/// convergence machinery, not tenant data — no values are ever returned here).
+/// `{namespace: [{key, hash, timestamp}]}` for every GuardianDB namespace this node holds:
+/// content-addressed HEAD metadata only, never values. The anti-entropy loop
+/// (`spawn_anti_entropy_loop` in main.rs) diffs one random healthy peer's heads against
+/// `guardian::namespace_heads()` to decide whether a real sync is needed; the public mount is
+/// `guardian_heads_public`.
 pub(crate) async fn guardian_heads(State(_c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(crate::guardian::namespace_heads().await))
 }
 
-/// REAL cluster resource accounting: this node's live CPU/mem/disk/network usage
-/// (sysinfo) plus cluster TOTALS = sum of every live node's capacity (gossiped via
-/// NodeInfo). Answers "available compute / storage / bandwidth across the mesh".
+/// Real cluster resource accounting (operator-only): this node's live CPU/mem/disk/network
+/// (sysinfo) plus cluster TOTALS summed over every live node's gossiped `NodeInfo` capacity.
 async fn resources_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -3651,22 +3194,11 @@ struct SetProjectTeamReq {
     team: String,
 }
 
-/// Operator-only repair for a project stuck at `__untagged__` (created before
-/// tenancy tagging existed, or a tag write that never landed) — real,
-/// witnessed failure mode: `mien-kamp` had zero deployments, zero relational
-/// rows, and settings.team == "__untagged__", so EVERY ownership check in the
-/// platform (the coordinator's own `authorized` gate in `project_delete`, and
-/// the peer-side gossip cascade's `owns_settings`/`owns_deploys`/
-/// `owns_relational` in `gossip.rs`) correctly refused every tenant,
-/// including the platform owner's own "personal" tenant — an untagged
-/// project the owner created is otherwise permanently undeletable, since
-/// `norm("__untagged__")` is NOT the empty-string case `norm()` maps to
-/// "personal". `spawn_tenancy_reconcile` only ever ADDS a tag when it can
-/// infer one from a deployment/relational record — a project with neither
-/// has nothing to infer from and stays untagged forever without a manual
-/// fix. Mirrors `ProjectStore::set_team`'s existing local-write +
-/// fleet-relational-mirror behavior exactly; this endpoint is just the
-/// missing operator-facing door to it.
+/// Operator-only repair for a project stuck at `__untagged__` (created before tenancy tagging, or a
+/// tag write that never landed): every ownership check refuses it, `norm("__untagged__")` is not
+/// the empty-string "personal" case, and `spawn_tenancy_reconcile` only adds a tag it can infer
+/// from a deployment or relational record. Mirrors `ProjectStore::set_team` (local write plus the
+/// fleet relational mirror).
 async fn admin_set_project_team(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -3685,18 +3217,21 @@ async fn admin_set_project_team(
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
 /// Read-only; peers pull `node_modules` tarballs by content-addressed key.
-async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Response, StatusCode> {
+async fn buildcache_get(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(key): Path<String>,
+) -> Result<axum::response::Response, StatusCode> {
     use axum::response::IntoResponse;
-    // Key is a hex content hash — reject anything else (path-traversal guard).
-    if key.is_empty() || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+    if require_fleet_read(claims.as_ref().map(|e| &e.0)).is_err() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    let is_not_hex_content_hash = key.is_empty() || !key.chars().all(|c| c.is_ascii_hexdigit());
+    if is_not_hex_content_hash {
         return Err(StatusCode::BAD_REQUEST);
     }
     let path = crate::git::cache_root().join(format!("{key}.tar"));
     match tokio::fs::read(&path).await {
         Ok(bytes) => {
-            // #22: attach a content digest (integrity) + an HMAC signature
-            // (authenticity, when a fleet secret is set) so the puller can reject
-            // corrupted or forged artifacts.
             let mut headers = vec![
                 (
                     axum::http::header::CONTENT_TYPE.as_str().to_string(),
@@ -3734,20 +3269,9 @@ async fn build_frameworks() -> Json<Value> {
     Json(json!(fluid_build::PRESETS))
 }
 
-// ---- Deployments (previews) ----
-
-/// The tenant (team slug) for a request, resolved with a strict trust order:
-///
-/// 1. **Verified JWT claims** (`claims`, injected into request extensions by
-///    [`crate::auth::require_auth`]). The `tenant` claim is cryptographically
-///    bound to the user's token, so when a JWT is present the spoofable
-///    `x-hive-team` header is ignored entirely. This closes the tenant-isolation
-///    bypass where any user could impersonate any team via the header.
-/// 2. A platform **API key** (`Authorization: Bearer hive_…`), which returns the
-///    key's bound team.
-/// 3. **Dev mode only** (`!auth::enforced()`, i.e. `HIVE_JWT_SECRET` unset): the
-///    dashboard's `x-hive-team` header, so unauthenticated local dev still works.
-/// 4. Default: `"personal"`.
+/// The tenant (team slug) for a request, by strict trust order: verified JWT claims (the spoofable
+/// `x-hive-team` header is then ignored entirely), a platform API key's bound team, the
+/// `x-hive-team` header in dev mode only (`!auth::enforced()`), else "personal".
 pub(crate) fn tenant(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3774,28 +3298,18 @@ fn resolve_tenant(
     header_team: Option<String>,
     enforced: bool,
 ) -> String {
-    // 1. JWT claim wins — authoritative, cryptographically bound, not spoofable.
     if let Some(cl) = claims {
         return norm(&cl.tenant).to_string();
     }
-    // 2. Platform API key → its bound team.
     if let Some(team) = api_team {
         return team;
     }
-    // 3. Dev mode only: trust the x-hive-team header when no JWT auth is enforced.
     if !enforced {
         if let Some(team) = header_team {
             return team;
         }
-        // Dev default: the single local user is the platform owner ("personal").
         return "personal".into();
     }
-    // ENFORCED mode, no JWT claim and no API key: this request is UNAUTHENTICATED.
-    // It must NOT fall back to "personal" (the owner's namespace) — that would
-    // serve the owner's data to any unauthenticated read (the window before a
-    // user's hive_jwt cookie is minted, or any tokenless caller). Scope it to an
-    // anonymous namespace that owns NOTHING, so an unauthenticated read yields an
-    // empty result instead of leaking another tenant's data.
     ANON_TENANT.into()
 }
 
@@ -3803,28 +3317,15 @@ fn resolve_tenant(
 /// Deliberately not a valid team slug so nothing is ever created under it.
 pub(crate) const ANON_TENANT: &str = "__anon__";
 
-/// Namespace for a STORED RECORD whose tenant tag was lost or never set — a
-/// gossiped `DeployRecord`/`DeploymentInfo` deserialized with `tenant: ""`
-/// (`#[serde(default)]`, e.g. from a pre-tenancy snapshot or a stale-binary peer),
-/// a restored snapshot record `Gateway::restore` never re-normalized, or a
-/// project absent from a node's local (never-gossiped) `ProjectStore`.
-///
-/// `norm()` maps that same empty string to the LITERAL "personal" slug — which
-/// is simultaneously the platform owner's real, live tenant — so every tag-loss
-/// event anywhere in the gossip/persist/restore pipeline used to fail OPEN into
-/// the owner's personal project list instead of failing closed (the multitenancy
-/// leak: an org's projects appearing under the owner's personal view). This
-/// mirrors `ANON_TENANT`'s fail-closed design for the read-request side; use it
-/// (never `norm`) wherever a STORED tag is being interpreted, so a lost tag is
-/// invisible to every tenant rather than adopted by the owner's.
+/// Namespace for a STORED RECORD whose tenant tag was lost or never set (pre-tenancy snapshot,
+/// stale-binary peer, a restored record never re-normalized, a project with no local row): `norm()`
+/// would map the empty tag to the owner's live "personal" tenant and fail OPEN, so a lost tag
+/// resolves here and stays invisible to every tenant. Use `record_tenant`, never `norm`, wherever a
+/// STORED tag is read.
 pub(crate) const UNTAGGED_TENANT: &str = "__untagged__";
 
-/// Interpret a STORED record's tenant tag: empty (tag-loss) resolves to the
-/// fail-closed `UNTAGGED_TENANT` sentinel, never to the owner's "personal"
-/// namespace. Use this instead of `norm()` for `DeployRecord.tenant`,
-/// `ProjectSettings.team`, and any other persisted/gossiped ownership tag;
-/// `norm()` remains correct for its existing callers that resolve a REQUEST's
-/// tenant (where an empty resolved value legitimately means personal/dev-mode).
+/// A STORED record's tenant tag: empty (tag loss) resolves to the fail-closed `UNTAGGED_TENANT`,
+/// never the owner's "personal"; `norm()` stays for resolving a REQUEST's tenant.
 pub(crate) fn record_tenant(tag: &str) -> &str {
     if tag.trim().is_empty() {
         UNTAGGED_TENANT
@@ -3852,11 +3353,9 @@ pub(crate) fn norm(team: &str) -> &str {
     }
 }
 
-/// Multi-tenant ownership guard: resolve the caller's tenant and verify it owns
-/// `project`. Returns the tenant slug, or 403 when the project belongs to a
-/// different team. EVERY handler that takes a project name from the path/body
-/// and reads or mutates that project's state must call this — the path param is
-/// attacker-controlled, the tenant is not.
+/// Multi-tenant ownership guard: resolves the caller's tenant and verifies it owns `project` (403
+/// otherwise). EVERY handler that takes a project name from the path or body must call it: the path
+/// param is attacker-controlled, the tenant is not.
 pub(crate) fn require_project(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3864,6 +3363,12 @@ pub(crate) fn require_project(
     project: &str,
 ) -> Result<String, (StatusCode, String)> {
     let t = tenant(c, h, claims);
+    let name_has_no_row = c.projects.get_if_set(project).is_none();
+    if name_has_no_row {
+        if let Some(tomb) = c.projects.renamed_away(project) {
+            return Err(renamed_away_refusal(project, &tomb.new));
+        }
+    }
     if project_owned_by(c, project, &t) {
         Ok(t)
     } else {
@@ -3874,23 +3379,107 @@ pub(crate) fn require_project(
     }
 }
 
-/// Whether `project` belongs to tenant `t`, judged fleet-aware. `ProjectStore`
-/// rows are NODE-LOCAL (never gossiped): on any node that never ran this
-/// project's deploy — including the control-plane leader for remotely-placed
-/// projects — `team_of` is UNTAGGED, so a row-only comparison 403'd the
-/// project's REAL team on every distributed read. Order of evidence:
-/// 1. Local settings row matches — owned.
-/// 2. Any deployment record (local gateway or gossiped peer copy) carries the
-///    tenant tag — owned. Same authority `dep_list`/`deployment_build` trust.
-/// 3. No row AND no deployment evidence anywhere in view: the project is
-///    unknown to this node — optimistically trust the caller's verified tenant
-///    (the sandboxes_api::require pattern). Deliberately narrower than that
-///    one: any visible deployment record for the project keeps this strict, so
-///    a wrong-team caller probing a real project still fails.
-pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> bool {
+fn renamed_away_refusal(name: &str, renamed_to: &str) -> (StatusCode, String) {
+    (
+        StatusCode::CONFLICT,
+        format!(
+            "The name \"{}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+            name, renamed_to
+        ),
+    )
+}
+
+/// `require_project`, then claims the row a settings write may have just materialized: left unclaimed it
+/// stays `UNTAGGED_TENANT` for good when no deploy follows. The claim is a compare-and-set
+/// (`ProjectStore::claim_team`): an untagged row is claimed, the owner's own claim is a no-op, and a
+/// row another team holds is never taken (a claim used to `set_team` unconditionally, so a team a
+/// project had been transferred away from took it back with its next env write).
+fn require_project_claiming_row(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    project: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = require_project(c, h, claims, project)?;
+    c.projects.claim_team(project, &t).map_err(|_| {
+        (
+            StatusCode::FORBIDDEN,
+            "project belongs to a different team".into(),
+        )
+    })?;
+    Ok(t)
+}
+
+/// The team a project's settings row names when the row carries a REAL tag, else `None`. That row is
+/// the owner of record: a transfer rewrites it, while a deployment's tag, a peer's gossiped copy and
+/// the relational replica are denormalized copies that converge later (`tenancy_reconcile`). Wherever
+/// a holder exists it ALONE decides who may act on the project, so a project moved to another team
+/// stays unreachable for the old one on every node the row has reached, however stale that node's
+/// deployment tags still are; the copies are evidence only for a row with no tag.
+pub(crate) fn row_holder(c: &CloudState, project: &str) -> Option<String> {
     let owner = c.projects.team_of(project);
-    if norm(&owner) == t {
-        return true;
+    (record_tenant(&owner) != UNTAGGED_TENANT).then_some(owner)
+}
+
+/// The tenant a DEPLOYMENT record belongs to as of now: its project's row holder when there is one,
+/// else the record's own tag (`record_tenant`, so an untagged record stays `UNTAGGED_TENANT`). Every
+/// gate that decides from a deployment's tag goes through here, never `record_tenant(&d.tenant)`
+/// alone.
+pub(crate) fn deployment_tenant(c: &CloudState, project: &str, tag: &str) -> String {
+    row_holder(c, project).unwrap_or_else(|| record_tenant(tag).to_string())
+}
+
+/// The tag on deployment `id`'s own record: this node's gateway first, then a gossiped peer copy. A
+/// copy whose tag was lost (`UNTAGGED_TENANT`) is skipped, so a tagged copy elsewhere still speaks
+/// for the deployment.
+fn deployment_record_tag(c: &CloudState, id: &str) -> Option<String> {
+    c.gw.deployment_records()
+        .into_iter()
+        .find(|r| r.id == id && record_tenant(&r.tenant) != UNTAGGED_TENANT)
+        .map(|r| r.tenant)
+        .or_else(|| {
+            c.peer_deployments
+                .read()
+                .values()
+                .flatten()
+                .find(|d| d.id.as_str() == id && record_tenant(&d.tenant) != UNTAGGED_TENANT)
+                .map(|d| d.tenant.clone())
+        })
+}
+
+/// Whether tenant `t` may see deployment `deployment_id` of `project`: the ONE gate for a read keyed
+/// by a deployment id (`deployment_build`, `deployment_integrity`, `deployment_resources`, and
+/// `build_owned_by` for a build that produced one). The project row's holder decides when the row
+/// carries a real tag, else the deployment record's own tag (`deployment_tenant`). Never optimistic,
+/// unlike `project_owned_by`: reading one specific entry of a project with no tagged row and no
+/// tagged record of that deployment is nobody's to read, and the sentinel tenants own nothing. `t` is
+/// compared with a tenant TAG only: a project NAME is not one (read as a tag it made any team whose
+/// slug equals the name the project's owner, and a slug is chosen by whoever creates the team).
+pub(crate) fn deployment_owned_by(
+    c: &CloudState,
+    project: &str,
+    deployment_id: &str,
+    t: &str,
+) -> bool {
+    let t = norm(t);
+    if t == ANON_TENANT || t == UNTAGGED_TENANT {
+        return false;
+    }
+    let tag = deployment_record_tag(c, deployment_id).unwrap_or_default();
+    deployment_tenant(c, project, &tag) == t
+}
+
+/// Whether `project` belongs to tenant `t`, judged fleet-aware. Order of evidence: the local
+/// settings row, which is the owner of record whenever it carries a REAL tag (`row_holder`: a
+/// transferred project belongs to its new team even while some host still tags its deployments with
+/// the old one); only for a row with no tag (never set, or lost) any deployment record (local gateway
+/// or gossiped peer copy) carrying the tenant tag; else, with no row AND no deployment evidence
+/// anywhere in view, the caller's verified tenant is trusted optimistically (never ANON_TENANT, which
+/// owns nothing). A visible deployment record keeps it strict, so a wrong-team caller probing a real
+/// project still fails.
+pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> bool {
+    if let Some(holder) = row_holder(c, project) {
+        return holder == t;
     }
     let mut dep_seen = false;
     for r in c.gw.deployment_records() {
@@ -3909,16 +3498,16 @@ pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> b
             }
         }
     }
-    record_tenant(&owner) == UNTAGGED_TENANT && !dep_seen
+    if t == ANON_TENANT {
+        return false;
+    }
+    !dep_seen
 }
 
-/// Multi-tenant ownership guard for TEAM-level resources: resolve the caller's
-/// tenant and verify it equals `slug` (a platform operator may act on any
-/// team). When `min_role` is non-empty, additionally require the caller's
-/// OWN role within that team (from the verified JWT claim — never
-/// client-supplied) to be one of the listed values. Every `/v1/teams/:slug*`
-/// handler must call this — the path `slug` is attacker-controlled, the
-/// caller's tenant/role are not.
+/// Ownership guard for TEAM-level resources: the caller's tenant must equal `slug` (a platform
+/// operator may act on any team) and, when `min_role` is non-empty, the caller's OWN role in that
+/// team (verified JWT claim) must be one of them. Every `/v1/teams/:slug*` handler must call it:
+/// the path `slug` is attacker-controlled.
 pub(crate) fn require_team(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3948,13 +3537,30 @@ pub(crate) fn require_team(
     Ok(t)
 }
 
-/// Multi-tenant ownership guard for DOMAIN resources: get-or-create the
-/// domain record (first registrant claims it, matching `DomainStore::ensure`'s
-/// existing semantics) and verify the caller's tenant owns it. Returns the
-/// tenant, or 403 when a DIFFERENT tenant already registered this domain
-/// string. `DomainStore` is keyed globally by the domain string with no
-/// built-in ownership check, so every `/v1/domains/:domain*` handler that
-/// creates-or-reads must call this.
+/// [`require_team`] for a handler that gates a team-scoped MUTATION by role. On an UNENFORCED node
+/// (`auth::enforced()` false: no `HIVE_JWT_SECRET`) there are no verified identities to rank, so —
+/// like every other role gate here (`operator_allowed`, `require_auth_read`) — the floor does not
+/// apply and the node stays as open as it is for every other mutation (a role floor added without
+/// this turned anonymous env writes and key revokes on a dev node from 200 into 403). With auth
+/// enforced the floor is exactly `require_team`'s: a viewer, a member below the floor, or an
+/// anonymous caller is 403.
+pub(crate) fn require_team_floor(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    slug: &str,
+    min_role: &[&str],
+) -> Result<String, (StatusCode, String)> {
+    if !crate::auth::enforced() {
+        return Ok(tenant(c, h, claims));
+    }
+    require_team(c, h, claims, slug, min_role)
+}
+
+/// Ownership guard for DOMAIN resources: get-or-create the record (the first registrant claims it,
+/// as `DomainStore::ensure` does) and 403 when a DIFFERENT tenant already registered the domain
+/// string. `DomainStore` is keyed globally with no ownership check of its own, so every
+/// creating-or-reading `/v1/domains/:domain*` handler must call it.
 fn require_domain_owner(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3972,11 +3578,9 @@ fn require_domain_owner(
     Ok(t)
 }
 
-/// Like [`require_domain_owner`] but does NOT create the domain record if it
-/// doesn't exist — for record-level edit/delete operations, where `ensure()`'s
-/// create-as-a-side-effect would be the wrong behavior for a domain nobody
-/// has registered yet. A missing domain is left for the underlying
-/// add/update/delete call to naturally report NOT_FOUND.
+/// Like [`require_domain_owner`] but never creates the record (for record-level edit/delete, where
+/// `ensure()`'s create-as-a-side-effect would be wrong); a missing domain is left for the
+/// underlying call to report NOT_FOUND.
 fn require_domain_owner_if_exists(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -3985,11 +3589,6 @@ fn require_domain_owner_if_exists(
 ) -> Result<String, (StatusCode, String)> {
     let t = tenant(c, h, claims);
     if let Some(rec) = c.domains.get(domain) {
-        // Only a VERIFIED record locks to its tenant (the `ensure_verify`
-        // rule): an unproven claim — pending or DNS-only — confers no
-        // ownership and must never 403 the real owner's attach, which takes
-        // the record over and lets DNS proof settle ownership (adversarial
-        // finding: first-come pending claims locked owners out permanently).
         let locked = rec.verify.as_ref().is_some_and(|v| v.status == "verified");
         if locked && norm(&rec.tenant) != norm(&t) {
             return Err((
@@ -4001,14 +3600,10 @@ fn require_domain_owner_if_exists(
     Ok(t)
 }
 
-/// Pure core of the platform-operator check (no env/global deps, so it's
-/// unit-testable without touching the process-global `HIVE_JWT_SECRET` other
-/// tests already own). Gate on `platform_admin`, NOT `role` — `role: "owner"`
-/// only ever means "owner of `tenant`", and every user is the owner of their
-/// own personal namespace. Using `role` here let any signed-up user reach
-/// global WAF/CDN/routing mutations. `platform_admin` is independently
-/// derived at mint time from this backend's own `owner_email`, never
-/// client-asserted.
+/// Pure core of the operator check (no env/global deps, so it is unit-testable). Gates on
+/// `platform_admin`, NOT `role`: `role: "owner"` only means owner of `tenant` and every user owns
+/// their personal namespace, whereas `platform_admin` is derived at mint time from this backend's
+/// own `owner_email`, never client-asserted.
 fn operator_allowed(claims: Option<&crate::auth::Claims>, enforced: bool) -> bool {
     if !enforced {
         return true;
@@ -4016,10 +3611,8 @@ fn operator_allowed(claims: Option<&crate::auth::Claims>, enforced: bool) -> boo
     matches!(claims, Some(cl) if cl.platform_admin)
 }
 
-/// Platform-operator guard for GLOBAL (non-tenant) infrastructure mutations —
-/// WAF rules, bot policy, CDN purge, routing, runtime-cache. When JWT auth is
-/// enforced, only a genuine platform operator may mutate; in dev (no
-/// enforcement) it's open, matching the rest of the dev-mode API.
+/// Platform-operator guard for GLOBAL (non-tenant) infrastructure mutations (WAF rules, bot policy,
+/// CDN purge, routing, runtime-cache): enforced auth requires a genuine operator, dev mode is open.
 pub(crate) fn require_operator(
     claims: Option<&crate::auth::Claims>,
 ) -> Result<(), (StatusCode, String)> {
@@ -4033,18 +3626,98 @@ pub(crate) fn require_operator(
     }
 }
 
-/// Like [`require_operator`], but also honors the internal node-to-node
-/// forward trust already used elsewhere in this file (`x-hive-internal` ==
-/// `HIVE_INTERNAL_TOKEN`, constant-time compare — see `mint_allowed` /
-/// `tls_bundle_mesh`). Needed because, unlike every other `require_operator`
-/// call site (global infra mutations executed on whichever node receives
-/// them), the two run-mutation endpoints that use this guard forward to a
-/// run's project's HOST node exactly like `cancel`/`replay`/`wakeup` do (env
-/// decrypts locally) — and `post_body_to_host` carries no Authorization
-/// header across that hop, only `x-hive-team`. A bare `require_operator`
-/// would 403 every legitimately-forwarded internal hop the instant auth is
-/// enforced, breaking these ops for any run not hosted on the node the
-/// operator happened to hit.
+/// Who may read fleet-wide (non-tenant) state from the public listener: a platform operator (the
+/// `require_operator` predicate) or a verified mesh-internal `service` delegation (tenant `mesh`,
+/// minted by `gossip::fetch` and by `git.rs` build-cache pulls), which is how a peer reaches these
+/// routes over the HTTP fallback when iroh is unavailable.
+///
+/// 403, never 401, so the dashboard's re-mint-and-retry path fires and a caller cannot tell
+/// "forbidden" from "absent".
+pub(crate) fn require_fleet_read(
+    claims: Option<&crate::auth::Claims>,
+) -> Result<(), (StatusCode, String)> {
+    if !crate::auth::enforced() {
+        return Ok(());
+    }
+    if matches!(claims, Some(cl) if cl.platform_admin || (crate::auth::is_mesh_internal(cl) && cl.tenant == "mesh"))
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "fleet-wide read requires a platform operator or a mesh service token".into(),
+    ))
+}
+
+/// Public mount for [`serve_hosts`] — see [`require_fleet_read`].
+async fn serve_hosts_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: Option<Query<ServeHostsQ>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(serve_hosts(State(c), q).await)
+}
+
+/// Public mount for [`leases_get`] — see [`require_fleet_read`].
+async fn leases_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(leases_get(State(c)).await)
+}
+
+/// Public mount for [`guardian_heads`] — see [`require_fleet_read`].
+async fn guardian_heads_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(guardian_heads(State(c)).await)
+}
+
+/// Public mount for [`fleet_deployments`]; see [`require_fleet_read`].
+async fn fleet_deployments_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(fleet_deployments(State(c)).await)
+}
+
+/// Public mount for [`anycast_table`]: the dashboard Network page reads it, so it takes the
+/// authenticated-read guard [`require_auth_read`] (any verified session, 401 otherwise), like
+/// `/v1/nodes`, and hands the claims on so the table is shaped per reader (operator or sanitized).
+async fn anycast_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    Ok(anycast_table(State(c), cl).await)
+}
+
+/// Public mount for [`functions`]: the same CWE-306 class but tenant-shaped, so it takes
+/// [`require_auth_read`] (401 without a session). It cannot stay open: the handler appends every
+/// peer's `?local=true` slice, which a peer serves UNFILTERED on purpose (the billing meter's
+/// aggregation path), and re-filters only this node's own stats. The mesh leg is unaffected: gossip
+/// calls the handler directly and the peer hop carries a mesh token.
+async fn functions_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: axum::extract::Query<LocalQ>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(functions(State(c), headers, claims, q).await)
+}
+
+/// Like [`require_operator`], but also honors the internal node-to-node trust (`x-hive-internal` ==
+/// `HIVE_INTERNAL_TOKEN`, constant-time). The run-mutation endpoints that use it forward to the
+/// project's HOST node (env decrypts locally) and `post_body_to_host` carries only `x-hive-team`
+/// across that hop, so a bare `require_operator` would 403 every legitimately forwarded hop once
+/// auth is enforced.
 pub(crate) fn require_operator_or_internal(
     headers: &HeaderMap,
     claims: Option<&crate::auth::Claims>,
@@ -4069,12 +3742,36 @@ pub(crate) fn require_operator_or_internal(
     ))
 }
 
-/// Authenticated-READ guard for the topology views the dashboard shows every
-/// signed-in user (network page: nodes/cluster/overview). Any verified claims
-/// pass — the handler then decides between the full operator payload and the
-/// sanitized tenant view. Missing claims while enforced is 401, not 403: the
-/// dashboard's transparent cookie re-mint keys on 401, and "no session" is an
-/// authentication failure, not an authorization decision.
+/// Gate for a node-to-node RPC that the public admin router also mounts (database-replica control,
+/// node announce, SMS egress relays). `auth::require_auth` only proves "some valid token", so an
+/// ordinary tenant JWT or platform API key reaches the handler unless this runs first: it admits a
+/// platform operator, the fleet's `x-hive-internal` secret, or a `mesh-internal` service delegation
+/// (`auth::is_mesh_internal`). `team` names the tenant the RPC acts for: a delegation must then be
+/// minted for exactly that tenant, so a hop can never act for a tenant its credential was not minted
+/// for; `None` takes any delegation. The mesh dispatch arms call the inner handler directly, behind
+/// the transport's own signer and trust gate, so a wrapper never changes the mesh path.
+pub(crate) fn require_mesh_rpc(
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    team: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    if require_operator_or_internal(headers, claims).is_ok() {
+        return Ok(());
+    }
+    let minted_for_team =
+        |cl: &crate::auth::Claims| team.map_or(true, |t| norm(&cl.tenant) == norm(t));
+    if claims.is_some_and(|cl| crate::auth::is_mesh_internal(cl) && minted_for_team(cl)) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::FORBIDDEN,
+        "node-to-node RPC requires a platform operator or a fleet service credential".into(),
+    ))
+}
+
+/// Authenticated-READ guard for the topology views every signed-in user sees: any verified claims
+/// pass (the handler picks the operator or the sanitized tenant view). Missing claims while
+/// enforced is 401, not 403, because the dashboard's transparent cookie re-mint keys on 401.
 pub(crate) fn require_auth_read(
     claims: Option<&crate::auth::Claims>,
 ) -> Result<(), (StatusCode, String)> {
@@ -4085,13 +3782,10 @@ pub(crate) fn require_auth_read(
     }
 }
 
-/// Like [`require_auth_read`], but also honors the internal node-to-node
-/// forward trust (`x-hive-internal` == `HIVE_INTERNAL_TOKEN`, constant-time
-/// compare — the same trust `require_operator_or_internal` grants). Needed by
-/// handlers a peer node probes for its OWN infra facts (not tenant data) on a
-/// caller's behalf, e.g. `billing_addons`'s leader-preflight forward — that
-/// hop carries no bearer token and must not require one to answer a
-/// node-local capability check.
+/// Like [`require_auth_read`], but also honors the internal node-to-node trust (`x-hive-internal`
+/// == `HIVE_INTERNAL_TOKEN`, constant-time), as `require_operator_or_internal` does: for handlers a
+/// peer probes for its OWN infra facts on a caller's behalf (e.g. `billing_addons`' leader
+/// preflight), a hop that carries no bearer.
 pub(crate) fn require_auth_read_or_internal(
     headers: &HeaderMap,
     claims: Option<&crate::auth::Claims>,
@@ -4113,9 +3807,8 @@ pub(crate) fn require_auth_read_or_internal(
     Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
 }
 
-/// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
-/// (virginia→iad, bangkok→sin, san-jose→sfo, los-angeles→lax). Unknown regions
-/// return "" so the dashboard falls back to the legacy region-agnostic zone URL.
+/// Public ingress region code (the `<dep>.<code>.ngrok.pizza` label); an unknown region returns ""
+/// so the dashboard falls back to the legacy region-agnostic zone URL.
 pub fn region_code(region: &str) -> &'static str {
     match region {
         "virginia" => "iad",
@@ -4132,64 +3825,33 @@ async fn dep_list(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
-    // STRICT multi-tenant isolation: a request only ever sees the deployments for
-    // its active tenant (the Clerk org slug / team via `x-hive-team`, or an API
-    // key's team). Projects in other tenants are never returned — this is what
-    // prevents data bleeding across accounts when switching teams.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // node name -> region, to resolve where each deployment ACTUALLY runs.
     let node_region: std::collections::HashMap<String, String> = c
         .registry
         .nodes()
         .into_iter()
         .map(|n| (n.name, n.region))
         .collect();
-    // deployment id -> the SET of regions it's actually hosted in (multi-region aware).
     let mut host_regions: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
     let mut list: Vec<_> =
         c.gw.list()
             .into_iter()
-            .filter(|d| {
-                // Trust the deployment's OWN tenant tag first — it's authoritative
-                // for who actually built/owns it (matches the peer branch below).
-                // `ProjectStore.team_of` is REPLICATED (store_sync merges rows
-                // with per-row updated_ms + tombstones) but converges on a sync
-                // cadence and repairs on the tenancy-reconcile loop, so on a
-                // node other than the one that ran `set_team` it can miss even for
-                // a correctly-tagged deployment; only consult it as a fallback when
-                // the record itself was never tagged, and even then fail CLOSED
-                // (never silently adopt into the owner's personal view).
-                let own = record_tenant(&d.tenant);
-                let effective = if own == UNTAGGED_TENANT {
-                    record_tenant(&c.projects.team_of(&d.project)).to_string()
-                } else {
-                    own.to_string()
-                };
-                effective == t
-            })
+            .filter(|d| deployment_tenant(&c, &d.project, &d.tenant) == t)
             .collect();
-    // Locally-hosted deployments run in THIS node's region.
     for d in &list {
         host_regions
             .entry(d.id.to_string())
             .or_default()
             .insert(c.region.clone());
     }
-    // Merge in deployments the placement scheduler placed on OTHER mesh nodes, and
-    // record each one's actual host region(s). Collect regions from EVERY peer that
-    // hosts it (multi-region); push to the list only once (dedup by id).
     let mut seen: std::collections::HashSet<String> =
         list.iter().map(|d| d.id.to_string()).collect();
     for (node, deps) in c.peer_deployments.read().iter() {
         let nr = node_region.get(node);
         for d in deps {
-            // Fail CLOSED on a lost/never-set gossiped tag: `record_tenant`
-            // resolves empty to `UNTAGGED_TENANT`, which can never equal a real
-            // tenant slug — unlike `norm`, which would collapse it into the
-            // owner's literal "personal" namespace (the leak).
-            if record_tenant(&d.tenant) != t {
+            if deployment_tenant(&c, &d.project, &d.tenant) != t {
                 continue;
             }
             if let Some(r) = nr {
@@ -4204,12 +3866,6 @@ async fn dep_list(
         }
     }
     list.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
-    // Enrich each with its region + public ingress code for the region-encoded URL
-    // (`<dep>.<code>.ngrok.pizza`). Use the region the deployment ACTUALLY runs in —
-    // NOT the project's configured region, which can drift across nodes or be stale
-    // until a redeploy (that mislabels the URL and makes the region ingress cross-hop).
-    // Prefer the configured region only when the deployment genuinely runs there
-    // (honors intent for multi-region); else any real host; else config, else default.
     let out: Vec<Value> = list
         .into_iter()
         .map(|d| {
@@ -4254,32 +3910,11 @@ async fn dep_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<fluid_core::DeployRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Tag the deployment (and the cells it spawns) with the caller's tenant so
-    // compute is partitioned per team — mirrors gw.deploy()'s defaults otherwise.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Honor the request's environment + git metadata (previously both were forced —
-    // `production=true`, `git=None` — which made preview deployments and
-    // commit-scoped routing, e.g. microfrontend fallback resolution, unreachable via
-    // this route). A project's first deploy still claims the production alias inside
-    // `deploy_full` even when `production=false`, so URLs resolve.
     let creator = req.creator.clone().unwrap_or_else(|| "you".into());
-    // Public raw-port allocation: same stable-keyed allocator the git build
-    // path uses (`raw_ports::allocate_raw_ports`) — a direct-API deployment
-    // declaring raw-protocol PortSpecs gets its public ports stamped before
-    // the record is registered/persisted. No-op for HTTP-only manifests.
     let mut manifest = req.manifest;
     let project = manifest.project.clone();
-    // Same per-project lifecycle writer gate `run_build`'s finalization
-    // section holds (`project_settings::lifecycle_write`) — this is also a
-    // "final production/preview deployment-registration path", and without
-    // this it could interleave with a concurrent `delete_project_local`
-    // exactly like the git-build race the gate exists to close. Held for the
-    // rest of this handler so registration below cannot straddle a delete's
-    // tombstone application.
     let _lifecycle = crate::project_settings::lifecycle_write(&project).await;
-    // `DeployRequest.project_incarnation` is rollout metadata exposed on a
-    // public schema, never authority. Resolve or mint the identity exclusively
-    // from the server-owned ProjectStore while the lifecycle writer is held.
     let row = c.projects.get_if_set(&project);
     let seen_deployment =
         c.gw.list()
@@ -4328,14 +3963,6 @@ async fn dep_create(
         adopt_authorized_legacy_deployments(&c, &project, incarnation, legacy_ids)
             .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
     }
-    // Browser-function contract enforcement (bn-launch-blocked-assets-never-deployed):
-    // this route runs NO bundle/persist step, so a manifest carrying a browser
-    // policy would present as loudly-ineligible forever, and a client-supplied
-    // `browser_artifact` descriptor would admit donors whose artifact fetch
-    // then 404s on every node. Mirror the git path's rule — an opt-in that
-    // cannot produce real bytes fails loudly — by rejecting browser policies
-    // here and stripping any descriptor: the ONLY legitimate descriptor
-    // source is the git build pipeline.
     for f in &mut manifest.functions {
         if f.browser.is_some() {
             return Err((
@@ -4385,32 +4012,17 @@ async fn dep_create(
         t,
         incarnation,
     );
-    // Persist so the deployment survives a node restart (without this it lived
-    // only in memory and was lost on reboot).
     causal_stamp_new_deployment(&c, &project, &info.id.0);
     crate::persist::persist(&c);
     Ok(Json(json!(info)))
 }
 
-/// Whether a just-registered deployment record is still authorized to exist.
-/// A captured incarnation is real proof and must still match the project's
-/// CURRENT active one (mirrors `persist::restore`'s own `Some` arm exactly).
-/// The legacy `None` case has no captured fact to re-check — LIVE-witnessed
-/// 2026-08-22: mirroring `persist::restore`'s `None` arm exactly (reject
-/// whenever the project was EVER tombstoned and no settings row has since
-/// been re-touched) false-positive-rejected an ordinary same-request redeploy
-/// of a just-deleted project name, because `dep_create` never happens to
-/// touch `ProjectSettings` — ordinary git builds usually do (via
-/// `set_production_branch`/`set_build`/etc.), so the boot-restore version of
-/// this bug is rare, but on the live path it fires on literally the very
-/// next request. So `None` is authorized UNLESS the current row proves a
-/// DIFFERENT, REAL incarnation is now active — i.e. a genuine
-/// incarnation-tracked recreation already exists and this legacy record
-/// would collide with it. Mere past deletion, or a row with no incarnation
-/// of its own, is never by itself proof of staleness for this case;
-/// preventing the actual interleaving race is `project_settings::
-/// lifecycle_write`'s job (held across `delete_project_local` and every
-/// gated registration path), not this heuristic's.
+/// Whether a just-registered deployment record is still authorized to exist. A captured incarnation
+/// must still match the project's CURRENT active one (as `persist::restore`'s `Some` arm does); the
+/// legacy `None` case has no captured fact to re-check, so it is authorized UNLESS the current row
+/// proves a DIFFERENT, REAL incarnation is active (mere past deletion, or a row with no
+/// incarnation, is never proof of staleness: preventing the interleaving race is
+/// `lifecycle_write`'s job, not this heuristic's).
 fn deployment_authorized(
     c: &Arc<CloudState>,
     project: &str,
@@ -4429,37 +4041,14 @@ fn deployment_authorized(
     }
 }
 
-/// Floor a fresh deployment's causal stamp at the project tombstone +1 (see
-/// `ProjectStore::tombstone_of`) — but only once the record has proven it is
-/// still authorized to exist. Every registration path (direct
-/// `POST /deployments`, git.rs's `run_build`, the first-deploy "Building…"
-/// placeholder) calls this immediately after `gw.deploy_full[_with_runtime]`,
-/// which makes it the ONE chokepoint every registration funnels through —
-/// deliberately kept a plain sync `fn` with this exact 3-arg signature so
-/// git.rs's existing call sites need no edit.
-///
-/// The race this closes (adversarial finding 2026-08-22): `run_build`'s own
-/// "still current" check can pass BEFORE a concurrent `delete_project_local`
-/// tombstones the project, and the build can still finish and register
-/// AFTER — `run_build` never re-reads the project's incarnation at that
-/// point, so without this check the registration got floored above the
-/// tombstone exactly like a genuine post-delete redeploy, resurrecting a
-/// project whose databases/volumes/source may already be purged underneath
-/// it. Rejected here means torn back down completely, detached (this fn
-/// cannot become `async` without editing every caller): no deployment, no
-/// alias, no causal stamp survives a delete the registration lost its race
-/// against.
+/// Ids of the legacy (incarnation-less) deployment records of `project` that `team` owns or that
+/// carry no tenant tag, from the local gateway and the gossiped peer copies; sorted and deduped.
 pub(crate) fn legacy_deployment_ids_for_owner(
     c: &Arc<CloudState>,
     project: &str,
     team: &str,
 ) -> Vec<String> {
     let team = norm(team).to_string();
-    // Local records (`DeployRecord`) and gossiped-peer records
-    // (`DeploymentInfo`) are different types with different `id` shapes
-    // (`String` vs `DeploymentId`) — map both onto one common
-    // (id, project, incarnation, tenant) tuple before chaining, rather than
-    // trying to chain incompatible iterator item types directly.
     let local = c.gw.deployment_records().into_iter().map(|record| {
         (
             record.id,
@@ -4503,10 +4092,9 @@ pub(crate) fn legacy_deployment_ids_for_owner(
     ids
 }
 
-/// Persist and apply the exact-id migration authority for records observed
-/// before a live legacy settings row acquired its first incarnation. The caller
-/// holds the project's lifecycle writer. A fresh or tombstone-ambiguous row
-/// returns an empty allow-set and therefore adopts nothing.
+/// Persists and applies the exact-id migration authority for records observed before a live legacy
+/// settings row acquired its first incarnation; the caller holds the project's lifecycle writer,
+/// and a fresh or tombstone-ambiguous row yields an empty allow-set that adopts nothing.
 pub(crate) fn adopt_authorized_legacy_deployments(
     c: &Arc<CloudState>,
     project: &str,
@@ -4567,6 +4155,14 @@ fn authorize_local_deployment_incarnation(
         .ok_or(StatusCode::CONFLICT)
 }
 
+/// Floors a fresh deployment's causal stamp at the project tombstone + 1
+/// (`ProjectStore::tombstone_of`), but only once the record has proven it is still authorized to
+/// exist. The ONE chokepoint every registration path (`POST /deployments`, `run_build`, the
+/// first-deploy "Building…" placeholder) calls right after `gw.deploy_full[_with_runtime]`, a plain
+/// sync `fn` so its callers need no edit. It closes the race where `run_build`'s "still current"
+/// check passes BEFORE a concurrent `delete_project_local` tombstones the project and the build
+/// then registers AFTER: a rejected registration is torn down completely, detached (no deployment,
+/// alias or causal stamp survives a delete it lost the race against).
 pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id: &str) {
     let incarnation =
         c.gw.list()
@@ -4582,11 +4178,6 @@ pub(crate) fn causal_stamp_new_deployment(c: &Arc<CloudState>, project: &str, id
                 Some(expected) => match c2.projects.get_exact(&project2, expected) {
                     Err(_) => c2.gw.remove_exact(&id2, expected).await,
                     Ok(_) => {
-                        // Authority recovered before this serialized callback ran.
-                        // Apply the same causal floor the synchronous fast path
-                        // would have applied; retaining an authorized record
-                        // without restamping it lets an older project tombstone
-                        // erase a genuine recreation on the next merge/restart.
                         if let Some(tombstone) = c2.projects.tombstone_of(&project2) {
                             c2.gw.restamp_created(&id2, tombstone.saturating_add(1));
                         }
@@ -4626,16 +4217,9 @@ pub(crate) async fn dep_promote(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Ownership check BEFORE the local-success path — this used to only be
-    // resolved for the cross-node proxy fallback below, so any caller with a
-    // valid JWT for ANY tenant could instantly repoint a DIFFERENT tenant's
-    // production alias to an arbitrary deployment id hosted on this node.
     let t0 = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        // Judge ownership from the record's OWN tenant tag (authoritative +
-        // present), falling back to the fleet-aware project predicate — the
-        // node-local project row is UNTAGGED on nodes that never ran the deploy.
-        if record_tenant(&d.tenant) != t0 && !project_owned_by(&c, &d.project, &t0) {
+        if !project_owned_by(&c, &d.project, &t0) {
             return Err(StatusCode::NOT_FOUND);
         }
         let project = d.project.clone();
@@ -4668,31 +4252,17 @@ pub(crate) async fn dep_promote(
         c.record(ev);
         crate::webhooks::dispatch(
             &c.webhooks,
+            &t0,
             &info.project,
             "deployment.promoted",
             json!({ "id": id, "project": info.project, "url": c.deploy_url(&info.alias) }),
         );
         return Ok(Json(json!(info)));
     }
-    // Not hosted locally — the placement scheduler put this deployment on a peer.
-    // Proxy the promote to its host NODE over iroh (FC nodes have no HTTP admin) so
-    // instant rollback works cross-node.
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) =
             post_to_host(&c, &node, &format!("/v1/deployments/{id}/promote"), &t0).await
         {
-            // The host node updated its alias, but THIS node (the leader) still
-            // holds the old project→deployment alias in its LOCAL gateway state.
-            // Without this local update, the leader serves the previous deployment
-            // for the project hostname forever, and every other node that round-
-            // robins the project hostname locally does the same — the promote only
-            // landed on one node. Update the local alias here so the leader and
-            // any node that proxies through it also route correctly.
-            //
-            // The host node already owns the deployment record; this node only
-            // needs the alias to point at it so mesh routing can forward requests
-            // to the host. The deployment record itself is gossiped fleet-wide via
-            // peer_deployments, so the alias is the only missing piece.
             if let Some(project) = v.get("project").and_then(|p| p.as_str()) {
                 c.gw.set_project_alias(project, &id);
                 crate::persist::persist(&c);
@@ -4703,9 +4273,9 @@ pub(crate) async fn dep_promote(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// POST to a host node by NAME (no body): HTTP admin if we know its URL, else over
-/// the iroh mesh. The mutation counterpart of `fetch_from_host` — proxies an action
-/// (e.g. instant-rollback) to an FC-hosted deployment's node. Returns the response.
+/// POST (no body) to a host node by NAME: HTTP admin when its URL is known, else the iroh mesh; the
+/// mutation counterpart of `fetch_from_host`, used to proxy an action (e.g. instant rollback) to a
+/// deployment's hosting node.
 async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
@@ -4733,10 +4303,16 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        // See `fetch_from_host`: bumped from 15s to give the discovery fallback in
-        // `PeerPool::acquire` room to complete instead of being cut off here.
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -4744,14 +4320,10 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     None
 }
 
-/// DELETE (no body) to a host node by NAME — same two-tier HTTP-then-mesh
-/// shape as `post_to_host`. `hive_p2p` defines only GOSSIP_GET/GOSSIP_POST
-/// (no delete-shaped verb), so the mesh fallback rides GOSSIP_POST like every
-/// other delete-shaped mutation already dispatched over the mesh (e.g. the
-/// `/v1/projects/*/delete` arm in `gossip::dispatch`) — the receiving arm
-/// tells create from delete by PATH SHAPE (a trailing snapshot-id segment),
-/// not by verb. Used by `storage_api`'s snapshot delete to reach a
-/// deployment's actual hosting node.
+/// DELETE (no body) to a host node by NAME, the same HTTP-then-mesh shape as `post_to_host`.
+/// `hive_p2p` has only GOSSIP_GET/GOSSIP_POST, so the mesh fallback rides GOSSIP_POST like every
+/// delete-shaped mutation (the receiving arm tells create from delete by PATH SHAPE, a trailing
+/// snapshot-id segment, not by verb); used by `storage_api`'s snapshot delete.
 pub(crate) async fn delete_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -4784,8 +4356,16 @@ pub(crate) async fn delete_to_host(
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -4793,15 +4373,11 @@ pub(crate) async fn delete_to_host(
     None
 }
 
-/// PUT (with a JSON body) to a host node by NAME: HTTP admin PUT if we know
-/// its URL — matching the real route's registered verb, since unlike
-/// `/promote` the `/network` route is only registered as `put(...)` and a
-/// `.post()` there would 405 — else over the iroh mesh (dispatched there as
-/// `GOSSIP_POST`; the mesh transport has no HTTP-verb distinction, only
-/// path/body — see the matching `/network` arm in `gossip::dispatch`). The
-/// body-carrying counterpart of `post_to_host`, used to forward
-/// `PUT /v1/projects/:project/network` to a project's actual hosting node
-/// when the record isn't local (see `project_network_put`).
+/// PUT (JSON body) to a host node by NAME: HTTP admin PUT when its URL is known (the `/network`
+/// route is registered only as `put(...)`, a `.post()` there would 405), else over the iroh mesh as
+/// `GOSSIP_POST` (the mesh has no HTTP verb, only path and body; see the `/network` arm in
+/// `gossip::dispatch`). The body-carrying counterpart of `post_to_host`, used to forward
+/// `PUT /v1/projects/:project/network` when the record is not local.
 pub(crate) async fn put_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -4865,10 +4441,10 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
     });
 }
 
-/// Delete a single deployment under the same project lifecycle writer used by
-/// build finalization, promotion, and full project deletion. The owned guard is
-/// moved into a task before the first cancellable await: dropping the HTTP
-/// request drops only the waiter, never the serialized deletion itself.
+/// Deletes a single deployment under the same project lifecycle writer as build finalization,
+/// promotion and full project deletion; the owned guard moves into a task before the first
+/// cancellable await, so dropping the HTTP request drops only the waiter, never the serialized
+/// deletion.
 async fn dep_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -4883,7 +4459,7 @@ async fn dep_delete(
     else {
         return Ok(Json(json!({ "removed": id, "project": null })));
     };
-    if record_tenant(&initial.tenant) != team && !project_owned_by(&c, &initial.project, &team) {
+    if !project_owned_by(&c, &initial.project, &team) {
         return Err(StatusCode::NOT_FOUND);
     }
     let project = initial.project.clone();
@@ -4900,10 +4476,7 @@ async fn dep_delete(
             .into_iter()
             .find(|deployment| deployment.id.0 == id2)
             .ok_or(StatusCode::NOT_FOUND)?;
-        if selected.project != project2
-            || (record_tenant(&selected.tenant) != team2
-                && !project_owned_by(&c2, &project2, &team2))
-        {
+        if selected.project != project2 || !project_owned_by(&c2, &project2, &team2) {
             return Err(StatusCode::NOT_FOUND);
         }
         let incarnation = authorize_local_deployment_incarnation(
@@ -4978,7 +4551,7 @@ fn path_build_id(
         return None;
     }
     let name = path.file_name()?.to_str()?;
-    crate::git::checkout_prefixes(project)
+    crate::project_settings::checkout_prefixes_including_previous(project)
         .iter()
         .find_map(|prefix| deploy_entry_build_id(prefix, name))
         .map(str::to_string)
@@ -5038,10 +4611,6 @@ fn project_delete_inventory(
     let project_tag = crate::git::sanitize_tag(project);
     let legacy_base = format!("hive-vol-{project_tag}");
 
-    // Grow-only settings claims are server-derived exact facts for volumes whose
-    // deployment record may already have been reaped. Add the exact names parsed
-    // from every still-live run configuration, but never invent a current base or
-    // service suffix from a project/function prefix.
     let mut current_volumes: std::collections::BTreeSet<String> =
         settings.owned_volume_names.iter().cloned().collect();
     let mut volume_residuals = Vec::new();
@@ -5065,9 +4634,6 @@ fn project_delete_inventory(
         }
     }
 
-    // Legacy names carry no incarnation and are never deletion authority. Exact
-    // candidates are retained and reported if present so a prefix-sharing tenant
-    // survives byte-identically while an operator can resolve the residue.
     let mut legacy_volumes = std::collections::BTreeSet::from([legacy_base.clone()]);
     for service in &services {
         legacy_volumes.insert(format!(
@@ -5080,11 +4646,6 @@ fn project_delete_inventory(
         .filter_map(|deployment| deployment.manifest.image.clone())
         .collect();
 
-    // Database catalog rows predate an incarnation field. Admission now records
-    // every newly minted platform id in the incarnation's grow-only settings
-    // lineage while holding the lifecycle writer. Only that exact id set is
-    // deletion authority; legacy/unclaimed rows are retained rather than guessed
-    // from names, teams, or timestamps.
     let owned_database_ids: std::collections::HashSet<&str> = settings
         .owned_database_ids
         .iter()
@@ -5113,9 +4674,9 @@ fn project_delete_inventory(
     }
 }
 
-/// Run one destructive container/volume command with a hard per-attempt budget.
-/// `kill_on_drop` makes a timeout real: no child survives to mutate the host
-/// after the lifecycle writer has returned an incomplete-cleanup result.
+/// Runs one destructive container/volume command under a hard per-attempt budget; `kill_on_drop`
+/// makes a timeout real, so no child survives to mutate the host after the lifecycle writer has
+/// returned an incomplete-cleanup result.
 async fn run_cleanup_command(bin: &str, args: Vec<String>, path_env: &str) -> Result<(), String> {
     const ATTEMPTS: u32 = 3;
     for attempt in 1..=ATTEMPTS {
@@ -5145,10 +4706,9 @@ async fn run_cleanup_command(bin: &str, args: Vec<String>, path_env: &str) -> Re
     unreachable!("bounded cleanup-command loop always returns")
 }
 
-/// Reclaim only the immutable inventory captured for one exact incarnation.
-/// The caller owns the project lifecycle writer for this whole await chain, so
-/// database creation and deployment registration cannot enter a new lifetime
-/// between proof and removal.
+/// Reclaims only the immutable inventory captured for one exact incarnation; the caller owns the
+/// project lifecycle writer across the whole await chain, so database creation and deployment
+/// registration cannot enter a new lifetime between proof and removal.
 async fn purge_project_resources(
     c: &Arc<CloudState>,
     project: &str,
@@ -5284,11 +4844,6 @@ async fn purge_project_resources(
 
     for image in &inventory.images {
         if !c.gw.image_is_referenced(image) && c.gw.backend_name() == "litebox" {
-            // The authoritative last-reference proof is here. The concrete
-            // backend is trait-erased behind `Fluid`, and the released
-            // lifecycle surfaces expose no safe downcast/forwarding seam; do
-            // not emulate `LiteboxBackend::retire_image_reference` with direct
-            // filesystem deletion. Surface the unresolved retirement instead.
             residuals.push(ProjectCleanupResidual::new(
                 "litebox_image_reference",
                 image,
@@ -5301,10 +4856,10 @@ async fn purge_project_resources(
     residuals
 }
 
-/// Enumerate a backend first, then remove only incarnation-qualified names that
-/// are actually present. Legacy names are byte-ambiguous (`app` service `v2`
-/// and project `app-v2` base both map to `hive-vol-app-v2`), so a present legacy
-/// candidate is retained and returned as an observable residual.
+/// Enumerates a backend first, then removes only incarnation-qualified names that are present;
+/// legacy names are byte-ambiguous (service `v2` of `app` and project `app-v2` both map to
+/// `hive-vol-app-v2`), so a present legacy candidate is retained and returned as an observable
+/// residual.
 async fn purge_project_podman_volumes(
     current: &std::collections::BTreeSet<String>,
     legacy: &std::collections::BTreeSet<String>,
@@ -5400,9 +4955,9 @@ fn is_platform_build_id(id: &str) -> bool {
     })
 }
 
-/// Parse one current/legacy checkout, placeholder, or retained-source name.
-/// Syntax only identifies the embedded build id; deletion additionally checks
-/// that id against the immutable incarnation lineage.
+/// Parses one current/legacy checkout, placeholder or retained-source name: syntax only identifies
+/// the embedded build id, deletion additionally checks it against the immutable incarnation
+/// lineage.
 fn deploy_entry_build_id<'a>(prefix: &str, name: &'a str) -> Option<&'a str> {
     let rest = name.strip_prefix(prefix)?;
     if let Some(build_id) = rest.strip_suffix(".src.zip") {
@@ -5424,10 +4979,9 @@ fn owned_deploy_entry(
     deploy_entry_build_id(prefix, name).is_some_and(|build_id| build_ids.contains(build_id))
 }
 
-/// Re-stat with `symlink_metadata` on every bounded attempt so a symlink is
-/// unlinked rather than traversed. Files and symlinks use `remove_file`, real
-/// directories use `remove_dir_all`, and unsupported special files are kept
-/// and reported.
+/// Re-stats with `symlink_metadata` on every bounded attempt so a symlink is unlinked, never
+/// traversed: files and symlinks use `remove_file`, real directories `remove_dir_all`, unsupported
+/// special files are kept and reported.
 async fn remove_owned_deploy_entry(path: &std::path::Path) -> Option<ProjectCleanupResidual> {
     const ATTEMPTS: u32 = 3;
     for attempt in 1..=ATTEMPTS {
@@ -5521,14 +5075,14 @@ async fn enumerate_owned_deploy_entries(
     Err(format!("{last_reason} after {ATTEMPTS} attempts"))
 }
 
-/// Remove only current/legacy source entries whose platform-issued build id is
-/// in the exact deleted-incarnation lineage. Enumeration, metadata, special
-/// types, and removal failures remain observable in the returned residual set.
+/// Removes only current/legacy source entries whose platform-issued build id is in the exact
+/// deleted-incarnation lineage; enumeration, metadata, special-type and removal failures stay
+/// observable in the returned residual set.
 async fn purge_project_source_dirs(
     project: &str,
     build_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<ProjectCleanupResidual> {
-    let prefixes = crate::git::checkout_prefixes(project);
+    let prefixes = crate::project_settings::checkout_prefixes_including_previous(project);
     let mut residuals = Vec::new();
     for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
         let targets = match enumerate_owned_deploy_entries(&base, &prefixes, build_ids).await {
@@ -5551,17 +5105,17 @@ async fn purge_project_source_dirs(
     residuals
 }
 
-/// Whether a `project_delete` caller has asserted SOME identity at all —
-/// verified claims (JWT or platform API key), or an explicit `x-hive-team`
-/// header. Pure core of the identity gate below, unit-testable without a
-/// `HeaderMap`/`CloudState`. A blank/whitespace-only team header counts as no
-/// identity (matches `resolve_tenant`'s own header-trimming behavior).
+/// Whether a `project_delete`/rename caller asserted SOME identity at all: verified claims (JWT or
+/// platform API key) or an explicit `x-hive-team` header (a blank one counts as none, as in
+/// `resolve_tenant`). `resolve_tenant`'s dev-mode "personal" default owns every project, so it must
+/// never authorize a destructive fleet-cascading operation; this is the pure core of that gate,
+/// unit-testable without a `HeaderMap`/`CloudState`.
 fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>) -> bool {
     claims_present || team_header.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 
 fn delete_forward_is_internal(headers: &HeaderMap, claims: Option<&crate::auth::Claims>) -> bool {
-    let service_claim = claims.is_some_and(|cl| cl.sub == "mesh-internal" && cl.role == "service");
+    let service_claim = claims.is_some_and(crate::auth::is_mesh_internal);
     let shared_secret = std::env::var("HIVE_INTERNAL_TOKEN")
         .ok()
         .filter(|t| !t.trim().is_empty())
@@ -5574,9 +5128,9 @@ fn delete_forward_is_internal(headers: &HeaderMap, claims: Option<&crate::auth::
     service_claim || shared_secret
 }
 
-/// A delete generation may lead the receiver's clock only by the skew the
-/// origin intentionally adds plus the opposite-direction skew of this receiver.
-/// Older generations remain valid forever for idempotent retries.
+/// A delete generation may lead the receiver's clock only by the skew the origin intentionally adds
+/// plus this receiver's opposite-direction skew; older generations stay valid forever for
+/// idempotent retries.
 pub(crate) const MAX_DELETE_GENERATION_FUTURE_MS: u64 =
     hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2;
 
@@ -5584,9 +5138,9 @@ pub(crate) fn valid_delete_generation(delete_ms: u64) -> bool {
     delete_ms > 0 && delete_ms <= now_ms().saturating_add(MAX_DELETE_GENERATION_FUTURE_MS)
 }
 
-/// Newest causal version this coordinator can see for `project`. A fresh
-/// deletion generation is issued strictly above this floor so it dominates
-/// settings and deployment records already visible anywhere in the fleet.
+/// Newest causal version this coordinator can see for `project`: a fresh deletion generation is
+/// issued strictly above it, so it dominates settings and deployment records already visible
+/// anywhere in the fleet.
 fn observed_project_version_ms(c: &Arc<CloudState>, project: &str) -> u64 {
     let settings_ms = c
         .projects
@@ -5628,10 +5182,9 @@ async fn project_delete_capabilities() -> Json<Value> {
     Json(json!({ "delete_generation": "v1" }))
 }
 
-/// Delete an entire project: all its deployments + settings. By default this
-/// cascades across the mesh. `?cascade=false` is the internal single-hop form
-/// used by a cascade receiver; relocation uses the separate, narrowly-scoped
-/// `/reap-deployments` arm and never calls project deletion.
+/// Deletes an entire project (deployments + settings), cascading across the mesh by default;
+/// `?cascade=false` is the internal single-hop form used by a cascade receiver. Relocation uses the
+/// separate, narrowly scoped `/reap-deployments` arm and never calls project deletion.
 async fn project_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -5639,17 +5192,6 @@ async fn project_delete(
     Path(project): Path<String>,
     Query(q): Query<CascadeQ>,
 ) -> Result<Json<Value>, StatusCode> {
-    // A destructive, fleet-cascading operation must never authorize purely off
-    // resolve_tenant's dev-mode "personal" default: on an unenforced node, a
-    // caller presenting NO credential at all (no JWT, no API key, no explicit
-    // x-hive-team header) still resolves to team "personal" — the platform
-    // owner's own namespace on a single-tenant deployment — which trivially
-    // "owns" every project. That turns every unenforced node's admin port into
-    // an anonymous delete-any-project-by-name endpoint. Require the caller to
-    // have asserted SOME identity (verified claims, or an explicit team header)
-    // before even resolving a tenant to check ownership against — this is the
-    // one endpoint on this router where the implicit personal-mode default is
-    // not an acceptable substitute for real authorization.
     if !has_explicit_caller_identity(
         claims.is_some(),
         headers.get("x-hive-team").and_then(|v| v.to_str().ok()),
@@ -5667,57 +5209,34 @@ async fn project_delete(
         return Err(StatusCode::BAD_REQUEST);
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Authorize against the local store if we have it, else against the gossiped
-    // fleet — a project placed by the scheduler may live ONLY on a peer, so it's
-    // absent from this node's project store (team_of would default to "personal"
-    // and wrongly 404). Allow the delete if the requester's tenant owns the
-    // project anywhere in the mesh.
-    let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
-        // a deployment of this project hosted locally under the requester's tenant
-        || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        // …or hosted on a peer (project lives only on a scheduler-placed node)
-        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t)
-        // …or known ONLY to the fleet-replicated relational mirror. This tier
-        // exists in the LISTING (`projects`' third fallback, added for a project
-        // created but never successfully deployed) and had no counterpart here,
-        // so a project the dashboard happily showed could never be authorized
-        // for deletion: every delete fell to the not-hosted-here branch, no peer
-        // could accept a cascade for a project none of them held either, and the
-        // handler answered 502 forever. Live-witnessed on `gpu-smoke` — zero
-        // deployments and zero settings rows fleet-wide, one `project_teams`
-        // row, undeletable from both the dashboard home and its own page.
-        // Anything we are willing to LIST for a tenant must be deletable by it.
-        || crate::relational::projects_for_team(&t).await.iter().any(|p| p == &project);
-    // Not locally verifiable ≠ deniable: after a partial delete (or right after a
-    // restart) this node may hold NO trace of a project that still serves on a
-    // peer, and the gossip view can be sparse — a hard 404 here left ORPHANS
-    // undeletable. Every receiving node re-checks ownership against ITS OWN store
-    // before acting, so the safe behavior is: skip local teardown, but still
-    // broadcast the single-hop cascade and let owners tear down their copies.
+    let authorized = match row_holder(&c, &project) {
+        Some(holder) if holder == t => true,
+        Some(_) => return Err(StatusCode::NOT_FOUND),
+        None => {
+            c.projects
+                .get_if_set(&project)
+                .map(|s| norm(&s.team) == t)
+                .unwrap_or(false)
+                || c.gw
+                    .list()
+                    .iter()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || c.peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || crate::relational::projects_for_team(&t)
+                    .await
+                    .iter()
+                    .any(|p| p == &project)
+        }
+    };
     if !authorized {
         if cascade {
-            // The coordinator cannot create a project-name tombstone until an
-            // owner has authenticated the tenant: on a sparse observer, doing
-            // so before one peer accepts could poison another tenant's project
-            // with the same name. Issue a candidate generation, let every
-            // receiver authorize locally, then retain it here only after the
-            // first confirmed acceptance. The small future allowance dominates
-            // an ordinary in-flight write on a peer whose clock is a few seconds
-            // ahead without letting retries ratchet the generation forever.
             let delete_ms = supplied_delete_ms.unwrap_or_else(|| {
                 now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
             });
-            // AWAIT the broadcast rather than spawning it and answering 200. This node
-            // holds no copy of the project, so a 200 here asserted a deletion it never
-            // performed and never observed anyone else perform — and the dashboard,
-            // which treats any 2xx as success, showed the user nothing at all while the
-            // project kept serving. That is the "deleting a project does nothing" bug.
-            // Deletes are rare and each hop is small, so paying the round trip to be
-            // able to tell the truth is the right trade.
-            //
-            // Broadcast to EVERY peer, not just healthy ones: health is a per-observer
-            // verdict, and a peer this node currently calls unhealthy is exactly the one
-            // most likely to still be serving the copy nobody could reach.
             let peers: Vec<String> = c
                 .registry
                 .nodes()
@@ -5726,31 +5245,13 @@ async fn project_delete(
                 .map(|n| n.name)
                 .collect();
             let n_peers = peers.len();
-            // Quick single-attempt pass, hard-capped per peer: the user is waiting,
-            // and the leader-forward client that proxied this request times out at
-            // 30s — an answer slower than that reads as failure even when the
-            // cascade later succeeds. Peers the quick pass could not reach get the
-            // full retry budget DETACHED below.
-            //
-            // 28s, not the old 20s: `dispatch_project_delete_with`'s own worst
-            // case chains HTTP-capabilities + HTTP-delete + mesh-capabilities +
-            // mesh-delete (the last kept intentionally generous for discovery
-            // fallback, see its own comment) — even after trimming the other
-            // three legs, that sum is ~31s, so a 20s outer cap could kill the
-            // future before it ever reached the mesh fallback it exists to
-            // provide. Witnessed live: a real project delete failed with
-            // "accepted == 0 across all 23 peers" on every attempt, because
-            // every peer with real-but-imperfect HTTP admin connectivity spent
-            // its entire budget stuck on the HTTP leg. 28s stays under the 30s
-            // proxy ceiling with 2s of margin for the response to actually
-            // return.
             let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
                 let c = c.clone();
                 let project = project.clone();
                 let t = t.clone();
                 async move {
                     tokio::time::timeout(
-                        std::time::Duration::from_secs(28),
+                        PROJECT_DELETE_QUICK_PASS_PEER_BUDGET,
                         dispatch_project_delete_with(&c, node, &project, &t, delete_ms, 1),
                     )
                     .await
@@ -5766,23 +5267,17 @@ async fn project_delete(
                 .map(|(n, _)| n.clone())
                 .collect();
             if accepted == 0 {
-                // Nobody confirmed. Either the project does not exist under this tenant,
-                // or every node that could own it is unreachable. Both are honest
-                // failures the user must see; neither is a deletion. Crucially, do
-                // not leave detached retries running after this 502: a later success
-                // would perform a deletion the coordinator never recorded.
                 tracing::warn!(
                     project, tenant = %t, peers = n_peers,
                     "project delete: not hosted locally and no peer accepted the cascade"
                 );
                 return Err(StatusCode::BAD_GATEWAY);
             }
-            // Authorization is now witnessed by at least one owner. Persist the
-            // same generation locally BEFORE scheduling slower retries, so every
-            // later acceptance is tracked by a durable tombstone on this
-            // coordinator even if the original HTTP request disappears.
             c.projects.apply_delete(&project, delete_ms);
             c.git_index.remove_project(&project);
+            // Same node-local cron drop: this coordinator never hosted the project, but its own
+            // cron set can still hold jobs for it, and those would keep firing here.
+            c.cron.remove_project(&project);
             crate::persist::persist(&c);
             if !unreached.is_empty() {
                 let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
@@ -5810,10 +5305,6 @@ async fn project_delete(
         }
         return Err(StatusCode::NOT_FOUND);
     }
-    // The exact local lifecycle owner issues a fresh generation for a user
-    // request, or applies the immutable supplied generation on an internal
-    // single-hop retry. It retains the owned writer until bounded physical
-    // cleanup has either completed or produced explicit residuals.
     let outcome = delete_project_local_requested(&c, &project, &t, supplied_delete_ms).await;
     if !outcome.logical_deleted && !outcome.recreated {
         tracing::warn!(project, residuals = ?outcome.cleanup_residuals, "project delete refused before logical tombstoning");
@@ -5824,6 +5315,7 @@ async fn project_delete(
     if outcome.logical_deleted && !outcome.recreated {
         crate::webhooks::dispatch(
             &c.webhooks,
+            &t,
             &project,
             "project.removed",
             json!({
@@ -5836,22 +5328,11 @@ async fn project_delete(
         );
     }
 
-    // Background cascade (cascade=false → single hop, no loops): BROADCAST the
-    // delete to EVERY peer instead of a gossip-derived "hosting" set —
-    // peer_deployments/peer_routes can be sparse right after restarts, which made
-    // the cascade silently dispatch to NOBODY and leave remote copies serving.
-    // The receiving arm is team-checked and idempotent, and retries carry this
-    // exact generation so they can never erase a causal recreation.
     if cascade {
         let c2 = c.clone();
         let project2 = project.clone();
         let team2 = t.clone();
         tokio::spawn(async move {
-            // Every peer, not only the ones this node currently calls healthy: health is
-            // a per-OBSERVER verdict, so an "unhealthy" peer is precisely the one most
-            // likely to still be serving a copy nobody could reach — and a delete it
-            // never receives is a project that serves forever. Concurrently, so one slow
-            // peer cannot delay the rest.
             let peers: Vec<String> = c2
                 .registry
                 .nodes()
@@ -5879,15 +5360,12 @@ async fn project_delete(
     })))
 }
 
-/// LOCAL-ONLY relocation reap (the receiving side of
-/// [`dispatch_deployments_reap`]): remove THIS node's production-lane
-/// deployment records for the project and nothing else — previews stay,
-/// ProjectSettings stay (team tag, production_branch, env), the relational row
-/// stays, no resource purge. The full-teardown primitive
-/// ([`delete_project_local`]) was reused for relocation reaping and its
-/// settings wipe is what made projects vanish from accounts (the team tag is
-/// how every listing filter finds them) and made push-classified builds treat
-/// preview branches as production (production_branch erased).
+/// LOCAL-ONLY relocation reap (receiving side of [`dispatch_deployments_reap`]): removes THIS
+/// node's production-lane deployment records for the project and nothing else (previews,
+/// ProjectSettings incl. team tag, production_branch and env, the relational row and resources all
+/// stay). The full-teardown [`delete_project_local`] must never be reused for relocation: its
+/// settings wipe made projects vanish from accounts and made push-classified builds treat previews
+/// as production.
 pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -> usize {
     let ids = c.gw.remove_project_superseded(project).await;
     if !ids.is_empty() {
@@ -5905,11 +5383,10 @@ pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -
     ids.len()
 }
 
-/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW
-/// arm rather than a parameter on the delete arm: a pre-upgrade peer answers
-/// NO_HANDLER (a safe no-op — its stale copies linger until it upgrades)
-/// instead of an old binary ignoring the scope parameter and running the FULL
-/// teardown, which is the destroy-by-omission this replaces.
+/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW arm, not a parameter
+/// on the delete arm: a pre-upgrade peer answers NO_HANDLER (a safe no-op, its stale copies linger
+/// until it upgrades) instead of an old binary ignoring the scope parameter and running the FULL
+/// teardown.
 pub(crate) async fn dispatch_deployments_reap(
     c: &Arc<CloudState>,
     node: &str,
@@ -5936,8 +5413,16 @@ pub(crate) async fn dispatch_deployments_reap(
             "/v1/projects/{project}/reap-deployments?{}",
             mesh_team_qs(team)
         );
-        if let Some(body) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+        if let Some(body) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            &path,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
             if v.as_ref()
@@ -5946,22 +5431,17 @@ pub(crate) async fn dispatch_deployments_reap(
             {
                 return true;
             }
-            // NO_HANDLER (pre-upgrade peer) or a refusal — both terminal.
             return false;
         }
     }
     false
 }
 
-/// Tear down a project on ONE peer node, over whatever control-plane transport
-/// reaches it: the HTTP admin URL when known (local tunnel peers), else the iroh
-/// mesh (Firecracker fleet nodes — `node_admins` is EMPTY for them since the SSH
-/// tunnels were cut, which is exactly why HTTP-only cascade deletes silently
-/// never reached the hosting nodes and "deleting a project didn't work").
-/// `cascade=false` semantics on the receiving side: single hop, no loops.
-/// Returns `true` when a peer ACCEPTED the delete over some transport. The caller
-/// on the not-hosted-here path reports that outcome to the user instead of
-/// claiming success it never observed.
+/// Tears down a project on ONE peer over whatever control-plane transport reaches it: the HTTP
+/// admin URL when known, else the iroh mesh (`node_admins` is EMPTY for Firecracker fleet nodes,
+/// which is why HTTP-only cascades never reached them). Single hop, no loops on the receiving side
+/// (`cascade=false`); returns `true` when a peer ACCEPTED the delete over some transport, so the
+/// caller reports what it actually observed.
 pub(crate) async fn dispatch_project_delete(
     c: &Arc<CloudState>,
     node: &str,
@@ -5972,13 +5452,10 @@ pub(crate) async fn dispatch_project_delete(
     dispatch_project_delete_with(c, node, project, team, delete_ms, 3).await
 }
 
-/// [`dispatch_project_delete`] with an explicit retry budget. The AWAITED
-/// cascade (the not-hosted-here delete path) uses `attempts = 1`: with the full
-/// 3-attempt budget a single dead peer holds the user's request for over a
-/// minute — longer than the leader-forward client's own 30s timeout, so the
-/// user would be told the delete failed while it went on to succeed. Reliability
-/// is not lost: the caller spawns the full-budget variant DETACHED for any peer
-/// the quick pass could not reach.
+/// [`dispatch_project_delete`] with an explicit retry budget: the AWAITED cascade (the
+/// not-hosted-here path) uses `attempts = 1`, since the full 3-attempt budget lets one dead peer
+/// hold the user's request past the leader-forward client's 30 s timeout; the caller spawns the
+/// full-budget variant DETACHED for the peers the quick pass could not reach.
 pub(crate) async fn dispatch_project_delete_with(
     c: &Arc<CloudState>,
     node: &str,
@@ -5988,39 +5465,16 @@ pub(crate) async fn dispatch_project_delete_with(
     attempts: u32,
 ) -> bool {
     if node == c.node_name {
-        return true; // local copy already handled by the caller
+        return true;
     }
-    // A delete is a ONE-SHOT broadcast — unlike a database write mirror
-    // (`db_replicate::send_mirrored`), there is no "next delete" to naturally
-    // retry a dropped attempt, so a single failed hop here left the peer
-    // serving the deleted project FOREVER. Try HTTP admin first (when known),
-    // fall back to the iroh mesh on failure instead of the two being mutually
-    // exclusive by transport availability, and retry the whole pair a few
-    // times with backoff so one transient blip on both transports in the same
-    // instant doesn't strand the peer either.
     let mut http_generation_v1 = false;
     let mut mesh_generation_v1 = false;
     for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
         }
-        // Bind out of the lock FIRST so no parking_lot guard is held across the
-        // await (the spawned cascade future must be `Send`).
         let admin = c.node_admins.read().get(node).cloned();
         if let Some(admin) = &admin {
-            // Budgeted, not the old flat 5s/15s/10s/20s: this whole function
-            // runs inside the caller's own 20s-per-peer timeout (team_delete's
-            // quick pass), and unlike a single-shot call this one chains FOUR
-            // network round trips in the worst case (HTTP capabilities, HTTP
-            // delete, mesh capabilities, mesh delete) when the HTTP path is
-            // slow-but-not-dead rather than cleanly absent. The old
-            // 5+15+10+20=50s sum could never fit the 20s budget, so a peer
-            // with imperfect-but-real HTTP admin connectivity burned its
-            // ENTIRE budget on the HTTP leg and never reached the mesh
-            // fallback the function is written to fall back to — exactly the
-            // "accepted == 0 across all peers" failure witnessed live deleting
-            // a real project. Shrunk so the four-hop worst case (3+5+3+6=17s)
-            // leaves headroom inside the 20s cap.
             if !http_generation_v1 {
                 http_generation_v1 = match c
                     .http
@@ -6044,9 +5498,6 @@ pub(crate) async fn dispatch_project_delete_with(
                     _ => false,
                 };
             }
-            // Never send a generation-bearing delete to a pre-upgrade HTTP
-            // receiver. An old handler ignores `delete_ms` and can erase a
-            // causal recreation before its ambiguous legacy response is rejected.
             let accepted = if http_generation_v1 {
                 let mut request = c
                     .http
@@ -6091,10 +5542,6 @@ pub(crate) async fn dispatch_project_delete_with(
                 return true;
             }
         }
-        // iroh mesh path: resolve the peer's cryptographic identity + address from
-        // the registry and dispatch the delete as a gossip POST (team rides as
-        // `?team=`). Tried even when an admin URL exists — a node reachable over
-        // one transport but not the other should not be abandoned.
         let target = c
             .registry
             .nodes()
@@ -6103,16 +5550,6 @@ pub(crate) async fn dispatch_project_delete_with(
             .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
         if let Some((id, addr)) = target {
             if !mesh_generation_v1 {
-                // 6s, not the 10s original NOR the over-corrected 3s: this is
-                // the ONLY transport ever exercised on a Firecracker fleet
-                // (`node_admins` is empty there, so the HTTP leg above never
-                // runs at all — its own timeouts cost nothing real here).
-                // Measured cross-continent mesh dial latency on this fleet
-                // reaches ~4.3s (lax) on a cold connection, so 3s risked
-                // failing the capabilities probe on real, healthy links
-                // rather than fixing anything — the actual bottleneck this
-                // whole change targets is the DELETE call below, which stays
-                // at its original, deliberately generous timeout.
                 mesh_generation_v1 = crate::gossip::request_to(
                     c,
                     &id,
@@ -6139,20 +5576,17 @@ pub(crate) async fn dispatch_project_delete_with(
                 "/v1/projects/{project}/delete?{}&delete_ms={delete_ms}",
                 mesh_team_qs(team)
             );
-            // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
-            if let Some(body) =
-                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-                    .await
+            if let Some(body) = crate::gossip::request_to(
+                c,
+                &id,
+                &addr,
+                hive_p2p::GOSSIP_POST,
+                &path,
+                &[],
+                MESH_FORWARD_TIMEOUT_SECS,
+            )
+            .await
             {
-                // The mesh protocol carries no status code, so a peer's REFUSAL
-                // ("not owner") arrives as a perfectly well-delivered body.
-                // Treating any reply as acceptance fabricated `accepted_by`
-                // counts for projects that exist nowhere — on the fleet, where
-                // `node_admins` is empty and iroh is the only transport, EVERY
-                // peer's refusal was counted as a confirmed deletion. Accepted
-                // means the arm actually ran `delete_project_local` (it answers
-                // `{"removed": n}`); an `error` body is an authoritative no, so
-                // further transports/retries are pointless for this peer.
                 let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
                 let accepted = v
                     .as_ref()
@@ -6168,7 +5602,6 @@ pub(crate) async fn dispatch_project_delete_with(
                 if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
                     return false;
                 }
-                // Unparseable reply: fall through to the retry loop.
             }
         } else if admin.is_none() {
             tracing::warn!(
@@ -6176,7 +5609,7 @@ pub(crate) async fn dispatch_project_delete_with(
                 project,
                 "project delete: no route to hosting node (no admin URL, no iroh identity)"
             );
-            return false; // no route exists at all; retrying won't help until routes change
+            return false;
         }
     }
     tracing::warn!(
@@ -6186,6 +5619,625 @@ pub(crate) async fn dispatch_project_delete_with(
         "project delete dispatch failed on every transport after retries — peer may keep \
          serving the deleted project until it receives a delete for another reason"
     );
+    false
+}
+
+/// Project names become real identifiers downstream, so they are bounded and their sanitized form
+/// must equal the name itself (a name that sanitized differently would give a volume/checkout path
+/// that does not match its own lookup prefix).
+const MAX_PROJECT_NAME_LEN: usize = 64;
+
+/// Query for `POST /v1/projects/:project/rename`: `rename_ms` is the immutable generation of the
+/// originating rename, reused by every retry (absent on a user request); `name` rides the query on
+/// the mesh path (a gossip POST has no body) and the JSON body on HTTP.
+#[derive(Deserialize, Default)]
+struct RenameQ {
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    cascade: Option<bool>,
+    #[serde(default)]
+    rename_ms: Option<u64>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct RenameBody {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ProjectRenameOutcome {
+    /// Deployments whose project name was rewritten on this node.
+    pub renamed: usize,
+    /// Trees rewritten, for the response's honest accounting.
+    pub moved_domains: Vec<String>,
+    pub moved_databases: usize,
+    pub moved_service_graphs: usize,
+    pub moved_metric_buckets: usize,
+    pub moved_sandboxes: usize,
+    /// True when the local rewrite committed and was persisted.
+    pub local_renamed: bool,
+    pub rename_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incarnation: Option<fluid_core::ProjectIncarnation>,
+    pub residuals: Vec<ProjectCleanupResidual>,
+}
+
+/// A rename generation is validated exactly like a delete generation (see
+/// [`MAX_DELETE_GENERATION_FUTURE_MS`]): bounded future skew, older generations stay valid forever
+/// so an idempotent retry is always accepted.
+pub(crate) fn valid_rename_generation(rename_ms: u64) -> bool {
+    valid_delete_generation(rename_ms)
+}
+
+/// Reject a new project name that cannot be used: empty, too long, or one whose
+/// sanitized form differs from itself (see [`MAX_PROJECT_NAME_LEN`]).
+pub(crate) fn invalid_project_name(new: &str) -> Option<&'static str> {
+    if new.is_empty() {
+        return Some("a new project name is required");
+    }
+    if new.len() > MAX_PROJECT_NAME_LEN {
+        return Some("project name is too long (64 characters maximum)");
+    }
+    if crate::git::sanitize_tag(new) != new.to_ascii_lowercase() {
+        return Some("project name may only contain letters, digits, '.', '_' and '-'");
+    }
+    None
+}
+
+async fn project_rename(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Query(q): Query<RenameQ>,
+    body: Option<Json<RenameBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let claims_ref = claims.as_ref().map(|e| &e.0);
+    if !has_explicit_caller_identity(
+        claims.is_some(),
+        headers.get("x-hive-team").and_then(|v| v.to_str().ok()),
+    ) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "rename requires an authenticated caller (a JWT or an explicit x-hive-team header)"
+                .into(),
+        ));
+    }
+    let cascade = q.cascade.unwrap_or(true);
+    let supplied_rename_ms = q.rename_ms;
+    if supplied_rename_ms.is_some()
+        && (cascade || !delete_forward_is_internal(&headers, claims_ref))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a rename generation is only accepted on an internal single-hop forward".into(),
+        ));
+    }
+    if supplied_rename_ms.is_some_and(|ms| !valid_rename_generation(ms)) {
+        return Err((StatusCode::BAD_REQUEST, "invalid rename generation".into()));
+    }
+    let t = tenant(&c, &headers, claims_ref);
+    let new = q
+        .name
+        .clone()
+        .or_else(|| body.and_then(|Json(b)| b.name))
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if let Some(reason) = invalid_project_name(&new) {
+        return Err((StatusCode::BAD_REQUEST, reason.into()));
+    }
+    if new.eq_ignore_ascii_case(&project) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the project is already named that".into(),
+        ));
+    }
+    if let Some(hit) = c.projects.find_key_ci(&new) {
+        let taken_by_caller = project_owned_by(&c, &hit, &t);
+        return Err((
+            StatusCode::CONFLICT,
+            if taken_by_caller {
+                format!("You already have a project named \"{new}\". Choose a different name.")
+            } else {
+                format!("The name \"{new}\" is already taken by another project. Choose a different name.")
+            },
+        ));
+    }
+    if let Some(tomb) = c.projects.renamed_away(&new) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "The name \"{new}\" is permanently reserved: a project was renamed from it to \"{}\". Choose a different name.",
+                tomb.new
+            ),
+        ));
+    }
+    let authorized = match row_holder(&c, &project) {
+        Some(holder) if holder == t => true,
+        Some(_) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no project by that name is owned by this tenant here".into(),
+            ))
+        }
+        None => {
+            c.projects
+                .get_if_set(&project)
+                .map(|s| norm(&s.team) == t)
+                .unwrap_or(false)
+                || c.gw
+                    .list()
+                    .iter()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || c.peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .any(|d| d.project == project && record_tenant(&d.tenant) == t)
+                || crate::relational::projects_for_team(&t)
+                    .await
+                    .iter()
+                    .any(|p| p == &project)
+        }
+    };
+    if !authorized {
+        if !cascade {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "no project by that name is owned by this tenant here".into(),
+            ));
+        }
+        let rename_ms = supplied_rename_ms.unwrap_or_else(|| {
+            now_ms().saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS)
+        });
+        let peers: Vec<String> = c
+            .registry
+            .nodes()
+            .into_iter()
+            .filter(|n| !n.is_self)
+            .map(|n| n.name)
+            .collect();
+        let n_peers = peers.len();
+        let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
+            let c = c.clone();
+            let project = project.clone();
+            let new = new.clone();
+            let t = t.clone();
+            async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(28),
+                    dispatch_project_rename_with(&c, node, &project, &new, &t, rename_ms, 1),
+                )
+                .await
+                .unwrap_or(false)
+            }
+        }))
+        .await;
+        let accepted = results.iter().filter(|ok| **ok).count();
+        if accepted == 0 {
+            tracing::warn!(
+                project, new, tenant = %t, peers = n_peers,
+                "project rename: not owned locally and no peer accepted the rename"
+            );
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                "no node that owns this project could be reached to perform the rename".into(),
+            ));
+        }
+        c.projects
+            .record_rename_tombstone(&project, &new, rename_ms);
+        crate::persist::persist(&c);
+        let unreached: Vec<String> = peers
+            .iter()
+            .zip(results.iter())
+            .filter(|(_, ok)| !**ok)
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !unreached.is_empty() {
+            let (c2, project2, new2, team2) = (c.clone(), project.clone(), new.clone(), t.clone());
+            tokio::spawn(async move {
+                futures::future::join_all(unreached.iter().map(|node| {
+                    dispatch_project_rename_with(&c2, node, &project2, &new2, &team2, rename_ms, 3)
+                }))
+                .await;
+            });
+        }
+        return Ok(Json(json!({
+            "project": &new,
+            "previous": &project,
+            "rename_ms": rename_ms,
+            "renamed": 0,
+            "accepted_by": accepted,
+            "local_renamed": false,
+            "cleanup_residuals": [{
+                "resource": "peer_rename_observation",
+                "id": &project,
+                "reason": "at least one peer accepted the rename, but this coordinator held no copy and did not observe the rewrite"
+            }],
+            "note": "not hosted here — rename accepted by peers; this coordinator performed no local rewrite",
+        })));
+    }
+
+    let outcome = rename_project_local_requested(&c, &project, &new, &t, supplied_rename_ms).await;
+    if !outcome.local_renamed {
+        let reason = outcome
+            .residuals
+            .first()
+            .map(|r| r.reason.clone())
+            .unwrap_or_else(|| "the rename could not be applied locally".into());
+        tracing::warn!(project, new, reason, "project rename refused");
+        return Err((StatusCode::CONFLICT, reason));
+    }
+    let rename_ms = outcome.rename_ms;
+    crate::webhooks::dispatch(
+        &c.webhooks,
+        &t,
+        &new,
+        "project.renamed",
+        json!({
+            "project": &new,
+            "previous": &project,
+            "deployments": outcome.renamed,
+            "rename_ms": rename_ms,
+        }),
+    );
+    if cascade {
+        let c2 = c.clone();
+        let project2 = project.clone();
+        let new2 = new.clone();
+        let team2 = t.clone();
+        tokio::spawn(async move {
+            let peers: Vec<String> = c2
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self)
+                .map(|n| n.name)
+                .collect();
+            futures::future::join_all(peers.iter().map(|node| {
+                dispatch_project_rename(&c2, node, &project2, &new2, &team2, rename_ms)
+            }))
+            .await;
+        });
+    }
+    Ok(Json(json!({
+        "project": &new,
+        "previous": &project,
+        "rename_ms": rename_ms,
+        "incarnation": outcome.incarnation,
+        "renamed": outcome.renamed,
+        "moved_domains": outcome.moved_domains,
+        "moved_databases": outcome.moved_databases,
+        "moved_service_graphs": outcome.moved_service_graphs,
+        "moved_metric_buckets": outcome.moved_metric_buckets,
+        "moved_sandboxes": outcome.moved_sandboxes,
+        "local_renamed": outcome.local_renamed,
+        "cleanup_residuals": outcome.residuals,
+    })))
+}
+
+pub(crate) async fn rename_project_local(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+) -> ProjectRenameOutcome {
+    rename_project_local_requested(c, project, new, team, Some(rename_ms)).await
+}
+
+async fn rename_project_local_requested(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    requested_rename_ms: Option<u64>,
+) -> ProjectRenameOutcome {
+    let (lexicographically_first, lexicographically_second) =
+        if project.to_ascii_lowercase() <= new.to_ascii_lowercase() {
+            (project.to_string(), new.to_string())
+        } else {
+            (new.to_string(), project.to_string())
+        };
+    let _lifecycle_first = crate::project_settings::lifecycle_write(&lexicographically_first).await;
+    let _lifecycle_second =
+        crate::project_settings::lifecycle_write(&lexicographically_second).await;
+    rename_project_owned(c, project, new, team, requested_rename_ms).await
+}
+
+/// The one place a rename is applied: holds BOTH lifecycle writers and rewrites every tree that
+/// keys on the project name in one order, the settings row FIRST (the authority every other tree
+/// keys off; its incarnation carries across, a rename is never a new identity), then routing, the
+/// production-deployment row (dropping it blinds relocation), custom-domain attachments (routing
+/// keys on the FULL hostname), databases, service graphs, metrics, sandboxes, webhooks, the git
+/// index and poll watermark (the REPO is not renamed) and the relational mirror (an authorization
+/// fallback), followed by ONE `persist()`. A rename is never a delete: no resource is purged and no
+/// tenant data dropped.
+async fn rename_project_owned(
+    c: &Arc<CloudState>,
+    project: &str,
+    new: &str,
+    team: &str,
+    requested_rename_ms: Option<u64>,
+) -> ProjectRenameOutcome {
+    let refused = |reason: String| ProjectRenameOutcome {
+        renamed: 0,
+        moved_domains: Vec::new(),
+        moved_databases: 0,
+        moved_service_graphs: 0,
+        moved_metric_buckets: 0,
+        moved_sandboxes: 0,
+        local_renamed: false,
+        rename_ms: requested_rename_ms.unwrap_or(0),
+        incarnation: None,
+        residuals: vec![ProjectCleanupResidual::new("rename", project, reason)],
+    };
+    if let Some(tomb) = c.projects.rename_tombstone_of(project) {
+        if tomb.new.eq_ignore_ascii_case(new) {
+            return ProjectRenameOutcome {
+                renamed: 0,
+                moved_domains: Vec::new(),
+                moved_databases: 0,
+                moved_service_graphs: 0,
+                moved_metric_buckets: 0,
+                moved_sandboxes: 0,
+                local_renamed: true,
+                rename_ms: tomb.rename_ms,
+                incarnation: tomb.incarnation,
+                residuals: Vec::new(),
+            };
+        }
+        return refused(format!(
+            "\"{project}\" was already renamed to \"{}\"",
+            tomb.new
+        ));
+    }
+    let Some(row) = c.projects.get_if_set(project) else {
+        return refused(
+            "this node holds no settings row for the project; the rename must be applied by a node that owns it".into(),
+        );
+    };
+    if record_tenant(&row.team) != UNTAGGED_TENANT && norm(&row.team) != norm(team) {
+        return refused("active project settings belong to another tenant".into());
+    }
+    if c.projects.find_key_ci(new).is_some() {
+        return refused(format!("a project named \"{new}\" already exists"));
+    }
+    if c.projects.renamed_away(new).is_some() {
+        return refused(format!("the name \"{new}\" is permanently reserved"));
+    }
+    let incarnation = row.incarnation;
+    let generation_floor = row.updated_ms.max(row.incarnation_created_ms);
+    if let Some(rename_ms) = requested_rename_ms {
+        if rename_ms < generation_floor {
+            return refused("the rename generation is older than this project's last write".into());
+        }
+    }
+    let mut residuals = Vec::new();
+    if let Some(incarnation) = incarnation {
+        if let Err(ids) = c
+            .build_cancels
+            .cancel_project_and_drain(c, project, incarnation, Duration::from_secs(10))
+            .await
+        {
+            residuals.extend(ids.into_iter().map(|id| {
+                ProjectCleanupResidual::new(
+                    "build_drain",
+                    id,
+                    "build task did not release its Drop-owned completion before the 10s deadline",
+                )
+            }));
+        }
+        if let Err(paths) =
+            crate::git::wait_for_checkout_drain(project, incarnation, Duration::from_secs(10)).await
+        {
+            residuals.extend(paths.into_iter().map(|path| {
+                ProjectCleanupResidual::new(
+                    "checkout_drain",
+                    path.display().to_string(),
+                    "checkout reservation did not release before the 10s deadline",
+                )
+            }));
+        }
+    }
+    if !residuals.is_empty() {
+        return ProjectRenameOutcome {
+            renamed: 0,
+            moved_domains: Vec::new(),
+            moved_databases: 0,
+            moved_service_graphs: 0,
+            moved_metric_buckets: 0,
+            moved_sandboxes: 0,
+            local_renamed: false,
+            rename_ms: requested_rename_ms.unwrap_or(0),
+            incarnation,
+            residuals,
+        };
+    }
+    let rename_ms = requested_rename_ms
+        .unwrap_or_else(|| now_ms().max(observed_project_version_ms(c, project).saturating_add(1)));
+    let moved_row = c.projects.rename_row(project, new, rename_ms);
+    if moved_row.is_none() {
+        return refused("the project's settings row disappeared before it could be moved".into());
+    }
+    let renamed = c.gw.rename_project(project, new);
+    c.production_deployments.rename(project, new);
+    let moved_domains = c.domains.rename_project(project, new);
+    let moved_databases = c.databases.rename_project(project, new);
+    let moved_service_graphs = c.svcgraph.rename_project(project, new);
+    let moved_metric_buckets = c.metrics.rename_project(project, new);
+    let moved_sandboxes = c.sandboxes.rename_project(project, new);
+    let moved_webhooks = c.webhooks.rename_project(norm(team), project, new);
+    c.git_index.rename_project(project, new);
+    {
+        let mut seen = c.git_poll_seen.write();
+        if let Some(sha) = seen.remove(project) {
+            seen.entry(new.to_string()).or_insert(sha);
+        }
+    }
+    crate::relational::rename_project(project, new, rename_ms).await;
+    crate::persist::persist(c);
+    c.audit.record(
+        team,
+        "system",
+        "rename",
+        "project",
+        new,
+        &format!(
+            "from={project} incarnation={} rename_ms={rename_ms}",
+            incarnation
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "none".into())
+        ),
+    );
+    record_event(
+        c,
+        new,
+        "rename",
+        &format!("renamed from {project} at generation {rename_ms}; deployments={renamed}; webhooks={moved_webhooks}"),
+    );
+    ProjectRenameOutcome {
+        renamed,
+        moved_domains,
+        moved_databases,
+        moved_service_graphs,
+        moved_metric_buckets,
+        moved_sandboxes,
+        local_renamed: true,
+        rename_ms,
+        incarnation,
+        residuals: Vec::new(),
+    }
+}
+
+/// Dispatches a rename to ONE peer over whichever control-plane transport reaches it (HTTP admin
+/// when known, else the iroh mesh); true only when the peer ACCEPTED it and echoed the same
+/// generation. Deliberately a NEW arm, not a parameter on the delete arm: a pre-upgrade peer
+/// answers 404/NO_HANDLER, a safe no-op reported as a residual, instead of an old binary ignoring
+/// the new name and running a teardown.
+pub(crate) async fn dispatch_project_rename(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+) -> bool {
+    dispatch_project_rename_with(c, node, project, new, team, rename_ms, 3).await
+}
+
+pub(crate) async fn dispatch_project_rename_with(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    new: &str,
+    team: &str,
+    rename_ms: u64,
+    attempts: u32,
+) -> bool {
+    if node == c.node_name {
+        return true;
+    }
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+        }
+        let admin = c.node_admins.read().get(node).cloned();
+        if let Some(admin) = &admin {
+            let mut request = c
+                .http
+                .post(format!(
+                    "{admin}/v1/projects/{project}/rename?cascade=false&rename_ms={rename_ms}&name={new}"
+                ))
+                .header("x-hive-team", team.to_string());
+            if let Ok(token) = std::env::var("HIVE_INTERNAL_TOKEN") {
+                if !token.trim().is_empty() {
+                    request = request.header("x-hive-internal", token);
+                }
+            }
+            if crate::auth::enforced() {
+                if let Ok(token) = crate::auth::issue(
+                    "mesh-internal",
+                    team,
+                    "service",
+                    false,
+                    crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+                ) {
+                    request = request.bearer_auth(token);
+                }
+            }
+            match request
+                .timeout(std::time::Duration::from_secs(8))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => {
+                    let ok = r
+                        .json::<Value>()
+                        .await
+                        .ok()
+                        .map(|v| {
+                            v.get("rename_ms").and_then(Value::as_u64) == Some(rename_ms)
+                                && v.get("renamed").is_some()
+                        })
+                        .unwrap_or(false);
+                    if ok {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let target = c
+            .registry
+            .nodes()
+            .into_iter()
+            .find(|n| n.name == node)
+            .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+        if let Some((id, addr)) = target {
+            let path = format!(
+                "/v1/projects/{project}/rename?{}&rename_ms={rename_ms}&name={new}",
+                mesh_team_qs(team)
+            );
+            if let Some(body) = crate::gossip::request_to(
+                c,
+                &id,
+                &addr,
+                hive_p2p::GOSSIP_POST,
+                &path,
+                &[],
+                MESH_FORWARD_TIMEOUT_SECS,
+            )
+            .await
+            {
+                let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                let accepted = v
+                    .as_ref()
+                    .map(|v| {
+                        v.get("error").is_none()
+                            && v.get("renamed").is_some()
+                            && v.get("rename_ms").and_then(Value::as_u64) == Some(rename_ms)
+                    })
+                    .unwrap_or(false);
+                if accepted {
+                    return true;
+                }
+                if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
+                    return false;
+                }
+            }
+        } else if admin.is_none() {
+            tracing::warn!(
+                node,
+                project,
+                "project rename: no route to peer (no admin URL, no iroh identity)"
+            );
+            return false;
+        }
+    }
     false
 }
 
@@ -6265,10 +6317,6 @@ fn delete_authority(
             .next()
             .expect("length was checked above")
     } else {
-        // No uniquely-authoritative incarnation survives locally. Mint a fresh
-        // server identity for the logical deletion, but do not adopt any of the
-        // ambiguous records into it; route removal will make them unreachable
-        // and the residual set will retain their storage for operator review.
         c.projects.ensure_incarnation(project).map_err(|error| {
             ProjectCleanupResidual::new("project_authority", project, error.to_string())
         })?
@@ -6363,9 +6411,6 @@ async fn delete_project_owned(
         }
     }
 
-    // Snapshot checkout ownership before cancellation: Drop-owned guards may
-    // disappear while the build unwinds, but their exact paths remain lineage
-    // evidence for the subsequent bounded source sweep.
     let active_checkouts = crate::git::active_checkout_paths(&project, incarnation);
     let mut drain_residuals = Vec::new();
     if let Err(ids) = c
@@ -6392,11 +6437,6 @@ async fn delete_project_owned(
             )
         }));
     }
-    // Inventory only after cancellation/drain has settled. An already-admitted
-    // build can create exact-incarnation workflow storage while the delete is
-    // acquiring this writer; snapshotting before the drain would miss that new
-    // database and then falsely report cleanup complete. The pre-cancel checkout
-    // paths above remain source-lineage evidence even after their guards drop.
     let inventory = project_delete_inventory(&c, &project, &team, &settings, &active_checkouts);
 
     let delete_ms = match requested_delete_ms {
@@ -6430,11 +6470,15 @@ async fn delete_project_owned(
     };
 
     c.git_index.remove_project(&project);
-    // Node-death self-heal: a deleted project's last-known production host
-    // must not survive it — the reconciler must never "relocate" a project
-    // the tenant deliberately removed. Tombstoned, same durability discipline
-    // as `ProjectStore`'s own tombstones.
     c.production_deployments.remove(&project);
+    // Cron is NODE-LOCAL: each node drops its own copy as part of this delete, never through
+    // store_sync. Without this the jobs survive in memory AND in the persisted snapshot (which
+    // `persist.rs` restores with `replace_all` on every boot), so a deleted project's cron keeps
+    // firing a 503 `no-deployment` forever — the `shoomoo` orphan.
+    let purged_crons = c.cron.remove_project(&project);
+    if purged_crons > 0 {
+        tracing::info!(project, purged_crons, "dropped cron jobs on project delete");
+    }
     let preserved_domains: std::collections::HashSet<String> = c
         .projects
         .all_domains()
@@ -6443,9 +6487,6 @@ async fn delete_project_owned(
         .collect();
     c.domains
         .clear_verify_for_project(&project, &preserved_domains);
-    // Persist the exact logical tombstone before any async runtime/resource
-    // teardown. A process death after this point may leave residual bytes, but
-    // it can never resurrect routing or the project lifetime.
     crate::persist::persist(&c);
 
     let removed_records = c.gw.remove_project_incarnation(&project, incarnation).await;
@@ -6530,10 +6571,9 @@ async fn delete_project_owned(
     }
 }
 
-/// LOCAL-ONLY project teardown used by HTTP and mesh receivers. The owned
-/// lifecycle guard moves into a spawned task before any await that request
-/// cancellation can drop; the task owns cancellation, tombstoning, exact route
-/// removal, and bounded physical cleanup to completion.
+/// LOCAL-ONLY project teardown for HTTP and mesh receivers: the owned lifecycle guard moves into a
+/// spawned task before any await a request cancellation can drop, and that task owns cancellation,
+/// tombstoning, exact route removal and bounded physical cleanup to completion.
 async fn delete_project_local_requested(
     c: &Arc<CloudState>,
     project: &str,
@@ -6566,9 +6606,9 @@ async fn delete_project_local_requested(
     }
 }
 
-/// Mixed-version mesh/main call seam: propagated deletes always carry a
-/// generation. User-originated deletes call `delete_project_local_requested`
-/// with `None` so the exact owner issues the generation under its writer.
+/// Mixed-version mesh/main call seam: propagated deletes always carry a generation; user-originated
+/// deletes call `delete_project_local_requested` with `None` so the exact owner issues the
+/// generation under its writer.
 pub(crate) async fn delete_project_local(
     c: &Arc<CloudState>,
     project: &str,
@@ -6578,10 +6618,9 @@ pub(crate) async fn delete_project_local(
     delete_project_local_requested(c, project, team, Some(delete_ms)).await
 }
 
-/// Query for project_delete: `cascade=false` deletes only on this node (no mesh
-/// fan-out). `delete_ms` is the immutable generation issued by the originating
-/// delete and reused by every retry; absent on a user-originated request and on
-/// pre-upgrade peers. Defaults to cascade when absent.
+/// Query for project_delete: `cascade=false` deletes only on this node (no mesh fan-out);
+/// `delete_ms` is the immutable generation of the originating delete, reused by every retry (absent
+/// on a user request and on pre-upgrade peers); cascade defaults to true.
 #[derive(Deserialize, Default)]
 struct CascadeQ {
     #[serde(default, deserialize_with = "de_lenient_bool")]
@@ -6590,9 +6629,8 @@ struct CascadeQ {
     delete_ms: Option<u64>,
 }
 
-/// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
-/// a bare `{}` still works). `target` chooses the environment (production /
-/// preview); `use_cache` toggles the existing build cache.
+/// Body of the Redeploy modal (every field optional, a bare `{}` works): `target` picks the
+/// environment (production/preview), `use_cache` toggles the build cache.
 #[derive(Deserialize, Default)]
 struct RedeployBody {
     #[serde(default)]
@@ -6605,10 +6643,9 @@ struct RedeployBody {
     git_token: Option<String>,
 }
 
-/// Redeploy a project's newest git source (create a fresh deployment).
-/// Find the latest git source for a project — from this node's gateway, OR (when
-/// the placement scheduler put the project on a peer) from the gossiped fleet
-/// deployments. Lets redeploy work even when the project is hosted remotely.
+/// The newest git source of a project from this node's gateway or, when the placement scheduler put
+/// the project on a peer, from the gossiped fleet deployments, so redeploy works for remotely
+/// hosted projects.
 pub(crate) fn git_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
@@ -6626,32 +6663,21 @@ pub(crate) fn git_for_project_fleet(
         .and_then(|d| d.git.clone())
 }
 
-/// The newest deployment's SOURCE for `project`, fleet-aware and INCLUDING the
-/// non-real-git pseudo-sources (`upload://` zip, `image://` prebuilt image). Unlike
-/// `git_for_project_fleet` (which filters `is_real_git`, powering GitHub-webhook
-/// lookups), this powers REDEPLOY, which must reconstruct a build for zip- and
-/// image-based projects too — those return `None` from the git-only helper and were
-/// the exact cause of redeploy 404ing for every non-git project.
-/// Returns the source plus whether it came from the PRODUCTION lane. A redeploy
-/// must rebuild from the newest PRODUCTION deployment when one exists — picking
-/// the newest record across ALL environments meant any preview (PR branch) that
-/// landed after the last production deploy hijacked "Redeploy": the rebuild
-/// cloned the preview's branch, branch-vs-production_branch classification then
-/// filed the result as a preview, and the project's production alias kept
-/// serving whatever was there before (or a failed preview).
+/// The newest deployment's SOURCE for `project`, fleet-aware and INCLUDING the non-real-git
+/// pseudo-sources (`upload://` zip, `image://` prebuilt image), unlike `git_for_project_fleet`
+/// (which filters `is_real_git` for GitHub-webhook lookups): redeploy must rebuild zip- and
+/// image-based projects too. Returns the source, whether it came from the PRODUCTION lane and the
+/// selected upload source's platform-issued BUILD ids (`GitSource.commit`; checkout dirs and
+/// retained archives are keyed by build id, not deployment id). A redeploy rebuilds from the newest
+/// PRODUCTION deployment when one exists (the newest record across all environments let a later
+/// preview hijack "Redeploy"), and the LIVE promoted deployment (`production == true`) outranks the
+/// lane heuristic entirely: `target` is immutable while promote/rollback flips only `production`,
+/// so sourcing the newest `target = "production"` record would re-promote the very deployment the
+/// operator just rolled back from.
 fn source_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
 ) -> Option<(fluid_core::GitSource, bool, Vec<String>)> {
-    // The third element is the selected upload source's platform-issued BUILD
-    // id (`GitSource.commit`). Checkout dirs and retained archives are keyed by
-    // build id, not by the independently-minted deployment id.
-    // The LIVE promoted deployment (production == true) outranks the lane
-    // heuristic entirely: `target` is immutable while promote/rollback flips
-    // only `production`, so after promoting a preview the current production
-    // deployment is stamped target="preview" — sourcing the newest
-    // target="production" record instead would rebuild (and re-promote) the
-    // very deployment the operator just rolled back from.
     let mut best_live: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_prod: Option<(u64, fluid_core::GitSource)> = None;
     let mut best_any: Option<(u64, fluid_core::GitSource)> = None;
@@ -6661,8 +6687,6 @@ fn source_for_project_fleet(
                 best_live = Some((ts, g.clone()));
             }
         }
-        // `target` is immutable ("production"/"preview"); empty = pre-target
-        // snapshot, fall back to the live promoted flag.
         let prod_lane = match target.trim() {
             "production" => true,
             "preview" => false,
@@ -6711,33 +6735,20 @@ fn source_for_project_fleet(
     })
 }
 
-/// The port + protocol the newest deployment for `project` was actually running with
-/// (its `web` function's declared port, whatever `container_manifest` baked in at
-/// deploy time — an explicit override or the auto-detected value) — LOCAL only (this
-/// node's own `deployment_records`; a project placed entirely on a peer has no
-/// manifest available here, since `peer_deployments`'/`DeploymentInfo` carries no
-/// port info, only `GitSource` — same fleet-locality gap `source_for_project_fleet`
-/// itself only partially closes). Feeds `redeploy_request` so an image redeploy
-/// restores the ORIGINAL port/protocol instead of blindly re-running auto-detection
-/// (which silently drops a manual override, and can't even land on the right answer
-/// for a multi-port image). `None` when there's no prior deployment with a declared
-/// port (no deploy yet, non-container deployment, or the record lives only on a peer).
+/// The port + protocol the project's newest deployment actually ran with (its `web` function's
+/// declared port, an explicit override or the auto-detected value), from LOCAL records only:
+/// `peer_deployments` carries no port info, so a project placed entirely on a peer has none here.
+/// Feeds `redeploy_request` so an image redeploy restores the ORIGINAL port/protocol instead of
+/// re-running auto-detection (which drops a manual override and cannot get a multi-port image
+/// right); `None` when no prior deployment declared a port.
 fn image_port_spec_for_project_fleet(
     c: &Arc<CloudState>,
     project: &str,
 ) -> Option<fluid_core::PortSpec> {
     fn spec_from(f: &fluid_core::FunctionConfig) -> Option<fluid_core::PortSpec> {
-        // Post-fix records carry the real spec directly.
         if let Some(p) = f.ports.first() {
             return Some(fluid_core::PortSpec::single(p.container_port, p.protocol));
         }
-        // Back-compat: a record written before `FunctionConfig.ports` existed —
-        // recover the port from the `__container__` structured marker
-        // (start_cmd = ["__container__", image, port, run_cfg_json], see
-        // `container_manifest`/`image_container_manifest` in git.rs) with whatever
-        // protocol was baked in (pre-fix that was always `http`, so this only ever
-        // recovers a plain TCP/HTTP port — the only kind that could exist before
-        // this patch).
         if f.runtime == "container"
             && f.start_cmd.first().map(String::as_str) == Some("__container__")
         {
@@ -6746,9 +6757,6 @@ fn image_port_spec_for_project_fleet(
         }
         None
     }
-    // Mirror source_for_project_fleet's lane preference: the redeploy sources
-    // the live/production record, so restoring the port spec from a NEWER
-    // preview record would pair a production source with a preview's ports.
     let mut best_live: Option<(u64, fluid_core::PortSpec)> = None;
     let mut best_prod: Option<(u64, fluid_core::PortSpec)> = None;
     let mut best_any: Option<(u64, fluid_core::PortSpec)> = None;
@@ -6789,9 +6797,9 @@ fn image_port_spec_for_project_fleet(
     best_live.or(best_prod).or(best_any).map(|(_, spec)| spec)
 }
 
-/// Build a placement `Target` addressing a specific node by NAME: self (both None),
-/// its HTTP admin URL when known, else its iroh mesh route. `None` when the node is
-/// unknown/unreachable. Used to pin a zip redeploy to the node holding the source.
+/// Builds a placement `Target` addressing a node by NAME: self (both None), its HTTP admin URL when
+/// known, else its iroh mesh route; `None` when the node is unknown or unreachable. Used to pin a
+/// zip redeploy to the node holding the source.
 fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::Target> {
     if node == c.node_name {
         return Some(crate::schedule::Target {
@@ -6818,9 +6826,9 @@ fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::T
     }
 }
 
-/// One deterministic node hosting `project`, preferring the live production
-/// record and then the newest record. Project-level owner proxies use this when
-/// public round-robin ingress lands on a node with no local deployment state.
+/// One deterministic node hosting `project`, preferring the live production record, then the
+/// newest; project-level owner proxies use it when public round-robin ingress lands on a node with
+/// no local deployment state.
 fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
     let mut candidates = Vec::new();
     for deployment in c.gw.list() {
@@ -6853,9 +6861,9 @@ fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
     candidates.into_iter().next().map(|(_, _, node)| node)
 }
 
-/// Peer node NAMES hosting `project` — addressed by node (not HTTP admin URL) so the
-/// caller can reach them over the iroh mesh via `fetch_from_host` (FC nodes have no
-/// HTTP admin URL in `node_admins`). Pairs with `peer_nodes_for_tenant` below.
+/// Peer node NAMES hosting `project`, addressed by node (not HTTP admin URL) so callers reach them
+/// over the iroh mesh via `fetch_from_host` (FC nodes have no HTTP admin URL in `node_admins`);
+/// pairs with `peer_nodes_for_tenant`.
 fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
     c.peer_deployments
         .read()
@@ -6865,11 +6873,10 @@ fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
         .collect()
 }
 
-/// GET `path` from a peer admin, forwarding the team header; returns parsed JSON.
-/// Byte-oriented sibling of [`fetch_from_host`], for reads whose payload isn't
-/// JSON (blob objects). Kept deliberately simple — HTTP admin URL only — since
-/// its callers all fall back to their existing not-found behaviour when it
-/// returns `None`, so it can never make a read worse than it is today.
+/// GET `path` from a peer admin, forwarding the team header, as raw bytes: the byte-oriented
+/// sibling of [`fetch_from_host`] for payloads that are not JSON (blob objects). Deliberately
+/// HTTP-admin-only: its callers all fall back to their existing not-found behaviour on `None`, so
+/// it can never make a read worse.
 pub(crate) async fn fetch_bytes_from_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -6906,10 +6913,6 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
         .get(format!("{admin}{path}"))
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(10));
-    // Under JWT enforcement `x-hive-team` alone resolves to ANON on the target
-    // (headers are client-supplied, never trusted) — every tenant-gated read
-    // proxied here silently 403'd. Attach the same short-lived signed service
-    // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
         if let Ok(tok) = crate::auth::issue(
             "mesh-internal",
@@ -6928,13 +6931,6 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     resp.json::<Value>().await.ok()
 }
 
-// ---- node-addressed read-view proxying (HTTP admin OR iroh mesh) ----------------
-// The NAT'd coordinator has NO HTTP admin path to the FC nodes (SSH tunnels cut), so
-// `node_admins` is empty for them and the HTTP `host_admin_for_*` helpers return None
-// — which silently emptied the dashboard's per-deployment read views (resources, and
-// the workflows tab) for FC-hosted projects. These resolve the host NODE NAME instead
-// and fetch over whichever transport works: HTTP admin if known, else the iroh mesh.
-
 /// Host node NAME for deployment `id` (no HTTP-admin requirement).
 pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
     c.peer_deployments
@@ -6944,9 +6940,9 @@ pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<
         .map(|(node, _)| node.clone())
 }
 
-/// Host node NAME for the selected upload source lineage. Matching the
-/// platform-issued build id stamped in `GitSource.commit` is load-bearing: a
-/// host carrying only a newer preview checkout cannot rebuild production.
+/// Host node NAME for the selected upload source lineage; matching the platform-issued build id
+/// stamped in `GitSource.commit` is load-bearing, since a host carrying only a newer preview
+/// checkout cannot rebuild production.
 fn host_node_for_source_ids(c: &Arc<CloudState>, ids: &[String]) -> Option<String> {
     c.peer_deployments
         .read()
@@ -6974,13 +6970,10 @@ fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
     out.into_iter().collect()
 }
 
-/// Every deployment across the WHOLE fleet, ALL tenants (operator scope): the
-/// locally-hosted set plus every gossiped `peer_deployments` entry, deduped by id.
-/// The ops overview + data browser run on one node, but the placement scheduler
-/// hosts deployments on peers — a bare `c.gw.list()` returns only what this node
-/// hosts (often nothing on a coordinator), which is why the ops console showed
-/// "0 deployments" while peers served every project. This mirrors `dep_list`'s
-/// aggregation but WITHOUT the tenant filter (operator-only callers).
+/// Every deployment across the WHOLE fleet, ALL tenants (operator scope): the locally hosted set
+/// plus every gossiped `peer_deployments` entry, deduped by id. `dep_list`'s aggregation without
+/// the tenant filter (operator-only callers), since a bare `c.gw.list()` returns only what this
+/// node hosts (often nothing on a coordinator).
 fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
     let mut list = c.gw.list();
     let mut seen: std::collections::HashSet<String> =
@@ -6996,17 +6989,12 @@ fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
     list.into_iter().map(|d| json!(d)).collect()
 }
 
-/// GET a read-view from a host node by NAME: HTTP admin if we have one, else over the
-/// iroh mesh (resolve the node's id+addr from the gossip registry). Team rides as a
-/// query param on the iroh path (no HTTP headers over that transport).
-/// Aggregate per-function usage stats across the WHOLE fleet: the local node's
-/// live stats plus each peer's `/v1/functions` (over HTTP admin or iroh gossip).
-/// The billing meter loop uses this so a NAT'd coordinator still bills compute that
-/// actually ran on the Firecracker nodes. Each `FunctionStats` carries its `tenant`.
+/// Aggregates per-function usage stats across the WHOLE fleet: this node's live stats plus each
+/// peer's `/v1/functions` (HTTP admin or iroh gossip), so the billing meter still bills compute
+/// that ran on Firecracker nodes behind a NAT'd coordinator; each `FunctionStats` carries its
+/// `tenant`.
 pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::FunctionStats> {
     let mut out: Vec<fluid_compute::FunctionStats> = c.fluid.stats();
-    // `local=true` is REQUIRED now that `/v1/functions` fans out itself —
-    // without it each peer would re-fan to every other peer.
     for v in fan_out_peers(c, &all_healthy_peers(c), "", "/v1/functions?local=true").await {
         if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
             out.append(&mut stats);
@@ -7015,11 +7003,10 @@ pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::Fun
     out
 }
 
-/// Build the mesh tenant query segment: `team=<t>` plus a signed, short-lived
-/// (`&tok=<jwt>`) delegation token when JWT signing is configured. The host node
-/// verifies the token as an authoritative, expiring tenant assertion instead of
-/// trusting the raw `team=` param (see `gossip::team_claims`). Empty `team`
-/// yields an empty segment (callers append nothing).
+/// The mesh tenant query segment: `team=<t>` plus a signed, short-lived `&tok=<jwt>` delegation
+/// when JWT signing is configured; the host node verifies the token as an authoritative expiring
+/// tenant assertion instead of trusting the raw `team=` param (`gossip::team_claims`). An empty
+/// `team` yields an empty segment.
 pub(crate) fn mesh_team_qs(team: &str) -> String {
     if team.is_empty() {
         return String::new();
@@ -7038,14 +7025,15 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
     format!("team={team}")
 }
 
+/// GETs a read-view from a host node by NAME: the HTTP admin when known, else over the iroh mesh
+/// (node id + addr from the gossip registry), where the team rides as a query param because that
+/// transport has no HTTP headers.
 pub(crate) async fn fetch_from_host(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,
     team: &str,
 ) -> Option<Value> {
-    // Bind out of the lock FIRST so no parking_lot guard is held across the await
-    // (the dispatched future must be `Send`).
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
         if let Some(v) = proxy_get_json(c, &admin, path, team).await {
@@ -7061,20 +7049,16 @@ pub(crate) async fn fetch_from_host(
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        // 20s (not the old flat 10s): `acquire`'s cached-hint attempt can now fall
-        // back to a fresh-discovery dial (`PeerPool::dial_fresh`) when the hint is
-        // stale, which needs headroom beyond `connect_budget()` alone to actually
-        // complete instead of being cut off by this outer timeout.
-        //
-        // `addr` here is `n.iroh_addr` — a snapshot serialized at the HOST's own
-        // boot/last-gossip time, so its relay (if any) can go stale exactly like
-        // the direct addrs can. `request_to` re-hints the relay transport (this
-        // node's live-gossiped registry view of `id`'s own/nearest relay_url —
-        // see `gossip::relay_hinted_addr`) before dialing, so a call from e.g.
-        // fc-hongkong to fc-sanjose hints sj's own live relay_url rather than
-        // whatever was cached in `addr` at gossip time.
-        if let Some(b) =
-            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20).await
+        if let Some(b) = crate::gossip::request_to(
+            c,
+            &id,
+            &addr,
+            hive_p2p::GOSSIP_GET,
+            &p,
+            &[],
+            MESH_FORWARD_TIMEOUT_SECS,
+        )
+        .await
         {
             return serde_json::from_slice(&b).ok();
         }
@@ -7082,73 +7066,33 @@ pub(crate) async fn fetch_from_host(
     None
 }
 
-/// `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh) are
-/// DIAL-RESILIENCE budgets — right for one-shot control operations,
-/// structurally wrong for anything on a request path: one registry-healthy
-/// peer whose trunk is cold made `/v1/functions` and `/v1/metrics` take a flat
-/// ~20s per poll (measured live), which the 3-5s dashboard polling then piled
-/// onto until the usage page rendered nothing at all. The fetches run
-/// concurrently, so the whole fan-out costs at most one budget; a peer that
-/// misses it contributes to the next poll instead (the wf_runs PHASE_BUDGET
-/// precedent, applied at the shared chokepoint). Kept for CONTROL callers
-/// (the billing meter's `fleet_function_stats`); polled dashboard reads use
-/// `POLLED_READ_PER_PEER_BUDGET` instead.
+/// Per-peer budget for CONTROL fan-outs (the billing meter's `fleet_function_stats`):
+/// `fetch_from_host`'s own 10 s HTTP / 20 s iroh budgets are dial-resilience budgets, wrong on a
+/// request path (one cold-trunk peer made `/v1/functions` and `/v1/metrics` take a flat ~20 s per
+/// poll). Fetches run concurrently, so the whole fan-out costs at most one budget and a peer that
+/// misses it contributes to the next poll; polled dashboard reads use
+/// [`POLLED_READ_PER_PEER_BUDGET`].
 const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
 
-/// Per-peer budget for a POLLED dashboard read (every `fan_out_peers_polled`
-/// caller). Live-measured on the 11-node fleet: a peer's `?local=true` handler
-/// answers in ~0.5 ms locally and the mesh round trip is 100-200 ms, so 3s is
-/// >10x headroom over a healthy peer — while 8s is exactly what turned a
-/// congested trunk into a flat 8.00 s page load (`/v1/functions` and
-/// `/v1/metrics` measured at 8.0028 s / 8.0030 s on fc-sanjose, and hitting
-/// 8.00 s on fc-virginia / fc-virginia-3 on every second poll). The mesh was
-/// NOT idle: every node's own gossip collect phase consumed its full 8000 ms
-/// deadline on 30-46 of 46-54 rounds per 10 min (`gossip rounds (last 10 min)`
-/// in the journal), because the admin fan-out shares the pooled trunks with
-/// gossip and the multi-MB store_sync pulls. A peer that misses this budget is
-/// still merged on the next poll, exactly as it was when it missed 8s.
+/// Per-peer budget for a POLLED dashboard read (every `fan_out_peers_polled` caller): a peer's
+/// `?local=true` handler answers in ~0.5 ms and the mesh round trip is 100-200 ms, so 3 s is >10x
+/// headroom over a healthy peer, while 8 s turned a congested trunk into a flat 8 s page load (the
+/// admin fan-out shares the pooled trunks with gossip and the multi-MB store_sync pulls). A peer
+/// that misses it is merged on the next poll.
 const POLLED_READ_PER_PEER_BUDGET: Duration = Duration::from_secs(3);
 
-/// TTL for the dashboard-polled response caches (`/v1/functions`,
-/// `/v1/metrics`) — and REQUIRED to outlast one poll INTERVAL plus one build,
-/// or a poller never sees a warm entry.
-///
-/// Live-witnessed 2026-09-30: both endpoints cost 3.0028 s to build on the
-/// control-plane leader (fc-sanjose) — exactly `POLLED_READ_PER_PEER_BUDGET`,
-/// i.e. one unreachable-but-healthy-listed peer burning the whole fan-out
-/// budget. A 3 s TTL is therefore shorter than one poll interval plus one
-/// build: an entry stored at T expired at T+3, while the dashboard's 3-5 s poll
-/// cadence next asks at ~T+3.5 — so every poll missed and rebuilt. (Back-to-
-/// back calls DID hit it — 3.0149 s then 0.0008 s, measured on the old binary —
-/// which is what masked this: it looks cached under `curl` twice and uncached
-/// under a real dashboard.)
-///
-/// The missed polls are not evenly distributed either: because the dashboard's
-/// `/ops/*` proxy forwards to the leader, the slow node is the one users hit.
-///
-/// 15 s is >4x the measured worst-case build, so a poll every 3-5 s hits a
-/// warm entry. Metrics are minute-granular so that staleness is invisible, and
+/// TTL of the dashboard-polled response caches (`/v1/functions`, `/v1/metrics`): it MUST outlast
+/// one poll interval plus one build, or a poller never sees a warm entry (a 3 s TTL expired before
+/// the dashboard's 3-5 s cadence asked again, so every poll rebuilt, while back-to-back `curl`
+/// calls looked cached). 15 s is >4x the measured worst-case build; metrics are minute-granular and
 /// the functions list only changes on a deploy.
 const POLLED_RESPONSE_CACHE_TTL: Duration = Duration::from_secs(15);
 
-/// Fan out `path` (identical for every peer — only the target host varies) to
-/// every node in `peers` CONCURRENTLY, returning each reachable peer's parsed
-/// JSON response (unreachable/malformed peers are silently absent — never
-/// fail the whole read over one bad node).
-///
-/// Replaces the hand-rolled `for node in <peer list> { ...fetch_from_host
-/// (...).await... }` sequential loop that used to live in every one of these
-/// "merge every peer's view" handlers (metrics_get, wf_list, wf_runs,
-/// wf_summary, cron_list, fleet_function_stats, admin_overview). Each hop can
-/// carry up to `fetch_from_host`'s own 20s timeout, so N sequential hops could
-/// cost up to N×20s in the worst case (live-witnessed as the dashboard's
-/// slowest reads); `join_all` bounds the total added latency to the SLOWEST
-/// single hop instead of the sum of every hop — with a 10-node fleet this is
-/// up to a ~9x cut. Callers keep their own per-endpoint merge logic (it's
-/// cheap, in-memory, never the bottleneck) — only the network fan-out itself
-/// changes shape. `peers` is caller-supplied (not always "every healthy fleet
-/// node" — `peer_nodes_for_tenant` narrows to only nodes hosting the tenant's
-/// projects for the workflow endpoints).
+/// Fans `path` (identical for every peer) out to every node in `peers` CONCURRENTLY and returns
+/// each reachable peer's parsed JSON; unreachable or malformed peers are silently absent, never
+/// failing the whole read. `join_all` bounds the added latency to the SLOWEST single hop instead of
+/// the sum of sequential hops; callers keep their own merge logic, and `peers` is caller-supplied
+/// (`peer_nodes_for_tenant` narrows to the nodes hosting the tenant's projects).
 async fn fan_out_peers(
     c: &Arc<CloudState>,
     peers: &[String],
@@ -7158,13 +7102,11 @@ async fn fan_out_peers(
     fan_out_peers_bounded(c, peers, team, path, PER_PEER_BUDGET).await
 }
 
-/// `fan_out_peers` for the endpoints the dashboard re-asks every few seconds
-/// (functions, metrics, cron, workflows, webhooks, notifications, ops
-/// overview, service-graph). Identical shape, tighter per-peer budget — see
-/// `POLLED_READ_PER_PEER_BUDGET`. Deliberately NOT used by the billing
-/// meter's `fleet_function_stats`: under-counting metered compute is a
-/// revenue-correctness question, and that loop is not latency-critical, so it
-/// keeps the generous control-operation budget.
+/// [`fan_out_peers`] for the endpoints the dashboard re-asks every few seconds (functions, metrics,
+/// cron, workflows, webhooks, notifications, ops overview, service graph), with the tighter
+/// [`POLLED_READ_PER_PEER_BUDGET`]. Deliberately NOT used by the billing meter's
+/// `fleet_function_stats`: under-counting metered compute is a revenue-correctness question and
+/// that loop is not latency-critical.
 async fn fan_out_peers_polled(
     c: &Arc<CloudState>,
     peers: &[String],
@@ -7205,15 +7147,12 @@ fn all_healthy_peers(c: &Arc<CloudState>) -> Vec<String> {
         .collect()
 }
 
-/// Assemble the deploy request for a redeploy from the resolved source. `no_fanout`
-/// pins a zip redeploy to the node holding the retained source (see below); git/image
-/// redeploys leave it false so the normal placement scheduler runs. `image_port_spec`
-/// is the ORIGINAL port/protocol the project's newest deployment ran with (see
-/// `image_port_spec_for_project_fleet`) — restored onto `image_port`/`image_protocol`
-/// so an image redeploy doesn't silently discard an explicit override (or a
-/// UDP-only image's only possible port) and blindly re-detect from scratch every
-/// time. Harmless to set for a non-image (git/zip) redeploy: `image_ref` stays
-/// `None` there, so `produce_manifest` never even looks at these two fields.
+/// Assembles the deploy request for a redeploy from the resolved source. `no_fanout` pins a zip
+/// redeploy to the node holding the retained source, git/image redeploys leave it false so the
+/// placement scheduler runs. `image_port_spec` is the ORIGINAL port/protocol of the project's
+/// newest deployment, restored onto `image_port`/`image_protocol` so an image redeploy keeps an
+/// explicit override (or a UDP-only image's only port); harmless for git/zip, where `image_ref`
+/// stays `None`.
 fn redeploy_request(
     project: &str,
     src: &fluid_core::GitSource,
@@ -7229,12 +7168,7 @@ fn redeploy_request(
         source_deployment_ids,
         repo_url: src.repo_url.clone(),
         branch: Some(src.branch.clone()).filter(|b| !b.is_empty()),
-        // Manual redeploy has no specific webhook-notified commit — build
-        // whatever the branch currently points to, same as before this field
-        // existed.
         commit: None,
-        // A redeploy always clones the project's own configured repo — there is
-        // no webhook PR payload here to have identified a fork in the first place.
         head_repo_url: None,
         project: Some(project.to_string()),
         project_incarnation: None,
@@ -7243,34 +7177,31 @@ fn redeploy_request(
         target,
         use_cache,
         root_dir,
-        env: None, // redeploy: existing project env is read from the store at build time
+        env: None,
         no_fanout,
-        // A pinned zip redeploy (`no_fanout: true`) targets exactly ONE node (the
-        // retained-source holder) — never one-of-many — so it is never a secondary.
         fanout_secondary: false,
-        build_config: None, // coordinator reads its own store; fanout fills these per-target
+        build_config: None,
         function_settings: None,
-        redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
+        redeploy: false,
         zip_b64: None,
         image_ref: None,
         image_port: image_port_spec.as_ref().map(|p| p.container_port),
         image_protocol: image_port_spec.as_ref().map(|p| p.protocol),
-        // Resource overrides (unlike port/protocol above) aren't restored from
-        // the project's deployment history — a redeploy takes the node's
-        // default until the caller re-specifies one.
         image_memory: None,
         image_cpus: None,
         image_pids: None,
-        // A multi-port declaration isn't restored from history on redeploy
-        // (only the single primary image_port_spec is) — a genuinely narrower,
-        // separately-tracked residual of this restore path, not a regression:
-        // the single-port restore this field sits beside has the exact same
-        // shape it always did.
         image_ports: None,
         git_token,
     }
 }
 
+/// Redeploys a project from its newest deployment's source (see [`source_for_project_fleet`]): a
+/// zip project rebuilds from the RETAINED source (locally when this node holds it, else dispatched
+/// to the holder), an image project is redeployed as an image, a real git source re-clones through
+/// the normal placement path. Without an explicit environment the rebuild lands in the sourced
+/// deployment's OWN environment, never branch-vs-production_branch guessing. A project that never
+/// deployed falls back to its `last_build` source (a failed first build is retried on the
+/// production lane); the webhook and the git poll keep ignoring never-deployed projects.
 async fn project_redeploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7291,8 +7222,6 @@ async fn project_redeploy(
         }
     };
 
-    // Environment chosen in the modal: "production" | "preview". When absent the
-    // branch decides (Vercel's classification).
     let target = body
         .target
         .as_ref()
@@ -7307,31 +7236,37 @@ async fn project_redeploy(
     )
     .filter(|s| !s.is_empty());
 
-    // Resolve the newest deployment's SOURCE including the non-git pseudo-sources
-    // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
-    // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
-    // zip-uploaded or image-based project (the reported bug).
-    let Some((src, prod_lane, source_ids)) = source_for_project_fleet(&c, &project) else {
+    let last_build_source = || {
+        let row = c.projects.get_if_set(&project)?;
+        let build = row.last_build?;
+        if build.repo_url.is_empty()
+            || build.repo_url.starts_with("upload://")
+            || build.repo_url.starts_with("image://")
+        {
+            return None;
+        }
+        Some((
+            fluid_core::GitSource {
+                repo_url: build.repo_url,
+                branch: build.branch,
+                commit: String::new(),
+                commit_message: String::new(),
+            },
+            true,
+            Vec::new(),
+        ))
+    };
+    let Some((src, prod_lane, source_ids)) =
+        source_for_project_fleet(&c, &project).or_else(last_build_source)
+    else {
         return Err((
             StatusCode::NOT_FOUND,
-            format!("Project '{project}' has no deployment to redeploy yet."),
+            format!("Project '{project}' has no deployment or build to redeploy from yet."),
         ));
     };
-    // No explicit environment in the modal: a redeploy rebuilds the deployment
-    // it sourced from into that deployment's OWN environment (Vercel's model).
-    // Leaving `target: None` fell through to branch-vs-production_branch
-    // guessing at build time, which misfiled production redeploys as previews
-    // whenever the sourced branch string didn't exactly match.
     let target = target.or_else(|| Some(if prod_lane { "production" } else { "preview" }.into()));
-    // Original port/protocol to restore on an image redeploy (see `redeploy_request`'s
-    // doc comment) — resolved once, reused across every branch below.
     let image_spec = image_port_spec_for_project_fleet(&c, &project);
 
-    // Zip-uploaded project: there is no re-fetchable remote — rebuild from the RETAINED
-    // source, which lives on the node that built it. Build locally (no re-placement)
-    // when this node holds it, else dispatch the redeploy to the host node so it
-    // rebuilds from its own source. (Git/image sources are re-fetchable anywhere and
-    // fall through to the normal placement path below.)
     if !src.is_real_git() && src.repo_url.starts_with("upload://") {
         if crate::git::has_local_source_for_ids(&project, &source_ids) {
             let req = redeploy_request(
@@ -7383,7 +7318,6 @@ async fn project_redeploy(
         ));
     }
 
-    // Prebuilt-image project: reconstruct the image ref and redeploy as an image.
     if src.repo_url.starts_with("image://") {
         let image_ref = src
             .repo_url
@@ -7407,15 +7341,6 @@ async fn project_redeploy(
             image_spec.clone(),
             source_ids.clone(),
         );
-        // Keep the SAME synthetic `image://…` source URL a fresh prebuilt-image
-        // deploy records (see `git_deploy_public`'s image branch) — never blank
-        // it. A prebuilt-image deploy has no repository to clone, but the
-        // source URL is still the deployment record's source identity and
-        // `validate_deploy_source`/`resolve_build_trust` legitimately parse it:
-        // blanking it made every image redeploy fail at the front door with
-        // "repository URL: repository URL is empty" (witnessed 2026-09-26,
-        // project `minecwaft` -> image://itzg/minecraft-server:latest, HTTP
-        // 409). `image_ref` remains what actually gets deployed.
         req.repo_url = src.repo_url.clone();
         req.branch = None;
         req.image_ref = Some(image_ref);
@@ -7425,7 +7350,6 @@ async fn project_redeploy(
         return Ok(Json(json!({ "build_id": build_id })));
     }
 
-    // Real git source: re-clone + rebuild through the normal placement/fanout path.
     let req = redeploy_request(
         &project,
         &src,
@@ -7443,24 +7367,46 @@ async fn project_redeploy(
     Ok(Json(json!({ "build_id": build_id })))
 }
 
-// ---- GitOps ----
+#[derive(Default, serde::Deserialize)]
+pub(crate) struct GitopsProjectsQuery {
+    /// `summary`: the dashboard's inventory view (`project_inventory::summary`), served by the leader so
+    /// a just-finished build is visible from any node; absent: the GitOps artifact rows below.
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Set by a proxying node: answer from this node's own view, never re-proxy.
+    #[serde(default)]
+    pub local: Option<bool>,
+}
 
-/// All projects owned by a tenant plus their settings + git source — the data the
-/// dashboard serializes into the committed `openedge.yaml`. FLEET-AWARE: iterating
-/// only the local `ProjectStore` snapshot (as this handler did before) misses any
-/// project this node never locally built/saw — `ProjectSettings` rows are
-/// confirmed node-local-only, never gossiped (unlike `dep_list`/`admin_overview`,
-/// which already merge `peer_deployments`). Union local settings with every
-/// project name a fleet-aggregated deployment carries for this tenant, so a
-/// project created (even with zero deployments yet) on ANOTHER node still
-/// appears here — the exact class of bug that hid team Simpfi's `drugs-wtf`
-/// project on 4 of 8 fleet nodes.
-async fn gitops_projects(
+/// All projects the tenant owns with their settings and git source, the data the dashboard
+/// serializes into the committed `openedge.yaml`. Fleet-aware: the union of local settings rows,
+/// every project a fleet-aggregated deployment names for this tenant and the fleet-replicated
+/// relational mirror, so a project created (even with zero deployments) on ANOTHER node still
+/// appears. `view=summary` serves the inventory view (`project_inventory::summary`).
+pub(crate) async fn gitops_projects(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Json<Value> {
+    Query(q): Query<GitopsProjectsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if q.view.as_deref() == Some("summary") {
+        require_auth_read(claims.as_ref().map(|e| &e.0))?;
+        if q.local != Some(true) {
+            if let Some(leader) = c.leader_forward_target() {
+                let read = fetch_from_host(
+                    &c,
+                    &leader,
+                    "/v1/gitops/projects?view=summary&local=true",
+                    &t,
+                );
+                if let Ok(Some(v)) = tokio::time::timeout(POLLED_READ_PER_PEER_BUDGET, read).await {
+                    return Ok(Json(v));
+                }
+            }
+        }
+        return Ok(Json(json!(crate::project_inventory::summary(&c, &t))));
+    }
     let mut out = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (project, settings) in c.projects.snapshot() {
@@ -7473,8 +7419,6 @@ async fn gitops_projects(
             c.gw.list()
                 .into_iter()
                 .find(|d| d.project == project && d.production);
-        // Enterprise deployment protection is part of the declarative config too —
-        // include mode/scope (never the password) so protection changes commit.
         let prot = c.enterprise.protection(&project);
         out.push(json!({
             "project": project,
@@ -7485,14 +7429,10 @@ async fn gitops_projects(
             "protection": { "mode": prot.mode, "scope": prot.scope },
         }));
     }
-    // Fleet-visible fallback rows: a project this node has never locally seen a
-    // ProjectSettings row for, but that the tenant owns per a gossiped deployment
-    // record. Settings/git/protection are unavailable here (this node genuinely
-    // has none) — surfaced with defaults rather than silently omitted, so the
-    // project is at least visible/selectable instead of invisible.
     for (_node, deps) in c.peer_deployments.read().iter() {
         for d in deps {
-            if record_tenant(&d.tenant) != t || !seen.insert(d.project.clone()) {
+            if deployment_tenant(&c, &d.project, &d.tenant) != t || !seen.insert(d.project.clone())
+            {
                 continue;
             }
             out.push(json!({
@@ -7505,12 +7445,6 @@ async fn gitops_projects(
             }));
         }
     }
-    // Second fallback tier: the fleet-replicated relational mirror (see
-    // relational.rs) — the DURABLE fix. Unlike peer_deployments (which can
-    // only know about a project that has at least one deployment somewhere),
-    // this catches a project that was CREATED but never successfully
-    // deployed anywhere in the fleet — `drugs-wtf`'s exact bug (zero
-    // deployments fleet-wide, live-witnessed).
     for project in crate::relational::projects_for_team(&t).await {
         if !seen.insert(project.clone()) {
             continue;
@@ -7530,7 +7464,7 @@ async fn gitops_projects(
             .unwrap_or("")
             .cmp(b["project"].as_str().unwrap_or(""))
     });
-    Json(json!(out))
+    Ok(Json(json!(out)))
 }
 
 async fn gitops_get(
@@ -7596,30 +7530,17 @@ async fn gitops_synced(
     Json(json!(link))
 }
 
-/// Inbound GitHub webhook: on a push (or merged/updated PR) to a repo that backs
-/// one or more existing projects, trigger a fresh production build+deploy from the
-/// pushed commit — repos become deployable workflows (taubyte-style GitOps CI).
-///
-/// Auth: this route is in the `open` allowlist (GitHub can't present a platform
-/// JWT). When `GITHUB_WEBHOOK_SECRET` is set the HMAC-SHA256 signature is
-/// verified. When it is unset, the safe default is to REJECT the delivery
-/// (401) rather than silently accepting anything unsigned — that permissive
-/// behavior must now be deliberately opted into via
-/// `GITHUB_WEBHOOK_ALLOW_UNSIGNED=1`, intended for local/dev convenience only
-/// (never set it in production once the secret is fleet-provisioned).
+/// Inbound GitHub webhook: a push (or an opened/updated PR) to a repo that backs existing projects
+/// triggers a build of the notified commit; a PR always builds a PREVIEW, a push is classified per
+/// project from its branch. The route is in the auth `open` allowlist (GitHub cannot present a
+/// platform JWT), so the HMAC-SHA256 signature is the gate: verified whenever
+/// `GITHUB_WEBHOOK_SECRET` is set, and with no secret an unsigned delivery is rejected (401) unless
+/// `GITHUB_WEBHOOK_ALLOW_UNSIGNED=1` (local/dev only).
 async fn git_webhook(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Signature policy: a SIGNED delivery is always verified when a secret is
-    // configured (a bad/forged signature is rejected). An UNSIGNED delivery is
-    // accepted ONLY with the explicit `GITHUB_WEBHOOK_ALLOW_UNSIGNED` opt-in —
-    // this restores auto-deploy for hooks that were installed before the UI
-    // was provisioned with the signing secret (they carry no signature and
-    // would otherwise 401 forever), without dropping verification of the
-    // hooks that DO sign. Re-signing those legacy hooks (reconnect GitHub) lets
-    // this flag be removed again for strict-everywhere verification.
     let secret = std::env::var("GITHUB_WEBHOOK_SECRET")
         .ok()
         .filter(|s| !s.is_empty());
@@ -7627,48 +7548,14 @@ async fn git_webhook(
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    // The opt-in is honored ONLY while no secret is configured. Its documented
-    // purpose is legacy hooks installed before the signing secret existed, which
-    // carry no signature — that is a pre-secret condition by construction. Left
-    // ungated it did something far larger: with a secret configured and this flag
-    // set, an unsigned delivery was accepted, so an attacker did not need to forge
-    // a signature at all — merely OMIT the header — and signature verification
-    // became unreachable for anyone who bothered.
-    //
-    // That was live, not theoretical: an ansible-invisible drop-in
-    // (`hive-node.service.d/webhook-unsigned.conf`) set it on 10 of 14 fleet
-    // nodes, including the control-plane leader, while the main unit correctly
-    // configured a secret. A public unsigned POST to `/v1/git/webhook` on the
-    // round-robin host returned 200 while the same request WITH a bogus signature
-    // correctly returned 401 — i.e. presenting no credential beat presenting a
-    // wrong one, and the webhook clones and deploys attacker-named source into a
-    // victim project WITH that project's env injected.
-    //
-    // Gating on `secret.is_none()` keeps the escape hatch working for the case it
-    // was written for (genuine local/dev with no secret provisioned) and makes it
-    // inert everywhere the fleet has one. A legacy unsigned hook on a
-    // secret-configured node is now rejected with the existing message, which
-    // already names the remedy: reconnect GitHub to re-sign it.
     let allow_unsigned = secret.is_none()
         && std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
     if !sig.is_empty() {
-        // Signed: verify against the secret. A signed delivery with no secret
-        // configured can't be verified — accept only under the opt-in.
         match &secret {
             Some(s) => {
                 if !verify_github_sig(s.as_bytes(), &body, sig) {
-                    // WARN, because this rejection used to be completely silent
-                    // and it has two very different causes that look identical
-                    // from outside: a forged/replayed delivery (correctly
-                    // refused, nothing to do) or a SECRET MISMATCH between the
-                    // UI that installed the hook and the backend that verifies
-                    // it — under which every real GitHub delivery is dropped and
-                    // auto-deploy is dead platform-wide, with no log, no event
-                    // and no incident to notice it by. The repo/event context is
-                    // what lets an operator tell the two apart: a mismatch shows
-                    // a steady stream from THEIR OWN repos.
                     let repo = serde_json::from_slice::<Value>(&body)
                         .ok()
                         .and_then(|v| {
@@ -7704,7 +7591,6 @@ async fn git_webhook(
             }
         }
     } else if !allow_unsigned {
-        // Unsigned and not opted in → reject (the strict default).
         return Err((
             StatusCode::UNAUTHORIZED,
             "unsigned webhook delivery rejected. The GitHub hook has no signing \
@@ -7724,28 +7610,18 @@ async fn git_webhook(
     let payload: Value = serde_json::from_slice(&body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
 
-    // Extract the repo + branch + head commit, supporting `push` and
-    // `pull_request` (opened/synchronize/reopened/closed) events. The deploy
-    // TARGET follows Vercel's model: a PR always builds a PREVIEW; a push is
-    // classified per-project from its branch (None => the production branch wins).
     let repo_full = payload["repository"]["full_name"]
         .as_str()
         .unwrap_or("")
         .to_string();
     let mut target: Option<String> = None;
     let mut pr_number: Option<u64> = None;
-    // `head_repo_url`: Some only for a PR opened FROM A FORK — its clone URL, used
-    // to override the clone SOURCE further down (never the project-matching repo,
-    // which always stays `repo_full`/the base repo — see `want` below).
     let (branch, commit, head_repo_url) = match event.as_str() {
         "pull_request" => {
             let action = payload["action"].as_str().unwrap_or("");
-            // A closed PR has nothing to (re)build. A merge fires a separate push
-            // to the base branch, which is what produces the production deployment.
             if action == "closed" {
                 return Ok(Json(json!({ "ignored": "pr closed" })));
             }
-            // opened / synchronize / reopened / ready_for_review -> preview.
             target = Some("preview".into());
             pr_number = payload["number"]
                 .as_u64()
@@ -7758,14 +7634,6 @@ async fn git_webhook(
                 .as_str()
                 .unwrap_or("")
                 .to_string();
-            // `head.repo` is the repo the PR branch actually lives on — null/absent
-            // for a same-repo PR (GitHub omits it in that case for some payload
-            // shapes) as well as for a PR opened from a since-deleted/inaccessible
-            // fork (nothing left to clone; falls through to the base-repo clone,
-            // which will then fail downstream with a clear git error, same as
-            // today). Only when it's PRESENT and differs from the base repo is
-            // this a genuine fork PR whose branch/commit live somewhere the base
-            // repo's remote has never heard of.
             let head_repo_full = payload["pull_request"]["head"]["repo"]["full_name"]
                 .as_str()
                 .map(str::to_string);
@@ -7774,9 +7642,6 @@ async fn git_webhook(
                 None => false,
             };
             let head_repo_url = if is_fork {
-                // Prefer GitHub's own clone_url when present; fall back to
-                // constructing it from full_name (covers hand-built test payloads
-                // and any delivery shape that omits clone_url).
                 payload["pull_request"]["head"]["repo"]["clone_url"]
                     .as_str()
                     .map(str::to_string)
@@ -7792,7 +7657,6 @@ async fn git_webhook(
         }
         "ping" => return Ok(Json(json!({ "pong": true }))),
         _ => {
-            // push event -> classified from the branch at build time.
             if payload["deleted"].as_bool().unwrap_or(false) {
                 return Ok(Json(json!({ "ignored": "branch deleted" })));
             }
@@ -7806,21 +7670,9 @@ async fn git_webhook(
     if repo_full.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "missing repository".into()));
     }
-    // PROJECT MATCHING always uses the BASE repo's full_name — a fork-originated
-    // PR still belongs to the base project; only the clone SOURCE (below) forks.
     let want = crate::gitops::norm_repo(&repo_full);
     tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, fork = ?head_repo_url, "git_webhook: received");
 
-    // Private-repo credential for every deploy this delivery triggers below,
-    // resolved ONCE (every triggered project shares the same `repo_full`).
-    // FIRST CHOICE: a GitHub App installation access token, minted server-side
-    // with no user session required (see `github_app_auth`) — this is what
-    // lets a repo that was only ever connected via a user's interactive
-    // GitHub App session (no node-wide GITHUB_TOKEN configured) still
-    // auto-deploy on push. `None` here (App not configured, App not
-    // installed on this repo, or a mint failure) is NOT fatal: `git.rs`'s
-    // clone path transparently falls back to the node-wide GITHUB_TOKEN env
-    // var exactly as it did before this existed.
     let webhook_git_token: Option<String> = if crate::github_app_auth::configured() {
         match repo_full.split_once('/') {
             Some((owner, repo)) => {
@@ -7831,9 +7683,6 @@ async fn git_webhook(
                         None
                     }
                     Err(e) => {
-                        // Never log `e`'s source token/key content — the error
-                        // variants in `github_app_auth` never carry credential
-                        // material, only status codes / parse failures.
                         tracing::warn!(repo = %want, error = %e, "git_webhook: GitHub App installation-token mint failed — falling back to node GITHUB_TOKEN");
                         None
                     }
@@ -7845,13 +7694,6 @@ async fn git_webhook(
         None
     };
 
-    // Candidate projects for this repo: O(1) via the reverse index
-    // (`gitops::GitRepoIndex`) in the normal case, instead of an O(projects)
-    // fleet-wide scan on every single webhook delivery. An index that has NEVER
-    // been populated at all (fresh boot before the first rebuild, or a bug) is
-    // NOT the same as "this repo genuinely has zero projects" — that specific
-    // case falls back to the original full scan defensively (not the normal
-    // path). See `GitRepoIndex`'s doc comment for what keeps it in sync.
     let candidates: Vec<String> = if !c.git_index.is_empty() {
         c.git_index.projects_for(&want)
     } else {
@@ -7859,17 +7701,8 @@ async fn git_webhook(
         c.projects.snapshot().into_keys().collect()
     };
 
-    // Deploy every project pointing at this repo for the pushed/PR branch. We do
-    // NOT filter by branch: a push to a non-production branch (or a PR) is exactly
-    // how preview deployments are created — the branch decides production vs
-    // preview at build time (or `target` forces a preview for PRs).
     let mut triggered = Vec::new();
     for project in candidates {
-        // Fleet-aware git lookup: a project placed on a peer node (the common case —
-        // most projects run on Firecracker nodes, not this coordinator) has no LOCAL
-        // gateway git source, so `gw.git_for_project` returns None and the webhook
-        // would silently trigger NOTHING. Use the gossiped fleet view so pushes/PRs
-        // to remotely-placed projects still create deployments.
         let Some(git) = git_for_project_fleet(&c, &project) else {
             continue;
         };
@@ -7882,18 +7715,6 @@ async fn git_webhook(
             branch.clone()
         };
 
-        // Already-building guard, matching `git_poll_cycle`'s (git.rs) — a
-        // webhook delivery firing near-simultaneously with a poll tick (or a
-        // redelivered/duplicate webhook) for the same commit would otherwise
-        // start a full duplicate build: production safety is already covered
-        // by `deploy_full`'s superseded-by veto (only the newest-started build
-        // goes live), but the loser still burns a full clone+install+build and
-        // fires a spurious `deployment.error` webhook when it's vetoed. Only
-        // guards when the commit is actually known at receipt time (every real
-        // `push`/`pull_request` payload carries one; a malformed/edge-case
-        // delivery with an empty SHA can't be deduped this way and falls
-        // through to start a build as before — an honest under-cover, not a
-        // silent one).
         if !commit.is_empty() {
             let already_building = c.builds.list().iter().any(|b| {
                 b.project == project
@@ -7918,46 +7739,31 @@ async fn git_webhook(
             source_deployment_ids: Vec::new(),
             repo_url: git.repo_url.clone(),
             branch: Some(deploy_branch).filter(|b| !b.is_empty()),
-            // Pin to the EXACT commit GitHub notified us about — without this the
-            // clone just builds "whatever the branch currently points to", which
-            // races a rapid double-push into building the wrong commit.
             commit: Some(commit.clone()).filter(|s| !s.is_empty()),
-            // Fork-originated PR: clone/fetch from the FORK's repo, not the base
-            // repo `git.repo_url` — the fork's branch (and, without SHA-fetch
-            // support, its commits) don't exist on the base repo's remote at all.
-            // None for same-repo PRs and every push — clones `git.repo_url` as before.
             head_repo_url: head_repo_url.clone(),
             project: Some(project.clone()),
             project_incarnation: None,
             creator: Some("github".into()),
-            production: true, // legacy field; classification uses `target`/branch
+            production: true,
             target: target.clone(),
-            use_cache: true, // git push redeploy: reuse the warm dependency cache
+            use_cache: true,
             root_dir,
-            env: None,               // git push redeploy: env comes from the project store
-            no_fanout: false,        // gitops redeploy is a coordinator deploy → schedule + fanout
-            fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
+            env: None,
+            no_fanout: false,
+            fanout_secondary: false,
             build_config: None,
             function_settings: None,
-            redeploy: false, // webhook push → start_build directly (bypasses git_deploy naming)
+            redeploy: false,
             zip_b64: None,
             image_ref: None,
             image_port: None,
             image_protocol: None,
-            image_memory: None, // git push deploy has no image_ref, so no container override to carry
+            image_memory: None,
             image_cpus: None,
             image_pids: None,
             image_ports: None,
-            // webhook auto-deploy: GitHub App installation token (first choice,
-            // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
         };
-        // Webhook push: not a fanout receiver and no pre-resolved incarnation
-        // (`req.project_incarnation` above is `None` too) — `start_build`
-        // determines/mints the current one itself under its own
-        // `lifecycle_write`. The project's own recorded team authenticates
-        // legacy-deployment adoption the same way `team_of` gates ownership
-        // elsewhere in this handler.
         let webhook_team = norm(&c.projects.team_of(&project)).to_string();
         let build_id = crate::git::start_build(c.clone(), req, None, Some(webhook_team))
             .await
@@ -7992,12 +7798,6 @@ async fn git_webhook(
     }
 
     if triggered.is_empty() {
-        // The single most common "preview build never starts" shape: a
-        // webhook/Actions-fallback delivery arrived and was accepted (no auth/
-        // signature error), but matched zero locally-known-or-fleet-gossiped
-        // projects for `want` — invisible before this line, since a 200 with
-        // `triggered: 0` looks identical to a genuine no-op from the GitHub
-        // delivery's own "Recent Deliveries" view.
         tracing::warn!(repo = %want, event = %event, "git_webhook: no project matched this repo — build not started");
     } else {
         tracing::info!(repo = %want, event = %event, triggered = triggered.len(), "git_webhook: build(s) started");
@@ -8020,7 +7820,6 @@ fn verify_github_sig(secret: &[u8], body: &[u8], header: &str) -> bool {
     };
     let expected = hmac_sha256(secret, body);
     let expected_hex = hex_lower(&expected);
-    // length-independent compare
     if hex.len() != expected_hex.len() {
         return false;
     }
@@ -8039,9 +7838,8 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// HMAC-SHA256, hex-encoded — shared by every webhook verifier in this crate
-/// (GitHub's `X-Hub-Signature-256`, Stripe's `Stripe-Signature`) so there's one
-/// implementation of the actual crypto primitive.
+/// HMAC-SHA256, hex-encoded: the one implementation of the primitive shared by every webhook
+/// verifier in this crate (GitHub's `X-Hub-Signature-256`, Stripe's `Stripe-Signature`).
 pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
     hex_lower(&hmac_sha256(key, msg))
 }
@@ -8077,24 +7875,33 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
     res
 }
 
-// ---- Mesh: a peer announces itself to us ----
+/// HTTP mount of [`node_announce`]: a self-report rewrites the registry entry for any node name
+/// (public address, health, peer id: what Seer, placement and the leader election read) and
+/// raises the fencing epoch, so only a node may send it ([`require_mesh_rpc`]: the HTTP fallback of
+/// `gossip::fetch` carries a `mesh-internal` delegation). The gossip arm calls the inner handler
+/// directly, behind the transport's signer and trust gate.
+async fn node_announce_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(node): Json<hive_edge::NodeInfo>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
+    Ok(node_announce(State(c), Json(node)).await)
+}
 
 pub(crate) async fn node_announce(
     State(c): State<Arc<CloudState>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Json<Value> {
-    // Converge the control-plane fencing epoch on the max witnessed anywhere.
     c.cluster.adopt_epoch(node.cp_epoch);
-    // The announcing node is describing ITSELF — the authoritative copy that
-    // may rename it past a stale registry entry (upsert_peer_self_report).
     c.registry.upsert_peer_self_report(node);
     Json(json!(c.registry.nodes()))
 }
 
-/// Observability for the hot-join mesh: the persisted key-addressed roster (this
-/// node's dial map, `endpoint_id -> (endpoint_id, iroh_addr)` — no IPs) plus the
-/// live trust-set size, so an operator can see who this node knows/trusts without
-/// SSH. Read-only; requires an operator token when JWT is enforced.
+/// Observability for the hot-join mesh: the persisted key-addressed roster (this node's dial map,
+/// `endpoint_id -> (endpoint_id, iroh_addr)`, no IPs) plus the live trust-set size, so an operator
+/// sees who this node knows and trusts without SSH. Read-only, operator token when JWT is enforced.
 async fn mesh_roster_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8117,14 +7924,12 @@ struct MeshAdmitReq {
     endpoint_id: String,
 }
 
-/// Operator-initiated admission: pre-register an endpoint id into this node's
-/// trust set before it ever connects (e.g. onboarding a node whose key you got
-/// out-of-band). Redundant with — but not required by — the zero-touch join-proof
-/// path (`STREAM_JOIN`, hive-p2p): a node holding `HIVE_JWT_SECRET` self-admits on
-/// first contact without this call. This exists for HIVE_PEER_TRUST-enforced
-/// fleets that also want an explicit, audited allowlist edit. Does NOT propagate
-/// to peers directly; the admitted id becomes visible to them transitively the
-/// next time this node gossips a NodeInfo carrying that iroh_addr (main.rs:1264).
+/// Operator-initiated admission: pre-registers an endpoint id into this node's trust set before it
+/// ever connects (a node whose key arrived out-of-band). Not required by the zero-touch join-proof
+/// path (`STREAM_JOIN`: a node holding `HIVE_JWT_SECRET` self-admits on first contact); it exists
+/// for `HIVE_PEER_TRUST` fleets that want an explicit, audited allowlist edit. It does not
+/// propagate to peers directly: the id becomes visible to them when this node next gossips a
+/// NodeInfo carrying that `iroh_addr`.
 async fn mesh_admit(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -8156,23 +7961,18 @@ async fn mesh_admit(
     ))
 }
 
-/// Unauthenticated, liveness-adjacent mesh-membership probe (`/v1/mesh`) — no
-/// JWT, matching `/healthz`, since the watchdog/monitoring polling it has none.
-/// Deliberately separate from `/healthz`: liveness ("is the process serving
-/// HTTP") tells you nothing about mesh membership. See `MeshHealth`'s doc.
+/// Unauthenticated, liveness-adjacent mesh-membership probe (`/v1/mesh`): no JWT, like `/healthz`,
+/// since the watchdog polling it has none; deliberately separate from `/healthz` because liveness
+/// says nothing about mesh membership (see `MeshHealth`'s doc).
 async fn mesh_health(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.mesh_health()))
 }
 
-/// The transport's connection-ESTABLISHMENT counters
-/// (`hive_p2p::EstablishStats`: `accept_stuck`, `accept_inflight_oldest_ms`,
-/// `last_*_established_ms`, the `*_window` counts over meshwatch's
-/// establishment window, `budget_in_use`/`budget_limit` per class, the top-10
-/// `budget_by_peer`) — the numbers meshwatch's `establishment_wedge` trigger
-/// reads. Operator-only, unlike `/v1/mesh`: to an outsider they are an exact
-/// oracle for the watchdog's arming state and for how close each inbound
-/// budget is to refusing. NODE-LOCAL, like `/v1/mesh/discovery` — query a
-/// node's own admin port (the dashboard's `/ops/*` proxy reads the leader's).
+/// The transport's connection-ESTABLISHMENT counters (`hive_p2p::EstablishStats`), the numbers
+/// meshwatch's `establishment_wedge` trigger reads. Operator-only, unlike `/v1/mesh`: to an
+/// outsider they are an exact oracle for the watchdog's arming state and how close each inbound
+/// budget is to refusing. NODE-LOCAL like `/v1/mesh/discovery`: query a node's own admin port (the
+/// dashboard's `/ops/*` proxy reads the leader's).
 async fn mesh_establish(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -8232,13 +8032,24 @@ async fn admin_runtime(
     Ok(Json(crate::runtime_watch::stats()))
 }
 
-/// THIS node's supervised background loops: restart counts + heartbeat age.
-/// Operator-only, and deliberately NODE-LOCAL (no leader proxy): each node
-/// reports its OWN loops — a dead reconciler on node X is only visible by
-/// asking X, so the round-robin read split is the semantics here, not a bug.
-/// Answers "is the world reconciler / lock sweep / anti-entropy loop actually
-/// alive on this node?" — the question that previously required inferring from
-/// which log lines had STOPPED appearing.
+/// Which algorithm content verifiers on THIS node actually accepted: operator-only and node-local
+/// (like `/v1/admin/runtime`). `accepted_sha256` still climbing means stored digests this node
+/// reads are legacy-minted, so a writer flip would make them read as a miss or an orphan; a writer
+/// may move only once every node reports it flat across a full deploy cycle, never on a flag day.
+async fn admin_content_hash(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(
+        json!({ "content_hash": fluid_core::content_verify_stats() }),
+    ))
+}
+
+/// THIS node's supervised background loops (restart counts, heartbeat age). Operator-only and
+/// deliberately NODE-LOCAL, with no leader proxy: a dead reconciler on node X is only visible by
+/// asking X, so the round-robin read split is the semantics here, not a bug. Answers "is the world
+/// reconciler / lock sweep / anti-entropy loop alive on this node?" without inferring it from log
+/// lines that stopped appearing.
 async fn tasks_health(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -8248,6 +8059,14 @@ async fn tasks_health(
     ))
 }
 
+/// Platform overview: operators get the platform-wide counters and control-plane state; every other
+/// signed-in user gets the topology shape only (a tenant's own usage is the tenant-scoped
+/// `/v1/metrics`). `control_plane.degraded` means peers are configured but nothing synced within
+/// the TTL (the data plane keeps serving local known-good state; this only makes the staleness
+/// observable), and `mesh` is the membership health distinct from it: a node launched with no
+/// `--peer` args has zero configured peers, so `degraded` is always false for it even when it is
+/// fully isolated (see `MeshHealth`). `peer_trust` reports whether P2P admission is enforced
+/// (`HIVE_PEER_TRUST`) and how many peers are trusted.
 async fn overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8255,9 +8074,6 @@ async fn overview(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     if !operator_allowed(cl, crate::auth::enforced()) {
-        // Tenant-safe subset: topology shape only. Platform-wide counters
-        // (requests/WAF/deployments/concurrency) stay operator-only; tenant
-        // usage lives at the tenant-scoped /v1/metrics instead.
         return Ok(Json(json!({
             "node": c.node_name,
             "region": c.region,
@@ -8292,26 +8108,70 @@ async fn overview(
         "cron_jobs": c.cron.list().len(),
         "workflows": c.workflows.defs().len(),
         "control_plane": {
-            // #25: gossip freshness. degraded=true means peers are configured but
-            // we haven't synced within the TTL — data plane still serves local
-            // known-good state; this just makes the staleness observable.
             "last_gossip_ms": c.last_gossip_ms(),
             "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
-            // Membership health, distinct from the staleness check above: a node
-            // launched with no --peer args has zero configured peers, so
-            // `degraded` above is unconditionally false for it even when it's
-            // fully isolated from the fleet (see MeshHealth's doc).
             "mesh": c.mesh_health(),
         },
         "peer_trust": {
-            // #20: P2P admission control. enforced=true rejects iroh peers whose
-            // cryptographic identity isn't in `trusted` (env + gossip roster).
             "enforced": std::env::var("HIVE_PEER_TRUST").map(|v| v == "1" || v == "true").unwrap_or(false),
             "trusted_peers": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0),
         },
     })))
 }
 
+/// Typed connectivity of `n` as THIS observer sees it, derived from signals the node already
+/// tracks: the boolean `healthy` collapses three situations an operator must tell apart. `"self"`;
+/// `"suspect"` (gossip-alive but this observer's probes fail repeatedly, withdrawn from
+/// placement/DNS by `health::demote`'s guarded path); `"degraded"` (gossip-alive and probes pass,
+/// but THIS observer's trunk to it recently failed, `health::is_cold`: an observer-local transport
+/// fault, not a sick node); `"healthy"`. A node with no gossip for 30 s is absent from the registry
+/// list, so "offline" never appears here. Per-observer by design: through the ops proxy it answers
+/// with the LEADER's view.
+fn node_connectivity(c: &Arc<CloudState>, n: &hive_edge::region::NodeInfo) -> &'static str {
+    if n.is_self {
+        "self"
+    } else if !n.healthy {
+        "suspect"
+    } else if crate::health::is_cold(&c.registry, &n.name) {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
+
+/// The node record served to a signed-in reader who is not a platform operator: topology, health
+/// and capacity descriptors for the network page (mesh map, health, capacity totals), and NONE of
+/// the mesh-internal addressing (`iroh_addr`, `peer_id`, `public_ip`, `public_url`, `relay_url`,
+/// `guardian_iroh_addr`, `private_addr`: all dialable endpoints). The GPU fields are hardware
+/// descriptors like `cpu_cores`, not addresses; omitting them blanked the regions map's GPU
+/// colouring and badge for every non-operator viewer. Every node view that reaches a non-operator
+/// goes through this one projection.
+fn non_operator_node_view(n: &hive_edge::region::NodeInfo, connectivity: &'static str) -> Value {
+    json!({
+        "id": n.name,
+        "name": n.name,
+        "region": n.region,
+        "city": n.city,
+        "country": n.country,
+        "lat": n.lat,
+        "lon": n.lon,
+        "healthy": n.healthy,
+        "connectivity": connectivity,
+        "last_seen_ms": n.last_seen_ms,
+        "is_self": n.is_self,
+        "backend": n.backend,
+        "cpu_cores": n.cpu_cores,
+        "mem_total_mb": n.mem_total_mb,
+        "disk_total_gb": n.disk_total_gb,
+        "gpu_count": n.gpu_count,
+        "gpu_model": n.gpu_model,
+        "gpu_vram_mb": n.gpu_vram_mb,
+    })
+}
+
+/// `/v1/nodes`: operators (and the mesh-internal gossip path, whose peer sync needs
+/// `iroh_addr`/`peer_id`) get the full node records plus `connectivity`; every other signed-in user
+/// gets [`non_operator_node_view`].
 pub(crate) async fn nodes(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8319,79 +8179,20 @@ pub(crate) async fn nodes(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     let list = c.registry.nodes();
-    // Typed connectivity, derived from signals the node already tracks — the
-    // boolean `healthy` collapses three distinct situations the operator needs
-    // to tell apart, and the dashboard rendered them all as one gray:
-    //  - "healthy":  gossip-alive and this observer's probes pass.
-    //  - "degraded": gossip-alive and probes pass, but THIS observer's trunk
-    //    to it recently failed (`health::is_cold`) — an observer-local
-    //    transport fault, not a sick node; requests route around it while the
-    //    trunk re-forms.
-    //  - "suspect":  gossip-alive but this observer's probes fail repeatedly
-    //    (withdrawn from placement/DNS by `health::demote`'s guarded path).
-    //  - absent from the list entirely = no gossip for 30s = offline; the
-    //    registry already drops those, so the dashboard's "unreachable" rows
-    //    come from its own roster diff, not from this endpoint.
-    // Per-observer by design (AGENTS.md: a health verdict is per-OBSERVER) —
-    // reading this through the ops proxy answers with the LEADER's view.
-    let connectivity = |n: &hive_edge::region::NodeInfo| -> &'static str {
-        if n.is_self {
-            "self"
-        } else if !n.healthy {
-            "suspect"
-        } else if crate::health::is_cold(&c.registry, &n.name) {
-            "degraded"
-        } else {
-            "healthy"
-        }
-    };
-    // Operators (and the mesh-internal gossip path) get the full record —
-    // peer sync depends on iroh_addr/peer_id being present.
     if operator_allowed(cl, crate::auth::enforced()) {
         let full: Vec<Value> = list
             .iter()
             .map(|n| {
                 let mut v = json!(n);
-                v["connectivity"] = json!(connectivity(n));
+                v["connectivity"] = json!(node_connectivity(&c, n));
                 v
             })
             .collect();
         return Ok(Json(json!(full)));
     }
-    // Every other signed-in user gets the sanitized topology: enough to render
-    // the network page (mesh map, health, capacity totals), none of the
-    // mesh-internal addressing (iroh_addr/peer_id/public_ip/public_url/
-    // relay_url/guardian_iroh_addr — all dialable endpoints, held back from
-    // non-operators same as public_url). GPU capacity fields are NOT
-    // addresses (they're the same class of hardware descriptor as
-    // cpu_cores/mem_total_mb/disk_total_gb, already included below) — omitting
-    // them used to blank the regions map's GPU coloring/badge
-    // (`isGpuNode`/`nodeColor` in ui/app/regions/page.tsx) for every node, for
-    // every non-operator signed-in viewer, fleet-wide.
     let sanitized: Vec<Value> = list
-        .into_iter()
-        .map(|n| {
-            json!({
-                "id": n.name,
-                "name": n.name,
-                "region": n.region,
-                "city": n.city,
-                "country": n.country,
-                "lat": n.lat,
-                "lon": n.lon,
-                "healthy": n.healthy,
-                "connectivity": connectivity(&n),
-                "last_seen_ms": n.last_seen_ms,
-                "is_self": n.is_self,
-                "backend": n.backend,
-                "cpu_cores": n.cpu_cores,
-                "mem_total_mb": n.mem_total_mb,
-                "disk_total_gb": n.disk_total_gb,
-                "gpu_count": n.gpu_count,
-                "gpu_model": n.gpu_model,
-                "gpu_vram_mb": n.gpu_vram_mb,
-            })
-        })
+        .iter()
+        .map(|n| non_operator_node_view(n, node_connectivity(&c, n)))
         .collect();
     Ok(Json(json!(sanitized)))
 }
@@ -8400,21 +8201,22 @@ async fn cluster_status(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Leader/term/member NAMES are the coordination view the network page shows
-    // every signed-in user; nothing mesh-internal is exposed here.
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
     let members: Vec<String> = c.registry.nodes().into_iter().map(|n| n.id).collect();
     Ok(Json(json!(c.cluster.status(members))))
 }
 
-/// Anycast routing table: every node with latency/health, and the node this edge
-/// would route a request to (lowest-latency healthy, region-preferred).
-async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
+/// Anycast routing table: every node with latency and health, the node this edge would route a
+/// request to (lowest-latency healthy, region-preferred), and `serving`: per node, how many
+/// deployment hosts it actually serves (this node's local ones plus peers' via `peer_routes`;
+/// absent = standby), independent of the single anycast pick. Operators (and dev mode) get the full
+/// node records; every other reader gets [`non_operator_node_view`] plus `latency_ms` (latency is
+/// not addressing), so this route never hands out what `/v1/nodes` withholds.
+async fn anycast_table(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<&crate::auth::Claims>,
+) -> Json<Value> {
     let selected = c.registry.anycast(Some(&c.region));
-    // REAL placement: which nodes actually HOST deployments — this node's local
-    // deployments plus peers' deployments learned via gossip (`peer_routes`). A
-    // node is "serving" if it hosts >= 1 deployment, independent of the single
-    // anycast pick. This is what the Network page reads to mark serving vs standby.
     use std::collections::{HashMap, HashSet};
     let mut serving: HashMap<String, HashSet<String>> = HashMap::new();
     let self_subs: HashSet<String> =
@@ -8436,17 +8238,35 @@ async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
     }
     let serving_counts: HashMap<String, usize> =
         serving.iter().map(|(k, v)| (k.clone(), v.len())).collect();
+    let table = if operator_allowed(claims, crate::auth::enforced()) {
+        json!(c.registry.routing_table())
+    } else {
+        let rows: Vec<Value> = c
+            .registry
+            .routing_table()
+            .iter()
+            .map(|n| {
+                let mut row = non_operator_node_view(n, node_connectivity(&c, n));
+                row["latency_ms"] = json!(n.latency_ms);
+                row
+            })
+            .collect();
+        json!(rows)
+    };
     Json(json!({
         "region": c.region,
         "selected": selected.as_ref().map(|n| n.name.clone()),
-        "table": c.registry.routing_table(),
-        // node name -> count of deployments it actually hosts (0/absent = standby).
+        "table": table,
         "serving": serving_counts,
     }))
 }
 
-async fn ratelimit_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.ratelimit.stats()))
+async fn ratelimit_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.ratelimit.stats())))
 }
 
 #[derive(Deserialize)]
@@ -8463,11 +8283,6 @@ async fn ratelimit_put(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<RateLimitBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // This mutates the NODE's single shared DDoS rate limiter — every other
-    // tenant hosted on this node relies on it. Unlike a per-tenant setting,
-    // any authenticated caller (of any role) could previously disable it
-    // fleet-wide, matching the operator-only gate already used for WAF/bot
-    // policy.
     require_operator(claims.as_ref().map(|e| &e.0))?;
     c.ratelimit.set(b.enabled, b.limit, b.window_ms);
     Ok(Json(json!(c.ratelimit.stats())))
@@ -8481,14 +8296,16 @@ async fn regions(
     Ok(Json(json!(c.registry.regions())))
 }
 
-/// TENANT-SCOPED function stats (Usage page's cost breakdown, the Functions
-/// list page, service-graph/deployment-canvas overlays). Previously gated
-/// behind `require_operator` — a hard 401/403 for every non-owner user, so
-/// all four dashboard consumers silently showed zero invocations/CPU/memory
-/// (and, on the Usage page, near-zero computed dollar charges) for the
-/// overwhelming majority of real users. No admin-only page ever depended on
-/// this endpoint's previous all-tenants shape — fixed the same way
-/// `databases_list` already scopes `/v1/databases`.
+/// TENANT-SCOPED function stats (Usage page cost breakdown, Functions list, service-graph and
+/// deployment-canvas overlays), scoped like `databases_list`. A verified `service` delegation
+/// asking for its own `local=true` slice is the billing meter's unfiltered aggregation path
+/// (`fleet_function_stats`); every other caller sees only its tenant's rows. A top-level read also
+/// fans out to every healthy peer's `?local=true` (functions run wherever placement put them; the
+/// guard stops the recursion) and then RE-SCOPES the merged rows to the caller, because a peer
+/// answers `?local=true` UNFILTERED on purpose: without it one tenant's page would list every other
+/// tenant's functions, and an anonymous read would match the peer slice. The result is cached per
+/// tenant for `POLLED_RESPONSE_CACHE_TTL` (never the inner hop), since the dashboard polls every
+/// 3-5 s from several components and tabs.
 pub async fn functions(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -8496,17 +8313,9 @@ pub async fn functions(
     axum::extract::Query(q): axum::extract::Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // `fleet_function_stats` (the billing meter) reads this endpoint on every
-    // peer over a signed node-to-node delegation with an EMPTY tenant, which
-    // `resolve_tenant` maps to "personal" — so the meter was only ever counting
-    // each peer's personal-tenant functions and silently UNDER-COUNTING org
-    // compute. A verified `service` delegation asking for its own local slice is
-    // the internal aggregation path, so it gets the unfiltered view; everything
-    // else stays tenant-scoped exactly as before.
     let internal = claims
         .as_ref()
-        .map(|e| e.0.role == "service")
-        .unwrap_or(false);
+        .is_some_and(|e| crate::auth::is_mesh_internal(&e.0));
     let mut list: Vec<Value> = c
         .fluid
         .stats()
@@ -8514,31 +8323,13 @@ pub async fn functions(
         .filter(|f| (internal && q.local == Some(true)) || norm(&f.tenant) == t)
         .map(|f| json!(f))
         .collect();
-    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
-    // few seconds — the same belt `metrics_get` already wears. The dashboard
-    // polls this endpoint every 3-5s from several co-mounted components and
-    // from every open tab, and the client-side `PATH_TTL` de-dupes only within
-    // ONE tab, so without this each poll paid a full cross-node fan-out:
-    // measured 8.0028s per call on fc-sanjose and a hit at the full per-peer
-    // budget on fc-virginia / fc-virginia-3 on every second poll. Keyed by
-    // tenant (never across tenants) and only for the top-level call, so the
-    // billing meter's own `local=true` slice is never served from here.
     let is_top_level = q.local != Some(true);
     let cache_key = format!("functions:{t}:{}", internal);
     if is_top_level {
-        if let Some(v) = c
-            .resp_cache
-            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
-        {
+        if let Some(v) = c.resp_cache.get(&cache_key, POLLED_RESPONSE_CACHE_TTL) {
             return Json(v);
         }
     }
-    // `c.fluid` is THIS node's in-process runtime, but functions run wherever
-    // the placement scheduler put them — so the dashboard, polling through the
-    // round-robin, kept landing on a node hosting none of the tenant's
-    // functions and rendering an empty Functions page and zero usage. The
-    // `local=true` guard is required: `fleet_function_stats` also reads this
-    // endpoint on every peer, and without it the fan-out would recurse.
     if is_top_level {
         let peers = all_healthy_peers(&c);
         for v in fan_out_peers_polled(&c, &peers, &t, "/v1/functions?local=true").await {
@@ -8554,6 +8345,9 @@ pub async fn functions(
                 v.get("name").and_then(|x| x.as_str()).unwrap_or("")
             ))
         });
+        if !internal {
+            list.retain(|v| norm(v.get("tenant").and_then(|x| x.as_str()).unwrap_or("")) == t);
+        }
     }
     let out = json!(list);
     if is_top_level {
@@ -8571,9 +8365,15 @@ async fn tunnels(
     Ok(Json(json!(c.gw.tunnel_stats().await)))
 }
 
-/// Relay cost accounting (#23): relay-vs-direct connection + byte breakdown for
-/// this node's mesh trunks. `relayed_*` bytes transit a relay server (a real cost
-/// + a holepunch-failure signal). Empty when P2P (iroh) isn't enabled on the node.
+/// Relay cost accounting: relay-vs-direct connection and byte breakdown for this node's mesh trunks
+/// (`relayed_*` bytes transit a relay server: a real cost and a holepunch-failure signal), plus
+/// per-trunk QUIC path state (rtt, cwnd, loss, mtu, selected relay-vs-direct: read it DURING a bulk
+/// pull, it is the only surface that separates a relayed path, a loss-collapsed window and an
+/// app-limited sender), iroh timeout counters, DNS-reconciler and TLS state, and gossip-verify and
+/// post-quantum key-exchange counters. `pq_kex` counts REAL negotiated handshakes
+/// (`hive_p2p::record_kex_telemetry`), not a config flag; `classical_fallback` includes every peer
+/// that cannot speak X25519MLKEM768, notably the wasm32 browser client, a permanent boundary rather
+/// than a bug. Empty when P2P (iroh) is not enabled.
 async fn relay_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8600,10 +8400,6 @@ async fn relay_stats(
                 "direct_bytes_tx": s.direct_bytes_tx,
                 "direct_bytes_rx": s.direct_bytes_rx,
                 "relayed_bytes_pct": relayed_pct,
-                // Per-trunk QUIC transport state, per path (rtt, cwnd, loss, mtu,
-                // selected relay-vs-direct). Read this DURING a bulk pull: it is the
-                // only surface that separates a relayed path, a loss-collapsed
-                // congestion window, and an app-limited sender.
                 "trunks": s.trunks.iter().map(|t| json!({
                     "endpoint_id": t.endpoint_id,
                     "incarnation": t.incarnation,
@@ -8634,13 +8430,11 @@ async fn relay_stats(
                         "lost_plpmtud_probes": p.lost_plpmtud_probes,
                     })).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
-                // Per-peer, per-phase iroh timeout counters (#H4) — p2p_timeout{phase,node_id}.
                 "timeouts": s.timeouts.iter().map(|t| json!({
                     "node_id": t.node_id,
                     "phase": t.phase,
                     "count": t.count,
                 })).collect::<Vec<_>>(),
-                // Vercel DNS reconciler (ngrok retirement) — leader-elected publish loop.
                 "dns_reconciler": {
                     "passes": crate::vercel_dns::STATS.passes.load(std::sync::atomic::Ordering::Relaxed),
                     "creates": crate::vercel_dns::STATS.creates.load(std::sync::atomic::Ordering::Relaxed),
@@ -8648,16 +8442,10 @@ async fn relay_stats(
                     "api_errors": crate::vercel_dns::STATS.api_errors.load(std::sync::atomic::Ordering::Relaxed),
                     "empty_set_blocks": crate::vercel_dns::STATS.empty_set_blocks.load(std::sync::atomic::Ordering::Relaxed),
                     "per_name_holds": crate::vercel_dns::STATS.per_name_holds.load(std::sync::atomic::Ordering::Relaxed),
-                    // Host labels currently pinned straight to their owning node
-                    // (deployment affinity) rather than falling through to the
-                    // all-nodes wildcard — 0 means every request is still a coin
-                    // flip across the fleet.
                     "affinity_records": crate::vercel_dns::STATS.affinity_records.load(std::sync::atomic::Ordering::Relaxed),
                     "last_pass_ms": crate::vercel_dns::STATS.last_pass_ms.load(std::sync::atomic::Ordering::Relaxed),
                 },
-                // ACME/TLS state: which zones have an installed certificate.
                 "tls_zones": crate::acme::installed_zones(),
-                // Web3 gossip signature verification (staged log→enforce rollout).
                 "gossip_verify": {
                     "mode": format!("{:?}", hive_p2p::verify_mode()).to_lowercase(),
                     "sign_outbound": hive_p2p::gossip_sign_enabled(),
@@ -8668,16 +8456,6 @@ async fn relay_stats(
                     "signer_mismatch": hive_p2p::verify_stats().4,
                     "rejected": hive_p2p::verify_stats().5,
                 },
-                // Post-quantum key exchange: REAL negotiated-handshake counts
-                // (`hive_p2p::record_kex_telemetry`, read off each connection's
-                // actual `HandshakeData` once, not derived from any config flag
-                // -- see docs/pqc-migration-scope.md). `hybrid_pq` is a
-                // key-exchange property only; transport IDENTITY stays
-                // classical Ed25519 regardless (no ML-DSA enrollment exists in
-                // this codebase yet). `classical_fallback` includes every peer
-                // that cannot yet speak X25519MLKEM768 -- an unrolled binary,
-                // or the wasm32 hive-browser client (aws-lc-rs has no
-                // realistic wasm32 target, a permanent boundary, not a bug).
                 "pq_kex": {
                     "hybrid_pq": hive_p2p::pq_kex_stats().0,
                     "classical_fallback": hive_p2p::pq_kex_stats().1,
@@ -8689,11 +8467,9 @@ async fn relay_stats(
     })
 }
 
-/// Serverless GPU pool snapshot (operator-only, same guard as `/v1/tunnels` /
-/// `/v1/relay`): every healthy `gpu_count > 0` node grouped into a named pool
-/// by region, with live aggregate + per-node free VRAM. See `gpu_pool`'s
-/// module doc for the allocate/release discipline and the fan-out rationale
-/// (per AGENTS.md's round-robin doc — live instance counts are node-local).
+/// Serverless GPU pool snapshot (operator-only): every healthy `gpu_count > 0` node grouped into a
+/// named pool by region, with live aggregate and per-node free VRAM; see `gpu_pool`'s module doc
+/// for the allocate/release discipline and the fan-out rationale.
 async fn gpu_pools(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8703,11 +8479,9 @@ async fn gpu_pools(
     Ok(Json(json!(regions)))
 }
 
-/// Managed-inference endpoint listing (operator): every project with an
-/// inference spec, its deterministic coordinator/port/URL, plus THIS node's
-/// own live server statuses (authoritative only for endpoints coordinated
-/// here — the listing names the coordinator so an operator knows where the
-/// authoritative status lives).
+/// Managed-inference endpoint listing (operator): every project with an inference spec, its
+/// deterministic coordinator/port/URL, and THIS node's live server statuses, authoritative only for
+/// endpoints coordinated here (the listing names the coordinator).
 async fn inference_endpoints(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8742,22 +8516,13 @@ async fn inference_endpoints(
     })))
 }
 
-/// Live memory accounting (operator). The measurement that was MISSING during
-/// the 2026-08 fc-hongkong OOM hunt: the heap profile said live sampled heap was
-/// ~80 MB while RSS was ~1.09 GB, and there was no way to read jemalloc's own
-/// `stats.allocated/active/resident/retained` to tell a leak from dirty-page
-/// fragmentation — `stats_print:true` only writes at exit, and the process is
-/// SIGKILLed, so the atexit hook never runs.
-///
-/// Unlike `/v1/debug/heap` this is CHEAP (no sampling, no dump) and safe to
-/// poll, so it is also the right thing for a monitor to scrape. It reports, on
-/// one document: the OS view (RSS, thread count), the allocator view, and every
-/// tenant-driven growth bound this node enforces as a live gauge — a bound
-/// nobody can read is indistinguishable from no bound at all.
-///
-/// NODE-LOCAL, like `/v1/dns/stats`: `/proc/self` and this process's own
-/// allocator. Through the dashboard's `/ops/*` proxy you are reading the
-/// LEADER's memory, not the page-serving node's.
+/// Live memory accounting (operator): the OS view (RSS, thread count), jemalloc's own
+/// `stats.allocated/active/resident/retained` (which tell a leak from dirty-page fragmentation;
+/// `stats_print` only writes at exit and a SIGKILLed process never reaches it) and every
+/// tenant-driven growth bound this node enforces as a live gauge. Unlike `/v1/debug/heap` it is
+/// CHEAP (no sampling, no dump), so it is safe to poll and to scrape. NODE-LOCAL, like
+/// `/v1/dns/stats`: through the dashboard's `/ops/*` proxy you read the LEADER's memory, not the
+/// page-serving node's.
 async fn memory_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8771,25 +8536,14 @@ async fn memory_stats(
     Ok(Json(v))
 }
 
-/// Restart audit (operator): did this node die, when, and why.
-///
-/// The question that had no answer. A cgroup OOM kill is SIGKILL — the dying
-/// process cannot log it — and systemd has the node back in under a second, so
-/// the platform's own view showed only "a node that is up". A node cycling
-/// every 2-3h was investigated for a whole session as "random unhealthy nodes",
-/// because every symptom (probe failures, dropped trunks, placement gaps) was
-/// visible and the cause was not.
-///
-/// Returns this boot's verdict with the EVIDENCE it was reached from (kernel
-/// line, cgroup counter, boot id, last-heartbeat RSS against the memory
-/// ceiling), the bounded restart history with each previous process's uptime —
-/// the list that makes a 2-3h cycle self-evident rather than an inference —
-/// and the live 24h counters.
-///
-/// NODE-LOCAL, like `/v1/dns/stats`: the marker file, the history file and
-/// `/proc` all belong to the node answering. Through the dashboard's `/ops/*`
-/// proxy you are reading the LEADER's restarts; the fleet view is the gossiped
-/// `NodeInfo::started_ms` / `oom_restarts_24h` / `last_oom_ms` on `/v1/nodes`.
+/// Restart audit (operator): did this node die, when and why. Returns this boot's verdict with the
+/// EVIDENCE it was reached from (kernel line, cgroup counter, boot id, last-heartbeat RSS against
+/// the memory ceiling), the bounded restart history with each previous process's uptime, and the
+/// live 24h counters. A cgroup OOM kill is SIGKILL, so the dying process cannot log it: this audit,
+/// and the gossiped `NodeInfo::started_ms` / `oom_restarts_24h` / `last_oom_ms` on `/v1/nodes` (the
+/// fleet view), are the only record. NODE-LOCAL: the marker file, the history file and `/proc`
+/// belong to the answering node, so through the dashboard's `/ops/*` proxy you read the LEADER's
+/// restarts.
 async fn node_restarts(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8798,16 +8552,11 @@ async fn node_restarts(
     Ok(Json(crate::restart_audit::snapshot(&c.node_name)))
 }
 
-/// Health-demotion guard (operator): how often THIS observer withdrew a peer
-/// from DNS/placement, how often it declined to because the peer was still
-/// gossiping, and which peers are currently in a local routing penalty.
-///
-/// `refused_gossip_alive` is the number to read during an incident: a large
-/// value means this node's transports are failing against peers that are
-/// demonstrably alive, i.e. the fault is local — and before the guard existed
-/// every one of those would have been a fleet-visible withdrawal (see
-/// health.rs). NODE-LOCAL, like `/v1/dns/stats`: a health verdict is
-/// per-observer, so this is deliberately one observer's counters.
+/// Health-demotion guard (operator): how often THIS observer withdrew a peer from DNS/placement,
+/// how often it declined because the peer was still gossiping, and which peers are in a local
+/// routing penalty. `refused_gossip_alive` is the number to read during an incident: a large value
+/// means this node's transports fail against peers that are demonstrably alive, i.e. the fault is
+/// local. NODE-LOCAL by design, since a health verdict is per-observer.
 async fn mesh_health_guard(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8821,26 +8570,13 @@ async fn mesh_health_guard(
     Ok(Json(v))
 }
 
-/// Live heap profile (operator). Answers "which allocation site is growing?"
-/// on a node that is ALREADY misbehaving, which is the question nothing on the
-/// fleet could answer during the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon
-/// before the kernel killed it, never root-caused).
-///
-/// `GET /v1/debug/heap` returns a jemalloc heap profile in jeprof's native
-/// format — analyze with the `jeprof` that ships alongside jemalloc, e.g.
-/// `jeprof --show_bytes --pdf /path/to/hive-cloud heap.prof`, or diff two with
-/// `jeprof --base=first.prof <binary> second.prof`. Sampling is OFF at boot
-/// (`prof_active:false` in main.rs's malloc_conf) so there is no steady-state
-/// cost; this handler turns it on for the process on first call and leaves it
-/// on, since a leak hunt needs the allocations that happen AFTER activation.
-///
-/// Intended use is a diff, not a single dump: call once to start sampling,
-/// wait while RSS climbs, call again, and compare the two profiles — the growth
-/// is what identifies the leak, whereas one snapshot mostly shows normal
-/// steady-state usage. `?deactivate=1` turns sampling back off.
-///
-/// Linux-only: the fleet is Linux and jemalloc profiling is unavailable on
-/// macOS, where this returns 501 rather than failing the build.
+/// Live heap profile (operator): `GET /v1/debug/heap` returns a jemalloc heap profile in jeprof's
+/// native format (`jeprof --show_bytes --pdf <binary> heap.prof`, or
+/// `jeprof --base=first.prof <binary> second.prof` for a diff). Sampling is OFF at boot
+/// (`prof_active:false` in main.rs's `malloc_conf`); the first call turns it on for the process and
+/// leaves it on, because a leak hunt needs the allocations AFTER activation, so the intended use is
+/// a diff of two dumps taken while RSS climbs; `?deactivate=1` turns it back off. Linux-only:
+/// elsewhere jemalloc profiling is unavailable and this returns 501 instead of failing the build.
 #[cfg(target_os = "linux")]
 async fn heap_profile(
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -8850,10 +8586,6 @@ async fn heap_profile(
     require_operator(claims.as_ref().map(|e| &e.0))?;
 
     let want_off = q.get("deactivate").is_some_and(|v| v == "1" || v == "true");
-    // `prof.active` is a bool mallctl; `prof.dump` takes a NUL-terminated path.
-    // Both are only present when the binary was built against a jemalloc with
-    // profiling enabled (see main.rs's malloc_conf) -- on a build without it,
-    // these return ENOENT, which is reported rather than silently ignored.
     let set_active = |on: bool| -> Result<(), String> {
         unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", on) }.map_err(|e| e.to_string())
     };
@@ -8884,9 +8616,6 @@ async fn heap_profile(
         );
     }
 
-    // Dump to a unique path so concurrent operator calls can't clobber each
-    // other, then read it back and delete it -- the profile is returned in the
-    // response body, never left on disk.
     let path = format!("/tmp/hive-heap-{}-{}.prof", std::process::id(), now_ms());
     let mut c_path = path.clone().into_bytes();
     c_path.push(0);
@@ -8935,12 +8664,10 @@ async fn heap_profile(
     ))
 }
 
-/// Host listener audit (operator). NODE-LOCAL, exactly like `/v1/dns/stats`:
-/// the report describes the node that answers, so through the dashboard's
-/// `/ops/*` proxy you are reading the LEADER's host, not the page-serving
-/// node's — the fleet view is `scripts/audit-public-listeners.sh`. `last` is
-/// `null` until the first pass (~30 s after boot); `supported: false` means
-/// the host has no `/proc/net/tcp` (macOS), which is "not audited", never
+/// Host listener audit (operator), NODE-LOCAL: it describes the answering node, so through the
+/// dashboard's `/ops/*` proxy you read the LEADER's host (the fleet view is
+/// `scripts/audit-public-listeners.sh`). `last` is `null` until the first pass (~30 s after boot);
+/// `supported: false` means the host has no `/proc/net/tcp` (macOS), which is "not audited", never
 /// "clean". See `listener_audit`.
 async fn host_listeners(
     State(c): State<Arc<CloudState>>,
@@ -8955,12 +8682,15 @@ async fn host_listeners(
     })))
 }
 
-/// Geo-DNS observability (operator): live Seer query counters, the
-/// tailored-vs-generic split that actually tells you whether proximity routing
-/// is working, the local geo table's identity and hit rate (plus the optional
-/// remote fallback's memo state and its on-disk persistence counters), the
-/// delegation record count the DNS reconciler published, and the per-node
-/// histogram of which address each answer handed out first.
+/// Geo-DNS observability (operator): live Seer query counters, the tailored-vs-generic split that
+/// tells whether proximity routing works, the local geo table's identity and hit rate
+/// (`table_source: "none"` means it failed validation and every answer is generic, the one state
+/// worth alerting on) plus the optional remote fallback's memo state and persistence counters, the
+/// delegation record count the reconciler published, the per-node proof verdicts and the histogram
+/// of which address each answer handed out first. `validation` is derived from verdicts computed
+/// FRESH in this response, never from the reconciler-written counters, which lag on non-leaders and
+/// right after a restart and contradicted the per-node verdicts; those stay exported as
+/// `reconciler_last_pass_*`.
 async fn dns_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8993,36 +8723,20 @@ async fn dns_stats(
             "tailored": s.tailored.load(Ordering::Relaxed),
             "generic": s.generic.load(Ordering::Relaxed),
             "with_ecs": s.with_ecs.load(Ordering::Relaxed),
-            // The local prefix table: which copy is loaded and how big it is.
-            // `source: "none"` means it failed validation and every answer here
-            // is generic — the one state worth alerting on.
             "table_source": table_source,
             "table_rows_v4": table_v4,
             "table_rows_v6": table_v6,
             "local_hits": geo.local_hits,
             "local_misses": geo.local_misses,
-            // The optional remote fallback. Disabled unless an operator set
-            // HIVE_DNS_GEO_ENDPOINT, in which case these count its memo.
             "remote_enabled": geo.remote_enabled,
             "remote_known": geo.remote_known,
             "remote_pending": geo.remote_pending,
             "remote_unlocatable": geo.remote_unlocatable,
-            // Durability of the remote memo: how many prefixes came back off
-            // disk at boot (0 after a first-ever boot OR a wiped/corrupt file —
-            // the signal that this node is re-warming from scratch) and how
-            // many debounced saves have run since.
             "cache_loaded_at_boot": loaded_at_boot,
             "cache_writes": cache_writes,
             "cache_file": crate::dns_geo::cache_path().display().to_string(),
         },
         "delegation_records": crate::vercel_dns::STATS.geo_delegation_records.load(Ordering::Relaxed),
-        // Prove-before-advertise, made visible. `nameservers` is the SAME
-        // verdict the DNS reconciler publishes from (`validate_nameservers`
-        // over the same gossiped registry) — an operator asking "why is this
-        // node not in the NS set?" gets the actual reason, plus who attested
-        // it and from which regions, rather than having to infer it. `probes`
-        // is this node's OWN raw evidence, which is what makes a disagreement
-        // between vantages diagnosable instead of mysterious.
         "nameservers": verdicts
             .iter()
             .map(|v| json!({
@@ -9052,15 +8766,6 @@ async fn dns_stats(
             "checked_ms": p.checked_ms,
         })).collect::<Vec<_>>(),
         "validation": {
-            // Derived from the verdicts computed FRESH in this response, never
-            // the reconciler-written counters: those are stamped only inside
-            // the DNS reconcile loop, so on a non-leader node (or on the
-            // leader between passes / right after a restart) they lag and
-            // CONTRADICT the per-node verdicts in the same payload —
-            // live-witnessed as `proven: 0` above eight `validated: true`
-            // rows. The counters stay exported below as the reconciler's own
-            // last-pass view (`reconciler_last_pass_*`), clearly named so a
-            // stale number can no longer masquerade as live truth.
             "proven": verdicts.iter().filter(|v| v.validated).count(),
             "unproven": verdicts.iter().filter(|v| v.declared && !v.validated).count(),
             "reconciler_last_pass_proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
@@ -9068,9 +8773,6 @@ async fn dns_stats(
             "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
             "api_delegation_holds": crate::vercel_dns::STATS.api_delegation_holds.load(Ordering::Relaxed),
             "create_circuit_skips": crate::vercel_dns::STATS.create_circuit_skips.load(Ordering::Relaxed),
-            // Never-dark cutover telemetry: cutovers completed, rollbacks
-            // (a climbing rollback count = a delegation RETRYING, never
-            // stranding), and ACME orphan challenges swept.
             "delegation_cutovers": crate::vercel_dns::STATS.delegation_cutovers.load(Ordering::Relaxed),
             "delegation_cutover_rollbacks": crate::vercel_dns::STATS.delegation_cutover_rollbacks.load(Ordering::Relaxed),
             "acme_orphans_swept": crate::vercel_dns::STATS.acme_orphans_swept.load(Ordering::Relaxed),
@@ -9081,24 +8783,16 @@ async fn dns_stats(
     })))
 }
 
-/// Mesh address-lookup observability (operator): which address SOURCES this
-/// node actually registered, and what the public mainline-DHT provider has
-/// done since boot.
-///
-/// This exists because "the DHT is enabled" is a config claim while "41
-/// resolves, 12 hits, 3 publishes requested" is evidence — without it the
-/// mechanism is unfalsifiable in production. It is also the fastest way to see
-/// the condition that motivated the DHT in the first place: a node whose
-/// `seed_providers`, `pkarr_providers` and `n0_enabled` are all zero/false has
-/// NO address source at all, so `PeerPool::dial_fresh` has nothing to consult
-/// and burns its budget for nothing.
-///
-/// **Node-local by construction, like `/v1/dns/stats`.** Every field is read
-/// from this process's own counters; there is no fleet-wide answer and none is
-/// implied. Note the consequence for the dashboard: `/ops/*` forwards to the
-/// control-plane LEADER, so a browser reading this through the dashboard sees
-/// the leader's numbers, not those of the node serving the page. Query a
-/// specific node's admin port directly to ask about that node.
+/// Mesh address-lookup observability (operator): which address SOURCES this node registered and
+/// what the public mainline-DHT provider has done since boot, so "the DHT is enabled" is evidence
+/// (resolves, hits, publishes requested) rather than a config claim. A node whose `seed_providers`,
+/// `pkarr_providers` and `n0_enabled` are all zero/false has NO address source, so
+/// `PeerPool::dial_fresh` burns its budget for nothing. `publishes_requested` is requested, not
+/// succeeded (`AddressLookup::publish` is fire-and-forget), and a `discovery_budget_ms` at or below
+/// ~4 s means the DHT provider is registered but cancelled before it can answer (measured resolve
+/// 2.0-4.6 s on a cold routing table). NODE-LOCAL by construction, like `/v1/dns/stats`: through
+/// the dashboard's `/ops/*` proxy you read the LEADER's numbers, so query a specific node's admin
+/// port to ask about that node.
 async fn mesh_discovery(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9108,37 +8802,21 @@ async fn mesh_discovery(
     let sources = usize::from(s.n0_enabled) + s.seed_providers + s.pkarr_providers;
     Ok(Json(json!({
         "node": c.node_name,
-        // This node's own 64-hex id: the argument another host passes to
-        // `--dht-probe` to prove it can find THIS node from cold.
         "endpoint_id": c.iroh.read().as_ref().map(|e| e.id().to_string()),
-        // The pre-DHT sources, so "this node had nowhere to look" is a reading
-        // rather than an inference.
         "sources": {
             "bootstrap_seeds": s.seed_providers,
             "pkarr_relays": s.pkarr_providers,
             "n0_public": s.n0_enabled,
             "mainline_dht": s.dht_registered,
-            // Sources OTHER than the DHT. 0 is the state that made a wiped
-            // node permanently dark on 12 of 14 fleet hosts.
             "non_dht_total": sources,
         },
         "dht": {
             "registered": s.dht_registered,
-            // Populated only while NOT registered — names the exact reason
-            // (disabled by env, bootstrap unresolvable, socket conflict), so a
-            // silently-inert feature is impossible to mistake for a live one.
             "skip_reason": s.dht_skip_reason,
             "bootstrap_nodes": s.dht_bootstrap_nodes,
-            // 0 = the crate default (try 6881, fall back to an ephemeral port).
             "port": s.dht_port,
             "publish": s.dht_publish,
-            // false ⇒ only this node's relay URL is on the public DHT; true ⇒
-            // its globally-routable direct address is too (never its RFC1918
-            // ones — see hive_p2p::dht's publish filter).
             "publish_direct": s.dht_publish_direct,
-            // "requested", not "succeeded": AddressLookup::publish is
-            // fire-and-forget by contract, so a success count here would be a
-            // claim with no witness.
             "publishes_requested": s.publishes_requested,
             "last_publish_request_ms": s.last_publish_request_ms,
             "resolves": s.resolves,
@@ -9146,23 +8824,24 @@ async fn mesh_discovery(
             "resolve_misses": s.resolve_misses,
             "resolve_errors": s.resolve_errors,
         },
-        // The budget dial_fresh gives the whole address-lookup set. Measured
-        // steady-state DHT resolve is 2.0-4.6s on top of a cold-routing-table
-        // warm-up, so a value at or below ~4s means the DHT provider is
-        // registered but is being cancelled before it can answer.
         "discovery_budget_ms": hive_p2p::dial_discovery_budget().as_millis() as u64,
         "dial_fallback_ceiling_ms": hive_p2p::dial_fallback_ceiling().as_millis() as u64,
     })))
 }
 
+/// `/v1/logs` query. EVERY field is bounded at parse time (see [`logs`]), because an unbounded
+/// window, list or limit on a fan-out endpoint is a denial-of-service vector, and a malformed term
+/// is a 400, never a silently ignored filter. Every parameter must be reconstructed in BOTH
+/// [`crate::gossip::logs_query`] (the mesh dispatch arm) and the fan-out query string built by
+/// [`logs_fanout_qs`]: one added in only one place works on the owner node and silently returns
+/// unfiltered or empty data on every peer.
 #[derive(Deserialize)]
-pub(crate) struct LimitQ {
+pub(crate) struct LogsQ {
     pub(crate) limit: Option<usize>,
     /// Filter events to a project (matches the deployment host subdomain).
     pub(crate) project: Option<String>,
-    /// Filter events to ONE deployment: events tagged with this deployment id
-    /// at record time, plus untagged events on that deployment's own alias
-    /// hosts. Composes with `project` (the deployment-detail view sends both).
+    /// Filter events to ONE deployment: events tagged with this deployment id at record time plus
+    /// untagged events on its own alias hosts; composes with `project`.
     #[serde(default)]
     pub(crate) deployment: Option<String>,
     /// Free-text search across path/host/detail.
@@ -9171,145 +8850,484 @@ pub(crate) struct LimitQ {
     /// local events (no fan-out) — prevents proxy recursion.
     #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
+    /// Named window: `30m` | `1h` | `24h` | `7d` | `30d`, resolved to absolute bounds server-side
+    /// and never forwarded as a string (a peer resolving it against its own clock would widen or
+    /// shrink the window).
+    #[serde(default)]
+    pub(crate) range: Option<String>,
+    /// Absolute inclusive lower bound (ms epoch).
+    #[serde(default)]
+    pub(crate) since_ms: Option<u64>,
+    /// Absolute inclusive upper bound (ms epoch).
+    #[serde(default)]
+    pub(crate) until_ms: Option<u64>,
+    /// Status filter: comma-separated codes and/or classes (`404,5xx`).
+    #[serde(default)]
+    pub(crate) status: Option<String>,
+    #[serde(default)]
+    pub(crate) method: Option<String>,
+    #[serde(default)]
+    pub(crate) host: Option<String>,
+    #[serde(default)]
+    pub(crate) route: Option<String>,
+    /// `info` | `warning` | `error` | `fatal` (derived — see `event_log`).
+    #[serde(default)]
+    pub(crate) level: Option<String>,
+    /// `hit` | `miss` | `stale` | `store` | `revalidate`.
+    #[serde(default)]
+    pub(crate) cache: Option<String>,
+    /// `production` | `preview` (derived from the deployment's target).
+    #[serde(default)]
+    pub(crate) env: Option<String>,
+    /// `static` | `function` | `fullstack` (derived from the deployment's kind).
+    #[serde(default)]
+    pub(crate) resource: Option<String>,
+    /// Rows to skip AFTER the fleet-wide merge (coordinator-only: a peer
+    /// skipping its own first N would page the wrong rows).
+    #[serde(default)]
+    pub(crate) offset: Option<usize>,
+    /// Return only events strictly older than this `ts_ms` (per-node bound).
+    #[serde(default)]
+    pub(crate) cursor: Option<u64>,
 }
 
+/// Default `limit` — unchanged, and deliberately small: the dashboard polls
+/// this endpoint every 1.5 s.
+pub(crate) const LOGS_LIMIT_DEFAULT: usize = 100;
+/// Hard ceiling on `limit`. Was unclamped (`limit=100000` was accepted), and
+/// the coordinator sorts + merges `nodes x limit` every poll.
+pub(crate) const LOGS_LIMIT_MAX: usize = 1000;
+/// Hard ceiling on `offset` (pagination depth).
+pub(crate) const LOGS_OFFSET_MAX: usize = 100_000;
+/// Retention ceiling: no plan reaches further back than this.
+pub(crate) const LOGS_MAX_AGE_MS: u64 = 30 * crate::event_log::DAY_MS;
+/// Slack on the age comparison: the coordinator resolves `range=7d` into an absolute `since_ms` on
+/// ITS clock and every peer re-checks it against its own, so without slack a peer whose clock is
+/// milliseconds ahead refuses a window the coordinator accepted and the whole fleet-wide read fails
+/// on clock skew. 5 minutes is slack against a 7/30-day window, not a loophole.
+pub(crate) const LOGS_AGE_TOLERANCE_MS: u64 = 5 * 60_000;
+
+/// One extra row per node beyond `limit + offset`: fetching exactly `limit + offset` makes `total`
+/// land on `limit` whenever more rows exist, so `has_more` would be false on page 1 of every result
+/// set and the UI's "Next" could never advance. Peer plus local fetch stays under
+/// `LOGS_LIMIT_MAX + 1`, so it does not widen the fan-out bound.
+const LOGS_PROBE_ROWS: usize = 1;
+
+/// Named window -> span in ms. `None` = unknown range (caller turns that into a
+/// 400 rather than silently ignoring it).
+pub(crate) fn logs_range_ms(r: &str) -> Option<u64> {
+    match r.trim().to_ascii_lowercase().as_str() {
+        "30m" | "30min" => Some(30 * 60_000),
+        "1h" | "60m" => Some(60 * 60_000),
+        "24h" | "1d" => Some(crate::event_log::DAY_MS),
+        "7d" | "1w" => Some(7 * crate::event_log::DAY_MS),
+        "30d" => Some(30 * crate::event_log::DAY_MS),
+        _ => None,
+    }
+}
+
+fn logs_err(code: &str, message: String) -> String {
+    serde_json::to_string(&json!({ "error": { "code": code, "message": message } }))
+        .unwrap_or_else(|_| code.to_string())
+}
+
+/// Validate every term of a comma-separated enum filter against `allowed`.
+fn logs_validate_terms(
+    raw: Option<&str>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<(), (StatusCode, String)> {
+    let Some(raw) = raw.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    for term in raw
+        .split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .take(16)
+    {
+        if term.is_empty() {
+            continue;
+        }
+        if !allowed.contains(&term.as_str()) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_FILTER",
+                    format!(
+                        "logs: {field}='{term}' is not one of {}",
+                        allowed.join(", ")
+                    ),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn logs_hdr(h: &mut HeaderMap, k: &'static str, v: impl std::fmt::Display) {
+    if let Ok(val) = HeaderValue::from_str(&v.to_string()) {
+        h.insert(k, val);
+    }
+}
+
+/// Event log read (`/v1/logs`): every input is bounded first and a malformed filter is a 400, never
+/// ignored. The window resolves to absolute bounds (`range` or `since_ms`/`until_ms`) and is gated
+/// on the OWNING TENANT's plan SERVER-SIDE (history older than the hobby window of 7 days is
+/// Pro/Enterprise, up to the 30-day retention ceiling): a request past it is REFUSED with a typed
+/// error, never silently truncated, with no operator carve-out because platform admins read as
+/// `enterprise` through the billing floor (the team row wins over billing, as in `team_plan`).
+/// Scoping runs INSIDE the scan: only events of projects this team owns, UNATTRIBUTED events (empty
+/// project: apex bot probes, unresolved hosts, control-plane noise) are operator-only in the
+/// unfiltered view because they leak cross-tenant request metadata, and a project view matches the
+/// EXACT project tag or untagged events on one of that project's real deployment hostnames, never a
+/// substring of host/detail (pre-tag deployment events match on the host's first label only, since
+/// project and branch aliases move on promote). Requests are recorded on the node that SERVES them,
+/// so a top-level read merges the relevant peers' events (`local=true` against recursion; a project
+/// filter targets its host node(s), otherwise every peer hosting one of this tenant's projects,
+/// addressed by NODE through `fetch_from_host` because FC nodes have no HTTP admin URL), surfaces a
+/// peer's error envelope (plan gate, bad filter) instead of merging it as an empty array, and sorts
+/// newest-first with a deterministic tie-break so paging does not reshuffle.
 pub(crate) async fn logs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-    Query(q): Query<LimitQ>,
-) -> Json<Value> {
-    let limit = q.limit.unwrap_or(100);
+    Query(q): Query<LogsQ>,
+) -> Result<(HeaderMap, Json<Value>), (StatusCode, String)> {
+    use crate::event_log::{parse_list, DeployFacts, EventFilter, StatusPred};
+
+    let now = hive_core::now_ms();
+    let limit = q
+        .limit
+        .unwrap_or(LOGS_LIMIT_DEFAULT)
+        .clamp(1, LOGS_LIMIT_MAX);
+    let offset = q
+        .offset
+        .unwrap_or(0)
+        .min(LOGS_OFFSET_MAX)
+        .min(LOGS_LIMIT_MAX.saturating_sub(limit));
     let cl = claims.as_ref().map(|e| &e.0);
     let is_operator = operator_allowed(cl, crate::auth::enforced());
     let t = tenant(&c, &headers, cl);
-    let mut evs = c.recent_events(2000);
-    // Tenant scope: only events for projects owned by this team. UNATTRIBUTED
-    // events (empty project: platform-apex bot probes, unresolved hosts,
-    // control-plane noise) are OPERATOR-ONLY in the unfiltered view — they are
-    // nobody's tenant traffic, and showing them to every signed-in team both
-    // leaks cross-tenant request metadata (hosts/paths) and buries the team's
-    // own logs in scanner noise. A project-scoped view below still re-admits
-    // the project's OWN untagged host traffic via the alias-host branch.
-    evs.retain(|e| {
-        if e.project.is_empty() {
-            return is_operator;
+
+    let mut since_ms = q.since_ms.unwrap_or(0);
+    let mut until_ms = q.until_ms.unwrap_or(u64::MAX);
+    let range_name = q
+        .range
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    if let Some(r) = range_name.as_deref() {
+        if q.since_ms.is_some() || q.until_ms.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_RANGE",
+                    "logs: pass either range= or since_ms/until_ms=, not both".into(),
+                ),
+            ));
         }
-        // Fleet-aware: an event's project is owned per the deployment tenant
-        // tags, not the node-local (row-missing on non-hosting nodes) project row.
-        project_owned_by(&c, &e.project, &t)
-    });
-    if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
-        let pl = p.to_lowercase();
-        // EXACT project scoping. The old filter also kept any event whose `host`
-        // or `detail` merely CONTAINED the project name as a substring — so
-        // `/projects/ctest/logs` leaked in every other project's events that
-        // happened to mention "ctest" anywhere (and a short name like "css"
-        // matched "cssdemosite", "processor", …). Scope instead to: events
-        // tagged with this exact project, OR untagged/infra events whose `host`
-        // is one of THIS project's real deployment hostnames (exact label or a
-        // subdomain of it) — never a blind substring on free-text detail.
-        // The deployment host set is TENANT-CHECKED (team_of == t): a
-        // same-named project belonging to another tenant must not contribute
-        // hosts that would pull its traffic into this view.
-        let hosts: std::collections::HashSet<String> =
+        let span = logs_range_ms(r).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_BAD_RANGE",
+                    format!("logs: unknown range '{r}' — use 30m, 1h, 24h, 7d or 30d"),
+                ),
+            )
+        })?;
+        since_ms = now.saturating_sub(span);
+        until_ms = u64::MAX;
+    }
+    if let Some(cur) = q.cursor {
+        until_ms = until_ms.min(cur.saturating_sub(1));
+    }
+    if since_ms > 0 && until_ms < since_ms {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            logs_err(
+                "LOGS_BAD_RANGE",
+                "logs: until_ms/sort cursor is before since_ms".into(),
+            ),
+        ));
+    }
+
+    if since_ms > 0 {
+        let age_ms = now.saturating_sub(since_ms);
+        let span_ms = until_ms.min(now).saturating_sub(since_ms);
+        if age_ms > LOGS_MAX_AGE_MS + LOGS_AGE_TOLERANCE_MS
+            || span_ms > LOGS_MAX_AGE_MS + LOGS_AGE_TOLERANCE_MS
+        {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                logs_err(
+                    "LOGS_RANGE_TOO_LARGE",
+                    format!(
+                        "logs: requested window is wider than the {}-day history the platform retains",
+                        LOGS_MAX_AGE_MS / crate::event_log::DAY_MS
+                    ),
+                ),
+            ));
+        }
+        let plan = match q.project.as_deref().filter(|p| !p.is_empty()) {
+            Some(p) => team_plan(&c, p),
+            None => c
+                .teams
+                .get(&t)
+                .map(|x| x.plan)
+                .unwrap_or_else(|| c.billing.account(&t).plan),
+        };
+        let max_age = crate::billing::plan_max_log_age_ms(&plan);
+        if age_ms > max_age + LOGS_AGE_TOLERANCE_MS || span_ms > max_age + LOGS_AGE_TOLERANCE_MS {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                serde_json::to_string(&json!({
+                    "error": {
+                        "code": "PLAN_UPGRADE_REQUIRED",
+                        "feature": "extended_log_history",
+                        "message": format!(
+                            "Log history older than {} days requires the Pro or Enterprise plan (current plan: {plan}).",
+                            crate::billing::plan_max_log_age_ms("hobby") / crate::event_log::DAY_MS
+                        ),
+                        "plan": plan,
+                        "requested_age_ms": age_ms,
+                        "max_age_ms": max_age,
+                    }
+                }))
+                .unwrap_or_else(|_| "PLAN_UPGRADE_REQUIRED".to_string()),
+            ));
+        }
+    }
+
+    logs_validate_terms(
+        q.level.as_deref(),
+        "level",
+        &["info", "warning", "error", "fatal"],
+    )?;
+    logs_validate_terms(
+        q.cache.as_deref(),
+        "cache",
+        &["hit", "miss", "stale", "store", "revalidate"],
+    )?;
+    logs_validate_terms(q.env.as_deref(), "env", &["production", "preview"])?;
+    logs_validate_terms(
+        q.resource.as_deref(),
+        "resource",
+        &["static", "function", "fullstack"],
+    )?;
+    let mut statuses: Vec<StatusPred> = Vec::new();
+    if let Some(raw) = q
+        .status
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        for term in raw.split(',').take(16) {
+            let term = term.trim();
+            if term.is_empty() {
+                continue;
+            }
+            match StatusPred::parse(term) {
+                Some(p) => statuses.push(p),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        logs_err(
+                            "LOGS_BAD_FILTER",
+                            format!("logs: status='{term}' is not a code (404) or a class (5xx)"),
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+    let text =
+        q.q.as_deref()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.len() > 256 {
+                    s[..256].to_string()
+                } else {
+                    s
+                }
+            });
+
+    let scope_project = q
+        .project
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_lowercase());
+    let scope_deployment = q
+        .deployment
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .map(|d| d.to_lowercase());
+    let project_hosts: Vec<(String, String)> = match scope_project.as_deref() {
+        Some(pl) => {
             c.gw.list()
                 .into_iter()
-                .filter(|d| d.project.eq_ignore_ascii_case(&pl) && record_tenant(&d.tenant) == t)
+                .filter(|d| d.project.eq_ignore_ascii_case(pl) && record_tenant(&d.tenant) == t)
                 .flat_map(|d| {
                     [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
                         .into_iter()
                         .filter(|h| !h.is_empty())
                         .map(|h| h.to_lowercase())
                 })
-                .collect();
-        evs.retain(|e| {
-            if e.project.to_lowercase() == pl {
-                return true;
+                .map(|h| {
+                    let dot = format!("{h}.");
+                    (h, dot)
+                })
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let owned_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        Default::default();
+    let scope: std::sync::Arc<dyn Fn(&crate::state::Event) -> bool + Send + Sync> = {
+        let cc = c.clone();
+        let tt = t.clone();
+        let hosts = project_hosts.clone();
+        let oc = owned_cache.clone();
+        Arc::new(move |e: &crate::state::Event| {
+            if e.project.is_empty() {
+                if !is_operator {
+                    return false;
+                }
+            } else {
+                let key = e.project.to_lowercase();
+                let hit = oc.lock().ok().and_then(|m| m.get(&key).copied());
+                let ok = match hit {
+                    Some(v) => v,
+                    None => {
+                        let v = project_owned_by(&cc, &e.project, &tt);
+                        if let Ok(mut m) = oc.lock() {
+                            if m.len() < 4096 {
+                                m.insert(key, v);
+                            }
+                        }
+                        v
+                    }
+                };
+                if !ok {
+                    return false;
+                }
             }
-            if !e.project.is_empty() {
-                return false; // tagged for a DIFFERENT project — never leak it.
+            if let Some(pl) = scope_project.as_ref() {
+                if e.project.to_lowercase() != *pl {
+                    if !e.project.is_empty() {
+                        return false;
+                    }
+                    let h = e.host.to_lowercase();
+                    if !hosts.iter().any(|(ph, phd)| {
+                        h == *ph || h.starts_with(phd) || ph.starts_with(h.as_str())
+                    }) {
+                        return false;
+                    }
+                }
             }
-            // Untagged/infra event: keep only if its host is one of this
-            // project's deployment hosts (exact or a subdomain label boundary).
-            let h = e.host.to_lowercase();
-            hosts.iter().any(|ph| {
-                h == *ph || h.starts_with(&format!("{ph}.")) || ph.starts_with(&format!("{h}."))
-            })
-        });
-    }
-    if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
-        let dl = d.to_lowercase();
-        // Deployment scope: events exactly tagged with this deployment id at
-        // record time (see Event.deployment), plus — for events recorded before
-        // the tag existed — untagged events whose host FIRST LABEL is the
-        // deployment id itself (the id_alias URL is unambiguous over time;
-        // project/branch aliases move between deployments on promote, so those
-        // are only trusted via the record-time tag).
-        evs.retain(|e| {
-            if e.deployment.to_lowercase() == dl {
-                return true;
+            if let Some(dl) = scope_deployment.as_ref() {
+                if e.deployment.to_lowercase() != *dl {
+                    if !e.deployment.is_empty() {
+                        return false;
+                    }
+                    let h = e.host.to_lowercase();
+                    let label = h
+                        .split(':')
+                        .next()
+                        .unwrap_or(&h)
+                        .split('.')
+                        .next()
+                        .unwrap_or(&h)
+                        .to_string();
+                    if label != *dl {
+                        return false;
+                    }
+                }
             }
-            if !e.deployment.is_empty() {
-                return false;
+            true
+        })
+    };
+
+    let fetch = limit + offset + LOGS_PROBE_ROWS;
+    let filter = EventFilter {
+        since_ms,
+        until_ms,
+        limit: fetch,
+        statuses,
+        methods: parse_list(q.method.as_deref(), 8, 16).unwrap_or_default(),
+        hosts: parse_list(q.host.as_deref(), 8, 128).unwrap_or_default(),
+        routes: parse_list(q.route.as_deref(), 8, 256).unwrap_or_default(),
+        levels: parse_list(q.level.as_deref(), 4, 16).unwrap_or_default(),
+        caches: parse_list(q.cache.as_deref(), 6, 16).unwrap_or_default(),
+        envs: parse_list(q.env.as_deref(), 4, 32).unwrap_or_default(),
+        resources: parse_list(q.resource.as_deref(), 4, 32).unwrap_or_default(),
+        text,
+        scope: Some(scope),
+    };
+    let facts = DeployFacts::build(&c.gw.list());
+
+    let evs = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| c.query_events(&filter, &facts))
+        }
+        _ => c.query_events(&filter, &facts),
+    };
+    let mut out: Vec<Value> = evs
+        .into_iter()
+        .map(|e| {
+            let d = facts.derive(&e);
+            let mut v = json!(e);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("env".into(), json!(d.env));
+                o.insert("resource".into(), json!(d.resource));
+                o.insert("cache".into(), json!(d.cache));
+                o.insert("level".into(), json!(d.level));
             }
-            let h = e.host.to_lowercase();
-            let label = h
-                .split(':')
-                .next()
-                .unwrap_or(&h)
-                .split('.')
-                .next()
-                .unwrap_or(&h);
-            label == dl
-        });
-    }
-    if let Some(s) = q.q.as_ref().filter(|s| !s.is_empty()) {
-        let sl = s.to_lowercase();
-        evs.retain(|e| {
-            e.path.to_lowercase().contains(&sl)
-                || e.host.to_lowercase().contains(&sl)
-                || e.detail.to_lowercase().contains(&sl)
-                || e.action.to_lowercase().contains(&sl)
-        });
-    }
-    // Fleet aggregation: requests are recorded on the node that SERVES them, so a
-    // project placed on a peer logs there, not here. Merge in the relevant peers'
-    // events (scoped to the same project/search, `local=true` to avoid recursion),
-    // then sort newest-first and truncate.
-    let mut out: Vec<Value> = evs.into_iter().map(|e| json!(e)).collect();
+            v
+        })
+        .collect();
+
     if !q.local.unwrap_or(false) {
-        let qs = {
-            let mut s = format!("limit={}&local=true", limit);
-            if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
-                s.push_str(&format!("&project={}", urlencode(p)));
-            }
-            if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
-                s.push_str(&format!("&deployment={}", urlencode(d)));
-            }
-            if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
-                s.push_str(&format!("&q={}", urlencode(qq)));
-            }
-            s
-        };
-        // A project filter targets just its host node(s); otherwise pull from every
-        // peer hosting one of this tenant's projects. Address by NODE (not HTTP admin
-        // URL) and go through `fetch_from_host`, which falls back to the iroh mesh —
-        // FC nodes have no HTTP admin URL, so an admin-URL-only path returns nothing.
-        // (The old `git_for_project` gate skipped the proxy entirely for git-sourced
-        // projects, but the placement scheduler still hosts those on peers → the
-        // coordinator logged nothing for them. This is the "empty project logs" bug.)
+        let qs = logs_fanout_qs(&q, fetch, since_ms, until_ms);
         let nodes: Vec<String> = match q.project.as_deref() {
             Some(p) if !p.is_empty() => host_nodes_for_project(&c, p),
             _ => peer_nodes_for_tenant(&c, &t),
         };
         for node in nodes {
             if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/logs?{qs}"), &t).await {
+                if v.get("error").is_some() {
+                    let st = v
+                        .get("error")
+                        .and_then(|e| e.get("status"))
+                        .and_then(|s| s.as_u64())
+                        .and_then(|s| StatusCode::from_u16(s as u16).ok())
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
+                    return Err((st, v.to_string()));
+                }
                 if let Some(arr) = v.as_array() {
                     out.extend(arr.iter().cloned());
                 }
             }
         }
+        out.sort_by(|a, b| {
+            let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+            ts(b)
+                .cmp(&ts(a))
+                .then_with(|| {
+                    a.get("host")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("host").and_then(|x| x.as_str()).unwrap_or(""))
+                })
+                .then_with(|| {
+                    a.get("path")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .cmp(b.get("path").and_then(|x| x.as_str()).unwrap_or(""))
+                })
+        });
+    } else {
         out.sort_by(|a, b| {
             b.get("ts_ms")
                 .and_then(|x| x.as_u64())
@@ -9317,11 +9335,71 @@ pub(crate) async fn logs(
                 .cmp(&a.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0))
         });
     }
-    out.truncate(limit);
-    Json(json!(out))
+    let total = out.len();
+    let has_more = total > offset + limit;
+    let out: Vec<Value> = out.into_iter().skip(offset).take(limit).collect();
+
+    let mut hdrs = HeaderMap::new();
+    logs_hdr(&mut hdrs, "x-hive-logs-limit", limit);
+    logs_hdr(&mut hdrs, "x-hive-logs-offset", offset);
+    logs_hdr(&mut hdrs, "x-hive-logs-returned", out.len());
+    logs_hdr(&mut hdrs, "x-hive-logs-total", total);
+    logs_hdr(
+        &mut hdrs,
+        "x-hive-logs-has-more",
+        if has_more { "1" } else { "0" },
+    );
+    logs_hdr(&mut hdrs, "x-hive-logs-oldest-ms", c.events_oldest_ms());
+    if since_ms > 0 {
+        logs_hdr(&mut hdrs, "x-hive-logs-since-ms", since_ms);
+    }
+    if until_ms != u64::MAX {
+        logs_hdr(&mut hdrs, "x-hive-logs-until-ms", until_ms);
+    }
+    if let Some(r) = range_name.as_deref() {
+        logs_hdr(&mut hdrs, "x-hive-logs-range", r);
+    }
+    Ok((hdrs, Json(json!(out))))
 }
 
-// ---- WAF ----
+/// The query string the coordinator sends to each peer. EVERY filter of [`LogsQ`] must appear here
+/// or it works on the owner node and silently returns unfiltered data everywhere else. `range=` is
+/// deliberately NOT forwarded (it is resolved to absolute bounds first, so a peer cannot widen the
+/// window by re-resolving it against its own clock) and neither is `offset=` (paging happens once,
+/// after the merge).
+fn logs_fanout_qs(q: &LogsQ, fetch: usize, since_ms: u64, until_ms: u64) -> String {
+    let mut s = format!("limit={fetch}&local=true");
+    if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
+        s.push_str(&format!("&project={}", urlencode(p)));
+    }
+    if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
+        s.push_str(&format!("&deployment={}", urlencode(d)));
+    }
+    if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
+        s.push_str(&format!("&q={}", urlencode(qq)));
+    }
+    if since_ms > 0 {
+        s.push_str(&format!("&since_ms={since_ms}"));
+    }
+    if until_ms != u64::MAX {
+        s.push_str(&format!("&until_ms={until_ms}"));
+    }
+    for (k, v) in [
+        ("status", q.status.as_deref()),
+        ("method", q.method.as_deref()),
+        ("host", q.host.as_deref()),
+        ("route", q.route.as_deref()),
+        ("level", q.level.as_deref()),
+        ("cache", q.cache.as_deref()),
+        ("env", q.env.as_deref()),
+        ("resource", q.resource.as_deref()),
+    ] {
+        if let Some(v) = v.map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            s.push_str(&format!("&{k}={}", urlencode(v)));
+        }
+    }
+    s
+}
 
 async fn waf_get(
     State(c): State<Arc<CloudState>>,
@@ -9338,7 +9416,6 @@ async fn waf_add_rule(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(rule): Json<WafRule>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // WAF rules are GLOBAL edge infrastructure — operator-only when auth is on.
     require_operator(claims.as_ref().map(|e| &e.0))?;
     c.waf.add_rule(rule);
     crate::persist::persist(&c);
@@ -9372,8 +9449,6 @@ async fn waf_managed(
     Ok(Json(json!({ "managed": c.waf.managed_enabled() })))
 }
 
-// ---- Bot management ----
-
 async fn bot_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9392,8 +9467,6 @@ async fn bot_put(
     Ok(Json(json!(*c.bot_policy.read())))
 }
 
-// ---- CDN ----
-
 async fn cdn_get(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -9404,8 +9477,6 @@ async fn cdn_get(
         json!({ "hits": hits, "misses": misses, "stale": stale, "entries": entries, "hit_ratio": ratio }),
     ))
 }
-
-// ---- Runtime Cache (Vercel-style regional data cache) ----
 
 #[derive(Deserialize)]
 struct RcKey {
@@ -9424,31 +9495,34 @@ struct RcTag {
     tag: String,
 }
 
-async fn rc_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn rc_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let (entries, reads, writes, hits, revalidations) = c.runtime_cache.stats();
-    Json(json!({
+    Ok(Json(json!({
         "entries": entries, "reads": reads, "writes": writes,
         "hits": hits, "revalidations": revalidations,
-    }))
+    })))
 }
 
-/// Runtime-cache scope authorization. The scope is `{project}:{env}`; project
-/// names are globally unique, so ownership is checked via the project's team.
-/// Requests carrying NO tenant context (no JWT / API key / x-hive-team) are the
-/// in-cell loopback data plane (HIVE_RUNTIME_CACHE_URL) — the admin port is
-/// loopback-bound + firewalled, so those pass through unchanged.
+/// The scope is `{project}:{env}` and the caller must own the project. A request with no credentials
+/// is served only without auth enforcement (dev); the public API ingress runs the same router as the
+/// loopback listener and the auth middleware never rejects a read, so under enforcement it is 401.
 fn rc_authorize(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
     claims: Option<&crate::auth::Claims>,
     scope: &str,
 ) -> Result<(), (StatusCode, String)> {
-    let has_ctx = claims.is_some()
+    let has_credentials = claims.is_some()
         || headers.contains_key("x-hive-team")
         || headers.contains_key(axum::http::header::AUTHORIZATION);
-    if !has_ctx {
+    if !has_credentials && !crate::auth::enforced() {
         return Ok(());
     }
+    require_auth_read(claims)?;
     let project = scope.split(':').next().unwrap_or("");
     let t = tenant(c, headers, claims);
     if project_owned_by(c, project, &t) {
@@ -9541,13 +9615,13 @@ async fn cdn_purge(
     Ok(Json(json!({ "purged": true })))
 }
 
-// ---- Concurrency scaling ----
-
-async fn concurrency_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.limiter.stats()))
+async fn concurrency_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.limiter.stats())))
 }
-
-// ---- Routing layer ----
 
 async fn routing_get(
     State(c): State<Arc<CloudState>>,
@@ -9620,8 +9694,13 @@ async fn del_rewrite(
     Ok(Json(json!({ "rewrites": c.router.rewrites() })))
 }
 
-// ---- Cron ----
-
+/// Tenant-scoped cron list: this team's jobs (legacy jobs with no recorded tenant are attributed to
+/// their target project's owning team), deduped by id, plus every healthy peer's local list
+/// (`?local=true` against recursion). Cron is NODE-LOCAL (a `vercel.json` cron is registered on the
+/// node that BUILT the deployment, a manual job on the control-plane leader, and neither
+/// replicates), so one node alone shows only its slice; this is a READ merge, never store
+/// replication plus leader-only execution, so each node keeps firing exactly its own jobs and
+/// nothing double-fires or drops a follower-hosted deployment's cron.
 pub(crate) async fn cron_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -9629,13 +9708,6 @@ pub(crate) async fn cron_list(
     Query(q): Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Tenant-scoped: only this team's jobs. Legacy jobs (no tenant recorded) are
-    // attributed by their target project's owning team.
-    // Dedup by id here too (`seen`): defends the merged view against a store
-    // that still holds pre-fix duplicate jobs (same id) until every node has
-    // restarted onto the deduping restore path — without it a node's own
-    // duplicates would show while a peer fanning them in would collapse them,
-    // leaving counts that never converge across the fleet.
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut jobs: Vec<CronJob> = c
         .cron
@@ -9651,17 +9723,7 @@ pub(crate) async fn cron_list(
         })
         .filter(|j| seen.insert(j.id.clone()))
         .collect();
-    // FLEET FAN-OUT (read-only): cron jobs are node-local — a `vercel.json` cron
-    // is registered on the node that BUILT the deployment (git.rs), and a manual
-    // job on the control-plane leader; neither replicates. So a dashboard read
-    // that lands on any single node shows only that node's slice. Merge every
-    // healthy peer's local list (dedup by job id) so the operator sees the whole
-    // fleet's schedule. Deliberately a READ merge, NOT store replication +
-    // leader-only execution: each node keeps firing exactly its own jobs, so
-    // this can never double-fire or drop a follower-hosted deployment's cron.
-    // `?local=true` (the internal fan-out marker) short-circuits the recursion.
     if !q.local.unwrap_or(false) {
-        // `seen` already holds this node's own (deduped) job ids from above.
         for v in fan_out_peers_polled(&c, &all_healthy_peers(&c), &t, "/v1/cron?local=true").await {
             if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
                 for j in peer_jobs {
@@ -9681,8 +9743,6 @@ async fn cron_add(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut job): Json<CronJob>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Stamp the caller's tenant (never trust a tenant in the body) and require
-    // the target project to belong to them.
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &job.deployment)?;
     job.tenant = t;
     match c.cron.add(job) {
@@ -9732,11 +9792,9 @@ fn cron_job_owner(c: &Arc<CloudState>, job: &CronJob) -> String {
     }
 }
 
-/// Manually trigger a cron job right now (the dashboard's "Run" button) — the
-/// SAME invocation path the scheduler's own tick loop uses
-/// (`spawn_cron_loop`/`invoke`), so a manual run behaves identically to a
-/// real firing, but stamped as a manual run in the recorded event and without
-/// touching the job's own `next_run_ms` (its schedule is unaffected).
+/// Manually triggers a cron job now (the dashboard's "Run" button) through the SAME invocation path
+/// as the scheduler's tick loop (`spawn_cron_loop`/`invoke`), recorded as a manual run and leaving
+/// the job's own `next_run_ms` untouched.
 async fn cron_run(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -9780,10 +9838,7 @@ async fn project_cron_enabled_put(
     Path(project): Path<String>,
     Json(b): Json<CronToggle>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // See project_git_ci_put's comment: claim an unowned row rather than
-    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
-    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    c.projects.set_team(&project, &t);
+    require_project_claiming_row(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_cron_enabled(&project, b.enabled);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -9794,14 +9849,9 @@ struct CronToggle {
     enabled: bool,
 }
 
-// ---- Workflows ----
-
-/// Lenient `Option<bool>` query-param deserializer: axum's default (via
-/// `serde_urlencoded`) only accepts the literal strings `"true"`/`"false"`
-/// and 400s on anything else, but callers (the dashboard, `?summary=1`) send
-/// `"1"`/`"0"` — the same convention `gossip.rs`'s internal `wf_query`/
-/// `logs_query` already special-case (`v == "true" || v == "1"`) for the
-/// mesh-RPC path. This brings the public HTTP path up to that convention.
+/// Lenient `Option<bool>` query-param deserializer: axum's default accepts only `"true"`/`"false"`
+/// and 400s on anything else, but callers (the dashboard, `?summary=1`) send `"1"`/`"0"`, the
+/// convention `gossip.rs`'s `wf_query`/`logs_query` already special-case on the mesh-RPC path.
 fn de_lenient_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -9839,6 +9889,12 @@ pub(crate) struct WfQuery {
     /// Scope a run-scoped read (e.g. `/v1/workflows/hooks`) to a single run.
     #[serde(default, rename = "runId")]
     pub(crate) run_id: Option<String>,
+    /// Internal: skip the per-project WORLD reads (`worlds=0`), set by the fleet-aggregation
+    /// fan-out only. A world is read over the project's own REST URL, which answers from ANY node,
+    /// so the aggregating node reads every tenant-owned project's world itself and each peer hop
+    /// would otherwise re-read the same worlds just to have its rows discarded as duplicates.
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    pub(crate) worlds: Option<bool>,
 }
 
 /// Does this workflow's project belong to the requesting team? Fleet-aware —
@@ -9930,10 +9986,10 @@ async fn wf_run_wakeup(
     .await
 }
 
-/// Shared dispatch for the four run operations. Resolves the project (given or
-/// auto-scanned), checks tenant ownership, then runs the op on the project's
-/// HOST node (env decrypts locally): local when we host it, else forwarded over
-/// the iroh mesh with `local=1` so the host runs it without re-forwarding.
+/// Shared dispatch for the four run operations: resolves the project (given or auto-scanned),
+/// checks tenant ownership, then runs the op on the project's HOST node (env decrypts locally): in
+/// place when this node hosts it, else forwarded over the iroh mesh with `local=1` so the host runs
+/// it without re-forwarding.
 pub(crate) async fn wf_run_op_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -9946,11 +10002,9 @@ pub(crate) async fn wf_run_op_dispatch(
     let is_forwarded = body.local.unwrap_or(false);
     let cancel_reason = body.cancel_reason.clone();
 
-    // 1) Resolve the project that holds this run.
     let project = if let Some(p) = body.project.clone() {
         p
     } else {
-        // Auto-scan: which of this tenant's world-backed projects has the run?
         let locals: Vec<String> = {
             let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
             for d in c.gw.list() {
@@ -9974,7 +10028,6 @@ pub(crate) async fn wf_run_op_dispatch(
             }
         }
         if found.is_empty() && !is_forwarded {
-            // Not on this node — fan the op out to peers hosting this tenant's projects.
             let peers = peer_nodes_for_tenant(c, &team);
             let body_json = json!({ "cancelReason": cancel_reason, "local": true });
             for node in peers {
@@ -10003,11 +10056,9 @@ pub(crate) async fn wf_run_op_dispatch(
     if project.is_empty() {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 2) Ownership.
     if !wf_in_team(c, &project, &team) {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 3) If this project isn't hosted locally, forward to its host node.
     if c.gw.git_for_project(&project).is_none() && !is_forwarded {
         if let Some(node) = host_node_for_project(c, &project) {
             let body_json =
@@ -10039,17 +10090,18 @@ pub(crate) async fn wf_run_op_dispatch(
             ));
         }
     }
-    // 4) Run it locally against the project's world.
     match crate::world::run_op(c, &project, id, op, cancel_reason.as_deref()).await {
         Ok(v) => Ok(Json(v)),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
-/// POST a JSON body to a host node by NAME: HTTP admin POST if we know its URL,
-/// else the iroh mesh (`GOSSIP_POST` — same body/path dispatch). The
-/// body-carrying, POST-verb counterpart of `post_to_host`/`put_to_host`, used
-/// to forward run operations to a project's hosting node.
+/// POSTs a JSON body to a host node by NAME: the HTTP admin when its URL is known, else the iroh
+/// mesh (`GOSSIP_POST`); the body-carrying counterpart of `post_to_host`/`put_to_host`, used to
+/// forward run operations to a project's host. A configured `HIVE_INTERNAL_TOKEN` rides along as
+/// `x-hive-internal`, so handlers gated by `require_operator_or_internal` (run events and
+/// attributes) still pass on this forwarded hop, which never carries the caller's Authorization
+/// header (an inert extra header for every other route).
 pub(crate) async fn post_body_to_host(
     c: &Arc<CloudState>,
     node: &str,
@@ -10063,11 +10115,6 @@ pub(crate) async fn post_body_to_host(
             .http
             .post(format!("{admin}{path}"))
             .header("x-hive-team", team);
-        // Carry the internal node-to-node trust token, when configured, so a
-        // handler gated by `require_operator_or_internal` (run events/
-        // attributes) still passes on this forwarded hop, which never carries
-        // the caller's Authorization header. Inert extra header for every
-        // other forwarded route, which doesn't check it.
         if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
             if !t.trim().is_empty() {
                 req = req.header("x-hive-internal", t);
@@ -10113,12 +10160,9 @@ pub(crate) async fn post_body_to_host(
     None
 }
 
-/// Body for the operator-only generic run-event append, matching the real
-/// `@workflow/world` spec's `events.create(runId, data, params)` shape:
-/// `eventType` = the event name (required — this is what makes the endpoint
-/// GENERIC, unlike the three hardcoded call sites in [`crate::world::run_op`]),
-/// `eventData` = its payload (spec's `data`), `correlationId` = spec's
-/// `params.correlationId`.
+/// Body for the operator-only generic run-event append, matching the `@workflow/world` spec's
+/// `events.create(runId, data, params)`: `eventType` (required, which makes the endpoint GENERIC),
+/// `eventData` (the spec's `data`) and `correlationId` (`params.correlationId`).
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunEventBody {
     /// Which project's world holds the run (lets the op skip the auto-scan).
@@ -10136,10 +10180,9 @@ pub(crate) struct RunEventBody {
     pub(crate) local: Option<bool>,
 }
 
-/// Body for the operator-only run-attributes merge, matching the real spec's
-/// `experimentalSetAttributes(runId, changes, options)`: `attributes` = the
-/// spec's `changes`, merged (top-level keys, overwriting) into the run's
-/// stored `attributes` object.
+/// Body for the operator-only run-attributes merge, matching the spec's
+/// `experimentalSetAttributes(runId, changes, options)`: `attributes` is the spec's `changes`,
+/// merged (top-level keys, overwriting) into the run's stored `attributes`.
 #[derive(serde::Deserialize, Default)]
 pub(crate) struct RunAttributesBody {
     #[serde(default)]
@@ -10185,13 +10228,11 @@ async fn wf_run_set_attributes(
     .await
 }
 
-/// Shared dispatch for the operator-only "append arbitrary event to a run"
-/// op. Mirrors [`wf_run_op_dispatch`]'s project-resolution + host-forward
-/// shape exactly (this is the same node-local world data cancel/replay/
-/// wakeup mutate — see AGENTS.md's round-robin-reads-vs-leader-forwarded-
-/// writes section), but gated by [`require_operator_or_internal`] instead of
-/// tenant ownership alone: this is a manual incident-recovery primitive for
-/// platform operators, not a tenant self-service action like the 3-dots menu.
+/// Shared dispatch for the operator-only "append arbitrary event to a run" op: the same project
+/// resolution and host forwarding as [`wf_run_op_dispatch`] (the data is the node-local world that
+/// cancel/replay/wakeup mutate), but gated by [`require_operator_or_internal`] rather than tenant
+/// ownership, because it is a manual incident-recovery primitive for platform operators, not tenant
+/// self-service.
 pub(crate) async fn wf_run_event_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -10210,8 +10251,6 @@ pub(crate) async fn wf_run_event_dispatch(
     let team = tenant(c, headers, claims);
     let is_forwarded = body.local.unwrap_or(false);
 
-    // 1) Resolve the project that holds this run — identical shape to
-    // `wf_run_op_dispatch`'s auto-scan/fan-out.
     let project = if let Some(p) = body.project.clone() {
         p
     } else {
@@ -10266,11 +10305,9 @@ pub(crate) async fn wf_run_event_dispatch(
     if project.is_empty() {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 2) Ownership.
     if !wf_in_team(c, &project, &team) {
         return Err((StatusCode::NOT_FOUND, "run not found".into()));
     }
-    // 3) If this project isn't hosted locally, forward to its host node.
     if c.gw.git_for_project(&project).is_none() && !is_forwarded {
         if let Some(node) = host_node_for_project(c, &project) {
             let body_json = json!({ "project": project, "eventType": event_type, "eventData": event_data, "correlationId": correlation_id, "local": true });
@@ -10301,7 +10338,6 @@ pub(crate) async fn wf_run_event_dispatch(
             ));
         }
     }
-    // 4) Run it locally against the project's world.
     match crate::world::append_run_event(
         c,
         &project,
@@ -10317,9 +10353,8 @@ pub(crate) async fn wf_run_event_dispatch(
     }
 }
 
-/// Shared dispatch for the operator-only "merge run attributes" op — same
-/// shape as [`wf_run_event_dispatch`] (and [`wf_run_op_dispatch`]), routed to
-/// [`crate::world::merge_run_attributes`] instead.
+/// Shared dispatch for the operator-only "merge run attributes" op, shaped like
+/// [`wf_run_event_dispatch`] and routed to [`crate::world::merge_run_attributes`].
 pub(crate) async fn wf_run_attributes_dispatch(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -10436,6 +10471,10 @@ pub(crate) async fn wf_run_attributes_dispatch(
     }
 }
 
+/// Workflow definitions for the caller's team. Workflows are ingested on the node that HOSTS a
+/// deployment: a project placed on a peer is proxied to its host node, and the global view (no
+/// project filter) merges in the workflows registered on every peer hosting one of this tenant's
+/// projects.
 pub(crate) async fn wf_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10443,8 +10482,6 @@ pub(crate) async fn wf_list(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Workflows are ingested on the node that HOSTS a deployment. If this project
-    // was placed on a peer, proxy to that node so its workflows show up.
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
             if let Some(node) = host_node_for_project(&c, project) {
@@ -10469,9 +10506,6 @@ pub(crate) async fn wf_list(
         .filter(|d| q.project.as_deref().map(|p| p == d.project).unwrap_or(true))
         .map(|d| json!(d))
         .collect();
-    // Global view (no project filter): merge in workflows registered on peer nodes
-    // that host this tenant's projects — they're ingested on the HOST, so the
-    // coordinator otherwise shows none for scheduler-placed projects.
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = defs
             .iter()
@@ -10514,7 +10548,6 @@ async fn wf_define(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(def): Json<WorkflowDef>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // The workflow's project must belong to the caller's team.
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &def.project)?;
     c.workflows.define(def);
     let defs: Vec<WorkflowDef> = c
@@ -10533,6 +10566,16 @@ fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
     LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
 }
 
+/// Workflow runs for the caller's team, the most expensive read on the dashboard (fleet fan-out
+/// plus per-project world reads), cached for 2 s per team/project/summary. The inner `local=true`
+/// hop runs inline, uncached and uncoalesced (its caller carries the budget); a top-level call
+/// aggregates on a DETACHED task coalesced per cache key: the dashboard's world proxy aborts a
+/// request at 20 s and axum then drops the handler future, so caches written only at handler
+/// completion starved `resp_cache` AND the last-known-good belt forever (every poll re-ran the slow
+/// path and aborted identically). Detaching means the computation always finishes and fills the
+/// caches, and coalescing means five aborted-and-retried polls spawn ONE aggregation. The in-flight
+/// map entry MUST clear even if the collector panics, or a dead sender sends every later poll down
+/// the uncached inline path forever.
 pub(crate) async fn wf_runs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10540,11 +10583,6 @@ pub(crate) async fn wf_runs(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Cache this endpoint's result for a couple seconds — it's "the most
-    // expensive read on the dashboard" per the comments below (fleet fan-out
-    // PLUS per-project Upstash world reads on every call), so collapsing
-    // concurrent/rapid requests from multiple tabs/team members matters more
-    // here than almost anywhere else. Never cache the inner `local=true` hop.
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
         "wf_runs:{team}:{}:{}",
@@ -10557,21 +10595,8 @@ pub(crate) async fn wf_runs(
         }
     }
     if !is_top_level {
-        // Inner `local=true` hop: run inline, never cached, never coalesced —
-        // its caller (a peer's own aggregation) carries the budget.
         return Json(wf_runs_collect(c, team, q).await);
     }
-    // Top-level: the aggregation runs on a DETACHED task, coalesced per cache
-    // key. Two reasons, both live-witnessed as "Error loading runs" on the
-    // dashboard: (1) the dashboard's own world proxy aborts this request at
-    // 20s, and axum then DROPS this handler future mid-await — with the
-    // caches written only at handler completion, an aborted poll starved
-    // `resp_cache` AND the last-known-good belt forever, so EVERY subsequent
-    // poll re-ran the full slow path and aborted identically (steady-state
-    // failure, not a transient). Detaching means the computation always
-    // finishes and always writes the caches — one slow poll instead of an
-    // endless series. (2) Coalescing means five aborted-and-retried polls
-    // spawn ONE aggregation, not five (the dc8286f amplification rule).
     type WfShared = tokio::sync::watch::Receiver<Option<Value>>;
     fn wf_inflight() -> &'static parking_lot::Mutex<std::collections::HashMap<String, WfShared>> {
         static M: std::sync::OnceLock<
@@ -10588,10 +10613,6 @@ pub(crate) async fn wf_runs(
                 m.insert(cache_key.clone(), rx.clone());
                 let (c2, team2, q2, key2) = (c.clone(), team.clone(), q.clone(), cache_key.clone());
                 tokio::spawn(async move {
-                    // The map entry MUST clear even if the collector panics:
-                    // a leaked entry's dead sender makes every later poll fall
-                    // through to the uncached inline path forever — the exact
-                    // steady-state starvation this task exists to prevent.
                     struct ClearOnDrop(String);
                     impl Drop for ClearOnDrop {
                         fn drop(&mut self) {
@@ -10607,11 +10628,8 @@ pub(crate) async fn wf_runs(
             }
         }
     };
-    // STALE-WHILE-REVALIDATE: with a computation already in flight, a recent
-    // last-known-good answer beats blocking this poll on the aggregation — the
-    // dashboard polls every few seconds, so it picks the fresh rows up on the
-    // next tick from the cache the detached task writes. Only the genuinely
-    // FIRST poll (nothing known yet) waits out the computation.
+    // Stale-while-revalidate: with a computation in flight, a recent last-known-good answer beats
+    // blocking this poll; only the FIRST poll (nothing known yet) waits it out.
     {
         let g = wf_last_good().lock();
         if let Some((at, v)) = g.get(&cache_key) {
@@ -10625,21 +10643,44 @@ pub(crate) async fn wf_runs(
             return Json(v);
         }
         if rx.changed().await.is_err() {
-            // Compute task died (panic) — degrade to the collector inline.
             return Json(wf_runs_collect(c, team, q).await);
         }
     }
 }
 
-/// The actual aggregation `wf_runs` serves — local workflow store + per-project
-/// Upstash world reads + peer fan-out, each slow phase under its OWN budget so
-/// the worst case stays inside the dashboard's 20s client abort (the phases'
-/// dial-resilience budgets — 10s HTTP + 20s iroh per peer, 20s per world read —
-/// are correct for one-shot control operations and structurally wrong for a
-/// polled read: this endpoint is re-asked every few seconds, so a phase that
-/// misses one poll's budget simply contributes to the next poll). Writes the
-/// LAST-KNOWN-GOOD belt (and consults it for empties) itself, so completion —
-/// not the HTTP caller's patience — is what populates it.
+/// Per-project world-read circuit breaker: a project whose world store does not answer (a dead or
+/// expired Upstash endpoint, tenant configuration no node can repair) used to cost every poll its
+/// full read budget forever (six of nine projects on the busiest tenant were in that state, about
+/// 2.5 s per poll for rows that never arrive). After a timeout the project's world is skipped for
+/// this long and retried when it lapses, so recovery is automatic and the steady state stays fast.
+const WORLD_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn world_cooldowns(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static M: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    M.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The actual aggregation `wf_runs` serves: the local workflow store, per-project Upstash world
+/// reads and the peer fan-out, each slow phase under its OWN budget so the worst case stays inside
+/// the dashboard's 20 s client abort (the dial-resilience budgets, 10 s HTTP and 20 s iroh per peer
+/// and 20 s per world read, are right for one-shot control operations and wrong for a polled read:
+/// a phase that misses one poll's budget simply contributes to the next). World reads run
+/// concurrently and are budgeted PER PROJECT, peer fetches PER PEER, never as one timeout over the
+/// whole join: one dead world or peer used to burn the phase budget and discard every healthy
+/// project's or peer's rows, so the runs table came back empty or incomplete (and the incomplete
+/// result overwrote last-known-good). A tenant-owned project with a world config is read directly
+/// on EVERY node (the env is gossiped and the world answers over its own REST URL), never only
+/// through the mesh forward, which returned a false `[]` on any fan-out hiccup (the "rows load then
+/// flicker and disappear" report); a best-effort deduplicated host merge still adds the host's
+/// engine-local rows. `?summary=1` strips each step's `output` (the table renders
+/// name/status/duration; the full detail is `/v1/workflows/runs/:id`). The LAST-KNOWN-GOOD belt is
+/// written here and consulted for empties, so completion, not the HTTP caller's patience, populates
+/// it: a poll that comes up empty while a recent one had rows serves those rows (a transient outage
+/// degrades to seconds-stale, never false-empty, and genuine emptiness wins once
+/// `WF_LAST_GOOD_TTL_MS` expires).
 async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value {
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
@@ -10650,13 +10691,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     /// One phase's budget: generous for a healthy fleet, and small enough that
     /// world-read + fan-out in sequence still complete under the client abort.
     const PHASE_BUDGET: Duration = Duration::from_secs(8);
-    // Scoped request for a project with a locally-readable, tenant-owned WORLD
-    // (env is gossiped, so this is true on EVERY node): never depend on the
-    // mesh forward for the world rows — the forward path returned a false-[]
-    // on any fan-out hiccup, live-witnessed as the project tab's runs table
-    // flickering to empty mid-poll even after the unscoped fix. The direct
-    // local world read below covers it; a best-effort host merge (dedup'd)
-    // still picks up the host's engine-local rows when reachable.
+    /// One project's world read budget: the world store is an EXTERNAL REST endpoint, so a hung one
+    /// must not eat the caller's whole deadline or take the healthy projects' rows down with it.
+    const WORLD_READ_BUDGET: Duration = Duration::from_millis(2_500);
     let scoped_world_local = q
         .project
         .as_deref()
@@ -10689,15 +10726,8 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
         .filter(|r| q.project.as_deref().map(|p| p == r.project).unwrap_or(true))
         .map(|r| json!(r))
         .collect();
-    // Append the REAL runs the deployed app executed, read from its WDK "world"
-    // store. Only for projects HOSTED on THIS node (env_map decrypts locally); the
-    // coordinator gets these via the per-project / `local=true` proxy paths above.
     {
         let mut locals: Vec<String> = match q.project.as_deref() {
-            // Direct world read whenever this node CAN (local deployment
-            // record OR gossiped world env + ownership) — see
-            // scoped_world_local above for why the mesh must not be the only
-            // source of a scoped table's rows.
             Some(p) if c.gw.git_for_project(p).is_some() || scoped_world_local => {
                 vec![p.to_string()]
             }
@@ -10705,24 +10735,10 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for d in c.gw.list() {
-                    // The deployment record's own tenant tag is authoritative and
-                    // present (local record); the project row is node-local and
-                    // UNTAGGED on nodes that never ran this deploy.
                     if record_tenant(&d.tenant) == team {
                         s.insert(d.project);
                     }
                 }
-                // ALSO every tenant-owned project from the GOSSIPED settings
-                // store whose env carries a world config. World reads go over
-                // the project's own REST URL, which works from ANY node — but
-                // deriving the list from node-local deployment records alone
-                // meant only the node(s) that ran the deploy read the world
-                // directly; every other node answered the console's poll from
-                // the iroh fan-out, and one mesh hiccup turned a populated
-                // runs table into a false-[] on the next poll. Live-witnessed
-                // as the "rows load then flicker and disappear" report:
-                // local=true returned 8 rows on the leader and 0 on all six
-                // other public-serving nodes.
                 for (name, _) in c.projects.snapshot() {
                     if !s.contains(&name)
                         && crate::world::has_world(&c, &name)
@@ -10734,28 +10750,67 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
                 s.into_iter().collect()
             }
         };
+        if q.worlds == Some(false) {
+            locals.clear();
+        }
         locals.retain(|p| crate::world::has_world(&c, p));
-        // Per-project Upstash world reads run CONCURRENTLY — a tenant with many
-        // projects previously paid one Upstash round-trip per project, one at a
-        // time (this function's own doc/comment history calls it "the most
-        // expensive read on the dashboard"). join_all bounds the added latency to
-        // the slowest single project's read instead of the sum of every project.
-        // Budgeted: a single slow/hung Upstash world must cost this POLL its
-        // rows for that project, never the whole endpoint its deadline.
-        if let Ok(all) = tokio::time::timeout(
-            PHASE_BUDGET,
-            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100))),
-        )
-        .await
         {
-            for wruns in all.into_iter().flatten() {
-                runs.extend(wruns);
+            let mut cd = world_cooldowns().lock();
+            let now = std::time::Instant::now();
+            let mut cooled: usize = 0;
+            locals.retain(|p| match cd.get(p) {
+                Some(until) if *until > now => {
+                    cooled += 1;
+                    false
+                }
+                Some(_) => {
+                    cd.remove(p);
+                    true
+                }
+                None => true,
+            });
+            if cooled > 0 {
+                tracing::debug!(
+                    team,
+                    cooled,
+                    "wf_runs: skipping world reads for projects still in cooldown"
+                );
             }
-        } else if !locals.is_empty() {
+        }
+        let world_start = std::time::Instant::now();
+        let world_reads: Vec<Value> = futures::future::join_all(locals.iter().map(|p| {
+            let c = c.clone();
+            async move {
+                let started = std::time::Instant::now();
+                match tokio::time::timeout(WORLD_READ_BUDGET, crate::world::list_runs(&c, p, 100))
+                    .await
+                {
+                    Ok(rows) => rows.unwrap_or_default(),
+                    Err(_) => {
+                        tracing::warn!(
+                            project = %p,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "wf_runs: world read exceeded its budget — serving this poll without that project's runs"
+                        );
+                        world_cooldowns()
+                            .lock()
+                            .insert(p.to_string(), std::time::Instant::now() + WORLD_COOLDOWN);
+                        Vec::new()
+                    }
+                }
+            }
+        }))
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+        runs.extend(world_reads);
+        if world_start.elapsed() > Duration::from_secs(2) {
             tracing::warn!(
                 team,
                 projects = locals.len(),
-                "wf_runs: world reads exceeded the phase budget — serving without them this poll"
+                elapsed_ms = world_start.elapsed().as_millis() as u64,
+                "wf_runs: world reads were slow this poll"
             );
         }
     }
@@ -10768,19 +10823,13 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
-        // Budgeted PER PEER, never as one timeout over the whole join: a
-        // single dark peer used to trip the outer budget and silently discard
-        // every HEALTHY peer's rows too — fast but permanently incomplete,
-        // and the incomplete (non-empty) result then overwrote last-known-
-        // good. Per-peer budgets bound the wall clock to one budget (the
-        // fetches run concurrently) while each healthy peer's rows land.
         let peer_results: Vec<Value> = futures::future::join_all(peers.iter().map(|node| {
             let c = c.clone();
             let team = team.clone();
             async move {
                 tokio::time::timeout(
                     PHASE_BUDGET,
-                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true", &team),
+                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true&worlds=0", &team),
                 )
                 .await
                 .ok()
@@ -10803,12 +10852,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     } else if let Some(project) = q.project.as_deref() {
-        // Scoped read served by the DIRECT local world (scoped_world_local)
-        // on a node with no local deployment record: the host node's
-        // engine-local rows for this project aren't in `runs` yet. Merge them
-        // best-effort (dedup'd) — a mesh miss here degrades to world-rows-only
-        // (still populated), never to an empty table, which is the whole
-        // point of the scoped-flicker fix.
         if scoped_world_local
             && !q.local.unwrap_or(false)
             && c.gw.git_for_project(project).is_none()
@@ -10840,11 +10883,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     }
-    // LIST-shape trim (`?summary=1`, sent by the dashboard's runs table): strip
-    // each step's `output` payload — the table renders name/status/duration
-    // only, but every poll was shipping full per-step output text for every
-    // run (the single biggest bytes item on the workflows page). The full
-    // detail stays on `/v1/workflows/runs/:id`.
     if q.summary.unwrap_or(false) {
         for r in runs.iter_mut() {
             if let Some(steps) = r.get_mut("steps").and_then(|s| s.as_array_mut()) {
@@ -10856,15 +10894,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         }
     }
-    // LAST-KNOWN-GOOD belt: the console polls this endpoint and REPLACES its
-    // table with whatever comes back, so a single transiently-failed world
-    // read (downstash hiccup, mesh fan-out miss, provider timeout — all
-    // swallowed into an empty vec upstream) rendered as rows-flicker-then-
-    // disappear. If THIS poll came up empty but a recent poll for the same
-    // cache key had rows, serve those instead: a transient outage degrades to
-    // seconds-stale, never to false-empty. Genuine emptiness still wins once
-    // the hold expires (WF_LAST_GOOD_TTL), so a truly-cleared world shows
-    // empty within a minute rather than pinning stale rows forever.
     if is_top_level {
         if runs.is_empty() {
             let g = wf_last_good().lock();
@@ -10882,10 +10911,9 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     json!(runs)
 }
 
-/// One run with full step detail (for the trace timeline / Gantt). Resolves from
-/// our engine first, else from the project's WDK "world" store — proxied to the
-/// hosting node when the project lives on a peer (the world env is decrypted
-/// there). `?project=` is required to locate a world run.
+/// One run with full step detail (for the trace timeline / Gantt): resolved from our engine first,
+/// else from the project's WDK "world" store, proxied to the hosting node when the project lives on
+/// a peer (the world env is decrypted there); `?project=` is required to locate a world run.
 pub(crate) async fn wf_run_detail(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -10895,19 +10923,12 @@ pub(crate) async fn wf_run_detail(
 ) -> Result<Json<Value>, StatusCode> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(r) = c.workflows.run(&id) {
-        // This fast path (a run hosted on THIS node) used to skip the team
-        // check every other lookup branch below performs — any authenticated
-        // tenant who learned/guessed a run id could read a different
-        // tenant's full workflow step output.
         if wf_in_team(&c, &r.project, &team) {
             return Ok(Json(json!(r)));
         }
         return Err(StatusCode::NOT_FOUND);
     }
     let found = |v: &Value| v.get("run").map(|r| !r.is_null()).unwrap_or(false);
-    // 1) Explicit project (proxy to its host node over iroh if remote, else local).
-    // Candidate hosts queried CONCURRENTLY — a project hosted on the LAST
-    // candidate used to cost one sequential hop per candidate before this fix.
     if let Some(project) = q.project.as_deref() {
         if !q.local.unwrap_or(false) {
             let hosts = host_nodes_for_project(&c, project);
@@ -10926,12 +10947,9 @@ pub(crate) async fn wf_run_detail(
             }
         }
     }
-    // 2) Auto-resolve: no (or wrong) project given — scan this node's world
-    // projects for the run (lets a bare /workflows/runs/<id> URL resolve).
     let locals: Vec<String> = {
         let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
         for d in c.gw.list() {
-            // Authoritative record tag, not the node-local project row.
             if record_tenant(&d.tenant) == team {
                 s.insert(d.project);
             }
@@ -10942,8 +10960,6 @@ pub(crate) async fn wf_run_detail(
         .into_iter()
         .filter(|p| crate::world::has_world(&c, p))
         .collect();
-    // Concurrent per-project Upstash world reads (was one sequential hop per
-    // locally-hosted project — same "most expensive read" class as wf_runs).
     let details = futures::future::join_all(
         world_locals
             .iter()
@@ -10953,7 +10969,6 @@ pub(crate) async fn wf_run_detail(
     if let Some(detail) = details.into_iter().flatten().find(|d| found(d)) {
         return Ok(Json(detail));
     }
-    // 3) Fleet: ask peers hosting this tenant's projects to resolve it (over iroh), concurrently.
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
         let path = format!("/v1/workflows/runs/{id}?local=true");
@@ -10989,7 +11004,7 @@ pub(crate) async fn wf_summary(
             r.project.clone()
         };
         let e = agg.entry(proj).or_insert((0, 0, 0, 0));
-        e.0 += 1; // created
+        e.0 += 1;
         match r.status {
             hive_edge::workflows::RunStatus::Succeeded => e.1 += 1,
             hive_edge::workflows::RunStatus::Failed => e.2 += 1,
@@ -10999,8 +11014,6 @@ pub(crate) async fn wf_summary(
             _ => {}
         }
     }
-    // Merge peer rollups (the tenant's projects placed on other nodes). A project
-    // lives on one host, so per-project rows don't overlap; sum defensively.
     if !q.local.unwrap_or(false) {
         let peers = peer_nodes_for_tenant(&c, &team);
         for v in fan_out_peers_polled(&c, &peers, &team, "/v1/workflows/summary?local=true").await {
@@ -11030,12 +11043,11 @@ pub(crate) async fn wf_summary(
     Json(json!(rows))
 }
 
-/// List workflow HOOKS for the observability console's Hooks tab. Hooks live ONLY
-/// in the deployed app's WDK "world" store (there's no engine-side source the way
-/// runs have one), so this reads them from every project HOSTED on this node and
-/// fans out to the peers hosting this tenant's other projects — the same
-/// tenant-scoping / project-filtering / `?local=` fleet-merge shape as `wf_runs`.
-/// `?runId=` scopes the read to a single run.
+/// Lists workflow HOOKS for the observability console's Hooks tab. Hooks live ONLY in the deployed
+/// app's WDK "world" store, so this reads them from every project hosted on this node and fans out
+/// to the peers hosting the tenant's other projects, with the same tenant scoping, project
+/// filtering, short-TTL collapse and `?local=` fleet merge as `wf_runs`; `?runId=` scopes the read
+/// to one run.
 pub(crate) async fn wf_hooks(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11043,8 +11055,6 @@ pub(crate) async fn wf_hooks(
     Query(q): Query<WfQuery>,
 ) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Same short-TTL collapse as wf_runs (fleet fan-out + per-project Upstash world
-    // reads). Never cache the inner `local=true` hop.
     let is_top_level = !q.local.unwrap_or(false);
     let run_id = q.run_id.as_deref();
     let cache_key = format!(
@@ -11058,8 +11068,6 @@ pub(crate) async fn wf_hooks(
         }
     }
     let rid_q = run_id.map(|r| format!("&runId={r}")).unwrap_or_default();
-    // Cross-region project: proxy to the node that HOSTS it — its world env is
-    // decrypted there (same per-project `local=true` proxy path as wf_runs).
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
             if let Some(node) = host_node_for_project(&c, project) {
@@ -11073,8 +11081,6 @@ pub(crate) async fn wf_hooks(
             }
         }
     }
-    // Hooks from the WDK world of each project hosted on THIS node (env_map decrypts
-    // locally); the coordinator gets remote ones via the proxy / fan-out paths.
     let mut hooks: Vec<Value> = Vec::new();
     {
         let locals: Vec<String> = match q.project.as_deref() {
@@ -11083,7 +11089,6 @@ pub(crate) async fn wf_hooks(
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for d in c.gw.list() {
-                    // Authoritative deployment-record tag, not the node-local project row.
                     if record_tenant(&d.tenant) == team {
                         s.insert(d.project);
                     }
@@ -11095,8 +11100,6 @@ pub(crate) async fn wf_hooks(
             .into_iter()
             .filter(|p| crate::world::has_world(&c, p))
             .collect();
-        // Per-project Upstash world reads run CONCURRENTLY (same "most expensive
-        // read" class as wf_runs) — bound the added latency to the slowest project.
         for whooks in futures::future::join_all(
             world_locals
                 .iter()
@@ -11135,7 +11138,6 @@ pub(crate) async fn wf_hooks(
             }
         }
     }
-    // Newest-first across the merged fleet view.
     hooks.sort_by(|a, b| {
         let am = a.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
         let bm = b.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -11154,7 +11156,6 @@ async fn wf_run(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Only the owning team may trigger a workflow run.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(def) = c.workflows.defs().into_iter().find(|d| d.id == id) {
         if !wf_in_team(&c, &def.project, &t) {
@@ -11170,8 +11171,6 @@ async fn wf_run(
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
-
-// ---- Sandbox (run arbitrary code in an isolated cell) ----
 
 #[derive(Deserialize)]
 struct SandboxReq {
@@ -11197,10 +11196,79 @@ struct SandboxResp {
     duration_ms: u64,
 }
 
+/// Longest a single-use `/v1/sandbox` cell may run; the caller's `timeout_secs` is clamped to it.
+const SANDBOX_TIMEOUT_MAX_SECS: u64 = 120;
+/// Single-use cells one tenant may have running on this node at once.
+const SANDBOX_TENANT_MAX_JOBS: usize = 2;
+
+static SANDBOX_INFLIGHT: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// One running `/v1/sandbox` cell charged to a tenant; the slot is released on drop, so a client
+/// that leaves mid-run (axum drops the future) never leaks it.
+struct SandboxSlot(String);
+
+impl SandboxSlot {
+    fn acquire(tenant: &str) -> Option<SandboxSlot> {
+        let mut inflight = SANDBOX_INFLIGHT.lock();
+        let running = inflight.entry(tenant.to_string()).or_insert(0);
+        if *running >= SANDBOX_TENANT_MAX_JOBS {
+            return None;
+        }
+        *running += 1;
+        Some(SandboxSlot(tenant.to_string()))
+    }
+}
+
+impl Drop for SandboxSlot {
+    fn drop(&mut self) {
+        let mut inflight = SANDBOX_INFLIGHT.lock();
+        if let Some(running) = inflight.get_mut(&self.0) {
+            *running = running.saturating_sub(1);
+            if *running == 0 {
+                inflight.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// The dashboard's single-use terminal cell (`POST /v1/sandbox`). Any signed-in tenant may run
+/// commands in a cell of the platform's default image: the image name selects a rootfs and the
+/// data drive named like it on the node, so choosing one is a platform-operator action, the
+/// run time is capped at [`SANDBOX_TIMEOUT_MAX_SECS`] and a tenant holds at most
+/// [`SANDBOX_TENANT_MAX_JOBS`] cells at once.
 async fn sandbox(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<SandboxReq>,
-) -> Json<SandboxResp> {
+) -> Result<Json<SandboxResp>, (StatusCode, String)> {
+    let claims = claims.as_ref().map(|e| &e.0);
+    let t = tenant(&c, &headers, claims);
+    if t == ANON_TENANT {
+        return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
+    }
+    let backend_runs_on_the_host_shell = c.gw.backend_name() == "mock";
+    if backend_runs_on_the_host_shell {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node's isolation backend cannot run sandbox commands".into(),
+        ));
+    }
+    if req.image != default_image() {
+        require_operator(claims).map_err(|_| {
+            (
+                StatusCode::FORBIDDEN,
+                "choosing the sandbox image requires a platform operator".into(),
+            )
+        })?;
+    }
+    let slot = SandboxSlot::acquire(&t).ok_or((
+        StatusCode::TOO_MANY_REQUESTS,
+        format!("at most {SANDBOX_TENANT_MAX_JOBS} sandboxes may run at once"),
+    ))?;
+    let timeout_secs = req.timeout_secs.clamp(5, SANDBOX_TIMEOUT_MAX_SECS);
     let started = now_ms();
     let job = BuildJob::builder(req.image)
         .commands(req.commands)
@@ -11208,14 +11276,30 @@ async fn sandbox(
             vcpus: 1,
             mem_mib: 512,
             disk_mib: 1024,
-            timeout_secs: req.timeout_secs,
+            timeout_secs,
         })
         .build();
     let id = c.hive.submit(job);
+    c.audit
+        .record(&t, "user", "run", "sandbox", &id.to_string(), "");
 
-    // Wait for completion (bounded).
+    let watch_cloud = c.clone();
+    let watch_id = id.clone();
+    let max_watch_polls = timeout_secs * 20 + 100;
+    tokio::spawn(async move {
+        let _slot_held_by_the_job = slot;
+        for _ in 0..max_watch_polls {
+            match watch_cloud.hive.job_view(&watch_id) {
+                Some(v) if v.state.is_terminal() => break,
+                Some(_) => {}
+                None => break,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
     let mut state = JobState::Queued;
-    for _ in 0..(req.timeout_secs.max(5) * 20) {
+    for _ in 0..(timeout_secs * 20) {
         if let Some(v) = c.hive.job_view(&id) {
             state = v.state;
             if v.state.is_terminal() {
@@ -11230,29 +11314,24 @@ async fn sandbox(
         .subscribe_logs(&id)
         .map(|(backlog, _rx)| backlog.into_iter().map(|l| l.line).collect())
         .unwrap_or_default();
-    Json(SandboxResp {
+    Ok(Json(SandboxResp {
         job_id: id.to_string(),
         state: format!("{state:?}"),
         exit_code: view.and_then(|v| v.exit_code),
         logs,
         duration_ms: now_ms().saturating_sub(started),
-    })
+    }))
 }
-
-// ============================ Teams ============================
 
 #[derive(Deserialize)]
 struct CreateTeam {
     name: String,
     #[serde(default = "default_plan")]
     plan: String,
-    /// Optional EXACT tenant slug (e.g. a Clerk-org-derived id/slug already in use
-    /// by existing tenant-scoped data — projects/deployments/billing accounts
-    /// that predate this team row and are tagged with a specific string). When
-    /// absent/empty, falls back to the original slugify(name)+uniqueness-suffix
-    /// behavior (unchanged for every existing caller). When present, the team is
-    /// created with exactly this slug so it lines up with data that already
-    /// exists under that tenant id — never silently re-derived.
+    /// Optional EXACT tenant slug (e.g. a Clerk-org-derived id already used by existing
+    /// tenant-scoped data that predates this team row). Absent or empty falls back to slugify(name)
+    /// plus a uniqueness suffix; present, the team is created with exactly this slug and never
+    /// silently re-derived. Operator-only (see `team_create`).
     #[serde(default)]
     slug: String,
 }
@@ -11303,10 +11382,6 @@ async fn team_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // An exact-slug creation targets a specific pre-existing tenant id (e.g. one
-    // already used by real projects/billing) — that's an operator-level action,
-    // not the normal self-serve "create my own org" flow every signed-in user can
-    // do, so gate it the same way every other cross-tenant admin write is gated.
     if !b.slug.trim().is_empty() {
         require_operator(claims.as_ref().map(|e| &e.0))?;
     }
@@ -11353,14 +11428,40 @@ async fn team_create(
                 format!("team slug '{slug}' already exists"),
             ))?
     };
-    // Tier lives in both TeamStore and BillingStore. Creation is not a special
-    // third write path: initialize the billing half through the same helper every
-    // later upgrade/downgrade uses.
-    apply_plan_everywhere(&c, &t.slug, &plan);
+    apply_plan_everywhere(
+        &c,
+        &t.slug,
+        &plan,
+        PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+    )?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
 
+/// The HTTP answer to a refused roster change.
+fn roster_refusal(refusal: crate::teams::RosterRefusal) -> (StatusCode, String) {
+    use crate::teams::RosterRefusal;
+    match refusal {
+        RosterRefusal::AboveActor => (
+            StatusCode::FORBIDDEN,
+            "you cannot change or remove a member whose role is above yours, or grant a role above yours".into(),
+        ),
+        RosterRefusal::LastOwner => (
+            StatusCode::CONFLICT,
+            "a team must keep at least one owner: make someone else an owner first".into(),
+        ),
+        RosterRefusal::NoTeam => (StatusCode::NOT_FOUND, "team not found".into()),
+        RosterRefusal::BadEmail => (
+            StatusCode::BAD_REQUEST,
+            "email is required: a non-empty address without control characters".into(),
+        ),
+    }
+}
+
+/// Adds a member or changes a member's role. The roster rule lives in `TeamStore::set_member_role`
+/// (the actor's rank is `roles::actor`): nobody changes a member above their own role or grants a
+/// role above it (an admin may change an admin, never the owner, and never grant Owner), and the
+/// last owner stays.
 async fn team_add_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11375,23 +11476,10 @@ async fn team_add_member(
         &slug,
         &["owner", "admin"],
     )?;
-    // Only an Owner-rank caller may grant Owner to someone else — an Admin
-    // adding/promoting a member to Owner would be a lateral privilege
-    // escalation within the team.
-    if matches!(b.role, crate::teams::Role::Owner) {
-        let is_owner_caller = claims
-            .as_ref()
-            .map(|e| e.0.platform_admin || e.0.role == "owner")
-            .unwrap_or(false);
-        if !is_owner_caller {
-            return Err((
-                StatusCode::FORBIDDEN,
-                "only an Owner may grant the Owner role".into(),
-            ));
-        }
+    let actor = crate::roles::actor(claims.as_ref().map(|e| &e.0));
+    if crate::teams::roster_email(&b.email).is_none() {
+        return Err(roster_refusal(crate::teams::RosterRefusal::BadEmail));
     }
-    // Seat quota (business locking): block adding a NEW member past the plan's seat
-    // limit. Updating an existing member's role is always allowed.
     let team = c
         .teams
         .get(&slug)
@@ -11412,12 +11500,23 @@ async fn team_add_member(
     }
     let t = c
         .teams
-        .add_member(&slug, &b.email, b.role)
-        .ok_or((StatusCode::NOT_FOUND, "team not found".into()))?;
+        .set_member_role(&slug, actor, &b.email, b.role)
+        .map_err(roster_refusal)?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
 
+/// Removes a team member. The ex-member's push/SMS registrations for THIS team are purged (email
+/// resolved to a Clerk user id through the identity mirror), because the rows capture the tenant at
+/// registration and the dispatcher would otherwise keep fanning the team's notifications to them.
+/// The membership change and purge are persisted BEFORE the first await (a client cancelled during
+/// the relay revocation must not restore the removed member on the next restart); then the team's
+/// browser grants are revoked fail-closed (membership is keyed by email and grants by subject id,
+/// so remaining members renew from a fresh platform session while the removed member loses service
+/// now), and the revocation's own persisted state is saved again. The roster rule lives in
+/// `TeamStore::remove_member_as`: nobody removes a member above their own role, and the last owner
+/// stays (a refusal, or an email nobody on the roster has, returns before anything is purged or
+/// revoked).
 async fn team_remove_member(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11433,13 +11532,16 @@ async fn team_remove_member(
     )?;
     let t = c
         .teams
-        .remove_member(&slug, &email)
-        .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
-    // Revoke the ex-member's push/SMS registrations for THIS team so they stop
-    // receiving its notifications immediately (rows capture the tenant at
-    // registration and the dispatcher would otherwise keep fanning to them
-    // forever — see push.rs). Resolve email -> Clerk user id via the identity
-    // mirror (push rows are keyed by user id, members by email).
+        .remove_member_as(
+            &slug,
+            crate::roles::actor(claims.as_ref().map(|e| &e.0)),
+            &email,
+        )
+        .map_err(roster_refusal)?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "nobody by that email is on this team".into(),
+        ))?;
     if let Some(uid) = c
         .identity
         .users()
@@ -11452,51 +11554,104 @@ async fn team_remove_member(
             tracing::info!(team = %slug, user = %uid, purged, "revoked ex-member push/SMS registrations");
         }
     }
-    // Commit the membership and notification purge before the first await.
-    // Client cancellation while relay revocation is in flight must not restore
-    // the removed member on the next process restart.
     crate::persist::persist(&c);
-    // TeamStore membership is email-keyed while browser grants are subject-id
-    // keyed. Revoke the whole team fail-closed; remaining members renew from a
-    // fresh platform session, while the removed member loses service now.
     crate::browser_admission::revoke_team(&c, &slug).await;
-    // Revocation mutates its own persisted admission state after the first save.
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
 
-/// Apply a tier change to a tenant EVERYWHERE it is stored.
+/// Applies a tier change to a tenant EVERYWHERE it is stored: `c.teams` (feature gating via
+/// `team_plan()`) and `c.billing` (project/seat quotas, the `can_deploy` credit lock, everything
+/// the billing UI shows). Four call sites used to write only the billing half (the free-plan
+/// checkout shortcut, Stripe `customer.subscription.deleted`, the operator grant, checkout
+/// confirmation), so a tenant could read Enterprise for features while quota-limited as Hobby;
+/// every tier change goes through here. `teams.set_plan` returning `None` is normal: personal
+/// namespaces (`personal`, `u_<uid>`) have a billing account but no team row. A downgrade drops
+/// Enterprise-only SSO, matching `team_set_plan`.
 ///
-/// A tenant's tier lives in two places that are read for different things:
-/// `c.teams` (feature gating via `team_plan()`) and `c.billing` (project/seat
-/// quotas, the `can_deploy` credit lock, and everything the billing UI shows).
-/// Four separate call sites used to write only the billing half — the free-plan
-/// checkout shortcut, Stripe `customer.subscription.deleted`, the operator
-/// grant, and checkout confirmation — so the two drifted apart silently and a
-/// tenant could read Enterprise for features while being quota-limited as
-/// Hobby. Every tier change goes through here so that cannot happen again.
-///
-/// `teams.set_plan` returning `None` is normal, not an error: personal
-/// namespaces (`personal`, `u_<uid>`) have a billing account but no team row.
-pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &str) {
+/// It is also where a tier change is AUTHORIZED: `change` names the authority behind it
+/// ([`PlanChange`]) and a plan that names no plan or a RAISE of the tier (above the higher of the
+/// team record and the billing account, never below Hobby) without the authority to raise it is
+/// refused here, so no route can reach this sink around the rule: a plan is bought (a verified
+/// checkout) or granted (an operator), never self-assigned.
+pub(crate) fn apply_plan_everywhere(
+    c: &Arc<CloudState>,
+    tenant: &str,
+    plan: &str,
+    change: PlanChange<'_>,
+) -> Result<(), (StatusCode, String)> {
+    if crate::billing::known_plan(plan).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown plan '{plan}': the plans are {}",
+                crate::billing::plan_ids()
+            ),
+        ));
+    }
+    let team_rank = c
+        .teams
+        .get(tenant)
+        .map(|t| crate::billing::plan_rank(&t.plan))
+        .unwrap_or(0);
+    let current = team_rank
+        .max(crate::billing::plan_rank(&c.billing.account(tenant).plan))
+        .max(crate::billing::plan_rank("hobby"));
+    if crate::billing::plan_rank(plan) > current && !change.may_raise() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!(
+                "raising the plan to '{plan}' needs a paid checkout (POST /v1/billing/checkout) or a platform operator"
+            ),
+        ));
+    }
     c.teams.set_plan(tenant, plan);
     c.billing.set_plan(tenant, plan);
-    // Downgrades drop Enterprise-only SSO, matching `team_set_plan`.
     if !crate::billing::plan_allows_sso(plan) {
         c.teams.set_sso(tenant, false);
     }
+    Ok(())
 }
 
-/// Lock a platform-admin's tenant at enterprise, permanently. Wraps
-/// `apply_plan_everywhere` (both halves) with an unbypassable tier FLOOR via
-/// `set_tier_lock` so no automatic downgrade path (free-plan checkout, Stripe
-/// `customer.subscription.deleted`) can drop it back below enterprise — the
-/// "no matter what" the admin-always-enterprise feature requires. Called from
-/// `mint_token`, on the billing writer only and idempotent (see its guards).
+/// The authority behind a tier change ([`apply_plan_everywhere`] decides from it whether the change
+/// may RAISE the tier): the rule lives at the one function every change funnels through, so a new
+/// route has to name its authority to change a plan at all.
+#[derive(Clone, Copy)]
+pub(crate) enum PlanChange<'a> {
+    /// A request from `claims`: a platform operator (`operator_allowed`: everyone in dev mode) may
+    /// set any tier, anyone else may only keep or LOWER it (`PUT /v1/teams/:slug/plan`, the
+    /// free-plan checkout shortcut, team creation).
+    Request(Option<&'a crate::auth::Claims>),
+    /// A payment was verified: a checkout confirmed with Stripe (`billing_confirm`, the Stripe
+    /// webhook), or the mock checkout of a developer's node (`billing::mock_checkout_allowed`: no
+    /// Stripe key and auth not enforced). The tier that was bought.
+    Paid,
+    /// The billing authority's own downgrade (a cancelled Stripe subscription): never raises.
+    Cancellation,
+    /// The platform operator's own tenant, locked at enterprise when its owner signs in
+    /// ([`apply_admin_enterprise`]).
+    AdminTenant,
+}
+
+impl PlanChange<'_> {
+    fn may_raise(self) -> bool {
+        match self {
+            PlanChange::Request(claims) => operator_allowed(claims, crate::auth::enforced()),
+            PlanChange::Paid | PlanChange::AdminTenant => true,
+            PlanChange::Cancellation => false,
+        }
+    }
+}
+
+/// Locks a platform-admin's tenant at enterprise permanently: `apply_plan_everywhere` plus an
+/// unbypassable tier FLOOR (`set_tier_lock`, which `billing.rs`'s `set_plan` honors, so the next
+/// downgrade cannot undo it) that no automatic downgrade path (free-plan checkout, Stripe
+/// `customer.subscription.deleted`) can drop. Called from `mint_token` on the billing writer only,
+/// and idempotent.
 pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
-    apply_plan_everywhere(c, tenant, "enterprise");
-    // The FLOOR is what makes it durable: set_plan alone is overwritten by the
-    // next downgrade, the lock is not (billing.rs set_plan honors it).
+    if let Err((_, why)) = apply_plan_everywhere(c, tenant, "enterprise", PlanChange::AdminTenant) {
+        tracing::error!(tenant, %why, "platform admin tenant could not be set to enterprise");
+    }
     c.billing.set_tier_lock(tenant, Some("enterprise"));
     crate::persist::persist(c);
     tracing::info!(tenant, "platform admin tenant locked to enterprise");
@@ -11508,7 +11663,9 @@ struct SetPlan {
 }
 
 /// Change a team's tier (hobby | pro | enterprise). Keeps the billing account in
-/// sync so the compute allowance + plan label update together.
+/// sync so the compute allowance + plan label update together. An owner or admin may keep or LOWER
+/// the team's plan; raising it is a platform operator's call or a paid checkout
+/// (`apply_plan_everywhere` refuses a raise without that authority: 403).
 async fn team_set_plan(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11530,7 +11687,12 @@ async fn team_set_plan(
     c.teams
         .get(&slug)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
-    apply_plan_everywhere(&c, &slug, &plan);
+    apply_plan_everywhere(
+        &c,
+        &slug,
+        &plan,
+        PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+    )?;
     crate::persist::persist(&c);
     Ok(Json(json!(c.teams.get(&slug))))
 }
@@ -11540,18 +11702,13 @@ struct SetSso {
     enabled: bool,
 }
 
-/// Delete a team. Owner-only, and deliberately refuses in the cases where
-/// deleting would strand resources or break the caller's own identity:
-///
-/// * a PERSONAL namespace (`personal`, `u_<uid>`) is a user's own space, not a
-///   team someone chose to create — removing it would leave that user with no
-///   tenant at all;
-/// * a team that still owns projects, because project records carry the team
-///   slug and would be orphaned (delete or move the projects first).
-///
-/// The billing account is cleared alongside the team record so a deleted team
-/// cannot leave a stray tier/quota row behind — the same
-/// both-halves-or-neither rule `apply_plan_everywhere` exists to enforce.
+/// Deletes a team. Owner-only, and refuses where deleting would strand resources or break the
+/// caller's identity: a PERSONAL namespace (`personal`, `u_<uid>`) is a user's own space (removing
+/// it would leave that user with no tenant), and a team that still owns projects would orphan
+/// records that carry its slug (delete or move the projects first). The billing account is cleared
+/// with the team record so no stray tier or quota row remains, the same both-halves-or-neither rule
+/// as `apply_plan_everywhere`. Like `team_remove_member`, it persists BEFORE awaiting the
+/// browser-grant revocation (a cancelled request must not resurrect the team) and again after.
 async fn team_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11583,13 +11740,10 @@ async fn team_delete(
         .remove(&s)
         .ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
     c.billing.remove_account(&s);
-    // The row+tombstone and billing removal are the authoritative deletion.
-    // Persist before relay revocation can suspend and the request be cancelled.
     crate::persist::persist(&c);
     crate::browser_admission::revoke_team(&c, &s).await;
     c.audit
         .record(&s, "user", "team_delete", "team", &s, "team deleted");
-    // Capture the admission revocation and audit append as a second generation.
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true, "deleted": s })))
 }
@@ -11637,23 +11791,14 @@ fn default_true_b() -> bool {
     true
 }
 
-/// Whether `project` belongs to NOBODY: its own tag is `__untagged__` AND no
-/// deployment record anywhere names a real tenant either.
-///
-/// This state is a trap, not a curiosity. `require_project` matches the owner
-/// tag against the caller's tenant and `__untagged__` matches none, while
-/// `project_owned_by`'s optimistic fallback only applies when the project has NO
-/// deployments at all — so an untagged project that HAS untagged deployments is
-/// claimable by no account in existence. It stays invisible in every project
-/// list while still holding its name platform-wide, which is exactly how
-/// creating a project can fail on a duplicate name its owner cannot find
-/// anywhere. Six projects sat in that state on 2026-08-08 (ctest,
-/// internet-structure, mien-kamp, silly-cat-test, smsrelay, tokenhun) — one of
-/// them proven the owner's by a database tagged `personal` under it.
-///
-/// Deliberately strict: if ANY deployment names a real tenant, that tenant owns
-/// the project and this returns false, so adoption can never take a project away
-/// from a live account.
+/// Whether `project` belongs to NOBODY: its own tag is `__untagged__` AND no deployment record
+/// anywhere names a real tenant. That state is a trap: `require_project` matches the owner tag
+/// against the caller's tenant and `__untagged__` matches none, while `project_owned_by`'s
+/// optimistic fallback applies only when the project has NO deployments, so an untagged project
+/// WITH untagged deployments is claimable by no account and invisible in every list while still
+/// holding its name platform-wide (creating a project then fails on a duplicate name its owner
+/// cannot find). Deliberately strict: if ANY deployment names a real tenant, that tenant owns the
+/// project and this returns false, so adoption can never take a project from a live account.
 fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     if record_tenant(&c.projects.team_of(project)) != UNTAGGED_TENANT {
         return false;
@@ -11667,6 +11812,61 @@ fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     local_clean && peer_clean
 }
 
+/// Whether `dest` is shaped like a tenant slug: a team slug, `personal` or a `u_<uid>` personal
+/// namespace (ASCII letters, digits, `-`, `_`, `.`), and none of the sentinels that are not a
+/// tenant: the empty team (which `norm` reads as the OPERATOR's `personal`), the anonymous and
+/// untagged tenants and the fleet's `mesh`.
+fn is_tenant_slug(dest: &str) -> bool {
+    !dest.is_empty()
+        && dest.len() <= 128
+        && dest
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        && !matches!(dest, ANON_TENANT | UNTAGGED_TENANT | "mesh")
+}
+
+/// Whether the verified caller administers the tenant `dest`: it is the caller's OWN personal
+/// namespace (`u_<uid>`, what the dashboard mints for a signed-in user), or the identity mirror
+/// knows the caller (`claims.sub`, a Clerk user id) and that user's email is on `dest`'s roster as
+/// an admin or owner. An API key (`sub` = `key:<id>`) is no user and administers nothing.
+fn caller_administers(c: &Arc<CloudState>, claims: &crate::auth::Claims, dest: &str) -> bool {
+    if dest == format!("u_{}", claims.sub) {
+        return true;
+    }
+    let email = c
+        .identity
+        .users()
+        .into_iter()
+        .find(|user| user.id == claims.sub)
+        .map(|user| user.email)
+        .filter(|email| !email.trim().is_empty());
+    let Some(email) = email else { return false };
+    c.teams
+        .get(dest)
+        .and_then(|team| team.member(&email).map(|member| member.role))
+        .is_some_and(|role| role.rank() >= crate::teams::Role::Admin.rank())
+}
+
+/// Whether `dest` is a tenant this node knows: a team row, the operator's `personal`, or the
+/// personal namespace of a user the identity mirror has seen.
+fn tenant_exists(c: &Arc<CloudState>, dest: &str) -> bool {
+    dest == "personal"
+        || c.teams.get(dest).is_some()
+        || dest
+            .strip_prefix("u_")
+            .is_some_and(|uid| c.identity.users().iter().any(|user| user.id == uid))
+}
+
+/// Changes a project's protection or moves it to another team. The role floor (admin) is the
+/// matrix's (`roles`); this handler decides WHERE the project may go. The current owning team may
+/// always save its own team again (that is how the dashboard toggles preview protection). A move to
+/// ANOTHER tenant needs the platform operator (into a team that exists) or a destination the caller
+/// administers (`caller_administers`): without that, any admin could hand a project, its settings
+/// and its env to a tenant of their choosing, or park it in a tenant that does not exist. A
+/// platform operator may also adopt an UNOWNED project (`project_unowned`, which refuses the moment
+/// any deployment names a real tenant); without that exception an orphaned project is frozen
+/// forever, since no tenant matches `__untagged__`. An unenforced dev node has no tenant boundary
+/// and stays open apart from the slug shape.
 async fn project_team_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -11674,31 +11874,66 @@ async fn project_team_put(
     Path(project): Path<String>,
     Json(b): Json<ProjectTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Only the CURRENT owning team may move a project (or change its protection)
-    // — EXCEPT that an UNOWNED project may be adopted by a platform operator.
-    // Without that exception an orphaned project is frozen forever: no tenant
-    // matches `__untagged__`, so no caller can pass the check that would let
-    // them fix it. See `project_unowned`, which refuses the moment any
-    // deployment names a real tenant.
-    let adopting_orphan =
-        project_unowned(&c, &project) && require_operator(claims.as_ref().map(|e| &e.0)).is_ok();
-    if !adopting_orphan {
-        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let cl = claims.as_ref().map(|e| &e.0);
+    let dest = b.team.trim();
+    if !is_tenant_slug(dest) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "team must be a team slug (letters, digits, '-', '_', '.')".into(),
+        ));
+    }
+    let operator = require_operator(cl).is_ok();
+    let adopting_orphan = project_unowned(&c, &project) && operator;
+    let from = if !adopting_orphan {
+        require_project(&c, &headers, cl, &project)?
     } else {
         tracing::warn!(
             %project,
-            new_team = %b.team,
+            new_team = %dest,
             "adopting an UNOWNED project into a tenant (operator action)"
         );
+        UNTAGGED_TENANT.to_string()
+    };
+    let same_team = norm(dest) == norm(&from) || norm(dest) == norm(&c.projects.team_of(&project));
+    if !same_team && crate::auth::enforced() {
+        let allowed = if operator {
+            tenant_exists(&c, dest)
+        } else {
+            cl.is_some_and(|cl| caller_administers(&c, cl, dest))
+        };
+        if !allowed {
+            return Err(if operator {
+                (StatusCode::NOT_FOUND, format!("no such team: {dest}"))
+            } else {
+                (
+                    StatusCode::FORBIDDEN,
+                    "moving a project to another team needs an owner or admin of that team, or a platform operator"
+                        .into(),
+                )
+            });
+        }
     }
-    c.projects.set_team(&project, &b.team);
+    if !same_team {
+        let audited_under = if adopting_orphan { dest } else { &from };
+        c.audit.record(
+            audited_under,
+            "user",
+            "transfer",
+            "project",
+            &project,
+            &format!("project moved from {from} to {dest}"),
+        );
+    }
+    c.projects.set_team(&project, dest);
     c.projects
         .set_preview_protection(&project, b.preview_protection);
+    if !same_team {
+        let retagged = c.gw.retag_project(&project, dest);
+        tracing::info!(%project, %dest, retagged, "project transferred: local deployments re-tagged");
+    }
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
-
-// ============================ API keys ============================
 
 #[derive(Deserialize)]
 struct CreateApiKey {
@@ -11707,12 +11942,25 @@ struct CreateApiKey {
     role: String,
 }
 
+/// Lists the caller's API keys. `apikeys` is NODE-LOCAL state while `admin_ingress` forwards
+/// mutations to the leader and serves GETs locally, so a key created from the dashboard was stored
+/// on the leader and read back from whichever node round-robin DNS picked ("generating an API key
+/// doesn't work"): a non-leader reads the leader's authoritative copy, the same shape as
+/// `project_settings_get`, falling back to local only when the leader is unreachable (a read local
+/// state can answer must never fail).
 async fn apikeys_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if !c.is_control_plane_leader() {
+        if let Some(leader) = c.leader_forward_target() {
+            if let Some(v) = fetch_from_host(&c, &leader, "/v1/apikeys", &t).await {
+                return Json(v);
+            }
+        }
+    }
     Json(json!(c
         .apikeys
         .list(&t)
@@ -11721,19 +11969,39 @@ async fn apikeys_list(
         .collect::<Vec<_>>()))
 }
 
+/// Mints a team-scoped API key. Its role must be one a tenant may carry
+/// (`apikeys::MINTABLE_ROLES`, never the mesh's `service`) and no higher than the caller's own
+/// (`apikeys::check_new_role`): a role string is stored data, and fleet-internal gates read it.
 async fn apikey_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateApiKey>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let creator = claims
+        .as_ref()
+        .map(|e| (e.0.role.as_str(), e.0.platform_admin));
+    let role =
+        crate::apikeys::check_new_role(&b.role, creator).map_err(|refusal| match refusal {
+            crate::apikeys::RoleRefusal::NotMintable => (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "role must be one of {}",
+                    crate::apikeys::MINTABLE_ROLES.join(", ")
+                ),
+            ),
+            crate::apikeys::RoleRefusal::AboveCreator => (
+                StatusCode::FORBIDDEN,
+                "a key cannot carry a higher role than its creator".into(),
+            ),
+        })?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let (key, token) = c.apikeys.create(&b.name, &t, &b.role);
+    let (key, token) = c.apikeys.create(&b.name, &t, role);
     crate::persist::persist(&c);
     // The plaintext token is returned exactly once.
     let mut v = key.public();
     v["token"] = json!(token);
-    Json(v)
+    Ok(Json(v))
 }
 
 async fn apikey_revoke(
@@ -11747,13 +12015,6 @@ async fn apikey_revoke(
     crate::persist::persist(&c);
     Json(json!({ "revoked": ok, "id": id }))
 }
-
-// ---- Connected integrations ----
-//
-// The team's linked third-party integrations as consumable resources. Every
-// endpoint is tenant-scoped, so a `hive_…` platform key (Authorization: Bearer)
-// transparently scopes the Vercel-compatible SDK to that key's team. The list/get
-// views are redacted; `/credentials` returns the secret token/connection.
 
 async fn integrations_list(
     State(c): State<Arc<CloudState>>,
@@ -11837,13 +12098,6 @@ async fn integration_delete(
     Json(json!({ "deleted": ok, "id": id }))
 }
 
-// ---- Intelligent service graph (Issue #2) ----
-//
-// The algorithmically-derived graph of services actually consumed by a deployment
-// (app/framework, bundled front+back nodes, workspace packages, databases). Scanned
-// async on build AND lazily on-demand (below) so EXISTING + FAILED deployments —
-// which predate the async scan — are backfilled the first time they're viewed.
-
 /// Scan a hosted deployment's on-disk source tree and store its service graph.
 /// Works for existing/failed deployments (the checkout is kept for live ones).
 async fn scan_root_graph(
@@ -11895,9 +12149,6 @@ pub(crate) async fn local_project_graph(
     if let Some(g) = c.svcgraph.latest_for_project(project) {
         return Some(g);
     }
-    // Try records newest-first, scanning the first whose checkout still exists on
-    // disk (a failed/newer redeploy may have a GC'd root while an older LIVE one
-    // is still present + serving).
     let mut recs: Vec<_> =
         c.gw.deployment_records()
             .into_iter()
@@ -11909,9 +12160,6 @@ pub(crate) async fn local_project_graph(
             return Some(g);
         }
     }
-    // No usable deployment RECORD here (e.g. a CONTAINER deploy: the record lives on
-    // the coordinator, but the container + source run on THIS lease-owner node). Fall
-    // back to the newest on-disk source checkout for the project.
     if let Some(dir) = crate::git::newest_deploy_dir(project) {
         return scan_root_graph(c, project, project, &dir.to_string_lossy()).await;
     }
@@ -11938,8 +12186,6 @@ pub(crate) async fn deployment_service_graph(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Locally hosted? Return the stored graph, or scan its source on-demand (backfill
-    // for existing/failed deployments), team-checked.
     if c.gw.deployment_records().iter().any(|r| r.id == id) {
         if let Some(g) = local_deployment_graph(&c, &id).await {
             if project_owned_by(&c, &g.project, norm(&t)) {
@@ -11947,7 +12193,6 @@ pub(crate) async fn deployment_service_graph(
             }
         }
     }
-    // Not here — proxy to the node that hosts the deployment.
     if let Some(node) = host_node_for_deployment(&c, &id) {
         if let Some(v) = fetch_from_host(
             &c,
@@ -11970,26 +12215,12 @@ async fn project_service_graph(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Fleet-aware ownership: `team_of` is UNTAGGED (never empty) on a node that
-    // doesn't host this project, so the old `!known.is_empty()` guard never
-    // relaxed and 404'd a member's own service graph everywhere but the host.
-    // project_owned_by trusts the deployment tenant tags and stays permissive
-    // for a fleet-unknown project (so the on-demand scan / host proxy below run).
     if !project_owned_by(&c, &project, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
-    // Stored, or scanned on-demand from a locally-hosted deployment (backfills
-    // existing/failed projects deployed here before the async scan existed).
     if let Some(g) = local_project_graph(&c, &project).await {
         return Ok(Json(json!(g)));
     }
-    // Not hosted here — the graph (or the source to scan) lives on whichever node
-    // built the project. Fan out to every OTHER reachable peer CONCURRENTLY and
-    // return the first that has it (each answers from its LOCAL store/scan +
-    // team-checks → no re-proxy loop, no cross-tenant leak). Registry is the
-    // reliable peer set (trunk-warmed). Concurrent rather than the old
-    // first-match-wins sequential loop — a project hosted on the LAST-checked
-    // node used to cost N sequential hops; now it costs one concurrent round.
     let self_name = c.node_name.clone();
     let peers: Vec<String> = c
         .registry
@@ -12009,10 +12240,25 @@ async fn project_service_graph(
     Err(StatusCode::NOT_FOUND)
 }
 
-// ============================ Webhooks ============================
-
 async fn webhook_events() -> Json<Value> {
     Json(json!(crate::webhooks::ALL_EVENTS))
+}
+
+/// A webhook as the caller may see it: the signing secret (what verifies a delivery, and so what
+/// forges one) only for an admin or above, who manage the team's webhooks; a member or viewer sees
+/// the hook without it.
+fn webhook_view(
+    w: crate::webhooks::Webhook,
+    claims: Option<&crate::auth::Claims>,
+) -> crate::webhooks::Webhook {
+    if crate::roles::at_least(claims, crate::teams::Role::Admin) {
+        w.decrypted()
+    } else {
+        crate::webhooks::Webhook {
+            secret: String::new(),
+            ..w
+        }
+    }
 }
 
 async fn webhooks_all(
@@ -12020,15 +12266,12 @@ async fn webhooks_all(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
-    // Only the caller's own webhooks (the payload includes signing secrets, so
-    // this must be tenant-scoped).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let list: Vec<_> = c
         .webhooks
-        .snapshot()
+        .list(crate::webhooks::Scope::Team(&t), None)
         .into_iter()
-        .filter(|w| norm(&w.team) == t)
-        .map(|w| w.decrypted())
+        .map(|w| webhook_view(w, claims.as_ref().map(|e| &e.0)))
         .collect();
     Json(json!(list))
 }
@@ -12048,29 +12291,45 @@ async fn webhook_create_team(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<CreateTeamWebhook>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if t == ANON_TENANT {
+        return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
+    }
     let targets: Vec<String> = if b.projects.is_empty() || b.projects.iter().any(|p| p == "*") {
         vec!["*".into()]
     } else {
         b.projects.clone()
     };
+    if let Some(foreign) = targets
+        .iter()
+        .find(|p| p.as_str() != "*" && !project_owned_by(&c, p, &t))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("project {foreign:?} belongs to a different team"),
+        ));
+    }
     let mut created = Vec::new();
     for p in targets {
-        created.push(c.webhooks.add(crate::webhooks::Webhook {
-            id: String::new(),
-            team: t.clone(),
-            project: p,
-            url: b.url.clone(),
-            events: b.events.clone(),
-            secret: String::new(),
-            enabled: true,
-            created_ms: 0,
-        }));
+        created.push(
+            c.webhooks
+                .add(crate::webhooks::Webhook {
+                    id: String::new(),
+                    team: t.clone(),
+                    project: p,
+                    url: b.url.clone(),
+                    events: b.events.clone(),
+                    secret: String::new(),
+                    enabled: true,
+                    created_ms: 0,
+                })
+                .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?,
+        );
     }
     crate::persist::persist(&c);
     let created: Vec<_> = created.into_iter().map(|w| w.decrypted()).collect();
-    Json(json!(created))
+    Ok(Json(json!(created)))
 }
 
 async fn webhooks_for_project(
@@ -12079,16 +12338,15 @@ async fn webhooks_for_project(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Don't expose another tenant's project webhooks (incl. their secrets).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
     }
     let list: Vec<_> = c
         .webhooks
-        .list(Some(&project))
+        .list(crate::webhooks::Scope::Team(&t), Some(&project))
         .into_iter()
-        .map(|w| w.decrypted())
+        .map(|w| webhook_view(w, claims.as_ref().map(|e| &e.0)))
         .collect();
     Json(json!(list))
 }
@@ -12106,22 +12364,24 @@ async fn webhook_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(b): Json<CreateWebhook>,
-) -> Result<Json<Value>, StatusCode> {
-    // A webhook may only be attached to a project the caller owns.
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
-        return Err(StatusCode::NOT_FOUND);
+        return Err((StatusCode::NOT_FOUND, "no such project".into()));
     }
-    let wh = c.webhooks.add(crate::webhooks::Webhook {
-        id: String::new(),
-        team: t,
-        project,
-        url: b.url,
-        events: b.events,
-        secret: String::new(),
-        enabled: true,
-        created_ms: 0,
-    });
+    let wh = c
+        .webhooks
+        .add(crate::webhooks::Webhook {
+            id: String::new(),
+            team: t,
+            project,
+            url: b.url,
+            events: b.events,
+            secret: String::new(),
+            enabled: true,
+            created_ms: 0,
+        })
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     crate::persist::persist(&c);
     Ok(Json(json!(wh.decrypted())))
 }
@@ -12133,16 +12393,20 @@ async fn webhook_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if let Some(w) = c.webhooks.snapshot().into_iter().find(|w| w.id == id) {
-        if norm(&w.team) != t {
-            return Err(StatusCode::NOT_FOUND);
-        }
+    if c.webhooks.remove(crate::webhooks::Scope::Team(&t), &id)
+        == crate::webhooks::Removal::NotYours
+    {
+        return Err(StatusCode::NOT_FOUND);
     }
-    c.webhooks.remove(&id);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
+/// Webhook delivery log. The delivery ring is in-process and NOT replicated, and dispatches fire
+/// both from the leader (promote/delete/database/incident mutations) and from whichever node ran a
+/// build, so one node's view is a slice (an operator saw an empty panel and concluded webhooks were
+/// broken when they had delivered); the top-level read merges every healthy peer's ring
+/// (`local=true` stops the recursion).
 async fn webhook_deliveries(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -12155,11 +12419,6 @@ async fn webhook_deliveries(
         .into_iter()
         .map(|d| json!(d))
         .collect();
-    // The delivery ring is in-process and NOT replicated, and dispatches fire
-    // both from the leader (promote/delete/database/incident mutations) and
-    // from whichever node ran a build (git.rs). So a single node's view is a
-    // slice: the operator saw an empty panel and concluded webhooks were
-    // broken when they had in fact delivered. `local=true` stops the recursion.
     if q.local != Some(true) {
         let peers = all_healthy_peers(&c);
         for v in fan_out_peers_polled(&c, &peers, "", "/v1/webhooks/deliveries?local=true").await {
@@ -12183,21 +12442,15 @@ async fn webhook_deliveries(
     Ok(Json(json!(all)))
 }
 
-// ============================ Databases ============================
-
-/// The leader's answer for a tenant-scoped databases path, or `None` when this
-/// node IS the leader (so there is nothing above it to ask, and no recursion).
-///
-/// Database records are replicated, but replication is neither instantaneous nor
-/// — measured live — always complete. A SQLite database created through the
-/// leader was present on 6 of 11 nodes and ABSENT on the other 5 well after
-/// creation; the five missing it were the nodes that had been restarting or
-/// OOM-thrashing, and nothing backfilled them. Because `admin_ingress` serves
-/// every GET **locally** while the public host is round-robin DNS, that made a
-/// real, ready database 404 on roughly half of all requests — including its
-/// `/credentials`, i.e. the connection string was simply unobtainable about half
-/// the time. That is exactly the round-robin-reads-vs-leader-writes split
-/// AGENTS.md names, and this is its documented owner/leader fallback.
+/// The leader's answer for a tenant-scoped databases path, or `None` when this node IS the leader
+/// (nothing above it to ask, no recursion). Database records are replicated, but not
+/// instantaneously or always completely (measured: a SQLite database created through the leader was
+/// present on 6 of 11 nodes and absent on the rest long after, the nodes that had been restarting
+/// or OOM-thrashing, with nothing to backfill them), and `admin_ingress` serves every GET locally
+/// while the public host is round-robin DNS, so a real, ready database 404'd on about half of all
+/// requests, `/credentials` (the ONLY way to obtain the connection string) included. This is the
+/// documented owner/leader fallback for that round-robin-reads-vs-leader-writes split; the leader
+/// re-runs its own tenant check before answering, so proxying can never widen access.
 async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     if c.is_control_plane_leader() {
         return None;
@@ -12206,6 +12459,10 @@ async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> O
     fetch_from_host(c, &leader, path, team).await
 }
 
+/// Lists the caller's databases: the local view MERGED with the leader's (never replaced, and never
+/// short-circuited on "local is non-empty", which would serve a short list that reads as "my
+/// database was deleted" instead of the replication gap it is), in a deterministic order so a
+/// re-poll never reshuffles the rendered list.
 async fn databases_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12219,10 +12476,6 @@ async fn databases_list(
         .filter(|d| record_tenant(&d.team) == t)
         .collect();
 
-    // MERGE the leader's view rather than replacing or short-circuiting on
-    // "local is non-empty": a node holding SOME of the tenant's databases would
-    // otherwise silently serve a short list, which reads as "my database was
-    // deleted" rather than as the replication gap it is.
     if let Some(v) = databases_from_leader(&c, "/v1/databases", &t).await {
         if let Ok(remote) = serde_json::from_value::<Vec<crate::databases::Database>>(v) {
             let have: std::collections::HashSet<String> =
@@ -12234,7 +12487,6 @@ async fn databases_list(
             }
         }
     }
-    // Deterministic order so a re-poll never reshuffles the rendered list.
     list.sort_by(|a, b| {
         b.created_ms
             .cmp(&a.created_ms)
@@ -12259,7 +12511,6 @@ async fn databases_for_project(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Only expose databases for a project the caller's tenant actually owns.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
@@ -12286,8 +12537,6 @@ async fn database_get(
         }
         return Ok(Json(json!(d)));
     }
-    // Absent HERE is not absent everywhere — see `databases_from_leader`. The
-    // leader re-runs its own tenant check, so this can never widen access.
     if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}"), &t).await {
         return Ok(Json(v));
     }
@@ -12300,7 +12549,7 @@ async fn database_credentials(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    // Returns unmasked connection secrets — must be strictly tenant-scoped.
+    // Unmasked connection secrets: strictly tenant-scoped.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.databases.credentials(&id) {
         if record_tenant(&d.team) != t {
@@ -12308,11 +12557,6 @@ async fn database_credentials(
         }
         return Ok(Json(json!(d)));
     }
-    // Same fallback as `database_get`, and it matters most here: this is the ONLY
-    // way to obtain a database's connection string, so a replication gap made the
-    // DSN unobtainable on any node that had not caught up. The leader applies the
-    // identical tenant check before answering — the `proxy_to_owner` re-check
-    // precedent — so proxying cannot leak another tenant's secrets.
     if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
     {
         return Ok(Json(v));
@@ -12320,10 +12564,10 @@ async fn database_credentials(
     Err(StatusCode::NOT_FOUND)
 }
 
-/// One-click "Open Studio" for a managed Supabase database: mint a short-lived,
-/// nonce-bearing login ticket. The ticket is returned only in a no-store JSON
-/// body; the dashboard POSTs it to the reserved database-host exchange path, so
-/// no bearer enters a URL, history, referrer, or upstream Studio request.
+/// One-click "Open Studio" for a managed Supabase database: mints a short-lived, nonce-bearing
+/// login ticket, returned only in a no-store JSON body; the dashboard POSTs it to the reserved
+/// database-host exchange path, so no bearer enters a URL, history, referrer or upstream Studio
+/// request.
 async fn database_studio_open(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12348,8 +12592,6 @@ async fn database_studio_open(
         } else if let Some(v) =
             databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
         {
-            // Replication-gap fallback: the leader applied the identical
-            // fail-closed tenant check before returning the record.
             let conn = v.get("connection").cloned().unwrap_or_default();
             let g = |k: &str| {
                 conn.get(k)
@@ -12396,11 +12638,11 @@ async fn database_studio_open(
     ))
 }
 
-/// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning
-/// project so deployments reach it automatically — canonical names (DATABASE_URL,
-/// REDIS_URL, …) for the common single-DB case PLUS name-prefixed copies that are
-/// collision-free when a project has several DBs of the same kind. Pure — no side
-/// effects — so create (apply) and delete (remove by key) agree on the key set.
+/// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning project so
+/// deployments reach it automatically: canonical names (DATABASE_URL, REDIS_URL, ...) for the
+/// common single-DB case plus name-prefixed copies that stay collision-free when a project has
+/// several DBs of one kind. Pure, so create (apply) and delete (remove by key) agree on the key
+/// set.
 fn db_egress_pairs(
     c: &Arc<CloudState>,
     d: &crate::databases::Database,
@@ -12439,35 +12681,28 @@ pub(crate) fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Databas
     }
 }
 
-/// NON-SECRET directory of gateway-addressable DBs hosted on this node — the
-/// same payload as the `/v1/db-directory` gossip arm (routing metadata only:
-/// {id, db_host, host_node, kind}). The DNS leader fans this out to publish
-/// per-DB A records for DBs provisioned on other nodes.
+/// NON-SECRET directory of gateway-addressable DBs hosted on this node (routing metadata only:
+/// `{id, db_host, host_node, kind}`), the same payload as the `/v1/db-directory` gossip arm; the
+/// DNS leader fans it out to publish per-DB A records for DBs provisioned on other nodes. Only this
+/// HTTP path is operator-gated (it stops a direct internet client using it as cross-tenant DB-id
+/// recon, a stepping stone to the `database_replica` finding); the gossip fan-out has its own
+/// inline arm in `gossip.rs` that never calls this handler.
 async fn db_directory(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Gating the HTTP path only — the iroh gossip fan-out this feeds
-    // (vercel_dns.rs's DNS reconciler, via `fetch_from_host`) has its own
-    // separate inline arm in gossip.rs that never calls this handler, so this
-    // does not break that legitimate mesh-internal use; it only stops a direct
-    // internet client from using this as cross-tenant DB-id recon (a stepping
-    // stone toward the `database_replica` finding).
     require_operator(claims.as_ref().map(|e| &e.0))?;
     Ok(Json(json!(c.databases.directory())))
 }
 
 const DATABASE_INCARNATION_PROVIDER_PREFIX: &str = "__hive_internal_project_incarnation_v1__:";
 
-/// Carry lifecycle authority through the existing `ProvisionReq` mesh ABI.
-///
-/// The iroh dispatch arm deserializes the body into `ProvisionReq` before it
-/// calls this module, so an additive top-level field would be discarded there.
-/// `provider` is cosmetic and optional; a capability-gated internal sender
-/// temporarily wraps its original value here, and the receiver restores it
-/// before the record is created. Public callers can never make this marker
-/// authoritative: only the internal provision handler decodes it, after its
-/// peer/operator gate has passed.
+/// Carries lifecycle authority through the existing `ProvisionReq` mesh ABI: the iroh dispatch arm
+/// deserializes the body into `ProvisionReq` before calling this module, so an additive top-level
+/// field would be dropped there. `provider` is cosmetic and optional, so a capability-gated
+/// internal sender temporarily wraps its original value in this marker and the receiver restores it
+/// before the record is created. Public callers can never make the marker authoritative: only the
+/// internal provision handler decodes it, after its peer/operator gate has passed.
 fn database_internal_provision(
     mut req: crate::databases::ProvisionReq,
     incarnation: fluid_core::ProjectIncarnation,
@@ -12670,6 +12905,7 @@ fn database_ready_callback(
             crate::persist::persist(&cloud);
             crate::webhooks::dispatch(
                 &cloud.webhooks,
+                &database.team,
                 &project,
                 "database.ready",
                 json!({
@@ -12683,6 +12919,30 @@ fn database_ready_callback(
     }
 }
 
+/// Creates a managed database. The tenant is ALWAYS the server-resolved one (a client-supplied
+/// `team` used to be trusted whenever non-empty, letting any caller register a database and
+/// auto-inject its connection env under a DIFFERENT tenant). Admission is a project-lifecycle
+/// mutation: the record is inserted while holding the writer project deletion owns (an empty
+/// project is unbound storage with no lifetime to serialize against), ownership is enforced only
+/// for an ALREADY registered project (provisioning for a brand-new name before its first deploy is
+/// a normal flow), and the identity is persisted before dispatch so the internal target can
+/// validate it even if the request is cancelled. The create is idempotent: a same-tenant,
+/// same-project, same-name, same-kind, non-error database already existing means this is a retry (a
+/// double-click once produced three identical blob databases), so it is returned, unmasked and with
+/// usable credentials, instead of minting another. Placement is region-aware (`schedule::place`,
+/// only when a region was requested and a healthy, reachable, public candidate exists; any miss
+/// falls through to this node, never failing the create) and must be ADMISSIBLE
+/// (`databases::db_host_admissible`): a database born on a node that cannot publish a public
+/// address (NAT'd, a macOS launchd node, or one that left the registry) is unreachable from
+/// creation while still advertising `ready`, so such a node is replaced by one that can, and with
+/// none in the registry the database is hosted here and the gap is logged loudly. A PEER host gets
+/// the provisioning work dispatched to it (`database_provision_local`; podman containers only run
+/// where the process that spawns them lives, so relabeling `host_node` alone would create a record
+/// claiming containers that never existed); its record is adopted into this node's store
+/// immediately (`upsert_replica`), because a delete arriving back here before the replication tick
+/// found nothing and answered `removed: true` while the remote container leaked. When dispatch
+/// fails, provisioning locally beats no database, and the requested region is dropped so the record
+/// does not claim a region its bytes do not live in.
 async fn database_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12690,24 +12950,13 @@ async fn database_create(
     Json(mut req): Json<crate::databases::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let cloud = c.clone();
-    // Always the server-resolved tenant — a client-supplied `team` used to be
-    // trusted outright whenever non-empty, letting any caller register a
-    // database (and auto-inject its connection env) under a DIFFERENT tenant.
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let project = req.project.clone();
-    // Database admission is a project-lifecycle mutation: mint/resolve the
-    // lifetime and insert the provisioning record while holding the same writer
-    // project deletion owns. An empty project is deliberately unbound storage
-    // and has no project lifetime to serialize against.
     let _lifecycle = if project.is_empty() {
         None
     } else {
         Some(crate::project_settings::lifecycle_write(&project).await)
     };
-    // Only enforce project ownership when the project is ALREADY registered
-    // (has a team of record) — provisioning a database for a brand-new
-    // project name before its first deploy is a normal flow and must keep
-    // working. An EXISTING project owned by a different tenant is rejected.
     if !project.is_empty() && c.projects.snapshot().contains_key(&project) {
         require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     }
@@ -12718,18 +12967,8 @@ async fn database_create(
         .map(|settings| settings.owned_database_ids.into_iter().collect())
         .unwrap_or_default();
     if incarnation.is_some() {
-        // The internal target must be able to validate this exact identity even
-        // if the request is cancelled before provisioning finishes.
         crate::persist::persist(&c);
     }
-    // Idempotency: provision() itself always mints a fresh id with no dedup
-    // check, so a client double-submit (double-click, a retry racing a slow
-    // response) silently created exact duplicate databases — witnessed live,
-    // three identical blob databases under one project, ~90s apart. A
-    // same-tenant, same-project, same-name, same-kind, non-error database
-    // already existing means this create is a retry of one that already
-    // landed: return that database (unmasked, so the caller still gets
-    // usable connection credentials) instead of minting another.
     if let Some(existing_id) = c
         .databases
         .list(Some(&project))
@@ -12747,45 +12986,60 @@ async fn database_create(
             return Ok(Json(json!(existing)));
         }
     }
-    // Region-aware placement: `provision()` used to always run on THIS node
-    // (whichever one the admin request happened to land on after leader-
-    // forwarding), so a tenant requesting `region=sao-paulo` from anywhere
-    // got a database really provisioned wherever the control-plane leader
-    // currently was — measured live: every Supabase database on the fleet
-    // landed on `fc-sanjose` regardless of its requested region. Reuses
-    // `schedule::place`'s existing health/region/reachability picker (the
-    // same one function deploys already go through). Only overrides when a
-    // region was actually requested and a healthy, reachable, public
-    // candidate exists there; any miss (unknown region, nothing eligible)
-    // falls through to self — this must never turn an empty placement into
-    // a failed database create, only an occasionally-suboptimal one.
-    let host_node = req
+    let requested_region = req
         .region
         .as_deref()
         .map(str::trim)
         .filter(|r| !r.is_empty())
+        .map(str::to_string);
+    let admissible = |node: &str| crate::databases::db_host_admissible(&c, node);
+    let mut host_node: Option<String> = requested_region
+        .as_deref()
         .and_then(|region| {
             let regions = [region.to_string()];
             crate::schedule::place(&c, &regions, true, true, false, false, false, false, None)
                 .into_iter()
                 .next()
+                .map(|t| t.node)
         })
-        .map(|t| t.node)
-        .unwrap_or_else(|| c.node_name.clone());
+        .filter(|node| admissible(node));
+    if host_node.is_none() {
+        if let Some(region) = requested_region.as_deref() {
+            tracing::warn!(
+                region = %region,
+                "database create: no registry node with a public address serves this region, so a \
+                 database placed there could never publish a resolvable <slug> A record; picking a \
+                 host that can"
+            );
+        }
+        if admissible(&c.node_name) {
+            host_node = Some(c.node_name.clone());
+        } else {
+            host_node =
+                crate::schedule::place(&c, &[], true, true, false, false, false, false, None)
+                    .into_iter()
+                    .map(|t| t.node)
+                    .find(|node| admissible(node));
+            if let Some(node) = &host_node {
+                tracing::warn!(
+                    node = %node,
+                    "database create: this node advertises no public address, so a database hosted \
+                     here could never publish an A record; placing it on a node that can"
+                );
+            }
+        }
+    }
+    let host_node = host_node.unwrap_or_else(|| {
+        tracing::warn!(
+            node = %c.node_name,
+            "database create: NO node in the registry advertises a public address; hosting here \
+             anyway, but this database's <slug> A record cannot be published until one does"
+        );
+        c.node_name.clone()
+    });
+    let mut local_req = req.clone();
 
     if host_node != c.node_name {
-        // The chosen node is a PEER, never this node: dispatch the actual
-        // provisioning work there (podman containers only ever run where the
-        // process that spawns them lives — relabeling `host_node` alone
-        // without also routing the work there would create a record
-        // claiming to live on a node that never actually got any
-        // containers). Mirrors the `post_body_to_host` pattern this file
-        // already uses for run-event forwarding. The target's own
-        // `database_provision_local` handler does provisioning +
-        // egress/replication/persist/webhooks locally and its result
-        // replicates back fleet-wide through the existing `databases`
-        // store-sync path (the same one that already carries every other
-        // node's database records into this node's own `state.json`).
         let remote_req = match incarnation {
             Some(expected) if database_incarnation_capable(&c, &host_node).await => {
                 Some(database_internal_provision(req.clone(), expected))
@@ -12814,16 +13068,6 @@ async fn database_create(
                 if let Some(error) = v.get("error").and_then(Value::as_str) {
                     return Err((StatusCode::CONFLICT, error.to_string()));
                 }
-                // Adopt the authoritative record into THIS node's own local store
-                // immediately, rather than waiting on `store_sync`'s replication
-                // tick — otherwise a delete that arrives back on THIS node (the one
-                // the client actually talks to) moments later finds nothing in
-                // `c.databases` yet and silently no-ops while still reporting
-                // `removed: true`, leaking the remote container. Witnessed live:
-                // create dispatched sj->bkk, immediate delete issued on sj, bkk
-                // container survived with no warn logged at all — the outer lookup
-                // itself was returning `None`. `upsert_replica` is the existing
-                // insert-or-replace-by-id primitive for exactly this shape.
                 let db = serde_json::from_value::<crate::databases::Database>(v.clone()).map_err(
                     |error| {
                         (
@@ -12842,22 +13086,20 @@ async fn database_create(
                 return Ok(Json(v));
             }
         }
-        // Dispatch failed (node unreachable over both HTTP admin and mesh) —
-        // fall through to local provisioning rather than failing the create
-        // outright. A database on the WRONG node beats no database at all;
-        // the same "admit and let the floor catch it" direction placement
-        // already takes elsewhere in this codebase (AGENTS.md's disk-floor
-        // section).
         tracing::warn!(
             node = %host_node,
-            "database create: chosen region node unreachable, provisioning locally instead"
+            requested_region = %requested_region.as_deref().unwrap_or_default(),
+            actual_host = %c.node_name,
+            "database create: chosen region node unreachable, provisioning locally instead — the \
+             record will name THIS node, not the requested region"
         );
+        local_req.region = None;
     }
 
     let db = crate::databases::provision(
         c.databases.clone(),
         c.region.clone(),
-        req,
+        local_req,
         c.db_domain.clone(),
         c.node_name.clone(),
         c.api_base(),
@@ -12876,6 +13118,7 @@ async fn database_create(
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &db.team,
         &db.project,
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
@@ -12883,16 +13126,15 @@ async fn database_create(
     Ok(Json(json!(db)))
 }
 
-/// Internal-only mirror of [`database_create`]'s local-provisioning tail,
-/// reached via [`post_body_to_host`] when that handler's own region-aware
-/// placement chose a DIFFERENT node than the one that received the client's
-/// request. Runs the exact same `provision()` + egress/replication/persist/
-/// webhooks sequence, just always locally (never re-dispatches — the caller
-/// already resolved placement, and re-resolving here on a `req.region` this
-/// node might interpret differently would risk a dispatch loop). Gated by
-/// [`require_operator_or_internal`]: the forwarded hop carries
-/// `x-hive-internal`, never the original caller's Authorization header,
-/// mirroring every other internal node-to-node forward in this file.
+/// Internal-only mirror of [`database_create`]'s local-provisioning tail, reached via
+/// [`post_body_to_host`] when that handler's region-aware placement chose a DIFFERENT node than the
+/// one that received the client's request: the same `provision()` +
+/// egress/replication/persist/webhooks sequence, always local (never re-dispatching: placement is
+/// already resolved, and re-resolving on a `req.region` this node might interpret differently risks
+/// a dispatch loop). Gated by [`require_operator_or_internal`]: the forwarded hop carries
+/// `x-hive-internal`, never the original caller's Authorization header. A cancelled coordinator
+/// request can be retried after this node already admitted the first copy, so it deduplicates under
+/// the same lifecycle writer.
 pub(crate) async fn database_provision_local(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -12922,9 +13164,6 @@ pub(crate) async fn database_provision_local(
         crate::persist::persist(&c);
     }
 
-    // A cancelled coordinator request can be retried after this node already
-    // admitted the first copy. Deduplicate under the same lifecycle writer so
-    // the retry cannot mint a second database in this incarnation.
     if let Some(existing) = c
         .databases
         .list(Some(&project))
@@ -12964,6 +13203,7 @@ pub(crate) async fn database_provision_local(
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
+        &db.team,
         &db.project,
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
@@ -12971,35 +13211,30 @@ pub(crate) async fn database_provision_local(
     Ok(Json(json!(db)))
 }
 
-/// Best-effort teardown of a database's backing containers/volume/SQLite
-/// file — the part of delete that only means anything ON THE NODE THAT
-/// ACTUALLY HOSTS THEM. Split out of `database_delete` so it can run either
-/// locally (the common case: this node IS `d.host_node`) or be dispatched to
-/// the real owner over the mesh (`database_teardown_local`) when it isn't —
-/// the exact gap `database_create`'s region-aware placement opened: before
-/// that change every database's `host_node` was always the node handling the
-/// request, so local-only teardown was correct by construction; a database
-/// now genuinely living on a peer node would otherwise leak its containers
-/// and (for Supabase) its data volume forever, since a podman `rm` for a
-/// name that doesn't exist locally just silently no-ops — witnessed live the
-/// first time this fix was tested: a deleted database's container kept
-/// running on its real host node with no error anywhere.
+/// Best-effort teardown of a database's backing containers, volume and SQLite file: the part of
+/// delete that only means something ON THE NODE THAT HOSTS THEM, split out so it runs locally (this
+/// node IS `host_node`) or is dispatched to the real owner over the mesh
+/// (`database_teardown_local`). Region-aware placement made that necessary: a database living on a
+/// peer would otherwise leak its containers and (for Supabase) its data volume forever, since a
+/// podman `rm` of a name that does not exist locally silently no-ops.
 async fn teardown_db_backing(d: &crate::databases::Database) {
     let id = &d.id;
     crate::databases::note_teardown_request(id);
-    // Managed SQLite: no container, so the teardown is its own. Streams
-    // first (each holds a pooled connection, and one mid-`BEGIN` holds the
-    // file's write lock), then the pool, then the file — in that order, or
-    // the unlink races a live writer.
+    // Order matters: close the streams (one mid-BEGIN holds the write lock), then the pool, then
+    // unlink the file, or the unlink races a live writer.
     if d.kind == crate::databases::DbKind::Sqlite {
         crate::hrana::close_streams(id);
         crate::sqlite_pool::close(id);
-        if let Some(path) = crate::databases::sqlite_file_path(id) {
-            for suffix in ["", "-wal", "-shm"] {
+        // Both engines' files, because a database may have been migrated and rolled back: whichever
+        // exist are removed (a `.musq` left behind would be served as a live database by the
+        // sidecar after its record is gone); musql keeps `.musq`, a 0-byte `.musq.lock` and
+        // transiently a `.musq.delta`, SQLite `-wal`/`-shm`; missing files are expected.
+        for suffix in ["", "-wal", "-shm"] {
+            if let Some(p) = crate::databases::sqlite_file_path(id) {
                 let p = if suffix.is_empty() {
-                    path.clone()
+                    p
                 } else {
-                    std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+                    std::path::PathBuf::from(format!("{}{suffix}", p.display()))
                 };
                 if let Err(e) = std::fs::remove_file(&p) {
                     if e.kind() != std::io::ErrorKind::NotFound {
@@ -13008,15 +13243,25 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
                 }
             }
         }
+        for suffix in ["", ".lock", ".delta"] {
+            if let Some(p) = crate::databases::sqlite_musql_path(id) {
+                let p = if suffix.is_empty() {
+                    p
+                } else {
+                    std::path::PathBuf::from(format!("{}{suffix}", p.display()))
+                };
+                if let Err(e) = std::fs::remove_file(&p) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove musql database file");
+                    }
+                }
+            }
+        }
     }
-    // Best-effort teardown of the backing container(s): the record's
-    // comma-joined `container` field when set (a Supabase record carries its
-    // whole stack db,meta,studio), else the platform-templated names by kind —
-    // a delete that races an IN-FLIGHT provision reads `container` while it is
-    // still None, and skipping there leaks the container the provision starts
-    // seconds later (witnessed live: redis on fc-bangkok outlived its catalog
-    // entry). `-v` is the podman lock-pool rule (anonymous volumes leak locks
-    // forever); the stack's NAMED data volume is removed explicitly below.
+    // The record's comma-joined `container` field (a Supabase record carries its whole stack), else
+    // the platform-templated names by kind: a delete racing an in-flight provision reads
+    // `container` while it is still None and would leak the container the provision starts seconds
+    // later. `-v` is the podman lock-pool rule.
     let short = &id[3..11.min(id.len())];
     let names: Vec<String> = match d.container.as_deref() {
         Some(container) => container
@@ -13053,10 +13298,8 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
             .await;
     }
     if d.kind == crate::databases::DbKind::Supabase {
-        // Deleting the database IS deleting its data — the stack's named
-        // volumes (engine + storage-api buckets) are platform-templated
-        // (`hive-vol-supa[st]-<id8>`), never tenant-named, so this cannot
-        // touch another volume.
+        // The stack's named volumes are platform-templated (`hive-vol-supa[st]-<id8>`), never
+        // tenant-named, so this cannot touch another volume.
         for vol in [
             format!("hive-vol-supa-{short}"),
             format!("hive-vol-supast-{short}"),
@@ -13078,10 +13321,10 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
     }
 }
 
-/// Record-free teardown by platform template: kind is unknowable without the
-/// catalog record, so cover both naming families (single-container
-/// `hive-db-<id8>` and the Supabase trio + its named volume). Every removal is
-/// idempotent best-effort; a name that never existed is a no-op.
+/// Record-free teardown by platform template: the kind is unknowable without the catalog record, so
+/// both naming families are covered (single-container `hive-db-<id8>` and the Supabase trio plus
+/// its named volume). Every removal is idempotent best-effort; a name that never existed is a
+/// no-op.
 async fn teardown_db_backing_blind(id: &str) {
     if id.len() <= 3 {
         return;
@@ -13123,10 +13366,11 @@ async fn teardown_db_backing_blind(id: &str) {
     }
 }
 
-/// Internal-only: run [`teardown_db_backing`] for `id` on THIS node. Reached
-/// via [`post_body_to_host`] from `database_delete` when the record's
-/// `host_node` is a peer. Gated by [`require_operator_or_internal`], same as
-/// [`database_provision_local`].
+/// Internal-only: runs [`teardown_db_backing`] for `id` on THIS node, reached via
+/// [`post_body_to_host`] from `database_delete` when the record's `host_node` is a peer; gated by
+/// [`require_operator_or_internal`] like [`database_provision_local`]. With no local record (the
+/// catalog delete's store_sync can beat this dispatch) it tears down by platform template instead
+/// of removing nothing and still answering `torn_down`.
 pub(crate) async fn database_teardown_local(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13137,11 +13381,6 @@ pub(crate) async fn database_teardown_local(
     if let Some(d) = c.databases.get_raw(&id) {
         teardown_db_backing(&d).await;
     } else {
-        // The catalog delete's store_sync can beat this dispatch to the peer —
-        // no record here means the old arm removed NOTHING and still answered
-        // `torn_down`, which is exactly how the witness container kept running
-        // after its catalog entry vanished. The backing names are platform
-        // templates, so a missing record does not blind the teardown.
         tracing::warn!(
             db = %id,
             "database teardown-local: no local record (catalog removal replicated first) — tearing down by platform template"
@@ -13151,6 +13390,22 @@ pub(crate) async fn database_teardown_local(
     Ok(Json(json!({ "torn_down": id })))
 }
 
+/// Deletes a database: removes the auto-injected egress env vars from the owning project, tears
+/// down cross-region replicas, and tears down the backing locally when this node is `host_node`,
+/// else dispatches to the owner (`database_teardown_local`), best-effort: an unreachable peer must
+/// not block the catalog delete (a stranded container is caught by the orphan-reap sweep, the
+/// customer asked for the database gone). Replication lag is retried (3 x 400 ms), both for the
+/// record itself (a database created on a peer via `database_provision_local` may not have
+/// replicated here yet, and a no-op on an unknown id used to answer `removed: true` while the
+/// container ran on forever). An id still unknown after those retries is a 404, never `removed`:
+/// the old answer also planted a tombstone for an id this node could not see, and a tombstone
+/// (replicated fleet-wide, matched by id alone) drops whichever record that id later names, another
+/// tenant's included. The retry covers an unset `host_node` too, which is NEVER read as "must be local":
+/// an unknown host is logged loudly (the backing was NOT torn down, the catalog entry is removed
+/// regardless) so an operator can find it through the orphan sweep. The catalog removal also purges
+/// the queue/vector/blob PAYLOAD data (keyed by a team-prefixed connection name, not the db id):
+/// removing only the catalog entry left customer data, possibly PII in vector metadata or queue
+/// message bodies, orphaned in memory and on disk and re-persisted in every snapshot.
 async fn database_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13158,19 +13413,6 @@ async fn database_delete(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Replication-lag guard, same reasoning as the inner `host_node`-empty
-    // retry below but for the OUTER lookup itself: a database created via
-    // `database_provision_local` on a PEER (this node's own region-aware
-    // placement dispatch) has not necessarily replicated into THIS node's
-    // local `databases` store yet by the time a fast-following delete
-    // arrives — witnessed live: `get_raw` returned `None` here, so the
-    // whole teardown block below (including its own host_node retry) never
-    // ran at all, `remove_db_and_purge_data` no-op'd on an id it had never
-    // heard of, and the API still answered `{"removed": true}` while the
-    // real container kept running on the peer forever. A few hundred ms of
-    // retry closes this for any delete within a couple of store-sync
-    // rounds of the create; a delete on a database that never existed
-    // still 404s after these attempts exhaust, unchanged from before.
     let mut record = c.databases.get_raw(&id);
     if record.is_none() {
         for _ in 0..3 {
@@ -13185,25 +13427,14 @@ async fn database_delete(
         if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
         }
-        // Remove the auto-injected egress env vars from the owning project.
         if !d.project.is_empty() {
             for (k, _, _) in db_egress_pairs(&c, &d) {
                 c.projects.delete_env(&d.project, &k);
             }
         }
-        // Tear down any cross-region replicas (before consuming `d.container`).
         if !d.replicas.is_empty() {
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
         }
-        // A replication-lag guard for the delete-moments-after-create case:
-        // if this node's own copy of the record has no `host_node` yet
-        // (created on a peer via `database_provision_local`, whose write
-        // hasn't finished propagating back here through the ordinary
-        // `databases` store-sync path), briefly re-fetch rather than
-        // immediately concluding "unknown, give up" — closes the race for
-        // any delete landing within a couple of store-sync rounds of the
-        // create, which is the overwhelming common case (a delete seconds
-        // or minutes later already has a fully-replicated `host_node`).
         let mut d = d;
         if d.host_node.is_empty() {
             for _ in 0..3 {
@@ -13219,30 +13450,12 @@ async fn database_delete(
         if d.host_node == c.node_name {
             teardown_db_backing(&d).await;
         } else if d.host_node.is_empty() {
-            // NEVER treat an unset `host_node` as "must be local" — that is
-            // exactly the trap that leaked a real container live: a delete
-            // landing on a node whose replicated copy of the record hasn't
-            // finished catching up from wherever `database_provision_local`
-            // actually created it reads `host_node` as its zero-value, not
-            // as the true owner, and the container silently outlives the
-            // catalog entry with no error anywhere. Loud and honest instead:
-            // this node genuinely does not know where the backing container
-            // lives, so it cannot tear it down — surfaced so an operator can
-            // find it via the orphan-reap sweep rather than trusting a
-            // "removed: true" response that only removed the catalog row.
             tracing::warn!(
                 db = %id,
                 "database delete: host_node unknown on this node (stale replication?) — \
                  backing container/volume was NOT torn down; catalog entry removed regardless"
             );
         } else {
-            // The containers/volume/file live on a PEER — dispatch there
-            // rather than silently no-op'ing a local `podman rm` against a
-            // name that was never created on this host. Best-effort: an
-            // unreachable peer must not block the catalog delete below (the
-            // customer asked for this database gone; a stranded container
-            // on an unreachable node is a leak to catch via the normal
-            // orphan-reap sweep, not a reason to refuse the delete).
             if post_body_to_host(
                 &c,
                 &d.host_node,
@@ -13260,20 +13473,18 @@ async fn database_delete(
                 );
             }
         }
+    } else {
+        return Err(StatusCode::NOT_FOUND);
     }
-    // Purges the actual queue/vector/blob PAYLOAD data too (keyed by a
-    // team-prefixed connection name, not the db id) — `remove_db` alone only
-    // ever removed the catalog entry, leaving customer data (which may
-    // include PII in vector metadata or queue message bodies) orphaned in
-    // memory/on-disk forever, re-persisted in every future snapshot.
     c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
-/// Regenerate a Blob database's access credentials without touching the
-/// underlying data or bucket identity -- the fix for a leaked credential
-/// (log, transcript, accidental print) that doesn't warrant losing the data.
+/// Regenerates a Blob database's access credentials without touching the underlying data or bucket
+/// identity: the fix for a leaked credential (log, transcript, accidental print) that does not
+/// warrant losing the data. The egress env is refreshed with the new credentials, so deployments
+/// pick them up on their next restart instead of the stale ones.
 async fn database_rotate(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13290,8 +13501,6 @@ async fn database_rotate(
     let Some(rotated) = crate::databases::rotate_blob_credentials(&c.databases, &id) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    // Refresh the egress env with the new credentials so deployments pick
-    // up the rotated values on their next restart instead of the stale ones.
     if !rotated.project.is_empty() {
         apply_db_egress(&c, &rotated);
     }
@@ -13299,12 +13508,34 @@ async fn database_rotate(
     Ok(Json(json!(rotated)))
 }
 
-/// Mesh-internal: register or remove a cross-region REPLICA of a database on this
-/// node. Called by the primary node's replication fanout (peer-authenticated over
-/// the mesh, or via the loopback+firewalled admin API). On register we record the
-/// database locally as a `replica` in THIS node's region, auto-inject its egress
-/// env into the owning project (so in-region deployments reach it), and — for
-/// Postgres/Redis — provision a real in-region backing container.
+/// HTTP mount of [`database_replica`]: a replica register/remove rewrites the owning project's env
+/// and can stop a container, so only a platform operator, the fleet's `x-hive-internal` secret or a
+/// `mesh-internal` delegation minted for the replicated database's own team may call it
+/// ([`require_mesh_rpc`]). The gossip arm calls the inner handler directly, behind the transport's
+/// signer and trust gate.
+async fn database_replica_public(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = body
+        .pointer("/db/team")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some(team))?;
+    database_replica(State(c), Json(body)).await
+}
+
+/// Mesh-internal: register or remove a cross-region REPLICA of a database on this node. Called by
+/// the primary node's replication fanout (the iroh gossip arm, or [`database_replica_public`] over
+/// HTTP). On register we record the database locally as a `replica` in THIS node's region,
+/// auto-inject its egress env into the owning project (so in-region deployments reach it), and, for
+/// Postgres/Redis, provision a real in-region backing container.
+///
+/// The body is peer-supplied, so the record it names is trusted only as far as THIS node's own
+/// state confirms it: an existing record must belong to the claimed team, and the project whose env
+/// it feeds or strips must belong to that team too.
 pub(crate) async fn database_replica(
     State(c): State<Arc<CloudState>>,
     Json(body): Json<Value>,
@@ -13313,16 +13544,6 @@ pub(crate) async fn database_replica(
     let mut db: crate::databases::Database =
         serde_json::from_value(body.get("db").cloned().unwrap_or(Value::Null))
             .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad db payload: {e}")))?;
-    // This RPC is reachable both over the (currently unauthenticated) mesh
-    // path and directly on the public HTTP admin router, and it used to fully
-    // trust a client-supplied `db` body — so a caller with no relationship to
-    // the target database could force-destroy or re-register it. Real
-    // mesh-peer authentication for this path is tracked separately (the
-    // gossip/peer-trust hardening work); as an immediate, scoped fix: when
-    // `db.id` already names an EXISTING record, require the request's team
-    // to match the REAL owning team on record before mutating it. A brand-new
-    // id (the normal "replicate to a new peer" case) has nothing to compare
-    // against yet and is unaffected.
     if !db.id.trim().is_empty() {
         if let Some(existing) = c.databases.get_raw(&db.id) {
             if record_tenant(&existing.team) != norm(&db.team) {
@@ -13333,20 +13554,20 @@ pub(crate) async fn database_replica(
             }
         }
     }
+    if !db.project.is_empty() && !project_owned_by(&c, &db.project, norm(&db.team)) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "db project belongs to a different team".into(),
+        ));
+    }
     match op {
         "register" => {
-            // Default to replica role / this node's region, but let the caller
-            // override either (the primary uses this same endpoint to re-register
-            // a corrected record without code changes).
             if db.role.is_empty() {
                 db.role = "replica".into();
             }
             if db.region.is_empty() {
                 db.region = c.region.clone();
             }
-            // Platform-native kinds serve from THIS node's in-process store (data
-            // arrives via write-mirroring); rewrite endpoint host to our API base.
-            // Postgres/Redis get a real local backing container so reads are local.
             let backed =
                 crate::databases::provision_replica_backing(c.databases.clone(), &db).await;
             db.connection = backed.0;
@@ -13390,15 +13611,17 @@ pub(crate) async fn database_replica(
     }
 }
 
-/// Apply a MIRRORED storage write received over the iroh mesh (the HTTP admin
-/// path goes through the normal handlers). Parses `<team>` from `?team=` and the
-/// kind/name/key from the path, applying to the SAME tenant namespace so the
-/// replica holds identical data. Never re-mirrors (already a replicated write).
+/// Applies a MIRRORED storage write received over the iroh mesh (the HTTP admin path goes through
+/// the normal handlers). The path is `/v1/storage/<kind>/<name>[/<key>]` with `?team=`, and the
+/// write lands in the SAME tenant namespace (`<team>::<name>`) so the replica holds identical data;
+/// it is never re-mirrored (already a replicated write). Realtime rooms ride the same broker as
+/// pub/sub topics, so a fanned-out room frame is published to it like a topic message (room frames
+/// are raw text on the wire, kept raw so a mirrored frame is byte-identical to a locally published
+/// one).
 pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: &[u8]) {
     let team = qs(path, "team").unwrap_or_else(|| "personal".into());
     let no_q = path.split('?').next().unwrap_or(path);
     let segs: Vec<&str> = no_q.trim_start_matches('/').split('/').collect();
-    // segs: ["v1","storage",<kind>, ...]
     let kind = segs.get(2).copied().unwrap_or("");
     match kind {
         "blob" => {
@@ -13439,15 +13662,10 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
                 }
             }
         }
-        // Realtime rooms ride the same broker as pub/sub topics. Without this
-        // arm a fanned-out room frame was accepted and then dropped, so two
-        // browsers in the same room but on different nodes never saw each other.
         "realtime" => {
             if let Some(room) = segs.get(3) {
                 if let Ok(v) = serde_json::from_slice::<Value>(body) {
                     if let Some(msg) = v.get("message") {
-                        // Room frames are raw text on the wire; keep them raw so a
-                        // mirrored frame is byte-identical to a locally-published one.
                         let text = msg
                             .as_str()
                             .map(|s| s.to_string())
@@ -13469,13 +13687,9 @@ fn qs(path: &str, key: &str) -> Option<String> {
     })
 }
 
-// ---- Functional storage REST (Blob / Queue / Vector) ----
-//
-// MULTI-TENANT: every namespace name (bucket/queue/index/topic/room) coming from
-// the request path is tenant-prefixed (`<tenant>::<name>`) before touching the
-// store, so two teams using the same name get DISJOINT storage. Responses echo
-// the caller's un-prefixed name.
-
+/// Tenant-prefixed namespace (`<tenant>::<name>`) for a bucket, queue, index, topic or room named
+/// in a request path, so two teams using the same name get DISJOINT storage. Responses echo the
+/// caller's un-prefixed name.
 fn ns(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -13485,18 +13699,16 @@ fn ns(
     format!("{}::{}", tenant(c, h, claims), name)
 }
 
-/// Resolve the (team, is_mirror) scope for a storage WRITE. A mesh-internal
-/// mirrored write is a trusted replication call from a primary node — its team
-/// is authoritative, so replicated data lands in the SAME tenant namespace on the
-/// replica. This MUST be bound to a verified identity, not header presence: this
-/// admin router is bound to the public API host (main.rs), so an arbitrary
-/// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok`
-/// carries a short-lived signed token (minted the same way as `mesh_team_qs`,
-/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`) — only a
-/// caller holding `HIVE_JWT_SECRET` can produce one, closing the cross-tenant
-/// write bypass. When JWT enforcement is off (dev/single-node), the raw header
-/// is trusted as before (nothing to forge against). Normal writes resolve the
-/// tenant as usual.
+/// Resolves the (team, is_mirror) scope for a storage WRITE. A mesh-internal mirrored write is a
+/// trusted replication call from a primary node, so its team is authoritative and replicated data
+/// lands in the SAME tenant namespace on the replica. That MUST be bound to a verified identity,
+/// never to header presence: this admin router is bound to the public API host, so an arbitrary
+/// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok` carries a
+/// short-lived signed token (minted like `mesh_team_qs`:
+/// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`),
+/// which only a caller holding `HIVE_JWT_SECRET` can produce, closing the cross-tenant write
+/// bypass. When JWT enforcement is off (dev/single-node) the raw header is trusted (nothing to
+/// forge against). Normal writes resolve the tenant as usual.
 fn write_scope(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -13556,6 +13768,12 @@ async fn blob_put(
     )
 }
 
+/// Reads a blob from the caller's tenant namespace. Blob bytes live on node-local disk, but
+/// `admin_ingress` forwards mutations to the control-plane leader while serving reads LOCALLY, and
+/// `BLOB_ENDPOINT` handed to every app points at the round-robin api host, so a PUT lands on the
+/// leader and the matching GET lands anywhere. A local miss therefore falls back to the leader (the
+/// same fallback `build_get` uses); without it the GET would 404 forever, with no sync path that
+/// ever heals it.
 async fn blob_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13567,12 +13785,6 @@ async fn blob_get(
     match c.databases.blob_get(&nsb, &key) {
         Some(data) => Ok(data.into_response()),
         None => {
-            // Blob bytes live on node-local disk, but `admin_ingress` forwards
-            // mutations to the control-plane leader while serving reads
-            // LOCALLY. `BLOB_ENDPOINT` handed to every app points at the
-            // round-robin api host, so a PUT lands on the leader and the
-            // matching GET lands anywhere — 404 forever, with no sync path that
-            // ever heals it. Same leader fallback `build_get` already uses.
             if let Some(leader) = c.leader_forward_target() {
                 let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
                 let path = format!("/v1/storage/blob/{bucket}/{key}");
@@ -13585,6 +13797,9 @@ async fn blob_get(
     }
 }
 
+/// Lists a bucket's keys in the caller's tenant namespace. An empty listing on a non-leader almost
+/// always means the objects were PUT on the leader rather than that the bucket is empty, so it
+/// falls back to the leader's listing (see [`blob_get`]).
 async fn blob_list_keys(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13593,8 +13808,6 @@ async fn blob_list_keys(
 ) -> Json<Value> {
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
     let keys = c.databases.blob_list(&nsb);
-    // An empty listing on a non-leader almost always means "the objects were
-    // PUT on the leader" rather than "the bucket is empty" — see `blob_get`.
     if let (true, Some(leader)) = (keys.is_empty(), c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
         if let Some(v) =
@@ -13651,6 +13864,10 @@ async fn queue_pop(
     )
 }
 
+/// Depth of a tenant's queue. `queue_push` and `queue_pop` are mutations and so run on the leader,
+/// while this read serves locally, so every non-leader node would report 0 however deep the real
+/// queue is: a depth of 0 on a non-leader falls back to the leader's answer. Depth is served by GET
+/// on the queue route itself (`/v1/storage/queue/:queue`); there is no `/depth` sub-route.
 async fn queue_depth(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13659,13 +13876,8 @@ async fn queue_depth(
 ) -> Json<Value> {
     let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
     let depth = c.databases.queue_depth(&nsq);
-    // `queue_push`/`queue_pop` are mutations and so run on the leader, while
-    // this read serves locally — so every non-leader node reports 0 no matter
-    // how deep the real queue is.
     if let (0, Some(leader)) = (depth, c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        // NOTE: depth is served by GET on the queue route itself
-        // (`/v1/storage/queue/:queue`) — there is no `/depth` sub-route.
         if let Some(v) =
             fetch_from_host(&c, &leader, &format!("/v1/storage/queue/{queue}"), &t).await
         {
@@ -13730,8 +13942,6 @@ async fn vector_query(
     Json(json!({ "index": index, "matches": c.databases.vector_query(&nsi, &b.vector, b.top_k) }))
 }
 
-// ---- Managed World Queue (Vercel WDK, hive-native, no external queue dep) ----
-
 #[derive(Deserialize)]
 struct WqueueEnqueueReq {
     target_url: String,
@@ -13747,35 +13957,41 @@ fn default_wqueue_max_attempts() -> u32 {
     10
 }
 
+/// Enqueues a delayed HTTP callback (`target_url`, `headers`, `payload`, `delay_seconds`,
+/// `max_attempts`) in the managed world queue, tenant-scoped like every other `/v1/storage/*`-style
+/// mutation. The target URL is caller-supplied, so the caller must resolve to a real authenticated
+/// tenant: an anonymous (`ANON_TENANT`) caller never schedules arbitrary HTTP callbacks.
 async fn wqueue_enqueue(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<WqueueEnqueueReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Tenant-scoped like every other /v1/storage/*-style mutation; the target
-    // URL is caller-supplied so it must resolve to a real, authenticated caller
-    // (never let an anonymous/ANON_TENANT caller schedule arbitrary HTTP callbacks).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
     }
-    let id = c.world_queue.enqueue(
-        t,
-        b.target_url,
-        b.headers,
-        b.payload,
-        b.delay_seconds,
-        b.max_attempts,
-    );
+    let id = c
+        .world_queue
+        .enqueue(
+            t,
+            b.target_url,
+            b.headers,
+            b.payload,
+            b.delay_seconds,
+            b.max_attempts,
+        )
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     Ok(Json(json!({ "message_id": id })))
 }
 
-async fn wqueue_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(c.world_queue.stats())
+async fn wqueue_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(c.world_queue.stats()))
 }
-
-// ---- Pub/Sub + Realtime (WebSocket secure streaming) ----
 
 async fn pubsub_info(
     State(c): State<Arc<CloudState>>,
@@ -13791,6 +14007,10 @@ async fn pubsub_info(
     }))
 }
 
+/// Publishes to the tenant-namespaced topic on the local broker and fans the message out to EVERY
+/// node, not just replica regions: the broker is per-process and subscribers sit on whichever node
+/// their WebSocket landed on, so anything less silently delivers to a subset (usually just the
+/// leader's own).
 async fn pubsub_publish(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13802,9 +14022,6 @@ async fn pubsub_publish(
     let nst = format!("{team}::{topic}");
     let delivered = c.databases.publish(&nst, b.message.to_string());
     let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
-    // Fan to EVERY node, not just replica regions: the broker is per-process and
-    // subscribers sit on whichever node their WebSocket landed on, so anything
-    // less silently delivers to a subset (usually just the leader's own).
     crate::db_replicate::fanout_all(
         &c,
         is_mirror,
@@ -13816,6 +14033,8 @@ async fn pubsub_publish(
     Json(json!({ "topic": topic, "delivered": delivered, "fanout": !is_mirror }))
 }
 
+/// WebSocket subscription to a tenant-namespaced pub/sub topic. A subscriber that lags skips the
+/// frames it missed.
 async fn ws_pubsub(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
@@ -13837,7 +14056,7 @@ async fn ws_pubsub(
             tokio::select! {
                 msg = rx.recv() => match msg {
                     Ok(m) => { if socket.send(Message::Text(m)).await.is_err() { break; } }
-                    Err(_) => continue, // lagged: skip
+                    Err(_) => continue,
                 },
                 client = socket.recv() => match client {
                     Some(Ok(Message::Close(_))) | None => break,
@@ -13848,6 +14067,10 @@ async fn ws_pubsub(
     })
 }
 
+/// WebSocket realtime room (tenant-namespaced, bidirectional): a client message is broadcast to the
+/// whole room. Subscribers sit on whichever node their socket landed on, so every frame is also
+/// fanned out to every node; locally only, two browsers in the same room would never see each
+/// other.
 async fn ws_realtime(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
@@ -13875,12 +14098,8 @@ async fn ws_realtime(
                     Err(_) => continue,
                 },
                 client = socket.recv() => match client {
-                    // Bidirectional: a client message is broadcast to the whole room.
                     Some(Ok(Message::Text(t))) => {
                         db.publish(&room, t.clone());
-                        // Subscribers sit on whichever node their socket landed
-                        // on, so a room frame has to reach every node — locally
-                        // only, two browsers in the same room never see each other.
                         crate::db_replicate::fanout_all(
                             &cloud,
                             false,
@@ -13919,8 +14138,6 @@ async fn ws_echo(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Res
     })
 }
 
-// ====================== Secure compute (WireGuard) ======================
-
 async fn securelinks_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -13933,17 +14150,19 @@ async fn securelinks_list(
     ))))
 }
 
+/// Provisions a secure-compute (WireGuard) link. The tenant is always the server-resolved one (a
+/// client-supplied `team` is never trusted, as in `database_create`), and project ownership is
+/// enforced only when wiring into an ALREADY-registered project (an unset or new project name is
+/// the normal "create the tunnel first" flow). The connector's local address is then injected as a
+/// project env var, so deployed functions reach the private backend through the encrypted tunnel
+/// transparently.
 async fn securelink_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut req): Json<crate::securelink::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Always the server-resolved tenant — see the identical fix on
-    // database_create for why a client-supplied `team` must never be trusted.
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Only enforce ownership when wiring into an ALREADY-registered project
-    // (an unset/new project name is a normal "create the tunnel first" flow).
     if let Some(p) = req.project.as_deref().filter(|p| !p.is_empty()) {
         if c.projects.snapshot().contains_key(p) {
             require_project(&c, &headers, claims.as_ref().map(|e| &e.0), p)?;
@@ -13955,9 +14174,6 @@ async fn securelink_create(
         .provision(req, &region)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    // Wire the function datapath: inject the connector's local address as a
-    // project env var, so deployed functions reach the private backend through
-    // the encrypted tunnel transparently.
     if !rec.project.is_empty() && !rec.env_var.is_empty() {
         c.projects.put_env(
             &rec.project,
@@ -14004,30 +14220,25 @@ async fn securelink_delete(
     Ok(Json(json!({ "removed": id })))
 }
 
-// ============================ Monitoring ============================
-
 #[derive(Deserialize)]
 struct MetricsQ {
     minutes: Option<usize>,
     project: Option<String>,
-    /// "minute" (default) | "hour" | "day" — the consumption-breakdown chart's
-    /// Daily/Weekly/Monthly toggle (ui/app/usage/page.tsx). Unrecognized/absent
-    /// falls back to "minute" (today's pre-existing behavior) via
-    /// `Granularity::parse` — never a 400, this is a display parameter.
+    /// "minute" (default) | "hour" | "day": the Usage page's Daily/Weekly/Monthly toggle.
+    /// Unrecognized or absent falls back to "minute" via `Granularity::parse`, never a 400: it is a
+    /// display parameter.
     gran: Option<String>,
-    /// Set by the fleet fan-out's own inner call (`metrics_get` -> peer) to
-    /// request ONLY this node's local view, with no further fan-out — stops
-    /// the recursion at one hop. Absent/false = the top-level call, which fans
-    /// out to every other healthy node (see `metrics_get`'s doc comment).
+    /// Set by the fleet fan-out's own inner call to request ONLY this node's local view, with no
+    /// further fan-out (one hop, no recursion). Absent/false is the top-level call, which fans out
+    /// to every other healthy node (see `metrics_get`).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 
-/// Merge one peer's `/v1/metrics?local=true` JSON response into the running
-/// accumulators (series by `t_ms`, status/top-paths/projects by key). Silently
-/// no-ops on a malformed/unreachable peer response — a single unreachable node
-/// must not fail the whole tenant's usage view (matches `fleet_function_stats`'s
-/// best-effort fan-out).
+/// Merges one peer's `/v1/metrics?local=true` JSON response into the running accumulators (series
+/// by `t_ms`, status/top-paths/projects by key). It silently no-ops on a malformed or unreachable
+/// peer response: a single unreachable node must not fail the whole tenant's usage view (matches
+/// `fleet_function_stats`'s best-effort fan-out).
 fn merge_peer_metrics(
     v: &Value,
     series: &mut Vec<crate::metrics::Bucket>,
@@ -14080,17 +14291,20 @@ fn merge_peer_metrics(
     }
 }
 
-/// TENANT-SCOPED usage series + breakdowns for the Usage page. FLEET-AGGREGATE:
-/// `MetricsStore` is confirmed node-local with zero cross-node merge (never
-/// gossiped, and deliberately NOT adopted from a peer on restore — see
-/// `guardian::strip_node_local`'s "would double-count its traffic" comment,
-/// unlike billing which has a single elected metering owner). A tenant's
-/// traffic can land on ANY healthy node the routing mesh sends it to, so
-/// without fanning out, `/v1/metrics` answers depend entirely on which node
-/// happens to serve the dashboard's request — live-witnessed: the SAME tenant
-/// showed 0 requests on 7 of 8 fleet nodes and real traffic only on the 8th.
-/// `q.local=true` (set only on the inner fan-out call below) stops a peer from
-/// ALSO fanning out — single-hop only, no N-way amplification.
+/// TENANT-SCOPED usage series and breakdowns for the Usage page: every series/status/path read is
+/// confined to the caller's tenant (the owner ops console reads global metrics through the separate
+/// operator-gated `admin_overview`). FLEET-AGGREGATE: `MetricsStore` is node-local with zero
+/// cross-node merge (never gossiped, and deliberately NOT adopted from a peer on restore, see
+/// `guardian::strip_node_local`: it would double-count that node's traffic, unlike billing, which
+/// has a single elected metering owner), and a tenant's traffic can land on ANY healthy node the
+/// routing mesh sends it to, so without fanning out `/v1/metrics` answers depend on which node
+/// serves the dashboard's request (the same tenant once showed 0 requests on 7 of 8 nodes and real
+/// traffic only on the 8th). `q.local=true` (set only on the inner fan-out call) stops a peer from
+/// fanning out again: single hop, no N-way amplification. The requested span is clamped to what the
+/// resolution's ring buffer retains (`Granularity::max_span_minutes`: minute 24 h, hour 30 d, day
+/// about 13 months, see `metrics.rs`), and the fleet-fan-out result (never the inner `local=true`
+/// hop) is cached for a few seconds, collapsing redundant fan-outs from several tabs or team
+/// members into one cross-node round.
 async fn metrics_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14098,20 +14312,10 @@ async fn metrics_get(
     Query(q): Query<MetricsQ>,
 ) -> Json<Value> {
     let gran = crate::metrics::Granularity::parse(q.gran.as_deref());
-    // Clamp to what this resolution's ring buffer actually retains (Minute:
-    // 24h, Hour: 30d, Day: ~13mo — see metrics.rs's MAX_*_BUCKETS) so a caller
-    // can never request a span longer than the data that exists to answer it.
     let minutes = q.minutes.unwrap_or(60).min(gran.max_span_minutes());
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // TENANT-SCOPED: every series/status/path read is confined to the caller's
-    // tenant — no cross-tenant telemetry leak. (The owner ops console reads global
-    // metrics through the separate operator-gated `admin_overview`.)
     let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
-    // few seconds — collapses redundant fan-outs from multiple tabs/team
-    // members viewing the same tenant's metrics within the window into one
-    // real cross-node round.
     let is_top_level = !q.local.unwrap_or(false);
     let cache_key = format!(
         "metrics:{t}:{minutes}:{}:{}",
@@ -14119,10 +14323,7 @@ async fn metrics_get(
         project.unwrap_or("")
     );
     if is_top_level {
-        if let Some(v) = c
-            .resp_cache
-            .get(&cache_key, POLLED_RESPONSE_CACHE_TTL)
-        {
+        if let Some(v) = c.resp_cache.get(&cache_key, POLLED_RESPONSE_CACHE_TTL) {
             return Json(v);
         }
     }
@@ -14199,9 +14400,9 @@ struct SpeedInsightsQ {
     minutes: Option<usize>,
     /// "desktop" | "mobile" — absent means both.
     device: Option<String>,
-    /// Set by the fleet fan-out's own inner call — same single-hop rationale
-    /// as `metrics_get`'s `MetricsQ.local` (RUM samples are node-local: a
-    /// tenant's visitors can land on any node the routing mesh sends them to).
+    /// Set by the fleet fan-out's own inner call: the same single-hop rationale as
+    /// `MetricsQ::local` (RUM samples are node-local, a tenant's visitors can land on any node the
+    /// routing mesh sends them to).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
@@ -14214,13 +14415,12 @@ fn parse_device(s: Option<&str>) -> Option<RumDevice> {
     }
 }
 
-/// Real User Monitoring summary for the Speed Insights page — p75/p90/p95/p99
-/// per Core Web Vital, a computed Real Experience Score, real top routes by
-/// beacon count, and the true sample count. See `fluid_gateway::RumStore` for
-/// where the underlying beacon data actually lives (this endpoint was
-/// entirely missing before — the beacon fired and was silently 202-accepted
-/// with no storage, and the dashboard's Speed Insights page was a hardcoded
-/// empty stub waiting for exactly this).
+/// Default Speed Insights window: the last 7 days.
+const SPEED_INSIGHTS_DEFAULT_MINUTES: usize = 10_080;
+
+/// Real User Monitoring summary for the Speed Insights page: p75/p90/p95/p99 per Core Web Vital, a
+/// computed Real Experience Score, real top routes by beacon count and the true sample count. See
+/// `fluid_gateway::RumStore` for where the underlying beacon data lives.
 async fn speed_insights_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14228,7 +14428,7 @@ async fn speed_insights_get(
     Query(q): Query<SpeedInsightsQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let minutes = q.minutes.unwrap_or(10_080); // default "Last 7 Days"
+    let minutes = q.minutes.unwrap_or(SPEED_INSIGHTS_DEFAULT_MINUTES);
     let device = parse_device(q.device.as_deref());
     let mut raw = c.gw.rum_raw(&t, minutes, device);
     if q.local.unwrap_or(false) {
@@ -14257,27 +14457,38 @@ async fn speed_insights_get(
     Json(result)
 }
 
-// ============================ Owner / ops dashboard ============================
-
 #[derive(Deserialize, Default)]
 struct OverviewQ {
-    /// Set by the fleet fan-out's own inner call — see `metrics_get`'s doc
-    /// comment for the identical single-hop-fan-out rationale (`c.counters()`
-    /// and `c.metrics` are both confirmed node-local with no live cross-node
-    /// merge, same defect class).
+    /// Set by the fleet fan-out's own inner call: the same single-hop rationale as
+    /// `MetricsQ::local` (`c.counters()` and `c.metrics` are both node-local with no live
+    /// cross-node merge).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 
+/// The operator ops-console overview: GLOBAL across all tenants (owner-only) and FLEET-AGGREGATE.
+/// `c.counters()` and `c.metrics` are node-local (the same defect as `metrics_get`), so without the
+/// fan-out the headline request, blocked and error-rate tiles would reflect only whichever node
+/// serves the request and understate fleet traffic by up to 8x; `local=true` on the fan-out call
+/// stops peer recursion (one hop). The raw 30-minute request/error counts are returned, not just
+/// the ratio, so a fan-out call can weight-average across nodes instead of averaging
+/// already-averaged per-node ratios. The result is cached like `metrics_get` (the fan-out costs
+/// ~100 ms per call on the leader and two admin pages poll this every few seconds). Deployments are
+/// local plus gossiped `peer_deployments` (deduped by id), because the placement scheduler hosts
+/// deployments on peers and a bare `c.gw.list()` would under-count to zero here; projects are the
+/// tenant-tagged projects store (authoritative, gossiped) UNION any project that only shows up as a
+/// hosted deployment, so a project is counted even before its record replicates. Cluster capacity
+/// is the sum of every live node's host resources.
 async fn admin_overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     q: Option<Query<OverviewQ>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    // Cached like `metrics_get`: the fleet fan-out below costs ~100 ms per
-    // call on the leader and two admin pages poll this every few seconds.
-    let local = q.as_ref().map(|q| q.0.local.unwrap_or(false)).unwrap_or(false);
+    let local = q
+        .as_ref()
+        .map(|q| q.0.local.unwrap_or(false))
+        .unwrap_or(false);
     if !local {
         if let Some(v) = c
             .resp_cache
@@ -14292,8 +14503,6 @@ async fn admin_overview(
     let nodes = c.registry.nodes();
     let dbs = c.databases.list(None);
     let live_dbs = dbs.iter().filter(|d| d.mode == "live").count();
-    // Recent error rate from the metrics buckets (last 30m), GLOBAL across all
-    // tenants — this is the operator ops console (owner-only), not tenant-facing.
     let series = c.metrics.series(
         crate::metrics::Granularity::Minute,
         30,
@@ -14303,11 +14512,6 @@ async fn admin_overview(
     );
     let mut req30: u64 = series.iter().map(|b| b.requests).sum();
     let mut err30: u64 = series.iter().map(|b| b.errors).sum();
-    // FLEET-AGGREGATE: `c.counters()`/`c.metrics` are node-local (same confirmed
-    // defect as `metrics_get` — see its doc comment). Without this, the ops
-    // console's headline request/blocked/error-rate tiles reflect only whichever
-    // node happens to serve the request, understating real fleet traffic by up
-    // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
     if !local {
         for v in fan_out_peers_polled(
             &c,
@@ -14328,12 +14532,6 @@ async fn admin_overview(
     } else {
         err30 as f64 / req30 as f64
     };
-    // Fleet-aggregated counts (operator, all tenants): the ops overview runs on
-    // ONE node while the placement scheduler hosts deployments on peers, so a
-    // bare `c.gw.list()` under-counts to zero here. Deployments = local + gossiped
-    // peer_deployments (deduped by id). Projects = the tenant-tagged projects
-    // store (authoritative, gossiped) UNION any project that only shows up as a
-    // hosted deployment — so a project is counted even before its record replicates.
     let fleet_deps = fleet_deployments_all(&c);
     let deployments_count = fleet_deps.len();
     let projects_count = {
@@ -14358,15 +14556,11 @@ async fn admin_overview(
         "requests": reqs,
         "blocked": blocked,
         "error_rate_30m": err_rate,
-        // Raw 30m request/error counts (not just the ratio) so a fleet fan-out
-        // call can correctly weight-average across nodes rather than averaging
-        // already-averaged per-node ratios.
         "req30": req30,
         "err30": err30,
         "incidents_open": c.incidents.open_count(),
         "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
-        "webhooks": c.webhooks.list(None).len(),
-        // Real cluster capacity = sum of every live node's host resources.
+        "webhooks": c.webhooks.list(crate::webhooks::Scope::Operator, None).len(),
         "resources": {
             "cpu_cores": nodes.iter().map(|n| n.cpu_cores as u64).sum::<u64>(),
             "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
@@ -14379,12 +14573,12 @@ async fn admin_overview(
     Ok(Json(overview))
 }
 
+/// The durable, append-only audit log of every state mutation, newest first (operator only).
 async fn admin_audit(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    // The durable, append-only audit log of every state mutation (newest first).
     Ok(Json(json!(c.audit.recent(300, None))))
 }
 
@@ -14428,43 +14622,54 @@ async fn status_incidents(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.incidents.public_board()))
 }
 
-/// Leader-forward for mutations of leader→follower REGISTRY-synced stores
-/// (incidents, push): a follower-side write returns 200, persists locally,
-/// then gets silently CLOBBERED by the next sync cycle's wholesale snapshot
-/// adoption (live-hit 2026-07-21: an incident created on fc-lax vanished from
-/// fc-lax itself minutes later). Mutations therefore run ONLY on the leader —
-/// a non-leader node forwards the request there (carrying the caller's own
-/// bearer, so the leader re-verifies the same JWT against the fleet-shared
-/// secret) and returns the leader's response, or fails LOUDLY with 502. It
-/// must never fall back to the local write: accepting a write the sync loop
-/// will erase is strictly worse than refusing it.
-///
-/// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation
-/// tokens are stripped of `platform_admin` on verification (`gossip::
-/// team_claims` — a compromised trusted peer could otherwise forge operator
-/// authority fleet-wide; closing that needs per-node signing keys), so an
-/// operator-gated mutation cannot ride the mesh under the current threat
-/// model. In practice the dashboard's `/ops` proxy already talks to the
-/// leader directly, so this 502 only surfaces on direct API calls against a
-/// follower whose HTTP admin map lacks the leader — which previously LOST the
-/// write silently and now names the fix instead.
-/// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT
-/// send from THIS node so a regional key is presented from an NA-classified
-/// IP. Reached via `put_to_host` (HTTP admin in dev, gossip arm on the mesh).
-async fn push_sms_relay(State(c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
-    Json(crate::push::sms_relay_exec(&c, v).await)
+/// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT send from THIS node so a
+/// regional key is presented from an NA-classified IP. Reached via `put_to_host` (HTTP admin in
+/// dev, gossip arm on the mesh), so it spends the platform's Textbelt key for whoever calls it:
+/// [`require_mesh_rpc`] keeps every tenant token out.
+async fn push_sms_relay(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(v): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
+    Ok(Json(crate::push::sms_relay_exec(&c, v).await))
 }
 
 /// Direct-MX carrier-gateway SMS relay: run the direct-MX blast on THIS node
 /// (chosen by the caller for its open outbound :25). Same node-to-node relay
-/// shape as `/v1/push/sms-relay`; the leader forwards here to an NA-egress peer.
+/// shape and gate as `/v1/push/sms-relay`; the leader forwards here to an NA-egress peer.
 async fn push_sms_direct_mx(
     State(_c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(v): Json<Value>,
-) -> Json<Value> {
-    Json(crate::push::sms_direct_mx_exec(v).await)
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_mesh_rpc(&headers, claims.as_ref().map(|e| &e.0), Some("mesh"))?;
+    Ok(Json(crate::push::sms_direct_mx_exec(v).await))
 }
 
+/// Leader-forward for mutations of leader-to-follower REGISTRY-synced stores (incidents, push): a
+/// follower-side write returns 200, persists locally, then gets silently CLOBBERED by the next sync
+/// cycle's wholesale snapshot adoption (an incident created on a follower vanished from it minutes
+/// later). Mutations therefore run ONLY on the leader: a non-leader forwards the request there,
+/// carrying the caller's own credentials so the leader re-verifies the same JWT against the
+/// fleet-shared secret, and returns the leader's response, or fails LOUDLY with 502. It must never
+/// fall back to the local write: accepting a write the sync loop will erase is strictly worse than
+/// refusing it. With no other owner to forward to (a configured chain dark in this node's view, or
+/// this node owns but may not serve: isolated) it answers a retryable 503, never a local apply.
+///
+/// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation tokens are stripped
+/// of `platform_admin` on verification (`gossip::team_claims`, so a compromised trusted peer cannot
+/// forge operator authority fleet-wide; closing that needs per-node signing keys), so an
+/// operator-gated mutation cannot ride the mesh under the current threat model. In practice the
+/// dashboard's `/ops` proxy already talks to the leader directly, so the 502 only surfaces on
+/// direct API calls against a follower whose HTTP admin map lacks the leader, which previously LOST
+/// the write silently and now names the fix. Every credential and tenant-context header the leader
+/// re-derives auth and tenant from is forwarded: Authorization (bearer), Cookie (the dashboard's
+/// `hive_jwt` is a cookie, not a bearer, and dropping it 401'd cookie-auth mutations) and
+/// `x-hive-team` (the tenant selector `tenant()` reads in unenforced mode; dropping it silently
+/// mis-stored the row under "personal").
 async fn forward_mutation_to_leader(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
@@ -14472,9 +14677,6 @@ async fn forward_mutation_to_leader(
     path: &str,
     body: &Value,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // No other owner to forward to (a configured chain dark in this node's
-    // view, or this node owns but may not serve — isolated): a retryable 503,
-    // never a local apply — the write belongs to a serving owner.
     let Some(leader) = c.leader_forward_target() else {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -14496,11 +14698,6 @@ async fn forward_mutation_to_leader(
     if !body.is_null() {
         req = req.json(body);
     }
-    // Forward EVERY credential/tenant-context header the leader re-derives auth
-    // and tenant from: Authorization (bearer), Cookie (the dashboard's hive_jwt
-    // is a cookie, not a bearer — dropping it 401'd cookie-auth mutations), and
-    // x-hive-team (the tenant selector `tenant()` reads in unenforced mode —
-    // dropping it silently mis-stored the row under "personal").
     for h in [
         axum::http::header::AUTHORIZATION,
         axum::http::header::COOKIE,
@@ -14561,9 +14758,8 @@ async fn incident_open(
     }
     let inc = c.incidents.open_new(req);
     crate::persist::persist(&c);
-    crate::webhooks::dispatch(
+    crate::webhooks::dispatch_platform(
         &c.webhooks,
-        "*",
         "incident.opened",
         json!({ "id": inc.id, "title": inc.title, "severity": inc.severity }),
     );
@@ -14595,9 +14791,8 @@ async fn incident_update(
         .ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
     if resolved {
-        crate::webhooks::dispatch(
+        crate::webhooks::dispatch_platform(
             &c.webhooks,
-            "*",
             "incident.resolved",
             json!({ "id": inc.id, "title": inc.title }),
         );
@@ -14630,16 +14825,13 @@ async fn incident_delete(
         .remove(&id)
         .ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
-    crate::webhooks::dispatch(
+    crate::webhooks::dispatch_platform(
         &c.webhooks,
-        "*",
         "incident.deleted",
         json!({ "id": inc.id, "title": inc.title }),
     );
     Ok(Json(json!({ "ok": true, "deleted": inc.id })))
 }
-
-// ============================ Push delivery (web push + SMS) ============================
 
 /// Caller's user id from verified claims (`sub` = Clerk user id via the mint);
 /// "local" in unenforced dev mode. Push/SMS rows are keyed by this so
@@ -14651,20 +14843,19 @@ fn push_user_id(claims: Option<&crate::auth::Claims>) -> String {
         .unwrap_or_else(|| "local".into())
 }
 
-/// Public VAPID key for `pushManager.subscribe` — requires a signed-in session
-/// (the key itself is public by design; the gate just keeps the surface
-/// consistent with every other dashboard read).
+/// Public VAPID key for `pushManager.subscribe`; it requires a signed-in session (the key itself is
+/// public by design, the gate just keeps the surface consistent with every other dashboard read).
+/// The key is generated ONLY on the leader (a follower minting its own key forks the fleet keypair
+/// and strands every subscription made against the other key), and a follower before the leader's
+/// key has synced in answers a transient, retryable 503.
 async fn push_vapid_key(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
-    // Generate ONLY on the leader (a follower minting its own key forks the
-    // fleet keypair, stranding every subscription made against the other key).
     crate::push::ensure_vapid_on_leader(&c);
     let keys = c.push.vapid();
     if keys.public_b64.is_empty() {
-        // Follower before the leader's key has synced in — transient, retryable.
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "push keys initializing; retry shortly".into(),
@@ -14682,21 +14873,20 @@ pub(crate) struct PushSubscribeBody {
     label: String,
 }
 
-/// Register (or re-register) this browser's push subscription under the
-/// caller's VERIFIED tenant — the tenant comes from `tenant()` (JWT claim
-/// first, never a bare spoofable header under enforcement), which is the
-/// entire cross-tenant isolation story for delivery: the dispatcher only fans
-/// a tenant's notifications to rows stored under that exact tenant.
+/// Registers (or re-registers) this browser's push subscription under the caller's VERIFIED tenant:
+/// the tenant comes from `tenant()` (JWT claim first, never a bare spoofable header under
+/// enforcement), which is the entire cross-tenant isolation story for delivery, since the
+/// dispatcher only fans a tenant's notifications to rows stored under that exact tenant. The
+/// endpoint host must be a recognized push service (so our VAPID-signed server-side POST cannot be
+/// aimed at an arbitrary attacker URL) and the subscriber keys well-formed (garbage keys create
+/// rows that fail encryption on every tick forever); both are validated BEFORE forwarding to the
+/// leader.
 async fn push_subscribe(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(b): Json<PushSubscribeBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Validate BEFORE forwarding: endpoint host must be a recognized push
-    // service (stops our VAPID-signed server-side POST from being aimed at an
-    // arbitrary attacker URL) and the subscriber keys must be well-formed
-    // (garbage keys create rows that fail encryption on every tick forever).
     if let Err(e) = crate::push::valid_subscription_input(&b.endpoint, &b.p256dh, &b.auth) {
         return Err((StatusCode::BAD_REQUEST, e.into()));
     }
@@ -14765,8 +14955,11 @@ async fn push_unsubscribe(
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
-/// The CALLER's own delivery config for the current tenant — never anyone
-/// else's (rows are filtered by the verified user id AND tenant).
+/// The CALLER's own delivery config for the current tenant, never anyone else's (rows are filtered
+/// by the verified user id AND tenant): registered devices, SMS state (`verified` gates delivery;
+/// `sms_quota` is served from a short-TTL cache so this read never blocks on a live Textbelt round
+/// trip) and the key state for the operator UI (which source is live and a masked tail, never the
+/// key itself).
 async fn push_settings(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14781,15 +14974,11 @@ async fn push_settings(
         .into_iter()
         .map(|d| json!({ "endpoint": d.endpoint, "label": d.label, "created_ms": d.created_ms }))
         .collect();
-    // `verified` gates delivery; `sms_quota` is served from a short-TTL cache so
-    // this read never blocks on a live Textbelt round trip.
     let sms = c
         .push
         .sms_for(&user, &team)
         .map(|s| json!({ "phone": s.phone, "enabled": s.enabled, "verified": s.verified }));
     let quota = crate::push::sms_quota_cached(&c).await;
-    // Key state for the operator UI: which source is live and a masked tail —
-    // never the key itself.
     let (key_source, key_masked) = match c.push.sms_key_override() {
         Some(k) => (
             "override",
@@ -14825,14 +15014,12 @@ pub(crate) struct PushSmsKeyBody {
     key: String,
 }
 
-/// Operator-set Textbelt key (see `PushState::sms_key_override`): refilling
-/// Textbelt is a purchase that funds a specific key, and requiring per-node
-/// env surgery to activate it left SMS dead even after payment. Platform-admin
-/// gated (it changes billing-bearing behavior for the whole platform);
-/// leader-forwarded so the store-sync registry replicates it fleet-wide
-/// (including the NA-egress relay peers) instead of a follower write being
-/// clobbered. Responds with the masked state + the NEW key's live quota so
-/// the dashboard confirms the paste worked in one round trip.
+/// Operator-set Textbelt key (see `PushState::sms_key_override`): refilling Textbelt is a purchase
+/// that funds a specific key, and per-node env surgery to activate it left SMS dead even after
+/// payment. Platform-admin gated (it changes billing-bearing behavior for the whole platform) and
+/// leader-forwarded so the store-sync registry replicates it fleet-wide (including the NA-egress
+/// relay peers) instead of a follower write being clobbered. It responds with the masked state plus
+/// the NEW key's live quota, so the dashboard confirms the paste worked in one round trip.
 async fn push_sms_key_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14878,11 +15065,11 @@ fn sms_verification_code() -> String {
     format!("{:06}", u32::from_be_bytes(b) % 1_000_000)
 }
 
-/// Set (or change) the SMS number. This does NOT enable delivery: it texts a
-/// verification code to the number and stores it PENDING. Delivery starts only
-/// after `push_sms_verify` confirms the code — so a caller can never point
-/// notifications at a phone number they don't control (anti-SMS-bombing).
-/// Toggling an already-verified number on/off skips re-verification.
+/// Sets (or changes) the SMS number. This does NOT enable delivery: it texts a verification code to
+/// the number and stores it PENDING. Delivery starts only after `push_sms_verify` confirms the
+/// code, so a caller can never point notifications at a phone number they do not control
+/// (anti-SMS-bombing). Toggling an already-verified, unchanged number on/off skips re-verification
+/// and sends no text, and a send within the resend cooldown spends no further SMS.
 async fn push_sms_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -14912,7 +15099,6 @@ async fn push_sms_put(
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let user = push_user_id(claims.as_ref().map(|e| &e.0));
 
-    // Fast path: toggling an already-verified, unchanged number needs no text.
     if let Some(existing) = c.push.sms_for(&user, &team) {
         if existing.verified && existing.phone == phone {
             c.push.set_sms_enabled(&user, &team, b.enabled);
@@ -14928,7 +15114,6 @@ async fn push_sms_put(
         .push
         .set_sms_pending(&user, &team, &phone, &code, hive_core::now_ms());
     if !sent {
-        // Within resend cooldown — do not spend another SMS.
         crate::persist::persist(&c);
         return Ok(Json(
             json!({ "ok": true, "verified": false, "code_sent": false, "note": "a code was already sent recently; check your messages or wait a minute" }),
@@ -15004,12 +15189,15 @@ static PUSH_TEST_LAST: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 const PUSH_TEST_COOLDOWN_MS: u64 = 30_000;
 
-/// Send a real test notification through the REAL delivery pipeline to the
-/// caller's own registered devices/SMS for the current tenant. Deliberately
-/// NOT leader-gated: it mutates nothing (no store writes), and running it on
-/// any node is exactly what makes dev/non-leader verification possible. Rate-
-/// limited per user; the SMS leg only ever reaches the caller's OWN verified
-/// number.
+/// Sends a real test notification through the REAL delivery pipeline to the caller's own registered
+/// devices/SMS for the current tenant. Deliberately NOT leader-gated: it mutates nothing in the
+/// store apart from pruning, and running it on any node is exactly what makes dev/non-leader
+/// verification possible. It is rate-limited per user, and the SMS leg only ever reaches the
+/// caller's OWN verified and enabled number. A 404/410 from a device means the subscription is
+/// permanently gone (browser profile closed or unsubscribed): it is pruned rather than reported as
+/// a scary failure, so the next test is clean, exactly like the background dispatcher does, durably
+/// (locally on the leader, else through the leader-forwarded DELETE, since the PushStore is
+/// REGISTRY-synced and a follower-local remove would be clobbered by the next sync).
 async fn push_test(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15021,7 +15209,6 @@ async fn push_test(
     let user = push_user_id(claims.as_ref().map(|e| &e.0));
     let opts = body.map(|Json(b)| b).unwrap_or_default();
 
-    // Rate-limit per (user, tenant) — cheap in-memory cooldown.
     let rl_key = format!("{user}|{team}");
     {
         let now = hive_core::now_ms();
@@ -15057,17 +15244,10 @@ async fn push_test(
     for d in &devices {
         match crate::push::send_web_push(&c, d, &payload).await {
             Ok(true) => sent += 1,
-            // A 404/410 means the subscription is permanently gone (the browser
-            // profile closed / unsubscribed). Don't report it as a scary
-            // failure — prune it so the test self-heals and the next one is
-            // clean, exactly like the background dispatcher does.
             Ok(false) => dead.push(d.endpoint.clone()),
             Err(e) => errors.push(format!("{}: {e}", d.label)),
         }
     }
-    // Prune the dead subscriptions durably: locally if we're the leader, else
-    // via the leader-forwarded DELETE (the PushStore is REGISTRY-synced, so a
-    // follower-local remove would be clobbered by the next sync).
     for endpoint in &dead {
         if c.is_control_plane_leader() {
             c.push.remove_subscription(endpoint, None);
@@ -15087,7 +15267,6 @@ async fn push_test(
     }
     let pruned = dead.len();
 
-    // SMS test only ever targets the caller's OWN verified+enabled number.
     let sms_result = match c.push.sms_for(&user, &team) {
         Some(t) if t.enabled && t.verified => match crate::push::send_sms(
             &c,
@@ -15109,12 +15288,17 @@ async fn push_test(
     })))
 }
 
-// ---- Notifications (inbox bell) ----
-
-/// Compute the live notification list for a team from real platform signals
-/// (failed deploys, 5xx error anomalies, blocked-traffic usage anomalies),
-/// applying the user's read/archived state. Archived items keep their `archived`
-/// flag so the client can render an Archive tab.
+/// Computes the live notification list for a team from real platform signals (failed deploys and
+/// builds, 5xx error anomalies, blocked-traffic usage anomalies), applying the user's read/archived
+/// state; archived items keep their `archived` flag so the client can render an Archive tab. A
+/// failed deploy or build is live only while it is still the most recent thing that happened to its
+/// project: the newest event timestamp per project is taken across BOTH deployments and builds, and
+/// a later deployment or build (for example a successful redeploy) makes the failure moot, where
+/// without that check a failure from weeks ago kept notifying forever. Deployment ownership uses
+/// the authoritative record tag (present on the local record, unlike the node-local project row,
+/// which is UNTAGGED on a non-hosting node), while builds and edge events (which carry no tenant
+/// tag) are judged through the fleet-aware `project_owned_by` predicate, so a member's alerts are
+/// not dropped on a node whose project row is absent.
 pub(crate) fn build_notifications(
     c: &Arc<CloudState>,
     team: &str,
@@ -15124,14 +15308,6 @@ pub(crate) fn build_notifications(
     let team = norm(team).to_string();
     let mut out: Vec<Notification> = Vec::new();
 
-    // Newest event timestamp per project, across BOTH deployments and builds --
-    // a failed deploy/build notification is only live while it's still the most
-    // recent thing that happened to its project. Without this, a failure from
-    // weeks ago kept notifying forever even after the project redeployed
-    // successfully since (the "old stale notifs" bug: build_notifications had no
-    // time window and no superseded-by-a-later-event check at all, so every
-    // Error-state deployment/build that ever existed showed up indefinitely
-    // unless the user explicitly archived it).
     let mut newest_per_project: HashMap<String, u64> = HashMap::new();
     for d in c.gw.list() {
         if record_tenant(&d.tenant) != team {
@@ -15148,15 +15324,10 @@ pub(crate) fn build_notifications(
         *e = (*e).max(b.started_ms);
     }
 
-    // 1) Failed deployments.
     for d in c.gw.list() {
-        // Authoritative record tag (present on the local record), not the
-        // node-local project row which is UNTAGGED on a non-hosting node.
         if record_tenant(&d.tenant) != team {
             continue;
         }
-        // Superseded by a later deployment or build for the same project (e.g.
-        // a subsequent successful redeploy) -- the failure is moot, stop notifying.
         if newest_per_project
             .get(&d.project)
             .is_some_and(|&t| t > d.created_at_ms)
@@ -15183,11 +15354,7 @@ pub(crate) fn build_notifications(
         }
     }
 
-    // 1b) Failed builds (git deploys that errored before going live).
     for b in c.builds.list() {
-        // Fleet-aware ownership (project rows are node-local): a failed-build
-        // alert would otherwise silently drop on any node whose project row is
-        // absent, hiding the failure from the owner.
         if !project_owned_by(&c, &b.project, &team) {
             continue;
         }
@@ -15215,16 +15382,12 @@ pub(crate) fn build_notifications(
         }
     }
 
-    // 2) Error / usage anomalies from recent edge events, grouped per project.
     let mut err5xx: HashMap<String, u64> = HashMap::new();
     let mut blocked: HashMap<String, u64> = HashMap::new();
     for ev in c.recent_events(300) {
         if ev.project.is_empty() {
             continue;
         }
-        // Edge events carry no tenant tag — judge via the fleet-aware predicate
-        // (deployment tenant tags) so a member's error/usage alerts aren't
-        // dropped on a node whose project row is absent.
         if !project_owned_by(c, &ev.project, &team) {
             continue;
         }
@@ -15272,6 +15435,13 @@ pub(crate) fn build_notifications(
     out
 }
 
+/// The tenant's notification list (the inbox bell). Every ITEM is derived from node-local sources
+/// (`gw.list`, `builds.list`, `recent_events`) even though the read/archived flags are replicated,
+/// so a deploy that fails on the node hosting it produced no notification on the others and the
+/// bell's poll made the badge appear and vanish depending on which node answered (a failed
+/// production deploy could go unseen). It therefore merges the peers' lists by the
+/// already-deterministic notification id; `local=true` (the inner fan-out call) answers from this
+/// node only.
 async fn notifications_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15283,12 +15453,6 @@ async fn notifications_list(
     if q.local == Some(true) {
         return Json(json!({ "unread": 0, "inbox": 0, "items": items }));
     }
-    // Every ITEM is derived from node-local sources (`gw.list`, `builds.list`,
-    // `recent_events`) even though the read/archived flags are replicated. A
-    // deploy that fails on the FC node hosting it produced no notification on
-    // the other nodes, so the bell's 8s poll made the badge appear and vanish
-    // depending on which node answered — and a failed production deploy could
-    // go unseen. Merge peers by the already-deterministic notification id.
     let mut merged: Vec<Value> = items.iter().map(|n| json!(n)).collect();
     let peers = peer_nodes_for_tenant(&c, &team);
     for v in fan_out_peers_polled(&c, &peers, &team, "/v1/notifications?local=true").await {
@@ -15316,6 +15480,9 @@ async fn notifications_list(
     Json(json!({ "unread": unread, "inbox": inbox, "items": merged }))
 }
 
+/// Archives one notification, only if the id belongs to the caller's own team's feed: the ids are
+/// predictable (`deploy-<id>`, `anom-*`), so an unchecked archive would let one team hide another
+/// team's alert by guessing the format.
 async fn notification_archive(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15323,10 +15490,6 @@ async fn notification_archive(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Only archive an id that actually belongs to the caller's own team's
-    // notification feed — this used to archive ANY id globally, letting one
-    // team hide another team's alert (e.g. a failed-deploy/error-rate
-    // notification) by guessing its predictable `deploy-<id>`/`anom-*` format.
     if !build_notifications(&c, &team).iter().any(|n| n.id == id) {
         return Err((StatusCode::NOT_FOUND, "no such notification".into()));
     }
@@ -15363,8 +15526,6 @@ async fn notifications_read(
     Json(json!({ "read": ids.len() }))
 }
 
-// ============================ Identity sync (orgs & users) ============================
-
 #[derive(Deserialize)]
 struct SyncOrg {
     id: String,
@@ -15394,34 +15555,16 @@ struct IdentitySyncReq {
     org: Option<SyncOrg>,
 }
 
-/// The dashboard syncs the signed-in user + active org from the identity provider
-/// (Clerk). We index them into the store, scoped to the active tenant namespace.
-///
-/// SECURITY (fixes a confirmed cross-tenant data leak): `is_owner` and the
-/// indexed tenant are now derived from the caller's OWN verified JWT claims
-/// (`platform_admin`/`tenant`) when auth is enforced — NEVER from the request
-/// body's `user.email`/`org`. The previous implementation trusted the body
-/// outright: this route requires SOME authenticated caller (any mutation not
-/// in `auth::require_auth`'s open list), but nothing checked that the caller
-/// actually WAS the identity/org they claimed — so any authenticated user,
-/// including one from a completely different, unprivileged tenant, could POST
-/// `{"user":{"email":"<owner's email>"},...}` and get back `is_owner: true`.
-/// The dashboard's own client then persisted that as `hive_is_owner=1` in
-/// their OWN browser's localStorage, and `currentTeam()` (ui/lib/api.ts) reads
-/// that flag to route EVERY subsequent request from that browser to the
-/// owner's "personal" tenant — exposing the owner's real projects,
-/// deployments, and billing data to that caller. Likewise, an org claimed in
-/// `req.org` is only honored if it matches the caller's own verified tenant
-/// (already Clerk-membership-checked at JWT-mint time in `/api/token`), so a
-/// caller can't index themselves into (or read as) an org they don't belong
-/// to. Unenforced (dev/local, no `HIVE_JWT_SECRET`) mode keeps the old
-/// body-trusting behavior — there is no tenant boundary to protect there.
-/// Pure decision core of `identity_sync` (no request/state deps, unit-testable):
-/// given the caller's OWN verified claims (if any), the enforcement mode, the
-/// org they're claiming (if any), and their raw user id, resolve `(tenant,
-/// org_slug_to_index, is_owner)`. `body_email_is_owner` is ONLY consulted in
-/// the unenforced-dev fallback (`auth_is_owner: None, enforced: false`) — it
-/// must never be trusted when `enforced` is true.
+/// Pure decision core of `identity_sync` (no request/state deps, unit-testable): given the caller's
+/// OWN verified claims (if any), the enforcement mode, the org they are claiming (if any) and their
+/// raw user id, resolves `(tenant, org_slug_to_index, is_owner)`. `body_email_is_owner` is ONLY
+/// consulted in the unenforced-dev fallback (`auth_is_owner: None, enforced: false`) and must never
+/// be trusted when `enforced` is true. An org claimed in the request is honoured only if it matches
+/// the caller's own verified tenant (already Clerk-membership-checked at JWT-mint time in
+/// `/api/token`): a caller authenticated as a DIFFERENT tenant never indexes, or reports, an org
+/// they are not verified to belong to, and falls back to their own real tenant. Personal scope: the
+/// OWNER keeps the legacy "personal" namespace and every other verified caller is isolated under
+/// their own `u_<uid>`, never the shared literal "personal".
 fn resolve_identity_sync(
     enforced: bool,
     auth_tenant: Option<&str>,
@@ -15433,9 +15576,6 @@ fn resolve_identity_sync(
     let (tenant, org_slug) = match claimed_org_slug {
         Some(slug) => {
             if enforced && auth_tenant != Some(slug) {
-                // Authenticated as a DIFFERENT tenant than the org claimed here —
-                // never index (or report) an org the caller isn't verified to
-                // belong to. Fall back to their own real tenant.
                 (
                     auth_tenant
                         .map(str::to_string)
@@ -15447,12 +15587,9 @@ fn resolve_identity_sync(
             }
         }
         None => match auth_is_owner {
-            // Personal scope: the OWNER keeps the legacy "personal" namespace;
-            // every other verified caller is isolated under their own `u_<uid>`
-            // — never the shared literal "personal".
             Some(true) => ("personal".to_string(), None),
             Some(false) => (format!("u_{user_id}"), None),
-            None if !enforced => ("personal".to_string(), None), // dev/unenforced fallback
+            None if !enforced => ("personal".to_string(), None),
             None => (ANON_TENANT.to_string(), None),
         },
     };
@@ -15464,6 +15601,31 @@ fn resolve_identity_sync(
     (tenant, org_slug, is_owner)
 }
 
+/// The dashboard syncs the signed-in user and active org from the identity provider (Clerk); we
+/// index them into the store, scoped to the active tenant namespace. `is_owner` and the indexed
+/// tenant come from the caller's OWN verified JWT claims (`platform_admin`/`tenant`) when auth is
+/// enforced, NEVER from the request body's `user.email`/`org` (see [`resolve_identity_sync`]): this
+/// route requires only SOME authenticated caller, so trusting the body let any authenticated user,
+/// even from an unprivileged tenant, POST the owner's email and get back `is_owner: true`, which
+/// the dashboard client then persisted (`hive_is_owner`) and used to route every later request to
+/// the owner's "personal" tenant. Unenforced (dev/local, no `HIVE_JWT_SECRET`) mode keeps the
+/// body-trusting behaviour: there is no tenant boundary to protect there.
+///
+/// Verified org membership is mirrored into the teams roster (`team_create` seeds only the platform
+/// owner, so Clerk org members were otherwise invisible to `GET /v1/teams`). `org_slug` is only
+/// Some when the caller's verified JWT tenant equals the claimed org, and the mirror is gated on
+/// `x-hive-internal` so the email is exactly the Clerk-verified one the server-side mint route
+/// posts: a browser-originated sync cannot write an arbitrary body email into its org's roster.
+/// Members are added if absent only (`TeamStore::add_member_if_absent`, the one primitive every
+/// directory sync uses: `add_member` overwrites an existing member's role, and a manually granted
+/// Owner/Admin must never be demoted by a routine sync).
+///
+/// The mirror feeds authorization (`team_create` takes the new team's owner from its email,
+/// `caller_administers` takes the caller's roster identity from it) and is what the operator's data
+/// view and the dashboard's member lists show, so only the dashboard SERVER writes it: its sync
+/// carries `x-hive-internal` and the Clerk-verified profile. A browser-originated sync (the topnav's
+/// own `/cloud/v1/identity/sync`) carries a body the caller wrote: it records NOTHING, no email, name,
+/// image, tenant or org, and only answers `tenant` and `is_owner`.
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15492,83 +15654,65 @@ async fn identity_sync(
         &req.user.id,
         body_email_is_owner,
     );
-    if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
-        c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
-    }
-    // Mirror VERIFIED org membership into the teams roster. Previously nothing
-    // ever did: `team_create` seeds only the platform owner, so every Clerk org
-    // member who signed in and used the team daily was invisible to
-    // GET /v1/teams. `org_slug` is only Some when the caller's verified JWT
-    // tenant equals the claimed org (Clerk-membership-checked at mint). Gated
-    // on `x-hive-internal` so the email is exactly the Clerk-verified one the
-    // server-side mint route posts — a browser-originated sync (no internal
-    // header) can't write an arbitrary body email into its org's roster.
-    if let Some(slug) = &org_slug {
-        let email = req.user.email.trim();
-        if !email.is_empty()
-            && mint_allowed(&headers)
-            && !email.eq_ignore_ascii_case(c.owner_email.trim())
-        {
-            if c.teams.get(slug).is_none() {
-                let name = req
-                    .org
-                    .as_ref()
-                    .map(|o| o.name.trim())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(slug.as_str());
-                let _ = c.teams.create_with_slug(slug, name, "pro", &c.owner_email);
-            }
-            // Add-if-absent only: `add_member` overwrites an existing member's
-            // role, and a manually granted Owner/Admin must never be demoted
-            // by a routine sync.
-            let already = c
-                .teams
-                .get(slug)
-                .map(|t| t.member(email).is_some())
-                .unwrap_or(false);
-            if !already {
+    let sync_is_from_the_dashboard_server = mint_allowed(&headers);
+    if sync_is_from_the_dashboard_server {
+        if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
+            c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
+        }
+        if let Some(slug) = &org_slug {
+            let email = req.user.email.trim();
+            if !email.is_empty() && !email.eq_ignore_ascii_case(c.owner_email.trim()) {
+                if c.teams.get(slug).is_none() {
+                    let name = req
+                        .org
+                        .as_ref()
+                        .map(|o| o.name.trim())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(slug.as_str());
+                    let _ = c
+                        .teams
+                        .create_with_slug(slug, name, "hobby", &c.owner_email);
+                }
                 let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
                     crate::teams::Role::Admin
                 } else {
                     crate::teams::Role::Member
                 };
-                c.teams.add_member(slug, email, role);
+                c.teams.add_member_if_absent(slug, email, role);
             }
         }
+        c.identity.upsert_user(
+            &req.user.id,
+            req.user.email.as_str(),
+            &req.user.name,
+            &req.user.image_url,
+            &tenant,
+            org_slug.as_deref(),
+        );
+        crate::persist::persist(&c);
     }
-    c.identity.upsert_user(
-        &req.user.id,
-        &req.user.email,
-        &req.user.name,
-        &req.user.image_url,
-        &tenant,
-        org_slug.as_deref(),
-    );
-    crate::persist::persist(&c);
     Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
-// ============================ Billing & compute credits ============================
-
-/// The single node currently metering usage into `BillingStore` — the SAME
-/// designation `spawn_billing_meter_loop`'s gate uses
-/// (`leadership::job_owner(BillingMeter)`: the strict chain owner, or on a
-/// chain-less mesh the `HIVE_BILLING_COORDINATOR_NODE` pin / the election) —
-/// every OTHER node's local `BillingStore` is stale/empty for live reads (only
-/// ever bootstrapped from a peer snapshot at boot, never kept live-current).
-/// `None` while no owner is resolvable (the caller serves its local copy).
+/// The single node currently metering usage into `BillingStore`: the SAME designation
+/// `spawn_billing_meter_loop`'s gate uses (`leadership::job_owner(BillingMeter)`: the strict chain
+/// owner, or on a chain-less mesh the `HIVE_BILLING_COORDINATOR_NODE` pin or the election). Every
+/// OTHER node's local `BillingStore` is stale or empty for live reads (only bootstrapped from a
+/// peer snapshot at boot, never kept live-current). `None` while no owner is resolvable (the caller
+/// serves its local copy).
 fn billing_authority_node(c: &Arc<CloudState>) -> Option<String> {
     crate::leadership::job_owner(c, crate::leadership::Job::BillingMeter)
 }
 
-/// Budget for the proxy-to-authority hop on a USER-FACING billing read.
-/// `fetch_from_host`'s own budgets (10 s HTTP admin, then 20 s iroh) are
-/// DIAL-RESILIENCE budgets — right for a one-shot control operation, wrong on
-/// a request path (measured live: a follower's `/v1/billing/ledger` spent
-/// ~20 s inside them). A healthy hop is one mesh round trip (100-200 ms
-/// measured), so 3 s is >10x headroom; a hop that misses it falls through to
-/// this node's own in-process billing state, which is the cheaper correct
-/// answer at that point, not an error. `HIVE_BILLING_PROXY_READ_MS` overrides.
+/// Default `billing_proxy_budget()`: 3 s.
+const BILLING_PROXY_BUDGET_DEFAULT: Duration = Duration::from_millis(3000);
+
+/// Budget for the proxy-to-authority hop on a USER-FACING billing read. `fetch_from_host`'s own
+/// budgets (10 s HTTP admin, then 20 s iroh) are DIAL-RESILIENCE budgets, right for a one-shot
+/// control operation and wrong on a request path (a follower's `/v1/billing/ledger` once spent ~20
+/// s inside them). A healthy hop is one mesh round trip (100-200 ms measured), so 3 s is more than
+/// 10x headroom; a hop that misses it falls through to this node's own in-process billing state,
+/// the cheaper correct answer at that point, not an error. `HIVE_BILLING_PROXY_READ_MS` overrides.
 fn billing_proxy_budget() -> Duration {
     static T: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *T.get_or_init(|| {
@@ -15577,25 +15721,23 @@ fn billing_proxy_budget() -> Duration {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
-            .unwrap_or(Duration::from_millis(3000))
+            .unwrap_or(BILLING_PROXY_BUDGET_DEFAULT)
     })
 }
 
-/// Proxy a billing GET to the authority node when this node isn't it — fixes the
-/// confirmed bug where `/v1/billing` answers diverge by node (live-witnessed: 5
-/// distinct billing states, including a `plan` disagreement, across 8 nodes for
-/// the SAME tenant). Falls back to serving this node's own (possibly stale)
-/// local value if the proxy is unreachable, rather than erroring the page.
-///
-/// Bounded by `billing_proxy_budget()` on every caller: these are user-facing
-/// reads, and the authority's own answer (the terminal hop of this proxy, see
-/// `gossip::dispatch`'s `/v1/billing/*` arms) is itself bounded now — so a hop
-/// that misses the budget means the mesh is sick, and this node's local state
-/// is the right thing to serve rather than the reason to wait longer.
+/// Proxies a billing GET to the authority node when this node is not it, so `/v1/billing` answers
+/// no longer diverge by node (5 distinct billing states, including a `plan` disagreement, were once
+/// witnessed across 8 nodes for the SAME tenant). It falls back to this node's own (possibly stale)
+/// local value if the proxy is unreachable rather than erroring the page, and `None` means this
+/// node IS the authority (the caller serves its own local read). Every caller is bounded by
+/// `billing_proxy_budget()`: these are user-facing reads, and the authority's own answer (the
+/// terminal hop of this proxy, see `gossip::dispatch`'s `/v1/billing/*` arms) is itself bounded, so
+/// a hop that misses the budget means the mesh is sick and this node's local state is the right
+/// thing to serve rather than the reason to wait longer.
 async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
     let authority = billing_authority_node(c)?;
     if authority == c.node_name {
-        return None; // we ARE authoritative; caller serves its own local read
+        return None;
     }
     match tokio::time::timeout(
         billing_proxy_budget(),
@@ -15616,6 +15758,10 @@ async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Opti
     }
 }
 
+/// The tenant's billing view: plan, live quota usage (the business-locking gauges), the metered
+/// rate card and this period's draft invoice, so the UI shows limits, usage and invoicing in one
+/// place. It is proxied to the metering authority when this node is not it (see
+/// [`proxy_billing_read`]).
 pub(crate) async fn billing_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15627,8 +15773,6 @@ pub(crate) async fn billing_get(
     }
     let acc = c.billing.account(&t);
     let plan = acc.plan.clone();
-    // Live quota usage (business-locking gauges) + the metered rate card + this
-    // period's draft invoice, so the UI shows limits/usage/invoicing in one place.
     let projects_used = c.projects.count_for_team(&t) as u32;
     let members_used = c
         .teams
@@ -15654,28 +15798,20 @@ pub(crate) async fn billing_get(
     }))
 }
 
-/// Invoices for the tenant (finalized periods + current draft, newest first).
+/// Invoices for the tenant (finalized periods plus the current draft, newest first). The read order
+/// is deliberate: (1) the LOCAL fleet-replicated relational mirror, bounded by
+/// `relational::billing_read_budget()`: no network hop, and the only source of finalized invoice
+/// history that exists on EVERY node; (2) the HTTP/mesh proxy to the billing authority, bounded by
+/// `billing_proxy_budget()`; (3) this node's own in-process `BillingStore` (instant, never fails).
 ///
-/// Read order, deliberately:
-///   1. the LOCAL fleet-replicated relational mirror, bounded by
-///      `relational::billing_read_budget()` — no network hop, and the only
-///      source of finalized invoice history that exists on EVERY node;
-///   2. the HTTP/mesh proxy to the billing authority, bounded by
-///      `billing_proxy_budget()`;
-///   3. this node's own in-process `BillingStore` (instant, never fails).
-///
-/// (2) before (3) is load-bearing, not a latency preference: `BillingStore`'s
-/// invoices are NOT part of the `store_sync` `billing` snapshot (which carries
-/// accounts + ledger only — see `store_sync::REGISTRY`), so a non-authority
-/// node's local `invoices` map holds finalized invoices for nobody. Serving it
-/// before the authority hop would replace a tenant's real invoice history with
-/// a lone draft for the whole duration of any mirror outage. The authority's
-/// own store DOES hold it (and its mirror read is bounded by the same budget,
-/// so the hop terminates there instead of hanging), which is what makes (2)
-/// both more correct than (3) and now fast.
-///
-/// Worst case is therefore bounded: budget + budget + instant, instead of the
-/// live `SQL_OP_TIMEOUT` (10 s) plus an unbounded proxy hop.
+/// Putting (2) before (3) is load-bearing, not a latency preference: `BillingStore`'s invoices are
+/// NOT part of the `store_sync` `billing` snapshot (accounts and ledger only, see
+/// `store_sync::REGISTRY`), so a non-authority node's local `invoices` map holds finalized invoices
+/// for nobody, and serving it before the authority hop would replace a tenant's real invoice
+/// history with a lone draft for the whole duration of any mirror outage. The authority's own store
+/// DOES hold it (and its mirror read is bounded by the same budget, so the hop terminates there
+/// instead of hanging). The worst case is therefore bounded: budget + budget + instant, instead of
+/// the live `SQL_OP_TIMEOUT` (10 s) plus an unbounded proxy hop.
 pub(crate) async fn billing_invoices(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15691,19 +15827,15 @@ pub(crate) async fn billing_invoices(
     Json(json!(c.billing.invoices(&t)))
 }
 
-/// The mirror half of `billing_invoices`, or `None` when the mirror cannot
-/// answer for this tenant (not mirrored here, or the read missed its budget) —
-/// the caller falls through to the authority, never to a fabricated empty list.
-///
-/// Equivalence with `BillingStore::invoices` (the last-resort answer in
-/// `billing_invoices`): that method returns the stored FINALIZED invoices plus
-/// `current_invoice` (the in-progress period's draft), sorted newest-first by
-/// `period_start_ms`. The mirror only ever holds finalized invoices (drafts are
-/// never persisted — see `relational::upsert_billing`'s doc comment), so the
-/// draft is appended here and the array re-sorted on the same key. No
-/// double-count is possible: `billing::build_invoice` mints a fresh random id
-/// for every draft, so the appended one can never be an invoice the mirror
-/// already holds.
+/// The mirror half of `billing_invoices`, or `None` when the mirror cannot answer for this tenant
+/// (not mirrored here, or the read missed its budget): the caller falls through to the authority,
+/// never to a fabricated empty list. It is equivalent to `BillingStore::invoices` (the last-resort
+/// answer in `billing_invoices`), which returns the stored FINALIZED invoices plus
+/// `current_invoice` (the in-progress period's draft) sorted newest-first by `period_start_ms`: the
+/// mirror only ever holds finalized invoices (drafts are never persisted, see
+/// `relational::upsert_billing`), so the draft is appended here and the array re-sorted on the same
+/// key. No double-count is possible: `billing::build_invoice` mints a fresh random id for every
+/// draft, so the appended one can never be an invoice the mirror already holds.
 async fn billing_invoices_from_mirror(c: &Arc<CloudState>, t: &str) -> Option<Value> {
     let invoices_json = match crate::relational::billing_snapshot(t).await {
         crate::relational::BillingSnapshot::Mirrored {
@@ -15775,22 +15907,19 @@ fn default_kind() -> String {
     "plan".into()
 }
 
-/// Which purchasable addons this fleet can actually deliver, and when it
-/// cannot, WHY. The dashboard reads this to render a disabled control with the
-/// operator's remedy instead of a Buy button that answers with an HTTP error
-/// only after the user clicks it. Tenant-authed (same read bar as billing).
+/// Which purchasable addons this fleet can actually deliver and, when it cannot, WHY: the dashboard
+/// renders a disabled control with the operator's remedy instead of a Buy button that answers with
+/// an HTTP error only after the user clicks it. Tenant-authed (same read bar as billing).
 ///
-/// GETs are served node-local (see `main.rs`'s admin_ingress dispatch doc) —
-/// correct for gossip-replicated tenant state, wrong here: Tencent
-/// credentials are NODE-LOCAL infrastructure config, so different nodes give
-/// genuinely different (not just eventually-consistent) answers. A tenant
-/// landing on a non-Tencent or not-yet-configured node saw "not available"
-/// even on a fleet where the purchase path (leader-forwarded, always a
-/// credentialed node per `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a
-/// local preflight failure, ask the leader's own view before answering
-/// "unavailable" — the leader is always Tencent-credentialed by the same
-/// invariant `provision_from_checkout` already relies on. Fail OPEN toward
-/// the local answer if the leader can't be reached, never hang the endpoint.
+/// GETs are served node-local (see the `admin_ingress` dispatch doc in `main.rs`), which is correct
+/// for gossip-replicated tenant state and wrong here: Tencent credentials are NODE-LOCAL
+/// infrastructure config, so different nodes give genuinely different (not eventually-consistent)
+/// answers, and a tenant landing on a non-Tencent or not-yet-configured node saw "not available"
+/// even on a fleet where the purchase path (leader-forwarded, always a credentialed node per
+/// `HIVE_CP_OWNER_CHAIN`) would have succeeded. On a local preflight failure it therefore asks the
+/// leader's own view before answering "unavailable" (the leader is always Tencent-credentialed by
+/// the same invariant `provision_from_checkout` relies on), failing OPEN toward the local answer if
+/// the leader cannot be reached: it never hangs the endpoint.
 async fn billing_addons(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -15825,24 +15954,49 @@ async fn billing_addons(
     })))
 }
 
+/// Opens a checkout for a plan, credits or an addon (`req.kind`). Errors carry their REASON: every
+/// arm used to return a bare StatusCode, so the dashboard's Buy button could only render "POST
+/// /v1/billing/checkout -> 502", indistinguishable from a platform bug when the cause was usually
+/// "this fleet has no Tencent credentials configured"; `apiSend` surfaces the response body
+/// verbatim, so a sentence here is a sentence in the UI. An addon is PREFLIGHTED before any
+/// checkout record exists (discovering missing config after confirming a checkout left a confirmed
+/// purchase with no address and told the buyer nothing), and because it is scoped to a project
+/// (e.g. dedicated_ipv4) Stripe lands the buyer back on that project's network settings rather than
+/// the unrelated billing overview.
+///
+/// A free plan (Hobby, or any future $0 tier) has nothing to charge (Stripe Checkout rejects a $0
+/// payment or subscription outright), so it is applied immediately, as the mock path always did.
+/// The same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`, an operator-set
+/// testing price, never assumed permanent) goes through the SAME `open_checkout_full` ->
+/// `confirm_checkout` -> `provision_from_checkout` sequence the paid path uses, just without the
+/// Stripe session a $0 amount could never produce; `provision_from_checkout` is idempotent on
+/// `ProjectSettings::dedicated_ipv4`, so hitting it more than once for the same project is safe.
+/// Otherwise it opens a real Stripe Checkout when configured. When Stripe cannot open one the record
+/// is DISCARDED and the buyer gets a 502: a mock session completes with no payment, so an amount
+/// Stripe refuses (over its limit, an outage) used to buy credits or a plan for nothing. The local
+/// mock checkout exists only where `billing::mock_checkout_allowed` (a developer's node: no Stripe key
+/// and auth not enforced); an enforced platform with no Stripe key refuses a paid checkout (503).
 async fn billing_checkout(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<CheckoutReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Errors carry their REASON. Every arm below used to return a bare
-    // StatusCode, so the dashboard's Buy button could only render
-    // "POST /v1/billing/checkout -> 502" — indistinguishable from a platform
-    // bug, when the actual cause was usually "this fleet has no Tencent
-    // credentials configured". `apiSend` surfaces the response body verbatim,
-    // so a sentence here is a sentence in the UI.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
     let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
         match req.kind.as_str() {
             "credits" => {
                 let amt = req.amount_cents.unwrap_or(1000);
+                if amt == 0 || amt > crate::billing::MAX_AMOUNT_CENTS {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "a credit purchase is between 1 and {} cents",
+                            crate::billing::MAX_AMOUNT_CENTS
+                        ),
+                    ));
+                }
                 (
                     "".to_string(),
                     amt,
@@ -15875,9 +16029,6 @@ async fn billing_checkout(
                         format!("project {target:?} is not owned by your team"),
                     ));
                 }
-                // PREFLIGHT before any checkout record exists: discovering
-                // missing config after confirming a checkout left a confirmed
-                // purchase with no address, and told the buyer nothing.
                 if let Err(why) = crate::tencent_eip::preflight() {
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -15897,7 +16048,15 @@ async fn billing_checkout(
             }
             _ => {
                 let plan = req.plan.unwrap_or_else(|| "pro".into());
-                let spec = crate::billing::plan_spec(&plan);
+                let Some(spec) = crate::billing::known_plan(&plan) else {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "unknown plan '{plan}': the plans are {}",
+                            crate::billing::plan_ids()
+                        ),
+                    ));
+                };
                 (
                     plan,
                     spec.price_cents,
@@ -15906,12 +16065,13 @@ async fn billing_checkout(
                 )
             }
         };
-    // A free plan (Hobby, or any future $0 tier) has nothing to charge —
-    // Stripe Checkout rejects a $0 payment/subscription outright, and there's
-    // no reason to round-trip it at all. Apply immediately, same as the mock
-    // path always did for this case.
     if amount == 0 && req.kind != "addon" {
-        apply_plan_everywhere(&c, &t, &plan);
+        apply_plan_everywhere(
+            &c,
+            &t,
+            &plan,
+            PlanChange::Request(claims.as_ref().map(|e| &e.0)),
+        )?;
         let acc = c.billing.account(&t);
         c.audit.record(
             &t,
@@ -15926,13 +16086,6 @@ async fn billing_checkout(
             json!({ "url": "", "mock": false, "applied": true, "account": acc }),
         ));
     }
-    // Same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`,
-    // an operator-set testing price, never assumed permanent): route through
-    // the SAME `open_checkout_full` -> `confirm_checkout` -> `provision_from_checkout`
-    // sequence the paid path uses below, just without the Stripe session that
-    // a $0 amount could never produce anyway. `provision_from_checkout` is
-    // already idempotent on `ProjectSettings::dedicated_ipv4` (see its own doc
-    // comment), so this is safe to hit more than once for the same project.
     if amount == 0 && req.kind == "addon" {
         let co = c.billing.open_checkout_full(
             &t,
@@ -15942,10 +16095,15 @@ async fn billing_checkout(
             crate::tencent_eip::SKU,
             &target,
         );
-        let (co, _acc) = c.billing.confirm_checkout(&co.id).ok_or((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "checkout could not be confirmed".to_string(),
-        ))?;
+        let (co, _acc) = c
+            .billing
+            .confirm_checkout(&co.id, crate::billing::Payment::Unproven)
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "checkout could not be confirmed".to_string(),
+                )
+            })?;
         match crate::tencent_eip::provision_from_checkout(&c, &co).await {
             Ok(alloc) => {
                 c.audit.record(
@@ -15975,16 +16133,21 @@ async fn billing_checkout(
     } else {
         ""
     };
+    let stripe = crate::billing::stripe_configured();
+    if !stripe && !crate::billing::mock_checkout_allowed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "billing is not set up on this platform (no payment provider is configured): \
+             nothing was purchased or charged"
+                .into(),
+        ));
+    }
     let co = c
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
-    // Real Stripe Checkout when configured; otherwise the local mock checkout.
-    if crate::billing::stripe_configured() {
+    if stripe {
         let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-        // An addon purchase is scoped to a project (e.g. dedicated_ipv4) --
-        // land the buyer back where they bought it, not on the unrelated
-        // billing overview page, which has nothing to show for it.
         let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
             let enc =
                 percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
@@ -16017,7 +16180,16 @@ async fn billing_checkout(
                 c.billing.attach_stripe_session(&co.id, &stripe_session_id);
                 return Ok(Json(json!({ "url": url, "mock": false, "session": co.id })));
             }
-            Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
+            Err(e) => {
+                tracing::warn!(error = %e, checkout = %co.id, tenant = %t, "stripe checkout failed; the checkout is discarded and nothing is applied");
+                c.billing.discard_checkout(&co.id);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    "the payment provider could not open the checkout: nothing was purchased or \
+                     charged, try again shortly"
+                        .into(),
+                ));
+            }
         }
     }
     Ok(Json(
@@ -16025,6 +16197,11 @@ async fn billing_checkout(
     ))
 }
 
+/// Reads a checkout by id. Checkouts live in an in-process map on whichever node opened them, and
+/// `POST /v1/billing/checkout` is a mutation, so it always runs on the billing authority, while the
+/// browser's follow-up GET (`/billing/checkout?session=<id>`) round-robins: a local miss therefore
+/// proxies to the authority like the sibling billing reads, or the upgrade flow would dead-end with
+/// "Checkout session not found".
 pub(crate) async fn billing_checkout_get(
     State(c): State<Arc<CloudState>>,
     Path(id): Path<String>,
@@ -16032,12 +16209,6 @@ pub(crate) async fn billing_checkout_get(
     if let Some(co) = c.billing.get_checkout(&id) {
         return Ok(Json(json!(co)));
     }
-    // Checkouts live in an in-process map on whichever node opened them, and
-    // `POST /v1/billing/checkout` is a mutation so it always runs on the billing
-    // authority. The browser then navigates to /billing/checkout?session=<id>,
-    // whose GET round-robins — landing anywhere else it 404'd and the upgrade
-    // flow dead-ended with "Checkout session not found". The sibling billing
-    // reads already proxy this way; this one was missed.
     if let Some(v) = proxy_billing_read(&c, &format!("/v1/billing/checkout/{id}"), "").await {
         return Ok(Json(v));
     }
@@ -16049,6 +16220,20 @@ struct ConfirmReq {
     session: String,
 }
 
+/// Confirms a checkout and applies its effect. Only the SAME tenant that opened a checkout may
+/// confirm it (otherwise any authenticated caller who learns or guesses another tenant's checkout
+/// id could force-complete or grief it). For a REAL Stripe checkout the payment is verified with
+/// Stripe before anything is applied: the client hitting this endpoint (the redirect back from
+/// Stripe, or a direct call) is not proof of payment, and without the check anyone could open a
+/// checkout and confirm it without ever paying. `confirm_checkout` only moves the billing half; the
+/// effect of a completed "plan"/"addon" checkout is dispatched here, never inside
+/// `confirm_checkout` itself (the same single-writer split as the "credits" branch). A provisioning
+/// failure after payment is surfaced as `addon_error` rather than failing the request: the payment
+/// already succeeded and the checkout is consumed, so an error status would read as "you weren't
+/// charged"; the caller can retry or contact support. A checkout with NO Stripe session (a mock one)
+/// completes only where `billing::mock_checkout_allowed`; anywhere else it is 402, decided by
+/// `confirm_checkout` itself, so a record persisted or replicated from a developer's node cannot be
+/// spent on a platform.
 async fn billing_confirm(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16060,19 +16245,12 @@ async fn billing_confirm(
         .billing
         .get_checkout(&req.session)
         .ok_or(StatusCode::NOT_FOUND)?;
-    // A checkout may only be confirmed by the SAME tenant that opened it —
-    // without this, any authenticated caller who learns/guesses another
-    // tenant's checkout id could force-complete or grief it.
     if norm(&co.tenant) != t {
         return Err(StatusCode::FORBIDDEN);
     }
-    // When this was a REAL Stripe checkout, verify actual payment with Stripe
-    // before applying anything — the client hitting this endpoint (a redirect
-    // back from Stripe, or a direct call) is NOT proof of payment on its own;
-    // without this check, anyone could open a checkout and immediately call
-    // confirm without ever paying, and receive the plan/credits for free.
     let mut stripe_customer = String::new();
     let mut stripe_subscription = String::new();
+    let mut payment = crate::billing::Payment::Unproven;
     if !co.stripe_session_id.is_empty() {
         let status = crate::billing::stripe_verify_session(&c.http, &co.stripe_session_id)
             .await
@@ -16082,29 +16260,24 @@ async fn billing_confirm(
         }
         stripe_customer = status.customer.unwrap_or_default();
         stripe_subscription = status.subscription.unwrap_or_default();
+        payment = crate::billing::Payment::Stripe;
     }
-    let (co, acc) = c
-        .billing
-        .confirm_checkout(&req.session)
-        .ok_or(StatusCode::NOT_FOUND)?;
-    // `confirm_checkout` only moves the billing half; the effect for a
-    // completed "plan"/"addon" checkout is dispatched here — never inside
-    // `confirm_checkout` itself, same single-writer split as the "credits"
-    // branch it already draws.
+    let (co, acc) = match c.billing.confirm_checkout(&req.session, payment) {
+        Ok(done) => done,
+        Err(crate::billing::Unconfirmed::Unknown) => return Err(StatusCode::NOT_FOUND),
+        Err(crate::billing::Unconfirmed::Unpaid) => return Err(StatusCode::PAYMENT_REQUIRED),
+    };
     let mut addon_error: Option<String> = None;
     match co.kind.as_str() {
         "credits" => {}
         "addon" => {
             if let Err(e) = crate::tencent_eip::provision_from_checkout(&c, &co).await {
-                // Payment already succeeded (verified above) and the checkout
-                // is already consumed — never fail this request over a
-                // provisioning error, which would read as "you weren't
-                // charged." Surface it instead so the caller can retry/support.
                 tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed after payment confirmed");
                 addon_error = Some(e);
             }
         }
-        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
+        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan, PlanChange::Paid)
+            .map_err(|(status, _)| status)?,
     }
     if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
         c.billing
@@ -16129,19 +16302,28 @@ async fn billing_confirm(
     ))
 }
 
-/// Stripe's server-to-server notification of billing events — the
-/// authoritative sync path (unlike `billing_confirm`, which only fires when a
-/// user's browser happens to be present for the redirect back). Handles the
-/// checkout completing (in case the user closes the tab before that redirect)
-/// and subscription cancellation/renewal so a tenant's plan stays correct even
-/// when nobody is watching.
+/// Stripe's server-to-server notification of billing events: the authoritative sync path (unlike
+/// `billing_confirm`, which only fires when a user's browser happens to be present for the redirect
+/// back). It handles the checkout completing (in case the user closes the tab before that redirect)
+/// and subscription cancellation/renewal, so a tenant's plan stays correct even when nobody is
+/// watching.
 ///
-/// Auth: this route is in `auth::require_auth`'s `open` allowlist (Stripe
-/// can't present a platform JWT — it's authenticated by its own HMAC
-/// signature, verified below). Deliberately FAILS CLOSED when
-/// `STRIPE_WEBHOOK_SECRET` is unset — unlike `git_webhook`'s dev-open
-/// default, an unverifiable delivery must never be allowed to mutate a
-/// tenant's billing state.
+/// Auth: this route is in `auth::require_auth`'s `open` allowlist (Stripe cannot present a platform
+/// JWT; it is authenticated by its own HMAC signature, verified below), and it deliberately FAILS
+/// CLOSED when `STRIPE_WEBHOOK_SECRET` is unset, unlike `git_webhook`'s dev-open default: an
+/// unverifiable delivery must never be allowed to mutate a tenant's billing state.
+///
+/// `checkout.session.completed` is the primary confirmation path and mirrors `billing_confirm`'s
+/// apply logic, keyed by the `checkout_id` stamped into the session's metadata (see
+/// `stripe_checkout`) rather than a tenant header, since Stripe is the caller; a checkout already
+/// confirmed through `billing_confirm` (the common case, the user's browser is usually still
+/// present) is a no-op, because `confirm_checkout` is idempotent (it removes on first success).
+/// `customer.subscription.deleted` (immediate or end-of-period cancellation, depending on Stripe
+/// settings) downgrades to Hobby, so quotas and business-locks re-engage even if nobody visits the
+/// dashboard again. `customer.subscription.updated` only logs: a renewal failure (card declined
+/// etc.) surfaces as the subscription moving to past_due/unpaid, and there is no automatic
+/// downgrade on a transient failure (Stripe's own retry schedule and dunning emails run first, and
+/// `customer.subscription.deleted` is still the terminal signal once retries are exhausted).
 async fn billing_webhook(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16168,18 +16350,23 @@ async fn billing_webhook(
         .unwrap_or_else(|| json!({}));
 
     match event_type {
-        // Primary confirmation path — mirrors `billing_confirm`'s apply logic,
-        // keyed by the `checkout_id` we stamped into the session's metadata
-        // (see `stripe_checkout`) rather than a tenant header, since Stripe is
-        // the caller here, not an authenticated user.
-        "checkout.session.completed" => {
+        "checkout.session.completed" | "checkout.session.async_payment_succeeded" => {
             let checkout_id = obj
                 .get("metadata")
                 .and_then(|m| m.get("checkout_id"))
                 .and_then(|s| s.as_str())
                 .unwrap_or("");
-            if !checkout_id.is_empty() {
-                if let Some((co, _acc)) = c.billing.confirm_checkout(checkout_id) {
+            if !crate::billing::session_paid(&obj) {
+                tracing::info!(
+                    event = event_type,
+                    checkout = checkout_id,
+                    "stripe webhook: the checkout is not paid yet, nothing applied"
+                );
+            } else if !checkout_id.is_empty() {
+                if let Ok((co, _acc)) = c
+                    .billing
+                    .confirm_checkout(checkout_id, crate::billing::Payment::Stripe)
+                {
                     match co.kind.as_str() {
                         "credits" => {}
                         "addon" => {
@@ -16189,7 +16376,13 @@ async fn billing_webhook(
                                 tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed (stripe webhook path)");
                             }
                         }
-                        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
+                        _ => {
+                            if let Err((_, why)) =
+                                apply_plan_everywhere(&c, &co.tenant, &co.plan, PlanChange::Paid)
+                            {
+                                tracing::error!(checkout = %co.id, tenant = %co.tenant, %why, "stripe webhook: the paid plan could not be applied");
+                            }
+                        }
                     }
                     let customer = obj.get("customer").and_then(|s| s.as_str()).unwrap_or("");
                     let subscription = obj
@@ -16205,26 +16398,33 @@ async fn billing_webhook(
                         "charge",
                         "billing",
                         &co.id,
-                        "stripe webhook: checkout.session.completed",
+                        &format!("stripe webhook: {event_type}"),
                     );
                     crate::persist::persist(&c);
                 }
-                // Already confirmed via `billing_confirm` (the common case,
-                // since the user's browser is usually still present) —
-                // `confirm_checkout` is idempotent (removes on first success),
-                // so a `None` here just means nothing left to do.
             }
         }
-        // Cancellation (immediate or end-of-period, depending on Stripe
-        // dashboard/API settings) — downgrade to Hobby so quotas/business-locks
-        // re-engage even if nobody visits the dashboard again.
+        "checkout.session.async_payment_failed" => {
+            tracing::warn!(
+                checkout = obj
+                    .get("metadata")
+                    .and_then(|m| m.get("checkout_id"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or(""),
+                "stripe webhook: a delayed payment failed, nothing applied"
+            );
+        }
         "customer.subscription.deleted" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
             if let Some(tenant) = (!sub_id.is_empty())
                 .then(|| c.billing.tenant_for_subscription(sub_id))
                 .flatten()
             {
-                apply_plan_everywhere(&c, &tenant, "hobby");
+                if let Err((_, why)) =
+                    apply_plan_everywhere(&c, &tenant, "hobby", PlanChange::Cancellation)
+                {
+                    tracing::error!(tenant = %tenant, %why, "stripe webhook: the cancelled subscription could not be downgraded");
+                }
                 c.audit.record(
                     &tenant,
                     "system",
@@ -16236,11 +16436,6 @@ async fn billing_webhook(
                 crate::persist::persist(&c);
             }
         }
-        // A renewal failure (card declined etc.) surfaces as the subscription
-        // moving to "past_due"/"unpaid" — logged for now (no automatic
-        // downgrade on a transient failure; Stripe's own retry schedule and
-        // dunning emails run first, and `customer.subscription.deleted` is
-        // still the terminal signal once retries are exhausted).
         "customer.subscription.updated" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
             let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
@@ -16263,6 +16458,10 @@ struct ChargeReq {
     note: String,
 }
 
+/// Debits the CALLER's own account by `cents` (usage the caller reports; it cannot touch another
+/// tenant's). The amount comes straight from the request body, so `BillingStore::charge` bounds it
+/// by `billing::MAX_AMOUNT_CENTS` (400 above it): a `u64` above `i64::MAX` cast `as i64` used to
+/// turn a huge debit into a CREDIT of the same size.
 async fn billing_charge(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16288,7 +16487,14 @@ async fn billing_charge(
             crate::persist::persist(&c);
             Ok(Json(json!({ "ok": true, "account": acc })))
         }
-        Err(e) => Err((StatusCode::PAYMENT_REQUIRED, e)),
+        Err(crate::billing::ChargeError::OutOfRange) => Err((
+            StatusCode::BAD_REQUEST,
+            format!("cents must be at most {}", crate::billing::MAX_AMOUNT_CENTS),
+        )),
+        Err(crate::billing::ChargeError::Insufficient) => Err((
+            StatusCode::PAYMENT_REQUIRED,
+            "Insufficient credits — upgrade to Pro or add credits.".into(),
+        )),
     }
 }
 
@@ -16303,27 +16509,31 @@ struct BillingGrantReq {
     plan: String,
     #[serde(default)]
     note: String,
-    /// Pin this tenant's tier FLOOR so no automatic path can downgrade below it.
-    /// `"enterprise"` locks at enterprise; `""` clears the lock; omitted leaves
-    /// any existing lock untouched.
-    ///
-    /// A grant without this is not durable, and that is not hypothetical: the
-    /// 2026-07-18 owner grant of `enterprise` was silently reverted to `hobby`
-    /// by a user-initiated free-plan checkout on 2026-07-25, and the 2026-07-29
-    /// remediation passed `plan=""` so the `!req.plan.is_empty()` guard below
-    /// skipped `apply_plan_everywhere` entirely — credits were added and the
-    /// tier was never restored, leaving the account quota-locked.
+    /// Pin this tenant's tier FLOOR so no automatic path can downgrade below it: `"enterprise"`
+    /// locks at enterprise, `""` clears the lock, omitted leaves any existing lock untouched. A
+    /// grant without this is not durable: a free-plan checkout silently reverted an owner grant of
+    /// `enterprise` to `hobby`, and a remediation that passed `plan=""` skipped
+    /// `apply_plan_everywhere` entirely (credits were added and the tier was never restored,
+    /// leaving the account quota-locked).
     #[serde(default)]
     lock_tier: Option<String>,
 }
 
-/// Operator-only: comp an account with prepaid credits and/or switch its plan
-/// directly, bypassing Stripe entirely — a support/goodwill grant (refunds,
-/// promotions, platform-owner self-testing). Distinct from the self-service
-/// `/v1/billing/charge` path (which only ever acts on the CALLER's own tenant,
-/// no operator gate needed since it can't touch anyone else's account): this
-/// targets an explicit `tenant` chosen by the caller, so it is hard-gated to
-/// `require_operator` the same way every other platform-wide admin mutation is.
+/// Operator-only: comps an account with prepaid credits and/or switches its plan directly,
+/// bypassing Stripe entirely: a support/goodwill grant (refunds, promotions, platform-owner
+/// self-testing). Distinct from the self-service `/v1/billing/charge` path, which only ever acts on
+/// the CALLER's own tenant and needs no operator gate since it cannot touch anyone else's account:
+/// this one targets an explicit `tenant` chosen by the caller, so it is hard-gated to
+/// `require_operator` like every other platform-wide admin mutation.
+///
+/// An unknown plan id is rejected up front through `billing::known_plan`, the lookup that does not
+/// fall back to Hobby (`plan_spec` does, so it would accept any string). The tier lock is applied
+/// AFTER any plan change, so a grant that both
+/// switches the plan and locks it lands in the right order; `set_tier_lock` also raises the live
+/// plan to the floor, which repairs an account whose stored plan was downgraded before the lock
+/// existed, and the teams half is kept in step with it (the two halves must never disagree: that
+/// split is what produced a tenant reading `enterprise` for features while quota-capped as
+/// `hobby`).
 async fn billing_grant(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -16334,10 +16544,16 @@ async fn billing_grant(
     if t.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "tenant is required".into()));
     }
-    // plan_spec() falls back to Hobby (PLANS[0]) for an unrecognized id rather
-    // than erroring, so an unknown id must be caught here by comparing the
-    // resolved spec's own id back against what was asked for.
-    if !req.plan.is_empty() && crate::billing::plan_spec(&req.plan).id != req.plan {
+    if req.credit_cents > crate::billing::MAX_AMOUNT_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "credit_cents must be at most {}",
+                crate::billing::MAX_AMOUNT_CENTS
+            ),
+        ));
+    }
+    if !req.plan.is_empty() && crate::billing::known_plan(&req.plan).is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
             format!("unknown plan '{}'", req.plan),
@@ -16348,16 +16564,13 @@ async fn billing_grant(
     } else {
         req.note.clone()
     };
+    let change = PlanChange::Request(claims.as_ref().map(|e| &e.0));
     if !req.plan.is_empty() {
-        apply_plan_everywhere(&c, t, &req.plan);
+        apply_plan_everywhere(&c, t, &req.plan, change)?;
     }
-    // Apply the tier lock AFTER any plan change, so a grant that both switches
-    // the plan and locks it lands in the right order. `set_tier_lock` also
-    // raises the live plan to the floor, which is what repairs an account whose
-    // stored plan was downgraded before the lock existed.
     if let Some(lock) = req.lock_tier.as_deref() {
         let floor = lock.trim();
-        if !floor.is_empty() && crate::billing::plan_spec(floor).id != floor {
+        if !floor.is_empty() && crate::billing::known_plan(floor).is_none() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 format!("unknown lock_tier '{floor}'"),
@@ -16365,12 +16578,8 @@ async fn billing_grant(
         }
         let floor_opt = if floor.is_empty() { None } else { Some(floor) };
         c.billing.set_tier_lock(t, floor_opt);
-        // Keep the teams half in step: the lock raises the billing plan, and
-        // the two halves must never disagree (that split is what produced a
-        // tenant reading `enterprise` for features while quota-capped as
-        // `hobby`).
         if let Some(f) = floor_opt {
-            apply_plan_everywhere(&c, t, f);
+            apply_plan_everywhere(&c, t, f, change)?;
         }
     }
     let acc = if req.credit_cents > 0 {
@@ -16402,20 +16611,17 @@ struct BillingBackfillReq {
     force: bool,
 }
 
-/// ADMIN-ONLY, ONE-SHOT (idempotent) billing schema backfill: normalize the
-/// pre-migration JSON-blob billing rows (`billing_accounts.account_json` /
-/// `billing_ledger_snapshot.ledger_json` / `billing_invoices_snapshot.invoices_json`)
-/// into the new normalized per-row tables (`billing_accounts`'s new scalar
-/// columns, `billing_ledger`, `billing_invoices` + `billing_invoice_lines`).
-/// See `relational::backfill_billing_normalize`'s doc comment for the full
-/// write/verify contract and the critical `billing_accounts` table-name-
-/// collision finding it exists to handle.
+/// ADMIN-ONLY, ONE-SHOT (idempotent) billing schema backfill: normalizes the pre-migration
+/// JSON-blob billing rows (`billing_accounts.account_json`, `billing_ledger_snapshot.ledger_json`,
+/// `billing_invoices_snapshot.invoices_json`) into the normalized per-row tables
+/// (`billing_accounts`'s new scalar columns, `billing_ledger`, `billing_invoices` +
+/// `billing_invoice_lines`). See `relational::backfill_billing_normalize` for the full write/verify
+/// contract and the `billing_accounts` table-name collision it exists to handle.
 ///
-/// NOT wired to run automatically anywhere — must be explicitly POSTed by a
-/// platform operator, and even then only after the separate production-data
-/// approval gate this migration's rollout plan calls for (this endpoint
-/// performs REAL writes against REAL billing data the moment it's called; it
-/// does not itself ask for confirmation — that gate lives outside this code).
+/// NOT wired to run automatically anywhere: a platform operator must POST it explicitly, and only
+/// after the separate production-data approval gate this migration's rollout plan calls for (it
+/// performs REAL writes against REAL billing data the moment it is called and does not itself ask
+/// for confirmation).
 async fn billing_backfill_run(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(body): Json<BillingBackfillReq>,
@@ -16427,13 +16633,16 @@ async fn billing_backfill_run(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
-// ============================ Ops data browser ============================
-//
-// Exposes the platform's own data — the persisted PlatformSnapshot collections
-// plus live in-memory stores — so the owner can query/view/explore the state
-// that rides the iroh/guardian-db replication mesh.
-
-/// All collections the platform stores, with row data. Ordered for the UI.
+/// All collections the platform stores, with row data, ordered for the UI: the persisted
+/// `PlatformSnapshot` collections plus live in-memory stores, so the owner can query and explore
+/// the state that rides the iroh/guardian-db replication mesh. Deployments are fleet-aggregated:
+/// this operator data browser runs on ONE node, but the placement scheduler hosts a project's
+/// deployments on peer nodes, so a bare `c.gw.list()` (locally hosted only) showed "0 deployments"
+/// here while every deployment lived on a peer; the gossiped `peer_deployments` are merged (deduped
+/// by id) exactly as the tenant-facing `dep_list` does, and the ops view spans ALL tenants
+/// (operator-only). The databases collection is MASKED: this feeds the ops-console data browser,
+/// and even an operator should not see raw credentials here (a real "reveal" affordance, if ever
+/// added, should be its own explicit, individually audited action).
 fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
     let mut projects: Vec<Value> = c
         .projects
@@ -16452,19 +16661,10 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
     let wf_defs: Vec<Value> = c.workflows.defs().into_iter().map(|d| json!(d)).collect();
 
     vec![
-        // Fleet-aggregated: this operator data browser runs on ONE node, but the
-        // placement scheduler hosts a project's deployments on peer nodes, so a
-        // bare `c.gw.list()` (locally-hosted only) showed "0 deployments" here
-        // while every deployment lived on a peer. Merge the gossiped
-        // peer_deployments (deduped by id) exactly as the tenant-facing
-        // `dep_list` does — the ops view spans ALL tenants (operator-only).
         ("deployments", fleet_deployments_all(c)),
         ("projects", projects),
         ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
         ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
-        // MASKED — this feeds the ops-console data browser; even an operator
-        // should not see raw credentials here (a real "reveal" affordance, if
-        // ever added, should be its own explicit, individually-audited action).
         ("databases", c.databases.list(None).into_iter().map(|d| json!(d)).collect()),
         ("domains", c.domains.snapshot().into_iter().map(|d| json!(d)).collect()),
         ("secure_links", c.securelinks.all().into_iter().map(|l| json!(l)).collect()),
@@ -16523,7 +16723,6 @@ async fn guardian_status(
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let mut keys = crate::guardian::keys().await;
     keys.sort();
-    // Round-trip the first key to prove reads come back from GuardianDB itself.
     let sample = match keys.first() {
         Some(k) => crate::guardian::get(k)
             .await
@@ -16551,7 +16750,6 @@ async fn data_collections(
         .into_iter()
         .map(|(name, rows)| json!({ "name": name, "count": rows.len(), "editable": false }))
         .collect();
-    // Editable document collections (full CRUD).
     for (name, count) in c.docs.collections() {
         cols.push(json!({ "name": name, "count": count, "editable": true }));
     }
@@ -16613,7 +16811,6 @@ async fn data_create(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Don't let custom docs shadow a typed platform collection.
     if all_collections(&c).iter().any(|(n, _)| *n == collection) {
         return Err((StatusCode::CONFLICT, format!("'{collection}' is a managed collection — create custom docs in a new collection name")));
     }
@@ -16644,7 +16841,10 @@ async fn data_patch(
     Ok(Json(json!(doc)))
 }
 
-/// Delete a row: a custom document, or a typed entry via its owning store.
+/// Deletes a row: a custom document, or a typed entry via its owning store. A deployment row
+/// releases the project's raw ports when it was the project's last deployment, as `dep_delete`
+/// does; a database row purges its queue/vector namespaces under the RECORD's own owning team (not
+/// the operator's tenant), so the purge targets the correct tenant.
 async fn data_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16662,7 +16862,6 @@ async fn data_delete(
     let ok = match collection.as_str() {
         "deployments" => match c.gw.remove(&id).await {
             Some(p) => {
-                // Same last-deployment raw-port release as `dep_delete`.
                 if !c.gw.list().iter().any(|d| d.project == p) {
                     let _ = crate::raw_ports::release_raw_ports_coordinated(&c, &p).await;
                 }
@@ -16671,8 +16870,6 @@ async fn data_delete(
             None => false,
         },
         "databases" => {
-            // Use the RECORD's own owning team (not the operator's `t`) so the
-            // queue/vector namespace purge targets the correct tenant.
             let owner = c
                 .databases
                 .get_raw(&id)
@@ -16686,7 +16883,7 @@ async fn data_delete(
             true
         }
         "webhooks" => {
-            c.webhooks.remove(&id);
+            c.webhooks.remove(crate::webhooks::Scope::Operator, &id);
             true
         }
         _ => {
@@ -16704,16 +16901,13 @@ async fn data_delete(
     Ok(Json(json!({ "deleted": id })))
 }
 
-// ============================ Data Browser: "view as PostgreSQL" ============================
-// An alternative, READ-ONLY view of the relational mirror built on guardian-db's
-// native SQL layer (crates/hive-cloud/src/relational.rs) — real typed tables
-// (project_teams, billing_*) instead of the document-collection JSON browsing
-// above. Deliberately a separate, narrower surface: no PUT/POST/DELETE here at
-// all (see relational::reject_unless_readonly) — mutations to this data still
-// only ever happen through the normal typed stores (ProjectStore/BillingStore),
-// never through this admin query box.
-
-/// List the known relational tables + their columns.
+/// Lists the known relational tables and their columns. The "view as PostgreSQL" data browser is an
+/// alternative, READ-ONLY view of the relational mirror built on guardian-db's native SQL layer
+/// (`relational.rs`): real typed tables (`project_teams`, `billing_*`) instead of the
+/// document-collection JSON browsing above. It is deliberately a separate, narrower surface with no
+/// PUT/POST/DELETE at all (see `relational::reject_unless_readonly`): mutations to this data still
+/// only happen through the normal typed stores (ProjectStore/BillingStore), never through this
+/// admin query box.
 async fn sql_tables(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -16731,10 +16925,11 @@ struct SqlQueryBody {
     table: Option<String>,
 }
 
-/// Run a read-only query against the relational mirror: either a caller-typed
-/// `sql` (SELECT/read-only WITH only — enforced in relational.rs, not just
-/// here), or a `table` name for the default `SELECT * FROM <table> LIMIT 200`
-/// the table-browser view uses. Exactly one of the two is expected.
+/// Runs a read-only query against the relational mirror: either a caller-typed `sql`
+/// (SELECT/read-only WITH only, enforced in `relational.rs`, not just here) or a `table` name for
+/// the default `SELECT * FROM <table> LIMIT 200` the table-browser view uses. Exactly one of the
+/// two is expected. A statement that does not finish inside the mirror's budget answers a retryable
+/// 503 (it was accepted and validated), never a 400.
 async fn sql_query(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(body): Json<SqlQueryBody>,
@@ -16759,20 +16954,27 @@ async fn sql_query(
     crate::relational::run_readonly_query(&sql)
         .await
         .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
+        .map_err(|e| {
+            if e.contains("timed out") {
+                (StatusCode::SERVICE_UNAVAILABLE, e)
+            } else {
+                (StatusCode::BAD_REQUEST, e)
+            }
+        })
 }
 
-// ============================ Deployment preview / thumbnail ============================
-
-/// Preview metadata for a project's production deployment: a site thumbnail for
-/// frontends, or the JSON/text body for backend services.
+/// Preview metadata for a project's production deployment: a site thumbnail for frontends, or the
+/// JSON/text body for backend services (fetched from "/" through the gateway). Another tenant's app
+/// content is never rendered as a preview. `c.gw.list()` is LOCALLY-hosted deployments only and
+/// most projects are placed on a peer, so with no local deployment it proxies to the hosting node
+/// like the sibling deployment reads, or the project page would show a permanently empty preview
+/// card on every node but the host.
 pub(crate) async fn project_preview(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Json<Value> {
-    // Don't render another tenant's app content as a preview.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return Json(json!({ "kind": "none" }));
@@ -16783,10 +16985,6 @@ pub(crate) async fn project_preview(
             .find(|d| d.project == project && d.production)
             .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
-        // `c.gw.list()` is LOCALLY-hosted deployments only. Most projects are
-        // placed on a peer, so without this the project page showed a
-        // permanently empty preview card on every node but the host. Sibling
-        // deployment reads here already proxy the same way.
         if let Some(node) = host_node_for_project(&c, &project) {
             if let Some(v) = fetch_from_host(
                 &c,
@@ -16810,10 +17008,8 @@ pub(crate) async fn project_preview(
             "alias": alias,
         }));
     }
-    // Backend service: fetch "/" through the gateway and return the body.
     let base = c.public_base.clone();
-    let resp = c
-        .http
+    let resp = hive_outbound::same_origin_client()
         .get(format!("{base}/"))
         .header("host", &alias)
         .send()
@@ -16859,8 +17055,13 @@ pub(crate) fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// A PNG thumbnail of the deployed site, captured with headless Chrome and
-/// cached per deployment. Falls back to a generated SVG card if capture fails.
+/// A PNG thumbnail of the deployed site, captured with headless Chrome and cached per deployment;
+/// it falls back to a generated SVG card if capture fails. It mirrors `project_preview`'s ownership
+/// check (another tenant's app content is never rendered as a preview; this handler independently
+/// captures and serves the image bytes, and once had no check at all, which also bypassed
+/// `preview_protection` for a password-gated project). Like the preview it only sees locally hosted
+/// deployments and the PNG cache lives under this node's own data dir, so a remotely placed project
+/// proxies the bytes from the hosting node instead of 404ing on every node but the host.
 async fn project_thumbnail(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -16868,10 +17069,6 @@ async fn project_thumbnail(
     Path(project): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // Don't render another tenant's app content as a preview — mirrors the
-    // check `project_preview` already performs; this handler independently
-    // captures/serves the actual image bytes and previously had no check at
-    // all (also bypassing `preview_protection` for a password-gated project).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !project_owned_by(&c, &project, &t) {
         return (StatusCode::NOT_FOUND, "no deployment").into_response();
@@ -16882,9 +17079,6 @@ async fn project_thumbnail(
             .find(|d| d.project == project && d.production)
             .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
-        // Locally-hosted deployments only (see `project_preview`), and the PNG
-        // cache below lives under this node's own data dir — so a remotely
-        // placed project 404'd its thumbnail on every node but the host.
         if let Some(node) = host_node_for_project(&c, &project) {
             let path = format!("/v1/projects/{}/thumbnail", urlencode(&project));
             if let Some(b) = fetch_bytes_from_host(&c, &node, &path, &t).await {
@@ -16917,16 +17111,18 @@ async fn project_thumbnail(
         )
             .into_response();
     }
-    // Fallback: a simple SVG placeholder card.
     let svg = thumbnail_placeholder(&project);
     ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
 }
 
+/// Gateway port the thumbnail capture dials when `HIVE_PUBLIC_PORT` is unset: the default of the
+/// local mesh.
+const THUMBNAIL_GATEWAY_PORT_DEFAULT: &str = "8787";
+
 /// Capture a screenshot of `http://<alias>:<gateway-port>/` with headless Chrome.
 async fn capture_thumbnail(alias: &str, out: &std::path::Path) -> anyhow::Result<()> {
-    // The gateway serves on the public port; derive it from public_base later if
-    // needed — default 8787 for the local mesh.
-    let port = std::env::var("HIVE_PUBLIC_PORT").unwrap_or_else(|_| "8787".into());
+    let port =
+        std::env::var("HIVE_PUBLIC_PORT").unwrap_or_else(|_| THUMBNAIL_GATEWAY_PORT_DEFAULT.into());
     let url = format!("http://{alias}:{port}/");
     let chrome = chrome_path();
     let status = tokio::time::timeout(

@@ -1,15 +1,8 @@
-//! Live-witness harness for `bn-impl-protocol-handler`: bind a real hive-p2p
-//! endpoint (BOTH ALPNs, per the crate's own `bind_full`), print its
-//! `addr_json`, and serve `hive/tunnel/0` + `hive/browser/0` until killed.
-//! Not part of any production binary — a throwaway proof that the FLEET
-//! accept-loop code (not just hive-browser's own wasm accept loop) really
-//! answers `hive/browser/0` echo requests from a real browser tab.
-//!
-//! Usage (serve):
-//! `HIVE_RELAY_URLS=http://<relay-ip>:3340 cargo run --example browser_echo_native`
-//!
-//! Usage (invoke a browser): set `HIVE_BROWSER_ADDR`, `HIVE_BROWSER_DIGEST`,
-//! and `HIVE_BROWSER_REQUEST`; the process prints the exact reply and exits.
+//! Live-witness harness: bind a real hive-p2p endpoint (both ALPNs via `bind_full`), print its
+//! `addr_json`, and serve `hive/tunnel/0` + `hive/browser/0` until killed, or drive one of the
+//! browser-node audit scenarios named by its first argument. Serve:
+//! `HIVE_RELAY_URLS=http://<relay-ip>:3340 cargo run --example browser_echo_native`; invoke a
+//! browser with `HIVE_BROWSER_ADDR`, `HIVE_BROWSER_DIGEST`, `HIVE_BROWSER_REQUEST`.
 
 use hive_browser_proto::{encode_request, Op};
 
@@ -25,21 +18,6 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(std::path::PathBuf::from);
     let ep = hive_p2p::bind_full(key_path, &[], &[], false).await?;
-    // `ep.addr()` right after bind() serializes whatever's registered so far —
-    // for a fresh endpoint that's local network interface candidates only; the
-    // relay entry lands asynchronously once the home-relay connection comes
-    // up. A browser peer cannot dial raw IP transport at all (compiled out;
-    // relay-only), so printing addr_json before `online()` resolves hands out
-    // an EndpointAddr with real-but-useless entries and no relay hint at all —
-    // exactly the shape that made the browser's connect() time out here.
-    //
-    // BOUNDED, not awaited forever: `online()` only resolves once net_report
-    // has selected a HOME relay, which never happens when every relay in the
-    // map fails its `/ping` probe (e.g. a plaintext http:// URL pointed at a
-    // relay whose TLS config moved all services to the https socket). An
-    // OUTBOUND dial doesn't need a home relay at all (the dial opens an
-    // on-demand relay connection for the peer's own relay URL), so hanging
-    // here both blocked every dial-mode witness and hid the distinction.
     match tokio::time::timeout(std::time::Duration::from_secs(20), ep.online()).await {
         Ok(()) => println!("NATIVE_ONLINE:home-relay"),
         Err(_) => println!("NATIVE_ONLINE:timeout(no home relay selected)"),
@@ -59,12 +37,6 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(15_000);
         let wait = std::time::Duration::from_millis(wait_ms);
         match mode.as_str() {
-            // Row audit-browser-truncation-reset, write-failure arm: send a valid
-            // request then stop reading before the peer writes; the peer's reply
-            // write fails and its reject must still stop our send half with a
-            // protocol code (HANDLER_FAILED), not a silent drop. Use the invoke
-            // op against a granted digest whose handler is deliberately slow, so
-            // the stop deterministically lands before the reply write.
             "stop-reading" => {
                 let conn = ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?;
                 let (mut send, mut recv) = conn.open_bi().await?;
@@ -85,15 +57,6 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // Row audit-browser-idle-connection-capacity loop 1: N concurrent
-            // exact-one-MiB Invoke frames on ONE connection, matching the
-            // original production workload that produced whole-connection
-            // "browser connection idle" failures. Per-stage timeouts track the
-            // browser's own 60-second no-progress shape instead of the
-            // production pool's 10-second budgets, so a slow last-mile link can
-            // still exercise the browser node's idle policy. Every call must
-            // succeed; any stream-level reset must carry a protocol code; the
-            // connection must NOT be closed by the peer at the end.
             "one-mib-workload" => {
                 let streams = std::env::var("HIVE_BROWSER_RAW_WORKLOAD_STREAMS")
                     .ok()
@@ -160,17 +123,12 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            // Plain valid echo: prints ECHO_REPLY on success. The fairness probe
-            // used while a sibling process saturates its own per-endpoint budget.
             "echo" => {
                 let conn = ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?;
                 let body = echo_roundtrip(&conn).await?;
                 println!("ECHO_REPLY:{}", String::from_utf8_lossy(&body));
                 return Ok(());
             }
-            // Row audit-native-browser-frame-lifecycle: an endpoint may hold 4
-            // connections; the 5th must be closed by the application with
-            // OVERLOADED rather than served.
             "conn-cap" => {
                 let mut conns = Vec::new();
                 for _ in 0..4 {
@@ -195,7 +153,6 @@ async fn main() -> anyhow::Result<()> {
                     Ok(other) => println!("CONN_CAP_FIFTH_CLOSE_OTHER:{other:?}"),
                     Err(_) => println!("CONN_CAP_FIFTH_CLOSE:pending"),
                 }
-                // The four held connections must still serve traffic.
                 let body = echo_roundtrip(&conns[0]).await?;
                 println!(
                     "CONN_CAP_HELD_ECHO_REPLY:{}",
@@ -203,9 +160,6 @@ async fn main() -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // Row audit-browser-idle-connection-capacity loop 2: one small echo,
-            // then keep the connection open with no active streams and observe
-            // the peer's application close code + timing, then reconnect.
             "echo-idle-watch" => {
                 let conn = ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?;
                 echo_roundtrip(&conn).await?;
@@ -229,11 +183,6 @@ async fn main() -> anyhow::Result<()> {
                 println!("IDLE_RECONNECT_REPLY:ok");
                 return Ok(());
             }
-            // Rows audit-browser-stream-fairness / audit-browser-quic-receive-bounds:
-            // hold N stalled partial-body streams on one connection, then probe
-            // with a valid echo on a SECOND connection (per-endpoint budget must
-            // refuse it while the fair share is saturated) and optionally a 9th
-            // stream on the SAME connection after the stalled set is released.
             "stall-streams" => {
                 let stall_count = std::env::var("HIVE_BROWSER_RAW_STALL_STREAMS")
                     .ok()
@@ -247,8 +196,6 @@ async fn main() -> anyhow::Result<()> {
                 let mut held = Vec::new();
                 for _ in 0..stall_count {
                     let (mut send, recv) = conn.open_bi().await?;
-                    // Declare total_len=3 (op + 2 payload), send op + 1 payload
-                    // byte, then hold the stream open without finishing.
                     send.write_all(&[3, 0, 0, 0, 0, b'x']).await?;
                     held.push((send, recv));
                 }
@@ -285,12 +232,9 @@ async fn main() -> anyhow::Result<()> {
                         Ok(Err(error)) => println!("STALL_STREAM_{index}_STOPPED_ERR:{error}"),
                         Err(_) => println!("STALL_STREAM_{index}_STOPPED:pending"),
                     }
-                    // Release the slot client-side so a fresh stream must be admitted.
                     let _ = send.reset(0u32.into());
                 }
                 println!("STALL_STREAMS_RELEASED");
-                // Row audit-browser-quic-receive-bounds: after capacity frees, a
-                // new stream on the SAME connection must proceed normally.
                 tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
                 match echo_roundtrip(&conn).await {
                     Ok(body) => {
@@ -300,8 +244,6 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            // Row audit-browser-echo-reserved-capacity: continuous unauthenticated
-            // echo load, replies deliberately never read, across 4 connections.
             "echo-load" => {
                 let duration_ms = std::env::var("HIVE_BROWSER_RAW_LOAD_MS")
                     .ok()
@@ -340,9 +282,6 @@ async fn main() -> anyhow::Result<()> {
                     tasks.push(tokio::spawn(async move {
                         let wrote = send.write_all(&frame).await.is_ok() && send.finish().is_ok();
                         let stopped = send.stopped().await;
-                        // The reply is deliberately NEVER read; hold the receive
-                        // half so the server sees backpressure-free delivery into
-                        // this client's flow-control window, not a STOP_SENDING.
                         drop(recv);
                         (wrote, stopped.ok().flatten().map(|code| code.into_inner()))
                     }));
@@ -456,9 +395,6 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    // The 1 MiB exact-frame capacity witness needs a request body larger than
-    // ARG_MAX allows in an environment variable, so the request may come from a
-    // file instead.
     let request_from_file = match std::env::var("HIVE_BROWSER_REQUEST_FILE") {
         Ok(path) => Some(std::fs::read_to_string(path)?),
         Err(_) => None,
@@ -667,15 +603,11 @@ async fn main() -> anyhow::Result<()> {
         "NATIVE_ADDR_JSON:{}",
         hive_p2p::addr_json(&ep).unwrap_or_default()
     );
-    // serve_tunnels(local_http, ...) needs SOME local_http target for HIVE_ALPN
-    // traffic; irrelevant here since only hive/browser/0 is exercised.
     hive_p2p::serve_tunnels(ep, "http://127.0.0.1:1".into(), 32, None, None).await;
     Ok(())
 }
 
-/// One complete valid echo request/response on a fresh bi stream of `conn`:
-/// writes `[u32 le len][op][payload]`, finishes, then reads the exact framed
-/// reply. Shared by the idle-watch and reconnection witnesses.
+/// One complete valid echo request/response on a fresh bi stream of `conn`.
 async fn echo_roundtrip(conn: &iroh::endpoint::Connection) -> anyhow::Result<Vec<u8>> {
     let (mut send, mut recv) = conn.open_bi().await?;
     let frame = encode_request(Op::Echo, b"idle-watch");

@@ -1,28 +1,17 @@
 import Link from "next/link";
 import type { Metadata } from "next";
+import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { Mail, MessageSquare, Building2 } from "lucide-react";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 
-export const metadata: Metadata = {
-  title: "Contact — shadw",
+export const metadata: Metadata = pageMeta({
+  title: "Contact",
+  socialTitle: "Contact — shadw",
   description:
-    "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
-  alternates: { canonical: "/contact" },
-  openGraph: {
-    title: "Contact — shadw",
-    description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
-    url: "/contact",
-    type: "website",
-    siteName: "shadw",
-  },
-  twitter: {
-    card: "summary_large_image",
-    title: "Contact — shadw",
-    description:
-      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise, or send us a message.",
-  },
-};
+    "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email.",
+  path: "/contact",
+});
+export const viewport = darkViewport;
 
 
 export default function ContactPage() {
@@ -41,8 +30,8 @@ export default function ContactPage() {
       <MarketingSection className="grid gap-6 py-16 md:grid-cols-3">
         {[
           { icon: MessageSquare, title: "Sales", desc: "Talk through your use case and self-hosting plan.", cta: "sales@shadw.cloud" },
-          { icon: Mail, title: "Support", desc: "Get help with deployments, domains, or the mesh.", cta: "support@shadw.cloud" },
-          { icon: Building2, title: "Enterprise", desc: "Data residency, SSO, audit logs and SLAs.", cta: "enterprise@shadw.cloud" },
+          { icon: Mail, title: "Support", desc: "Email support for Pro and Enterprise; Hobby has community support.", cta: "support@shadw.cloud" },
+          { icon: Building2, title: "Enterprise", desc: "Multi-region fail-over, SAML SSO and priority support.", cta: "enterprise@shadw.cloud" },
         ].map((c) => (
           <GlowCard key={c.title}>
             <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-white/5">
@@ -50,7 +39,7 @@ export default function ContactPage() {
             </div>
             <div className="mt-4 text-lg font-semibold text-white">{c.title}</div>
             <p className="mt-2 text-sm text-zinc-400">{c.desc}</p>
-            <a href={`mailto:${c.cta}`} className="mt-4 inline-block text-sm font-medium text-emerald-300 hover:underline">
+            <a href={`mailto:${c.cta}`} className="tap-44 mt-4 inline-flex items-center text-sm font-medium text-emerald-300 hover:underline">
               {c.cta}
             </a>
           </GlowCard>
@@ -58,21 +47,7 @@ export default function ContactPage() {
       </MarketingSection>
 
       <MarketingSection className="pb-24">
-        <GlowCard className="mx-auto max-w-2xl">
-          <h2 className="text-2xl font-bold tracking-tight text-white">Send us a message</h2>
-          <p className="mt-2 text-sm text-zinc-400">We typically reply within one business day.</p>
-          <div className="mt-6 grid gap-4 sm:grid-cols-2">
-            <input placeholder="Name" className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm text-white outline-none placeholder:text-zinc-500 focus:border-white/30" />
-            <input placeholder="Work email" className="rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm text-white outline-none placeholder:text-zinc-500 focus:border-white/30" />
-          </div>
-          <textarea placeholder="How can we help?" rows={4} className="mt-4 w-full rounded-lg border border-white/15 bg-white/5 px-4 py-2.5 text-sm text-white outline-none placeholder:text-zinc-500 focus:border-white/30" />
-          <div className="mt-5 flex items-center justify-between">
-            <Link href="/" className="text-sm text-zinc-500 hover:text-zinc-300">← Back to home</Link>
-            <button className="inline-flex items-center gap-2 rounded-full bg-emerald-400 px-6 py-3 text-sm font-semibold text-black transition-transform hover:scale-[1.03]">
-              Send message
-            </button>
-          </div>
-        </GlowCard>
+        <Link href="/" className="tap-44 inline-flex items-center text-sm text-zinc-500 hover:text-zinc-300">← Back to home</Link>
       </MarketingSection>
     </MarketingShell>
   );

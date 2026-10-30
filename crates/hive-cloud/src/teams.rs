@@ -1,9 +1,9 @@
-//! Teams — the top-level ownership/tenancy unit. Every project belongs to a
-//! team; access to previews and dashboards is gated by team membership. This
-//! mirrors Vercel/Railway's team model (owner > admin > member > viewer).
+//! Teams: the top-level ownership/tenancy unit. Every project belongs to a team, and access to
+//! previews and dashboards is gated by team membership, mirroring Vercel/Railway's team model
+//! (owner > admin > member > viewer).
 //!
-//! Membership is keyed by email so it lines up with Clerk identities in the UI.
-//! The store is in-memory + persisted via the platform snapshot.
+//! Membership is keyed by email so it lines up with Clerk identities in the UI. The store is
+//! in-memory and persisted via the platform snapshot.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -32,6 +32,99 @@ impl Role {
     pub fn can_view(&self) -> bool {
         true
     }
+}
+
+/// What [`TeamStore::remove_plain_member`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberRemoval {
+    /// A Member or Viewer was removed.
+    Removed,
+    /// Nobody by that email is on the roster.
+    Absent,
+    /// The email is an Owner or Admin: nothing was changed.
+    Privileged,
+}
+
+/// Why a roster change was refused ([`TeamStore::set_member_role`],
+/// [`TeamStore::remove_member_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterRefusal {
+    /// The change touches a member whose role is above the actor's, or grants a role above it.
+    AboveActor,
+    /// The change would remove or demote the team's last Owner.
+    LastOwner,
+    /// No such team.
+    NoTeam,
+    /// The email is not one: empty, over-long or carrying a control character ([`roster_email`]).
+    BadEmail,
+}
+
+/// The roster key of an email: trimmed, `None` when nothing usable is left (empty, over 320 bytes,
+/// a control character). Such a string is never a member, whatever the request claims: a leading
+/// space once made a GHOST row beside the real member, and an empty email took a seat.
+pub fn roster_email(raw: &str) -> Option<&str> {
+    let email = raw.trim();
+    (!email.is_empty() && email.len() <= 320 && !email.chars().any(char::is_control))
+        .then_some(email)
+}
+
+/// Whether two roster emails name the same person: trimmed and case-insensitive.
+fn same_person(a: &str, b: &str) -> bool {
+    a.trim().to_lowercase() == b.trim().to_lowercase()
+}
+
+/// The one rule every roster change obeys, whoever makes it: nobody changes or removes a member of
+/// a higher role than their own, nobody grants a role above their own, and the last Owner is never
+/// removed or demoted (by an owner, by themselves or by a platform operator). `current` is the
+/// target's role now (`None` for a new member), `new` its role afterwards (`None` for a removal).
+/// Equal rank is allowed: an admin may change another admin.
+fn check_roster_change(
+    team: &Team,
+    actor: Role,
+    current: Option<Role>,
+    new: Option<Role>,
+) -> Result<(), RosterRefusal> {
+    if current.is_some_and(|role| role.rank() > actor.rank())
+        || new.is_some_and(|role| role.rank() > actor.rank())
+    {
+        return Err(RosterRefusal::AboveActor);
+    }
+    let owners = team
+        .members
+        .iter()
+        .filter(|member| member.role == Role::Owner)
+        .count();
+    if current == Some(Role::Owner) && new != Some(Role::Owner) && owners <= 1 {
+        return Err(RosterRefusal::LastOwner);
+    }
+    Ok(())
+}
+
+/// [`check_roster_change`] for a REMOVAL, which may delete several rows (one person stored twice: a
+/// ghost row an older build left beside the real member): every row it deletes is authorised, never
+/// just the first. `removed` holds the role of each row about to go: nobody removes a member above
+/// their own role, and the last Owner is never removed (the rows removed may not include every
+/// Owner the team has).
+fn check_roster_removal(team: &Team, actor: Role, removed: &[Role]) -> Result<(), RosterRefusal> {
+    if removed.iter().any(|role| role.rank() > actor.rank()) {
+        return Err(RosterRefusal::AboveActor);
+    }
+    let owners = team
+        .members
+        .iter()
+        .filter(|member| member.role == Role::Owner)
+        .count();
+    let owners_removed = removed.iter().filter(|role| **role == Role::Owner).count();
+    if owners_removed > 0 && owners <= owners_removed {
+        return Err(RosterRefusal::LastOwner);
+    }
+    Ok(())
+}
+
+/// What [`TeamStore::remove_checked`] did to a member that passed the rule.
+enum Removal {
+    Removed,
+    Absent,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -63,9 +156,9 @@ pub struct Team {
     /// `0` is a legacy row and is never promoted merely by loading it.
     #[serde(default)]
     pub updated_ms: u64,
-    /// A locally-created availability fallback, not authoritative tenant state.
-    /// It never crosses a persistence or replication boundary, so an older
-    /// binary cannot strip provenance and relay the placeholder as real.
+    /// A locally created availability fallback, not authoritative tenant state. It never crosses a
+    /// persistence or replication boundary, so an older binary cannot strip provenance and relay
+    /// the placeholder as real.
     #[serde(skip)]
     pub(crate) synthetic_seed: bool,
 }
@@ -74,9 +167,13 @@ fn default_plan() -> String {
 }
 
 impl Team {
+    /// The member with this email, matched trimmed and case-insensitively ([`same_person`]); an
+    /// empty email is nobody (a ghost row with an empty email must never answer "is a member").
     pub fn member(&self, email: &str) -> Option<&Member> {
-        let e = email.to_lowercase();
-        self.members.iter().find(|m| m.email.to_lowercase() == e)
+        if email.trim().is_empty() {
+            return None;
+        }
+        self.members.iter().find(|m| same_person(&m.email, email))
     }
 }
 
@@ -96,8 +193,8 @@ struct TeamState {
 }
 
 pub struct TeamStore {
-    // Rows and tombstones share one lock so no snapshot can observe the gap
-    // between removing a row and recording why it is absent.
+    /// Rows and tombstones share one lock so no snapshot can observe the gap between removing a row
+    /// and recording why it is absent.
     state: RwLock<TeamState>,
 }
 
@@ -105,10 +202,11 @@ fn time_ceiling(now: u64) -> u64 {
     now.saturating_add(hive_edge::region::MAX_GOSSIP_FUTURE_SKEW_MS * 2)
 }
 
+/// The next causal version of a row: a Lamport floor with wall-clock readability (never below the
+/// wall clock, the previous version or the tombstone), not a wall-clock timestamp that may move
+/// backward. Remote future values are rejected at ingress (`time_ceiling`), and a generation held
+/// locally is never rebased down.
 fn next_version(previous: u64, tombstone: u64) -> u64 {
-    // This is a Lamport floor with wall-clock readability, not a wall-clock
-    // timestamp that may move backward. Remote future values are rejected at
-    // ingress; once a generation is held locally it must never be rebased down.
     now_ms()
         .max(previous.saturating_add(1))
         .max(tombstone.saturating_add(1))
@@ -122,10 +220,9 @@ fn tie_break_take(local: &Team, remote: &Team) -> bool {
     }
 }
 
-/// Synthetic boot availability must never outrank real tenant state, including
-/// a legacy real row whose causal version is still zero. Within one provenance
-/// class, generation then canonical whole-row bytes form the deterministic
-/// total order used by every observer.
+/// Synthetic boot availability must never outrank real tenant state, including a legacy real row
+/// whose causal version is still zero. Within one provenance class, generation then canonical
+/// whole-row bytes form the deterministic total order every observer uses.
 fn row_take(local: &Team, remote: &Team) -> bool {
     match (local.synthetic_seed, remote.synthetic_seed) {
         (true, false) => true,
@@ -216,12 +313,12 @@ impl TeamStore {
         self.state.read().teams.clone()
     }
 
+    /// The replicated snapshot: live rows plus tombstones. The synthetic personal seed is a
+    /// node-local availability placeholder and is never published, since an older peer would ignore
+    /// the provenance field and could relay it back as authoritative real tenant state.
     pub fn snapshot_synced(&self) -> SyncedTeams {
         let state = self.state.read();
         SyncedTeams {
-            // Synthetic personal is a node-local availability placeholder. Never
-            // publish it: an older peer would ignore the provenance field and
-            // could relay it back as authoritative real tenant state.
             rows: state
                 .teams
                 .iter()
@@ -262,16 +359,15 @@ impl TeamStore {
             .retain(|slug, team| survives_tombstone(team, tombstones.get(slug).copied()));
     }
 
-    /// Per-team generation merge for live gossip. Absence never deletes; a
-    /// tombstone at or after a row does. Implausibly future live inputs are
-    /// refused at this ingress boundary.
+    /// Per-team generation merge for live gossip. Absence never deletes; a tombstone at or after a
+    /// row does. Implausibly future live inputs are refused at this ingress boundary.
     pub fn merge_synced(&self, remote: SyncedTeams) -> usize {
         self.merge(remote, false)
     }
 
-    /// Merge a previously durable snapshot. Already-held Lamport generations
-    /// remain valid across a local wall-clock rollback and must not be rebased
-    /// or discarded merely because they now look future-dated.
+    /// Merges a previously durable snapshot. Already-held Lamport generations remain valid across a
+    /// local wall-clock rollback and must not be rebased or discarded merely because they now look
+    /// future-dated.
     pub fn merge_recovered(&self, remote: SyncedTeams) -> usize {
         self.merge(remote, true)
     }
@@ -331,13 +427,13 @@ impl TeamStore {
         changed
     }
 
+    /// Creates a team owned by `owner_email`. The slug is `slugify(name)`, extended with a nonce
+    /// and then a sequence until it is unique among LIVE rows, so an insert can never overwrite an
+    /// existing aggregate (the old one-shot `% 10000` suffix could collide).
     pub fn create(&self, name: &str, plan: &str, owner_email: &str) -> Team {
         let base = slugify(name);
         let mut slug = base.clone();
         let mut state = self.state.write();
-        // Ensure unique among LIVE rows. The old one-shot `% 10000` suffix
-        // could collide and overwrite an existing aggregate. Keep extending a
-        // deterministic candidate until insertion is provably non-destructive.
         if state.teams.contains_key(&slug) {
             let nonce = now_ms() % 10000;
             slug = format!("{base}-{nonce}");
@@ -437,16 +533,30 @@ impl TeamStore {
         Some(team)
     }
 
-    pub fn add_member(&self, slug: &str, email: &str, role: Role) -> Option<Team> {
+    /// Sets `email`'s role to `role`, adding the member when absent, on behalf of a person acting
+    /// as `actor`, under one lock and under [`check_roster_change`]: an actor may not change a
+    /// member above their own role or grant a role above it, and the last Owner stays. An unchanged
+    /// role is a no-op. This and [`Self::remove_member_as`] are the ONLY roster writes a person's
+    /// request reaches (there is no unchecked `add_member`/`remove_member`), so every membership
+    /// mutation path obeys the one rule.
+    pub fn set_member_role(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+        role: Role,
+    ) -> Result<Team, RosterRefusal> {
+        let email = roster_email(email).ok_or(RosterRefusal::BadEmail)?;
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
-        let team = state.teams.get_mut(slug)?;
-        let email_lower = email.to_lowercase();
+        let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
+        let current = team.member(email).map(|member| member.role);
+        check_roster_change(team, actor, current, Some(role))?;
         let mut changed = false;
         if let Some(existing) = team
             .members
             .iter_mut()
-            .find(|member| member.email.to_lowercase() == email_lower)
+            .find(|member| same_person(&member.email, email))
         {
             if existing.role != role {
                 existing.role = role;
@@ -465,22 +575,116 @@ impl TeamStore {
             team.synthetic_seed = false;
             team.updated_ms = next_version(team.updated_ms, tombstone);
         }
-        Some(team.clone())
+        Ok(team.clone())
     }
 
-    pub fn remove_member(&self, slug: &str, email: &str) -> Option<Team> {
+    /// Adds `email` as `role` ONLY when nobody on the roster has it (case-insensitive), under one
+    /// lock, and returns the team plus whether a member was added. An existing member keeps its role.
+    /// [`Self::set_member_role`] OVERWRITES an existing member's role: right for an explicit change
+    /// by a person, wrong for a routine sync. Everything that mirrors an external directory into the
+    /// roster (SCIM provisioning, SAML auto-provision, the Clerk org mirror in `identity_sync`) adds
+    /// through this, so a directory entry can never demote an owner or admin or promote a viewer.
+    pub fn add_member_if_absent(
+        &self,
+        slug: &str,
+        email: &str,
+        role: Role,
+    ) -> Option<(Team, bool)> {
         let mut state = self.state.write();
         let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
         let team = state.teams.get_mut(slug)?;
-        let email_lower = email.to_lowercase();
-        let before = team.members.len();
-        team.members
-            .retain(|member| member.email.to_lowercase() != email_lower);
-        if team.members.len() != before {
-            team.synthetic_seed = false;
-            team.updated_ms = next_version(team.updated_ms, tombstone);
+        let Some(email) = roster_email(email) else {
+            return Some((team.clone(), false));
+        };
+        if team.member(email).is_some() {
+            return Some((team.clone(), false));
         }
-        Some(team.clone())
+        team.members.push(Member {
+            email: email.to_string(),
+            role,
+            name: String::new(),
+            added_ms: now_ms(),
+        });
+        team.synthetic_seed = false;
+        team.updated_ms = next_version(team.updated_ms, tombstone);
+        Some((team.clone(), true))
+    }
+
+    /// Removes `email` on behalf of a person acting as `actor`, under one lock and under
+    /// [`check_roster_change`] (nobody removes a member above their own role, and the last Owner
+    /// stays). `Ok(None)` when nobody by that email is on the roster: nothing changed, so the caller
+    /// has nothing to purge or revoke.
+    pub fn remove_member_as(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+    ) -> Result<Option<Team>, RosterRefusal> {
+        self.remove_checked(slug, actor, email)
+            .map(|(team, removal)| matches!(removal, Removal::Removed).then_some(team))
+    }
+
+    /// Removes `email` ONLY when it is a plain member (Member or Viewer): the same rule as
+    /// [`Self::remove_member_as`] with a Member as the actor, so an Owner or Admin is left in place
+    /// ([`MemberRemoval::Privileged`]). A directory deprovisioning (SCIM PATCH/DELETE) must never
+    /// strip the people who run the team, that takes a person (`team_remove_member`). `None` when
+    /// the team does not exist.
+    pub fn remove_plain_member(&self, slug: &str, email: &str) -> Option<MemberRemoval> {
+        match self.remove_checked(slug, Role::Member, email) {
+            Ok((_, Removal::Removed)) => Some(MemberRemoval::Removed),
+            Ok((_, Removal::Absent)) => Some(MemberRemoval::Absent),
+            Err(RosterRefusal::NoTeam) => None,
+            Err(RosterRefusal::AboveActor | RosterRefusal::LastOwner) => {
+                Some(MemberRemoval::Privileged)
+            }
+            Err(RosterRefusal::BadEmail) => Some(MemberRemoval::Absent),
+        }
+    }
+
+    /// The one removal path: look the member up, authorise EVERY row it will delete
+    /// ([`check_roster_removal`]), drop them. The email is matched as [`same_person`], except that a
+    /// row stored under EXACTLY this string (case aside) wins: a ghost row an older build stored with
+    /// a stray space or no email can still be removed on its own, without taking the real member
+    /// beside it, and a request that matches two rows (the ghost AND the Owner) must pass the rule
+    /// for both.
+    fn remove_checked(
+        &self,
+        slug: &str,
+        actor: Role,
+        email: &str,
+    ) -> Result<(Team, Removal), RosterRefusal> {
+        let mut state = self.state.write();
+        let tombstone = state.tombstones.get(slug).copied().unwrap_or_default();
+        let team = state.teams.get_mut(slug).ok_or(RosterRefusal::NoTeam)?;
+        let exact = email.to_lowercase();
+        let blank = email.trim().is_empty();
+        let by_exact = team
+            .members
+            .iter()
+            .any(|member| member.email.to_lowercase() == exact);
+        let is_target = |member: &Member| {
+            if blank {
+                member.email.trim().is_empty()
+            } else if by_exact {
+                member.email.to_lowercase() == exact
+            } else {
+                same_person(&member.email, email)
+            }
+        };
+        let targets: Vec<Role> = team
+            .members
+            .iter()
+            .filter(|member| is_target(member))
+            .map(|member| member.role)
+            .collect();
+        if targets.is_empty() {
+            return Ok((team.clone(), Removal::Absent));
+        }
+        check_roster_removal(team, actor, &targets)?;
+        team.members.retain(|member| !is_target(member));
+        team.synthetic_seed = false;
+        team.updated_ms = next_version(team.updated_ms, tombstone);
+        Ok((team.clone(), Removal::Removed))
     }
 
     /// Is `email` a member of `slug` (for preview access control)?

@@ -41,7 +41,6 @@ function providerImg(provider?: string): string | null {
 
 const handleStyle = { width: 8, height: 8, background: "var(--rf-handle, #888)", border: "2px solid hsl(var(--card))" };
 
-/* ---- db / env helpers ---- */
 type AddKind = "postgres" | "redis" | "blob";
 
 /** The conventional env var name a given db kind populates. */
@@ -60,7 +59,7 @@ function envKeyForKind(kind?: string): string | null {
 function connString(db: Database): string {
   const c = db.connection || {};
   if (c.url) return c.url;
-  if (c.token) return c.token; // e.g. blob read/write token
+  if (c.token) return c.token;
   const host = c.host, port = c.port, user = c.user ?? c.username, pass = c.password ?? c.pass, name = c.database ?? c.db;
   if (host) {
     const scheme = db.kind === "redis" ? "redis" : db.kind === "postgres" ? "postgresql" : "db";
@@ -69,11 +68,9 @@ function connString(db: Database): string {
     const dbPart = name ? `/${name}` : "";
     return `${scheme}://${auth}${host}${portPart}${dbPart}`;
   }
-  // Nothing usable — reference the db by id so the platform can resolve it.
   return `@${db.id}`;
 }
 
-/* ---- custom nodes ---- */
 function IngressNode({ data }: { data: any }) {
   return (
     <div className="w-[230px] rounded-xl border border-border bg-card p-3 shadow-card">
@@ -158,8 +155,6 @@ type AdderOption = (typeof ADDER_OPTIONS)[number];
 function AdderNode({ data }: { data: any }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  // The option the user picked but has not yet confirmed. Nothing is provisioned
-  // until they click "Add & deploy" in the confirmation dialog.
   const [pending, setPending] = useState<AdderOption | null>(null);
 
   async function confirm() {
@@ -205,8 +200,6 @@ function AdderNode({ data }: { data: any }) {
         </div>
       ) : null}
 
-      {/* Confirmation gate — provisioning a resource is a real, committed change
-          (it mutates env + the GitOps config), so never auto-apply on a click. */}
       {pending ? (
         <div className="absolute left-0 top-full z-30 mt-1 w-[260px] overflow-hidden rounded-lg border border-border bg-card text-sm shadow-card">
           <div className="flex items-center gap-2 border-b border-border px-3 py-2.5 font-medium">
@@ -300,16 +293,12 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
   const { data: settings } = usePoll<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`, 10000);
   const { data: gitopsLink } = usePoll<GitOpsLink>("/v1/gitops", 30000);
   const gitops = !!(gitopsLink?.connected && gitopsLink?.repo);
-  // Intelligently-scanned service graph (Issue #2) — computed async on deploy. When
-  // present it drives the graph (app/framework, bundled front+back, packages,
-  // consumed databases); otherwise we fall back to the derived view below.
   const { data: sg } = usePoll<SvcGraph>(`/v1/projects/${encodeURIComponent(project)}/service-graph`, 15000);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const lastKey = useRef("");
   const rf = useRef<ReactFlowInstance | null>(null);
-  // Canvas locked by default (no pan/zoom/drag); unlock via the Controls lock button.
   const [locked, setLocked] = useState(true);
 
   const kind = prod?.kind ?? "static";
@@ -336,9 +325,7 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         });
       }
     } finally {
-      // Let the new resource node appear without waiting for the 6s poll.
       refreshDbs();
-      // Reflect the new resource in the committed GitOps config (no-op if unlinked).
       triggerGitopsSync();
     }
   }, [project, refreshDbs]);
@@ -350,7 +337,6 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     if (key === lastKey.current) return;
     lastKey.current = key;
 
-    // ---- Intelligent computed graph (Issue #2) ----
     const appNodesSg = (sg?.nodes ?? []).filter((n) => n.kind !== "ingress" && n.kind !== "database");
     const procLabel = kind === "container" ? "Container" : kind === "static" ? "Static Site" : "Web Process";
     if (sg && appNodesSg.length) {
@@ -362,7 +348,6 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         MySQL: "mysql", MongoDB: "mongo", Redis: "redis", "Upstash Redis": "redis", SQLite: "sqlite",
       };
       const provisionedKinds = new Set((dbs ?? []).map((d) => d.kind));
-      // A detected DB the user hasn't explicitly provisioned → show it (consumed).
       const detected = sgDbs.filter((n) => !provisionedKinds.has((techToKind[n.tech] || "") as never));
 
       const primaryNode = appNodesSg[0];
@@ -402,14 +387,12 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
       const es: Edge[] = [
         { id: "e-ingress", type: "smoothstep", source: "ingress", sourceHandle: "out", target: primary, targetHandle: "in", animated: true, style: { stroke: "#f5a623", strokeWidth: 2 } },
       ];
-      // Internal app↔app + app→package edges from the scan (skip ingress + deduped dbs).
       for (const e of sg.edges) {
         if (e.from === "ingress" || e.to === "ingress") continue;
         const okTarget = appNodesSg.some((a) => a.id === e.to) || detected.some((d) => d.id === e.to);
         if (!okTarget) continue;
         es.push({ id: `e-${e.from}-${e.to}`, type: "smoothstep", source: e.from, sourceHandle: serviceNodeSourceHandle(e.from), target: e.to, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
       }
-      // Provisioned resources hang off the primary app node.
       for (const c of conns) {
         es.push({ id: `e-res-${c.id}`, type: "smoothstep", source: primary, sourceHandle: serviceNodeSourceHandle(primary), target: `res-${c.id}`, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
       }
@@ -457,7 +440,6 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     ];
     setNodes(ns);
     setEdges(es);
-    // Refit (zoomed out 6%) once the (async-loaded) nodes are in place.
     setTimeout(() => rf.current && fitOut(rf.current), 80);
   }, [key, project, kind, prod, instances, memory, ddos, cdnActive, conns, gitops, sg, dbs, onAdd, setNodes, setEdges]);
 
@@ -478,8 +460,6 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         maxZoom={1.75}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{ animated: true, type: "smoothstep" }}
-        // Locked by default: no panning/zoom/drag until the user clicks the lock
-        // toggle in the Controls (which flips `locked` via onInteractiveChange).
         nodesConnectable={false}
         nodesDraggable={!locked}
         elementsSelectable={!locked}

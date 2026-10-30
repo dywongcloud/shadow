@@ -1,42 +1,34 @@
 #!/usr/bin/env bash
-# Acceptance / system test: the REAL `shadw` CLI against a REAL hive-cloud node,
-# end to end — through the actual control API, in-memory stores, and the on-disk
-# persistence layer (the "DB"). Hermetic: a throwaway node on isolated ports with
-# a temp data dir; deploys a local file:// repo (no network); cleans up on exit.
+# Acceptance test: the REAL `shadw` CLI against a REAL hive-cloud node (control API, in-memory stores, on-disk persistence).
+# Hermetic: a throwaway node on isolated ports with a temp data dir, a local file:// repo, cleanup on exit.
 #
 # Usage:  ./scripts/cli-acceptance.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 ADMIN=8899; PUBLIC=8898; DNS=5390; TLS=8490
+DB_TEARDOWN_TIMEOUT_SECS=25
 API="http://127.0.0.1:$ADMIN"
 DATA="$(mktemp -d)"
 REPO="$(mktemp -d)/acc-repo"
-HOMEDIR="$(mktemp -d)"     # isolated ~/.shadw for `shadw auth login`
+ISOLATED_HOME="$(mktemp -d)"
 SHADW=./target/debug/shadw
 NODE=./target/debug/hive-cloud
 PASS=0; FAIL=0; NODE_PID=""
 
-cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null; rm -rf "$DATA" "$REPO" "$HOMEDIR"; }
+cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null; rm -rf "$DATA" "$REPO" "$ISOLATED_HOME"; }
 trap cleanup EXIT
 
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
-# A FAIL prints the node's own log tail right there: CI keeps only stdout, so
-# without this a failed step ("alpha self-delete failed", 2026-09-02) has no
-# diagnosis at all and has to be re-run blind.
-bad()  {
-  echo "  FAIL: $1"; FAIL=$((FAIL+1))
-  if [ -f "$DATA/node.log" ]; then
-    echo "  --- node.log tail ---"
-    tail -n 20 "$DATA/node.log" | cut -c1-220 | sed 's/^/  | /'
-  fi
+print_node_log_tail() {
+  [ -f "$DATA/node.log" ] || return 0
+  echo "  --- node.log tail ---"
+  tail -n 20 "$DATA/node.log" | cut -c1-220 | sed 's/^/  | /'
 }
-# assert <description> <command...>  → command must exit 0
-assert() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else bad "$d"; fi; }
-# assert_out <description> <expected-substr> <command...>  → stdout must contain substr
-assert_out() { local d="$1" want="$2"; shift 2; local o; o="$("$@" 2>&1)"; if echo "$o" | grep -qF "$want"; then ok "$d"; else bad "$d (wanted '$want', got: $(echo "$o" | head -1))"; fi; }
-# assert_fail <description> <command...>  → command must exit NON-zero
-assert_fail() { local d="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$d (expected failure)"; else ok "$d"; fi; }
+bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); print_node_log_tail; }
+assert() { local description="$1"; shift; if "$@" >/dev/null 2>&1; then ok "$description"; else bad "$description"; fi; }
+assert_out() { local description="$1" expected_substr="$2"; shift 2; local output; output="$("$@" 2>&1)"; if echo "$output" | grep -qF "$expected_substr"; then ok "$description"; else bad "$description (wanted '$expected_substr', got: $(echo "$output" | head -1))"; fi; }
+assert_fail() { local description="$1"; shift; if "$@" >/dev/null 2>&1; then bad "$description (expected failure)"; else ok "$description"; fi; }
 
 echo "==> Building hive-cloud + shadw"
 cargo build -q -p hive-cloud -p shadw-cli || { echo "build failed"; exit 1; }
@@ -52,14 +44,12 @@ start_node() {
 echo "==> Starting throwaway node ($API, data=$DATA)"
 start_node
 
-# A local static repo to deploy (hermetic — no network).
 mkdir -p "$REPO"; printf '<!doctype html><h1>acc</h1>' > "$REPO/index.html"
 ( cd "$REPO" && git init -q -b main && git config user.email a@a && git config user.name a && git add -A && git commit -qm init )
 
-# Issue an API key via the API (dev: unauth, team=personal), then log the CLI in.
 KEY="$(curl -s -m5 -X POST "$API/v1/apikeys" -H 'content-type: application/json' -d '{"name":"acc","role":"owner"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')"
 [ -n "$KEY" ] || { echo "failed to issue API key"; exit 1; }
-export HOME="$HOMEDIR"
+export HOME="$ISOLATED_HOME"
 
 echo "==> Auth"
 assert_out "auth login saves config + verifies"        "Logged in"      "$SHADW" auth login --token "$KEY" --api "$API"
@@ -73,8 +63,6 @@ assert_out "obs nodes lists the node"  "acc-node"  "$SHADW" obs nodes
 echo "==> Deploy (clone → build → ready) via the real build pipeline"
 assert_out "deploy --follow reaches ready" "ready"  "$SHADW" deploy "file://$REPO" --project accproj --follow
 assert_out "deps list shows the project"   "accproj" "$SHADW" deps list
-# Compute multi-tenancy: the deployment (and the real cells it spawns) is tagged
-# with its owning tenant, threaded deploy → Fluid pool → CellSpec.
 DTEN="$(curl -s -m5 "$API/deployments" -H "authorization: Bearer $KEY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(next((x.get("tenant","") for x in d if x.get("project")=="accproj"),"MISSING"))')"
 [ "$DTEN" = "personal" ] && ok "deployment accproj is tenant-tagged ($DTEN)" || bad "deployment tenant tag (got '$DTEN')"
 
@@ -96,14 +84,11 @@ NEW_ID="$("$SHADW" keys create rt --json | python3 -c 'import sys,json;print(jso
 assert     "keys revoke"  "$SHADW" keys revoke "$NEW_ID"
 
 echo "==> Multi-tenant isolation (cross-tenant access must be DENIED)"
-# Mint two API keys scoped to two different teams (team comes from x-hive-team
-# when creating the key; thereafter the key's bearer token carries that team).
-mint_key() { curl -s -m5 -X POST "$API/v1/apikeys" -H "x-hive-team: $1" -H 'content-type: application/json' -d '{"name":"'$1'","role":"owner"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])'; }
+mint_key_for_team() { curl -s -m5 -X POST "$API/v1/apikeys" -H "x-hive-team: $1" -H 'content-type: application/json' -d '{"name":"'$1'","role":"owner"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])'; }
 hcode() { curl -s -m5 -o /dev/null -w '%{http_code}' "$@"; }
-KEY_A="$(mint_key alpha)"; KEY_B="$(mint_key beta)"
+KEY_A="$(mint_key_for_team alpha)"; KEY_B="$(mint_key_for_team beta)"
 [ -n "$KEY_A" ] && [ -n "$KEY_B" ] && ok "minted per-team API keys (alpha, beta)" || bad "mint per-team keys"
 
-# --- Databases: alpha owns a DB with secret credentials; beta must not see it. ---
 DBID="$(curl -s -m5 -X POST "$API/v1/databases" -H "authorization: Bearer $KEY_A" -H 'content-type: application/json' -d '{"name":"secretdb","project":"aproj","kind":"redis"}' | python3 -c 'import sys,json;print(json.load(sys.stdin).get("id",""))')"
 [ -n "$DBID" ] && ok "alpha provisioned database $DBID" || bad "alpha provision database"
 [ "$(hcode "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha reads its OWN database (200)" || bad "alpha cannot read own db"
@@ -111,15 +96,8 @@ DBID="$(curl -s -m5 -X POST "$API/v1/databases" -H "authorization: Bearer $KEY_A
 [ "$(hcode "$API/v1/databases/$DBID/credentials" -H "authorization: Bearer $KEY_B")" = "404" ] && ok "beta BLOCKED from alpha's DB credentials (404)" || bad "beta read alpha's credentials (LEAK)"
 [ "$(hcode -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_B")" = "404" ] && ok "beta BLOCKED from deleting alpha's database (404)" || bad "beta deleted alpha's db"
 [ "$(hcode "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha's database SURVIVED beta's delete attempt" || bad "db lost to cross-tenant delete"
-# The owner's delete tears the backing container down INLINE (`podman rm -f
-# -v`, up to podman's 10 s stop grace) and, on a host with podman, contends
-# with the provision's still-running image pull for the storage lock -- a
-# by-design wait, not a fault. 2.3-2.5 s on the CI runner when the pull is
-# done, >5 s when it is not (2026-09-02, the run at 04:12 UTC): budget it
-# like the teardown it is, not like the 5 s reads around it.
-[ "$(curl -s -m25 -o /dev/null -w '%{http_code}' -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha deletes its OWN database (200)" || bad "alpha self-delete failed"
+[ "$(curl -s -m"$DB_TEARDOWN_TIMEOUT_SECS" -o /dev/null -w '%{http_code}' -X DELETE "$API/v1/databases/$DBID" -H "authorization: Bearer $KEY_A")" = "200" ] && ok "alpha deletes its OWN database (200)" || bad "alpha self-delete failed"
 
-# --- Webhooks: tenant-scoped list + delete (validates the new Webhook.team field). ---
 WHID="$(curl -s -m5 -X POST "$API/v1/webhooks" -H "authorization: Bearer $KEY_A" -H 'content-type: application/json' -d '{"url":"https://alpha.example/hook"}' | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d[0] if isinstance(d,list) else d).get("id",""))')"
 [ -n "$WHID" ] && ok "alpha created webhook $WHID" || bad "alpha create webhook"
 assert_out "alpha's webhook list shows it"           "$WHID" curl -s -m5 "$API/v1/webhooks" -H "authorization: Bearer $KEY_A"

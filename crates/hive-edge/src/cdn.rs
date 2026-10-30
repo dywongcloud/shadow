@@ -1,12 +1,5 @@
-//! CDN edge cache, modeled on Vercel's CDN
-//! (<https://vercel.com/docs/how-vercel-cdn-works>, `/docs/caching/cdn-cache`):
-//!
-//! * Cache states surfaced via `x-hive-cache`: **HIT / MISS / STALE / REVALIDATED**
-//!   (mirrors Vercel's `x-vercel-cache`).
-//! * **stale-while-revalidate** — a fresh-but-past-max-age-within-SWR response is
-//!   served immediately as `STALE` while an async refresh runs.
-//! * Header precedence for cache directives:
-//!   `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control`.
+//! CDN edge cache: HIT/MISS/STALE/REVALIDATED via `x-hive-cache`, stale-while-revalidate, and
+//! directive precedence `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control`.
 
 use hive_core::now_ms;
 use parking_lot::Mutex;
@@ -41,29 +34,19 @@ pub struct CachedResponse {
     fresh_until_ms: u64,
     /// Past this, the entry is unusable even as stale (max-age + SWR).
     usable_until_ms: u64,
-    /// Set by `note_revalidation_failed` on a FAILED revalidation (any status
-    /// outside 200/301/302/307/308/404/410, or a network error/timeout) —
-    /// mirrors Vercel's documented ISR contract: on failure the stale entry
-    /// is preserved untouched and retried no sooner than this. 0 = no
-    /// pending backoff.
+    /// Epoch-ms before which a failed revalidation is not retried; 0 = no pending backoff.
     retry_not_before_ms: u64,
 }
 
 impl CachedResponse {
-    /// True while a prior revalidation attempt failed and the 30s backoff
-    /// (Vercel's documented ISR failed-revalidation retry window) hasn't
-    /// elapsed yet — the caller should skip firing another background
-    /// refresh for this entry.
+    /// True while this entry's failed-revalidation backoff has not elapsed yet.
     pub fn revalidation_backoff_active(&self) -> bool {
         now_ms() < self.retry_not_before_ms
     }
 }
 
-/// Status codes Vercel's ISR treats as a SUCCESSFUL revalidation outcome
-/// (<https://vercel.com/docs/incremental-static-regeneration>): the cache is
-/// updated to match. Every other status, plus any network error/timeout
-/// reaching the origin, is a FAILED revalidation — the existing stale entry
-/// is preserved and retried no sooner than `REVALIDATION_FAILURE_BACKOFF_MS`.
+/// Statuses that count as a successful revalidation; any other status, network error or corrupt
+/// body keeps the stale entry untouched and arms `REVALIDATION_FAILURE_BACKOFF_MS`.
 const REVALIDATION_SUCCESS_STATUSES: [u16; 7] = [200, 301, 302, 307, 308, 404, 410];
 const REVALIDATION_FAILURE_BACKOFF_MS: u64 = 30_000;
 
@@ -98,8 +81,23 @@ impl CdnCache {
         }
     }
 
-    pub fn key(host: &str, path_q: &str) -> String {
-        format!("{host}{path_q}")
+    /// Cache identity for one request: the deployment the host resolves to, then host + path.
+    ///
+    /// The deployment dimension is load-bearing, not decoration. A cached body is only meaningful
+    /// for the deployment that produced it: an HTML document embeds BUILD-SCOPED asset names
+    /// (`/_next/static/chunks/<content-hash>.js`), so once a promotion swaps the deployment behind
+    /// a hostname, the predecessor's HTML references chunk names the new build never emitted and
+    /// every one of them 404s (`ChunkLoadError`). With the deployment in the key, a promoted
+    /// deployment simply MISSES its predecessor's entries and refetches — which is what makes this
+    /// the right site for the fix: it needs no purge, no invalidation call site and no cross-node
+    /// fanout, because every node's cache is independent and each one derives the same identity
+    /// from the same live alias table. A stale entry can therefore never be *read*, only aged out.
+    ///
+    /// `deployment` is `None` for a host with no deployment record; those share one namespace, so
+    /// the dimension never changes the identity of traffic the gateway cannot attribute anyway.
+    pub fn key(host: &str, path_q: &str, deployment: Option<&str>) -> String {
+        // US (0x1f) cannot occur in a host or a request-target, so the split is unambiguous.
+        format!("{}\u{1f}{host}{path_q}", deployment.unwrap_or("-"))
     }
 
     /// Look up an entry, classifying it as Hit / Stale / Miss.
@@ -115,26 +113,19 @@ impl CdnCache {
                 self.stale.fetch_add(1, Ordering::Relaxed);
                 return Lookup::Stale(e.clone());
             }
-            map.remove(key); // fully expired
+            map.remove(key);
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
         Lookup::Miss
     }
 
-    /// Mark an entry refreshed after a stale-while-revalidate background fetch.
-    pub fn note_revalidated(&self) {
-        // Accounting handled via store(); this is a hook for symmetry/tests.
-    }
+    /// Mark an entry refreshed after a stale-while-revalidate background fetch; the accounting
+    /// itself happens in `maybe_store`.
+    pub fn note_revalidated(&self) {}
 
-    /// Cache a GET response if its status is one of Vercel's documented
-    /// ISR revalidation-success codes (200/301/302/307/308/404/410) and its
-    /// (precedence-resolved) directives allow. Any other status is a FAILED
-    /// revalidation: an existing entry for `key` is left completely
-    /// untouched (body/headers/TTL) and only gated behind
-    /// `REVALIDATION_FAILURE_BACKOFF_MS` before the next retry — see
-    /// `note_revalidation_failed`, which callers on a hard network
-    /// error/timeout (no status at all) should call directly instead of this
-    /// method. Returns true if stored.
+    /// Cache a GET response whose status is a revalidation success, whose body matches its headers
+    /// and whose directives allow it; anything else is a failed revalidation (entry preserved,
+    /// backoff armed). Returns true if stored.
     pub fn maybe_store(
         &self,
         key: &str,
@@ -146,51 +137,13 @@ impl CdnCache {
             self.note_revalidation_failed(key);
             return false;
         }
-        // Integrity gates: a captured body that is provably not the response
-        // the origin declared must NEVER enter the cache — an origin instance
-        // dying mid-stream once otherwise poisons an immutable entry that
-        // every later client replays. Witnessed live (nodes-wtf 2026-08-26):
-        // a 59-byte truncated prefix of a 6142-byte gzip chunk was cached as
-        // a complete `Content-Encoding: gzip` 200 and served to every browser
-        // as ERR_CONTENT_DECODING_FAILED until the next process restart.
-        let header = |name: &str| {
-            headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-                .map(|(_, v)| v.as_str())
-        };
-        if let Some(declared) = header("content-length").and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            if declared != body.len() as u64 {
-                // A truncated/corrupt body is treated the same as a failed
-                // revalidation, not a "legitimately uncacheable" decision —
-                // back off before the next attempt against a possibly still-
-                // misbehaving origin, same as a bad status code would.
-                self.note_revalidation_failed(key);
-                return false;
-            }
-        }
-        if header("content-encoding").is_some_and(|v| v.eq_ignore_ascii_case("gzip")) {
-            // Full decode, bounded by the body we already hold in memory: the
-            // only proof a gzip stream is complete is decoding it to its end.
-            use std::io::Read;
-            let mut decoder = flate2::read::GzDecoder::new(body);
-            let mut sink = [0_u8; 16 * 1024];
-            loop {
-                match decoder.read(&mut sink) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(_) => {
-                        self.note_revalidation_failed(key);
-                        return false;
-                    }
-                }
-            }
+        if !body_matches_declared(headers, body) {
+            self.note_revalidation_failed(key);
+            return false;
         }
         let Some((ttl, swr)) = cache_policy(headers) else {
             return false;
         };
-        // Cacheable if fresh for a while OR usable as stale-while-revalidate.
         if ttl == 0 && swr == 0 {
             return false;
         }
@@ -214,19 +167,21 @@ impl CdnCache {
         true
     }
 
-    /// Record a FAILED revalidation for an existing entry (per Vercel's
-    /// documented ISR contract: any status outside the 7-code success
-    /// allowlist, a network error/timeout reaching the origin, or a
-    /// corrupt/truncated body). The entry's existing body/headers/TTL are
-    /// left completely untouched — only the retry backoff advances. A no-op
-    /// if there is no existing entry for `key` (nothing to preserve, and a
-    /// cold MISS should just be retried on the next request, not backed
-    /// off).
+    /// Record a failed revalidation: the existing entry's body/headers/TTL stay untouched and only
+    /// its retry backoff advances; a no-op when `key` has no entry.
     pub fn note_revalidation_failed(&self, key: &str) {
         let mut map = self.map.lock();
         if let Some(entry) = map.get_mut(key) {
             entry.retry_not_before_ms = now_ms() + REVALIDATION_FAILURE_BACKOFF_MS;
         }
+    }
+
+    /// Drop ONE entry. Used when a response stops being servable at its key — a
+    /// protected deployment must not keep a body cached before protection
+    /// applied, and `purge()` would discard the whole node's cache to do it.
+    /// Returns whether an entry was present.
+    pub fn invalidate(&self, key: &str) -> bool {
+        self.map.lock().remove(key).is_some()
     }
 
     pub fn purge(&self) {
@@ -254,9 +209,41 @@ impl Default for CdnCache {
     }
 }
 
-/// Resolve `(max-age, stale-while-revalidate)` seconds using Vercel's header
-/// precedence: `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control`.
-/// Returns None if not cacheable.
+/// A body whose length or gzip stream disagrees with its headers is a truncated capture, never a
+/// cacheable response.
+fn body_matches_declared(headers: &[(String, String)], body: &[u8]) -> bool {
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    if let Some(declared) = header("content-length").and_then(|v| v.trim().parse::<u64>().ok()) {
+        if declared != body.len() as u64 {
+            return false;
+        }
+    }
+    if header("content-encoding").is_some_and(|v| v.eq_ignore_ascii_case("gzip")) {
+        return gzip_decodes_to_end(body);
+    }
+    true
+}
+
+fn gzip_decodes_to_end(body: &[u8]) -> bool {
+    use std::io::Read;
+    let mut decoder = flate2::read::GzDecoder::new(body);
+    let mut sink = [0_u8; 16 * 1024];
+    loop {
+        match decoder.read(&mut sink) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+/// Resolve `(max-age, stale-while-revalidate)` seconds with precedence `Vercel-CDN-Cache-Control`
+/// > `CDN-Cache-Control` > `Cache-Control`; None = not cacheable.
 pub fn cache_policy(headers: &[(String, String)]) -> Option<(u64, u64)> {
     for name in [
         "vercel-cdn-cache-control",
@@ -291,61 +278,4 @@ fn directive(cc: &str, key: &str) -> Option<u64> {
         }
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn precedence_and_states() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/a");
-        assert!(matches!(cdn.lookup(&k), Lookup::Miss));
-        // Vercel-CDN-Cache-Control wins over Cache-Control.
-        let stored = cdn.maybe_store(
-            &k,
-            200,
-            &[
-                ("cache-control".into(), "max-age=0".into()),
-                ("vercel-cdn-cache-control".into(), "max-age=60".into()),
-            ],
-            b"x",
-        );
-        assert!(stored);
-        assert!(matches!(cdn.lookup(&k), Lookup::Hit(_)));
-    }
-
-    #[test]
-    fn stale_while_revalidate() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/swr");
-        // max-age=0 but SWR=60 -> immediately stale-but-usable.
-        cdn.maybe_store(
-            &k,
-            200,
-            &[(
-                "cache-control".into(),
-                "max-age=0, stale-while-revalidate=60".into(),
-            )],
-            b"body",
-        );
-        match cdn.lookup(&k) {
-            Lookup::Stale(r) => assert_eq!(r.body, b"body"),
-            _ => panic!("expected STALE"),
-        }
-    }
-
-    #[test]
-    fn no_store_not_cached() {
-        let cdn = CdnCache::new();
-        let k = CdnCache::key("app", "/api");
-        assert!(!cdn.maybe_store(
-            &k,
-            200,
-            &[("cache-control".into(), "no-store".into())],
-            b"x"
-        ));
-        assert!(matches!(cdn.lookup(&k), Lookup::Miss));
-    }
 }

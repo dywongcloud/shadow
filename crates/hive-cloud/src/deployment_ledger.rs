@@ -50,10 +50,10 @@ pub struct DeploymentAcceptance {
     pub accepting_boot_nonce: String,
     pub accepted_ms: u64,
     pub published_ms: Option<u64>,
-    /// Tamper-evidence chain for this deployment (build/publish/execution
-    /// facts) — see `hive_core::integrity`'s module doc for exact scope.
-    /// `#[serde(default)]` so ledger files persisted before this field
-    /// existed load with an empty chain rather than failing to deserialize.
+    /// Tamper-evidence chain for this deployment (build, publish and execution facts); see
+    /// `hive_core::integrity`'s module doc for the exact scope. `#[serde(default)]` so ledger files
+    /// persisted before this field existed load with an empty chain instead of failing to
+    /// deserialize.
     #[serde(default)]
     pub integrity_chain: Vec<hive_core::IntegrityEntry>,
 }
@@ -292,11 +292,10 @@ impl DeploymentLedger {
         })
     }
 
-    /// Append one entry to `deployment_id`'s integrity chain, assigning it
-    /// the next strictly-increasing `seq`. No-op (returns `Ok`) if the
-    /// deployment has no acceptance record yet — callers on the execution
-    /// path (`ExecutionStarted`/`ExecutionEnded`) can race a not-yet-accepted
-    /// deployment in principle and must not fail loudly for a benign race.
+    /// Appends one entry to `deployment_id`'s integrity chain, assigning the next strictly
+    /// increasing `seq`. A no-op (returns `Ok`) when the deployment has no acceptance record yet:
+    /// callers on the execution path (`ExecutionStarted`/`ExecutionEnded`) can in principle race a
+    /// not-yet-accepted deployment and must not fail loudly on that benign race.
     pub fn append_integrity_entry(
         &self,
         deployment_id: &str,
@@ -545,12 +544,28 @@ pub fn spawn_outbox(cloud: Arc<crate::state::CloudState>) {
     });
 }
 
+/// The team an outbox entry's webhooks belong to: the tenant tag of the deployment it is about
+/// (this node accepted it, so its record is local), else the project's owner. A blank answer
+/// reaches no hook, which acknowledges the entry as having no subscribers.
+fn outbox_team(cloud: &Arc<crate::state::CloudState>, entry: &LifecycleOutboxEntry) -> String {
+    cloud
+        .gw
+        .deployment_records()
+        .into_iter()
+        .find(|record| record.id == entry.deployment_id)
+        .map(|record| record.tenant)
+        .filter(|tenant| !tenant.trim().is_empty())
+        .unwrap_or_else(|| cloud.projects.team_of(&entry.project))
+}
+
 pub async fn drain_outbox_once(cloud: &Arc<crate::state::CloudState>) {
     for entry in cloud.deployment_ledger.pending_outbox() {
+        let team = outbox_team(cloud, &entry);
         let delivered = crate::webhooks::dispatch_durable(
             &cloud.webhooks,
             &entry.id,
             entry.created_ms,
+            crate::webhooks::Audience::Team(&team),
             &entry.project,
             &entry.event,
             entry.payload,
@@ -758,6 +773,14 @@ fn canonical_bytes(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(value).context("serialize deployment ledger value")
 }
 
+/// Mints the checksum a NEWLY WRITTEN ledger carries.
+///
+/// Still SHA-256, and deliberately so: this digest is written to disk by this node and read back by
+/// every other node in the fleet, including nodes still running the previous binary, so flipping
+/// the writer is a flag day no rolling deploy can express (an old reader would reject a BLAKE3
+/// checksum it cannot reproduce, which is how a node once crash-looped tens of thousands of times
+/// on an intact ledger; see [`load_payload`]). The READ side already accepts both, so the writer
+/// flip is safe the moment every node has taken that change, and not before.
 fn raw_payload_checksum(payload_json: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(CHECKSUM_DOMAIN);
@@ -765,10 +788,27 @@ fn raw_payload_checksum(payload_json: &[u8]) -> String {
     format!("{:x}", digest.finalize())
 }
 
+/// Dual-algorithm read-side twin of [`raw_payload_checksum`]: accepts a stored checksum minted by
+/// EITHER algorithm over [`CHECKSUM_DOMAIN`]. This is the point of the coexistence shape: once
+/// every node can verify both, the writer can move to BLAKE3 in any order with no ledger anywhere
+/// failing, since a node that has already flipped and one that has not still agree on every file
+/// either of them wrote.
+fn raw_payload_checksum_matches(payload_json: &[u8], stored: &str) -> bool {
+    fluid_core::verify_content(CHECKSUM_DOMAIN, payload_json, stored)
+}
+
 fn payload_checksum(payload: &LedgerPayload) -> anyhow::Result<String> {
     Ok(raw_payload_checksum(&canonical_bytes(payload)?))
 }
 
+/// Loads and verifies the ledger file: size ceiling, sentinel, digest shape, then the checksum over
+/// the payload's bytes AS WRITTEN. Re-serializing the decoded struct instead would make every field
+/// added later, even a `#[serde(default)]` one, change those bytes, so a ledger written by any
+/// earlier binary would fail closed on the next one (a node crash-looped that way after
+/// `integrity_chain` was added, with the file byte-for-byte intact). The check is dual-algorithm: a
+/// checksum minted by EITHER SHA-256 or BLAKE3 over `CHECKSUM_DOMAIN` verifies, so a mismatch only
+/// ever means "these bytes are not what was sealed", never "someone changed the algorithm", the
+/// failure this file has already lived through once.
 fn load_payload(path: &Path) -> anyhow::Result<Option<LedgerPayload>> {
     let file = match File::open(path) {
         Ok(file) => file,
@@ -795,14 +835,8 @@ fn load_payload(path: &Path) -> anyhow::Result<Option<LedgerPayload>> {
         "deployment ledger sentinel mismatch"
     );
     validate_digest(&stored.checksum_sha256, "deployment ledger checksum")?;
-    // The checksum covers the payload's bytes AS WRITTEN. Re-serializing the
-    // decoded struct instead makes every field added later (even a
-    // `#[serde(default)]` one) change those bytes, so a ledger written by any
-    // earlier binary fails closed on the next one: fc-phoenix crash-looped
-    // 21,679 times over ~20 h after `integrity_chain` was added, with the file
-    // byte-for-byte intact.
     anyhow::ensure!(
-        raw_payload_checksum(stored.payload.get().as_bytes()) == stored.checksum_sha256,
+        raw_payload_checksum_matches(stored.payload.get().as_bytes(), &stored.checksum_sha256),
         "deployment ledger checksum mismatch"
     );
     let payload: LedgerPayload =
@@ -853,12 +887,10 @@ fn write_payload(path: &Path, payload: &LedgerPayload) -> anyhow::Result<()> {
     write_result
 }
 
-/// The real `hive_core::ExecutionObserver` — records
-/// `ExecutionStarted`/`ExecutionEnded` facts from `fluid-compute`'s cold-
-/// start/termination paths into this node's `DeploymentLedger`. Late-bound
-/// (`fluid_compute::Fluid::set_execution_observer`) once `CloudState`, and
-/// therefore this ledger, exists — see the call site in `main.rs` for why
-/// it can't be a `Fluid::start` constructor argument.
+/// The real `hive_core::ExecutionObserver`: records `ExecutionStarted`/`ExecutionEnded` facts from
+/// `fluid-compute`'s cold-start and termination paths into this node's `DeploymentLedger`.
+/// Late-bound (`fluid_compute::Fluid::set_execution_observer`) once `CloudState`, and therefore
+/// this ledger, exists; `main.rs` explains why it cannot be a `Fluid::start` constructor argument.
 pub struct LedgerExecutionObserver {
     ledger: Arc<DeploymentLedger>,
 }

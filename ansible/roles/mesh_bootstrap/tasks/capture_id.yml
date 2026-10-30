@@ -1,9 +1,5 @@
 ---
-# Read a running node's own iroh endpoint id from its /v1/nodes self-entry.
-# Used by playbooks/node-join.yml to learn a freshly-joined node's id so it
-# can be pushed into every other node's HIVE_TRUSTED_NODE_IDS (only matters
-# when hive_peer_trust_enabled -- the default self-admit path needs none of
-# this).
+# Read a running node's own iroh endpoint id from its /v1/nodes self-entry, so playbooks/node-join.yml can push it into every other node's HIVE_TRUSTED_NODE_IDS (only matters when hive_peer_trust_enabled).
 
 - name: Mint a short-lived operator token (server-only, x-hive-internal)
   ansible.builtin.uri:

@@ -2,11 +2,8 @@
 
 import { useEffect } from "react";
 
-/**
- * Root error boundary — catches exceptions thrown in the root layout itself
- * (which the per-route error.tsx cannot). Must render its own <html>/<body>.
- * Last line of defense against a fully blank app.
- */
+/** Root error boundary: catches exceptions thrown in the root layout itself (which the per-route error.tsx cannot), so it renders its own <html>/<body>; the last defense
+ *  against a fully blank app. */
 export default function GlobalError({ error }: { error: Error & { digest?: string }; reset: () => void }) {
   useEffect(() => {
     console.error("[global error]", error);
@@ -17,8 +14,6 @@ export default function GlobalError({ error }: { error: Error & { digest?: strin
         <div style={{ minHeight: "100vh", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, padding: 24, textAlign: "center" }}>
           <div style={{ fontSize: 18, fontWeight: 600 }}>The dashboard hit an unexpected error</div>
           <p style={{ maxWidth: 420, fontSize: 13, color: "#9ca3af", margin: 0 }}>{error?.message || "Unexpected error."}</p>
-          {/* Labeled "Reload" — make it a real reload, not reset(): a stale
-              cached bundle can only be cleared by refetching the HTML. */}
           <button
             onClick={() => window.location.reload()}
             style={{ marginTop: 4, background: "#fff", color: "#000", border: 0, borderRadius: 8, padding: "8px 14px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}

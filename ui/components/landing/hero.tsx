@@ -1,0 +1,69 @@
+import Link from "next/link";
+import { ArrowRight, Play } from "lucide-react";
+import { GlobeWireframe } from "@/components/globe-wireframe";
+import { DeployTerminal } from "./deploy-terminal";
+import { DomeLight } from "./dome-light";
+import { PreviewCard } from "./preview-card";
+import { GlowRing } from "./glow-ring";
+import { delay } from "./lp-utils";
+
+/** What the cards need below the globe from the `lg` breakpoint up: the finished terminal's height (about 375 px in a 974 px dome, 309 px in a 1160 px one)
+ *  less the 54 % of the globe's height it overlaps, fitted as a line in the dome's width because a padding percentage is a share of the width. */
+const CARDS_OVERHANG = "max(0px, calc(725px - 55.6%))";
+
+/** The hero: one dominant luminous object (the globe dome under its tracers) with the product shown doing its job in two glass panels. The dome is
+ *  art: it prints no count and names no region. */
+export function Hero() {
+  return (
+    <section className="lp-hero pb-14 lg:pb-24">
+      <div className="lp-bg" aria-hidden="true">
+        <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
+        <div className="lp-glow-blue" />
+        <div className="lp-aurora-a" />
+        <div className="lp-aurora-b" />
+        <div className="lp-grid" />
+        <div className="lp-grain" />
+      </div>
+
+      <div className="relative z-10 mx-auto max-w-[1100px] px-6 pt-12 sm:pt-[60px]">
+        <h1 className="lp-h1 lp-rise mt-7" style={delay(90)}>
+          Push to Git.
+          <br />
+          <span className="lp-gradient-text">Get a live URL.</span>
+        </h1>
+        {/* the standfirst is desktop-only: on a phone it pushed the headline and the calls to action off the first screen */}
+        <p className="lp-sub lp-rise mx-auto mt-6 max-w-[640px] max-sm:hidden" style={delay(180)}>
+          Deploy functions, containers and static sites from Git, a zip upload or a container image, with managed databases beside them. Every
+          pull request on a connected GitHub repository gets a live preview.
+        </p>
+        <div className="lp-rise mt-9 flex flex-wrap items-center justify-center gap-x-3.5 gap-y-4" style={delay(270)}>
+          <Link href="/sign-up" className="lp-btn">
+            Start building <ArrowRight className="h-[18px] w-[18px]" />
+          </Link>
+          <Link href="/docs" className="lp-btn-ghost">
+            Read the docs
+          </Link>
+          <a
+            href="https://www.youtube.com/watch?v=qp_lhPioZF4"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex h-[44px] items-center gap-2 rounded-full px-4 text-[15px] text-zinc-300 transition-colors hover:text-white"
+          >
+            <Play className="h-4 w-4 fill-current" /> Watch the demo<span className="sr-only"> (opens YouTube in a new tab)</span>
+          </a>
+        </div>
+      </div>
+
+      <div className="lp-dome lp-rise mt-[76px] px-6" style={delay(360)}>
+        <div className="relative">
+          <GlobeWireframe className="relative -ml-[34vw] w-[168vw] sm:ml-0 sm:w-full" boxClassName="lp-dome-mask">
+            <DomeLight />
+          </GlobeWireframe>
+          <DeployTerminal className="relative z-10 mx-auto -mt-12 w-[min(560px,calc(100%-32px))] lg:absolute lg:left-0 lg:top-[46%] lg:mx-0 lg:mt-0 lg:w-[min(540px,45%)]" />
+          <PreviewCard className="absolute right-0 top-[30%] z-10 hidden w-[320px] lg:block" />
+        </div>
+        <div aria-hidden="true" className="hidden lg:block" style={{ paddingBottom: CARDS_OVERHANG }} />
+      </div>
+    </section>
+  );
+}

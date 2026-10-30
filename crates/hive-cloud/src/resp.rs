@@ -1,20 +1,28 @@
-//! Minimal RESP (REdis Serialization Protocol) client — just enough to back the
-//! Upstash-style REST surface of the DB gateway: encode one command as a RESP
-//! array-of-bulk-strings, read one reply (any RESP2 type, recursively).
-//!
-//! Hand-rolled on purpose: the REST translator needs exactly encode-command +
-//! decode-reply over an existing TcpStream (loopback to the podman container);
-//! a full redis crate would be a far larger maintained surface for the same job.
+//! Minimal RESP (REdis Serialization Protocol) client, just enough to back the Upstash-style REST
+//! surface of the DB gateway: encode one command as a RESP array of bulk strings and read one reply
+//! (any RESP2 type, recursively). Hand-rolled on purpose: the REST translator needs exactly
+//! encode-command and decode-reply over an existing TcpStream (loopback to the podman container),
+//! and a full redis crate would be a far larger maintained surface for the same job.
 
 use anyhow::{anyhow, bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
-/// Max CUMULATIVE bulk-string bytes buffered across one pipeline/command's
-/// replies. The per-bulk cap below (64MiB) bounds a single value; without this,
-/// N commands each returning a large value multiply unboundedly (e.g. 1000x GET
-/// on a stored ~4MiB value ~= 4GiB) — a small request forcing a huge buffered
-/// response. This is checked in addition to, not instead of, the per-bulk cap.
+/// Per-bulk cap: bulk payloads are length-prefixed, so a lying server cannot make us allocate more
+/// than this for one value.
+const MAX_BULK_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Every bulk payload is followed by `\r\n`.
+const CRLF_LEN: usize = 2;
+
+/// RESP lines are tiny (tags and lengths); the cap defends against a garbage stream.
+const MAX_LINE_BYTES: usize = 4096;
+
+/// Max CUMULATIVE bulk-string bytes buffered across one pipeline/command's replies. The per-bulk
+/// cap ([`MAX_BULK_BYTES`]) bounds a single value; without this budget, N commands each returning a
+/// large value multiply unboundedly (1000 GETs of a stored ~4 MiB value would buffer ~4 GiB), a
+/// small request forcing a huge buffered response. Checked in addition to, not instead of, the
+/// per-bulk cap.
 const REPLY_BYTE_BUDGET: i64 = 64 * 1024 * 1024;
 
 /// One decoded RESP reply, mapped to the JSON shapes the REST surface returns.
@@ -60,10 +68,10 @@ pub fn encode_command(parts: &[String]) -> Vec<u8> {
     out
 }
 
-/// Read exactly one RESP reply (recursive for arrays). Depth-capped so a
-/// malicious/broken server can't stack-overflow us. `budget` is the CUMULATIVE
-/// bulk-string bytes remaining across the whole pipeline/command call (shared
-/// across recursive/sibling calls via the `&mut` — see [`REPLY_BYTE_BUDGET`]).
+/// Reads exactly one RESP reply (recursive for arrays). Depth-capped so a malicious or broken
+/// server cannot stack-overflow us. `budget` is the CUMULATIVE bulk-string bytes remaining across
+/// the whole pipeline/command call, shared across recursive and sibling calls through the `&mut`
+/// (see [`REPLY_BYTE_BUDGET`]).
 pub async fn read_reply(
     r: &mut BufReader<TcpStream>,
     depth: u8,
@@ -86,8 +94,7 @@ pub async fn read_reply(
             if n < 0 {
                 return Ok(Reply::Null);
             }
-            // Bulk payloads are length-prefixed; cap so a lying server can't OOM us.
-            if n > 64 * 1024 * 1024 {
+            if n > MAX_BULK_BYTES {
                 bail!("RESP bulk string too large ({n} bytes)");
             }
             if n > *budget {
@@ -97,7 +104,7 @@ pub async fn read_reply(
                 );
             }
             *budget -= n;
-            let mut buf = vec![0u8; n as usize + 2]; // + trailing \r\n
+            let mut buf = vec![0u8; n as usize + CRLF_LEN];
             r.read_exact(&mut buf).await?;
             buf.truncate(n as usize);
             Ok(Reply::Text(String::from_utf8_lossy(&buf).into_owned()))
@@ -121,7 +128,6 @@ pub async fn read_reply(
 }
 
 async fn read_line(r: &mut BufReader<TcpStream>) -> Result<String> {
-    // RESP lines are tiny (tags + lengths); cap defends against a garbage stream.
     let mut line = Vec::with_capacity(32);
     loop {
         let b = r.read_u8().await?;
@@ -133,7 +139,7 @@ async fn read_line(r: &mut BufReader<TcpStream>) -> Result<String> {
             break;
         }
         line.push(b);
-        if line.len() > 4096 {
+        if line.len() > MAX_LINE_BYTES {
             bail!("RESP line too long");
         }
     }
@@ -153,9 +159,9 @@ pub async fn run_command(port: u16, password: &str, parts: &[String]) -> Result<
         .ok_or_else(|| anyhow!("no reply"))
 }
 
-/// Run several commands on ONE connection (the `/pipeline` REST endpoint), in
-/// order, collecting one reply per command. Commands are written back-to-back
-/// then replies drained — true pipelining, not N round-trips.
+/// Runs several commands on ONE connection (the `/pipeline` REST endpoint), in order, collecting
+/// one reply per command. Commands are written back-to-back and then replies drained: true
+/// pipelining, not N round-trips.
 pub async fn run_pipeline(
     port: u16,
     password: &str,

@@ -1,11 +1,7 @@
-//! JWT signing + verification for the admin/control API.
-//!
-//! * Service tokens are HS256-signed with `HIVE_JWT_SECRET`.
-//! * Tenancy: the `tenant` claim (Clerk org id when Clerk is enabled, else a
-//!   default) scopes a token to a team/account.
-//! * **Dev-open default:** if `HIVE_JWT_SECRET` is unset, verification is skipped
-//!   so local development (and the dashboard with no auth wired) keeps working.
-//!   Set the secret to enforce signed requests.
+//! JWT signing and verification for the admin/control API. Service tokens are HS256-signed with
+//! `HIVE_JWT_SECRET`; the `tenant` claim (Clerk org id when Clerk is enabled, else a default)
+//! scopes a token to a team. Dev-open default: with `HIVE_JWT_SECRET` unset verification is
+//! skipped, and setting it enforces signed requests.
 
 use axum::{
     extract::Request,
@@ -16,40 +12,89 @@ use axum::{
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-/// TTL (seconds) for a `mesh-internal` delegation token minted to authenticate
-/// one node-to-node forwarded call (`gossip::team_claims`'s `?tok=`,
-/// `fetch_from_host`/`proxy_get_json`'s `Authorization: Bearer`). Must clear
-/// the iroh mesh's own dial/connect budget with real headroom: `fetch_from_host`
-/// gives `gossip::request_to` up to 20s specifically because `PeerPool::acquire`
-/// can fall back to a fresh-discovery dial when its cached hint is stale — a
-/// token minted just before that fallback fires, plus any receiver-side queuing
-/// under load, was landing on the verifying node already expired. Witnessed
-/// live 2026-08-28: a stuck build-status poller retrying a forwarded
-/// `/v1/builds/:id` read logged "mesh delegation token present but INVALID"
-/// (jsonwebtoken's `ExpiredSignature`) 500+ times/hour against two real build
-/// ids, every retry re-minting a fresh-at-mint-time 60s token that still
-/// expired in transit. 90s clears the 20s dial budget with a wide margin
-/// without meaningfully widening the token's replay window (it is still
-/// single-purpose, mesh-peer-trust-gated, and self-invalidates on use by the
-/// receiver's own expiry check).
+/// TTL (seconds) of a `mesh-internal` delegation token for one node-to-node forwarded call. It must
+/// clear the mesh dial budget with headroom (`fetch_from_host` lets `gossip::request_to` run up to
+/// 20 s, and a stale-hint fallback dial plus receiver queuing must not land an already-expired
+/// token) without widening the replay window of a single-purpose token.
 pub const MESH_DELEGATION_TOKEN_TTL_SECS: i64 = 90;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String,    // user id
-    pub tenant: String, // org/team id (multi-tenancy)
-    pub role: String, // TENANT-scoped role: owner | member | service (never a platform-operator signal)
-    pub exp: usize,   // expiry (unix seconds)
+    /// Subject: the user id, or `key:<id>` for a dashboard API key.
+    pub sub: String,
+    /// Tenant: the org/team id that scopes the token (multi-tenancy).
+    pub tenant: String,
+    /// TENANT-scoped role: `owner` | `admin` | `member` | `viewer` (`apikeys::MINTABLE_ROLES`);
+    /// `service` only on a fleet token ([`is_fleet_service`]) or the workflow World's queue client
+    /// token ([`is_queue_client`]), and never a team role. Never a platform-operator signal (see
+    /// `platform_admin`).
+    pub role: String,
+    /// Expiry, unix seconds.
+    pub exp: usize,
     pub iat: usize,
-    /// Whether the subject is a genuine PLATFORM operator (the backend's own
-    /// `HIVE_OWNER_EMAIL`), independent of `role`. `role: "owner"` only ever
-    /// means "owner of `tenant`" — every user is the owner of their own personal
-    /// namespace, so it must never be treated as platform-wide authority.
-    /// `require_operator()` gates on THIS field, not `role`. `#[serde(default)]`
-    /// so any already-issued/short-lived legacy token without this field
-    /// deserializes to `false` (fail closed), never `true`.
+    /// Whether the subject is a genuine PLATFORM operator (an email in `HIVE_OWNER_EMAIL` or
+    /// `HIVE_ADMIN_EMAILS`), independent of `role`: `role: "owner"` only means owner of `tenant`
+    /// (every user owns their personal namespace). `require_operator()` gates on THIS field; legacy
+    /// tokens without it deserialize to `false` (fail closed).
     #[serde(default)]
     pub platform_admin: bool,
+}
+
+/// Subject of a mesh delegation token: a fleet node acting on the mesh's behalf, minted through
+/// `issue` with [`MESH_SERVICE_ROLE`].
+pub const MESH_INTERNAL_SUB: &str = "mesh-internal";
+/// Role reserved for [`MESH_INTERNAL_SUB`] delegations. A tenant never carries it:
+/// `apikeys::check_new_role` refuses to mint it and `api_key_claims` demotes a stored one through
+/// `apikeys::effective_role`.
+pub const MESH_SERVICE_ROLE: &str = "service";
+
+/// THE predicate for "this caller is a fleet node", never a tenant: subject AND role of a mesh
+/// delegation. The role alone is not proof (a role string is data a tenant can store), so every
+/// fleet-internal gate asks this one question.
+pub fn is_mesh_internal(claims: &Claims) -> bool {
+    claims.sub == MESH_INTERNAL_SUB && claims.role == MESH_SERVICE_ROLE
+}
+
+/// Subject prefix of a runtime-artifact-transfer token (`mesh-node:<coordinator>`): a fleet node
+/// acting for one transfer, minted through `issue` with [`MESH_SERVICE_ROLE`]
+/// (`runtime_artifact_transfer` checks the coordinator and tenant inside).
+pub const MESH_NODE_SUB_PREFIX: &str = "mesh-node:";
+
+/// Subject of the workflow World's queue client token ([`issue_queue_client_token`]): the one
+/// `service` claim that reaches a TENANT's workload (it sits in the project's env as
+/// `HIVE_QUEUE_TOKEN`), so it is verified apart from the fleet's ([`verify_queue_client`]) and
+/// the role matrix lets it call the queue and nothing else.
+pub const QUEUE_CLIENT_SUB: &str = "world-queue-client";
+
+/// "This caller is a fleet node": a mesh delegation or a transfer token, subject AND role. These are
+/// the ONLY `service` claims [`verify`] accepts, so a `service` role string alone (data a tenant's
+/// workload can carry around) opens nothing: the role matrix passes exactly these through.
+pub fn is_fleet_service(claims: &Claims) -> bool {
+    claims.role == MESH_SERVICE_ROLE
+        && (claims.sub == MESH_INTERNAL_SUB || claims.sub.starts_with(MESH_NODE_SUB_PREFIX))
+}
+
+/// "This caller is a tenant workload's queue client": subject AND role of [`issue_queue_client_token`].
+pub fn is_queue_client(claims: &Claims) -> bool {
+    claims.sub == QUEUE_CLIENT_SUB && claims.role == MESH_SERVICE_ROLE
+}
+
+/// `raw` when it is a path on THIS origin, otherwise `fallback`: the only way a caller-supplied
+/// return path may become a `Location` (the unlock and SSO flows redirect back to one).
+///
+/// A same-origin path is one leading `/` followed by neither `/` nor `\`, with no control character
+/// anywhere. A `starts_with("//")` check is not enough: the WHATWG URL parser strips ASCII tab and
+/// newline from ANY position and reads `\` as `/`, so `/\evil.example` and `/<TAB>/evil.example`
+/// both resolve to `https://evil.example/`. Twin of `ui/lib/same-origin-path.ts`
+/// (`sameOriginPath`): change them together.
+pub fn same_origin_path<'a>(raw: &'a str, fallback: &'a str) -> &'a str {
+    let mut chars = raw.chars();
+    let path_absolute = chars.next() == Some('/') && !matches!(chars.next(), Some('/' | '\\'));
+    if path_absolute && !raw.chars().any(char::is_control) {
+        raw
+    } else {
+        fallback
+    }
 }
 
 fn secret() -> Option<String> {
@@ -62,10 +107,9 @@ pub fn enforced() -> bool {
     secret().is_some()
 }
 
-/// Issue a signed token for a subject/tenant valid for `ttl_secs`. `platform_admin`
-/// must be independently derived by the caller (matching the backend's own
-/// `owner_email` against the verified account email) — never trust a
-/// client-supplied boolean for this field.
+/// Issue a signed token valid for `ttl_secs`. `platform_admin` must be derived independently by the
+/// caller (the backend's `owner_email` against the verified account email), never from a
+/// client-supplied boolean.
 pub fn issue(
     sub: &str,
     tenant: &str,
@@ -110,20 +154,94 @@ pub fn verify(token: &str) -> anyhow::Result<Claims> {
     verify_with_secret(token, &key)
 }
 
-/// `verify` with an explicit secret (no env read) — the deterministic core.
+/// `verify` with an explicit secret (no env read) — the deterministic core. A `service` claim is
+/// accepted only for a FLEET identity ([`is_fleet_service`]): the queue client token and any other
+/// `service` claim fail here, at the one decode every generic verification site shares (the preview
+/// gate, the browser resolver, the mirror token, the ingress), so none of them can mistake it for a
+/// tenant. [`verify_queue_client`] is the only way in for the queue client.
 pub fn verify_with_secret(token: &str, key: &str) -> anyhow::Result<Claims> {
+    let claims = decode_claims(token, key, true)?;
+    if claims.role == MESH_SERVICE_ROLE && !is_fleet_service(&claims) {
+        anyhow::bail!("a service claim is accepted only for a fleet identity");
+    }
+    Ok(claims)
+}
+
+fn decode_claims(token: &str, key: &str, check_expiry: bool) -> anyhow::Result<Claims> {
+    let mut validation = Validation::default();
+    validation.validate_exp = check_expiry;
     let data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(key.as_bytes()),
-        &Validation::default(),
+        &validation,
     )?;
     Ok(data.claims)
 }
 
-/// Extract a platform JWT from a request: `Authorization: Bearer <jwt>` first,
-/// else the `hive_jwt` cookie. The cookie lets the self-hosted dashboard carry
-/// the token as an httpOnly cookie over the same-origin `/cloud` rewrite (no
-/// token in browser JS, no CORS), while Bearer still works for API/SDK clients.
+const QUEUE_TOKEN_MAX_AGE_DEFAULT_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a queue client token may be used, counted from its `iat`: `HIVE_QUEUE_TOKEN_MAX_AGE_SECS`
+/// (default 30 days, clamped to 1 h..=365 d), and also the lifetime it is issued with. A cap on the
+/// AGE, not on `exp`, so the 365-day tokens issued before the cap are retired too.
+pub fn queue_token_max_age_secs() -> i64 {
+    std::env::var("HIVE_QUEUE_TOKEN_MAX_AGE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .map(|secs| secs.clamp(3600, 365 * 24 * 3600))
+        .unwrap_or(QUEUE_TOKEN_MAX_AGE_DEFAULT_SECS)
+}
+
+/// The workflow World's queue client token for `team`'s projects (`HIVE_QUEUE_TOKEN`): a `service`
+/// claim the role matrix confines to `POST /v1/wqueue/enqueue`, valid for
+/// [`queue_token_max_age_secs`] and re-issued by every workflow build and by the node's rotation of
+/// live deployments (`world_queue::rotate_queue_tokens`).
+pub fn issue_queue_client_token(team: &str) -> anyhow::Result<String> {
+    issue(
+        QUEUE_CLIENT_SUB,
+        team,
+        MESH_SERVICE_ROLE,
+        false,
+        queue_token_max_age_secs(),
+    )
+}
+
+/// The claims of a queue client token that is still young enough to use: signature, `exp`, subject
+/// AND role, never an operator, and an `iat` no older than [`queue_token_max_age_secs`]. `None` for
+/// anything else.
+pub fn verify_queue_client(token: &str) -> Option<Claims> {
+    let key = secret()?;
+    let claims = decode_claims(token, &key, true).ok()?;
+    let now = chrono::Utc::now().timestamp();
+    let issued = claims.iat as i64;
+    (is_queue_client(&claims)
+        && !claims.platform_admin
+        && issued <= now + 60
+        && now - issued <= queue_token_max_age_secs())
+    .then_some(claims)
+}
+
+/// The claims of a queue client token THIS platform signed, whatever its age or expiry: what the
+/// rotation asks of a token already sitting in a deployment's env. `None` for anything that is not
+/// a validly signed queue client token.
+pub fn queue_token_claims_ignoring_age(token: &str) -> Option<Claims> {
+    let key = secret()?;
+    let claims = decode_claims(token, &key, false).ok()?;
+    (is_queue_client(&claims) && !claims.platform_admin).then_some(claims)
+}
+
+/// The authenticated principal of a bearer: a platform JWT, a dashboard API key, or the queue
+/// client token. `require_auth` and the regional ingress (`main::admin_ingress`) both ask it, so
+/// the ingress cannot accept a credential the node would refuse, or the reverse.
+pub fn principal(state: &crate::state::CloudState, token: &str) -> Option<Claims> {
+    verify(token)
+        .ok()
+        .or_else(|| api_key_claims(state, token))
+        .or_else(|| verify_queue_client(token))
+}
+
+/// Extract a platform JWT: `Authorization: Bearer` first, else the `hive_jwt` cookie, which lets
+/// the self-hosted dashboard carry the token httpOnly over the same-origin `/cloud` rewrite (no
+/// token in browser JS, no CORS).
 pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     if let Some(bearer) = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -134,7 +252,6 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     {
         return Some(bearer);
     }
-    // Parse the `hive_jwt` cookie out of the Cookie header.
     let cookie = headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())?;
@@ -146,13 +263,11 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     })
 }
 
-/// Resolve a bearer that is a dashboard-issued API key (`hive_…`, see
-/// `apikeys.rs`) into synthesized tenant-scoped [`Claims`]. API keys are the
-/// documented CLI/SDK credential, so they must clear the same mutation gates a
-/// platform JWT does — before this, the JWT-only check silently made every API
-/// key READ-ONLY on an enforced platform (mutations 401'd at both gates).
-/// `platform_admin` is always false: a key scopes to its team, never to
-/// platform-operator authority.
+/// Resolve a bearer that is a dashboard-issued API key (`hive_…`, see `apikeys.rs`) into
+/// synthesized tenant-scoped [`Claims`], so the CLI/SDK credential clears the same mutation gates
+/// as a platform JWT. `platform_admin` is always false: a key scopes to its team, never to operator
+/// authority, and its role is `apikeys::effective_role` of the stored one, so a key can never
+/// authenticate as the mesh's `service` role whatever was stored.
 pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claims> {
     if !token.starts_with("hive_") {
         return None;
@@ -162,116 +277,87 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
     Some(Claims {
         sub: format!("key:{}", k.id),
         tenant: k.team,
-        role: k.role,
+        role: crate::apikeys::effective_role(&k.role).to_string(),
         iat: now,
         exp: now + 3600,
         platform_admin: false,
     })
 }
 
-/// Middleware: when a JWT secret is configured, require a valid bearer token on
-/// mutating requests (POST/PUT/DELETE). Reads are always allowed. With no secret
-/// configured it is a pass-through (dev mode).
+/// Routes that carry their OWN credential, so a mutation to them needs no platform JWT or API key
+/// and each fails closed in its own handler: `/healthz`; `/v1/token` (the mint); the GitHub and
+/// Stripe webhooks (their own HMAC signature); `/v1/zkauth/{register,preview-proof,project-team}`
+/// (the dashboard's server-to-server `x-hive-internal` secret, `zkauth::internal_ok`);
+/// `/v1/browser/admissions` (`admit()` through `fresh_user_claims`; the item routes stay gated);
+/// `/v1/sqlite/` (the database's own bearer, checked in `hrana.rs`); `/v1/browser-db/` (the
+/// project's `browser_db_rest` bearer); `/v1/drive/webdav/` (HTTP Basic, verified by
+/// `drive_webdav.rs` before any filesystem call); `/v1/scim/v2/` (the team's SCIM bearer, resolved
+/// by `enterprise_api::scim_auth`: an IdP's directory sync carries no platform JWT). The SAML ACS
+/// is deliberately NOT here: its handler verifies no signature.
 ///
-/// Tenancy: whenever a valid platform JWT — or a valid dashboard API key — is
-/// presented (read OR write), the verified [`Claims`] are inserted into the
-/// request's extensions so downstream handlers can resolve the tenant from the
-/// cryptographically-bound `tenant` claim — never from a client-supplied
-/// `x-hive-team` header, which is spoofable. Extensions are in-process only and
-/// cannot be set by the client.
-pub async fn require_auth(
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::CloudState>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    // Verify the bearer token (if any) up front and bind its claims to the
-    // request. This runs for reads too, so read handlers also get the
-    // authoritative tenant. A JWT wins; a dashboard API key is an equal
-    // second-class citizen (tenant-scoped claims, never platform_admin).
-    //
-    // API-key claims are bound even in DEV (no `HIVE_JWT_SECRET`): key
-    // verification is self-contained (hash lookup), needs no signing secret, and
-    // an identity endpoint must not report a valid key as unauthenticated just
-    // because the platform isn't enforcing JWTs. Only the JWT half depends on
-    // the secret.
-    let claims = extract_token(req.headers())
-        .and_then(|t| verify(&t).ok().or_else(|| api_key_claims(&state, &t)));
-    let authed = claims.is_some();
-    if let Some(c) = claims {
-        req.extensions_mut().insert(c);
-    }
-    if !enforced() {
-        return next.run(req).await;
-    }
-    let method = req.method().clone();
-    let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    // Allow the token-mint + health endpoints unauthenticated.
-    let path = req.uri().path();
-    // GitHub/Stripe webhooks can't present a platform JWT — they are
-    // authenticated by their own HMAC signature inside the handler
-    // (GITHUB_WEBHOOK_SECRET / STRIPE_WEBHOOK_SECRET respectively). The two
-    // zkauth endpoints are called server-to-server by the dashboard's
-    // preview-unlock route with ONLY a shared x-hive-internal secret (see
-    // zkauth::internal_ok) — never a platform JWT, since the whole point is
-    // authenticating a browser tab that has no session on this node at all.
-    // Without this exemption every preview-unlock attempt 401'd here before
-    // ever reaching zkauth's own (correct) internal-token check — live-
-    // witnessed as "missing or invalid bearer token" on both routes.
-    let open = path == "/healthz"
+/// THE one list: `require_auth` and `main::admin_ingress` (which rejects an unauthenticated
+/// mutation before forwarding it to the leader) both ask it, so they cannot disagree about which
+/// routes may skip the gate.
+pub fn is_open_route(path: &str) -> bool {
+    path == "/healthz"
         || path == "/v1/token"
         || path == "/v1/git/webhook"
         || path == "/v1/billing/webhook"
         || path == "/v1/zkauth/register"
         || path == "/v1/zkauth/preview-proof"
         || path == "/v1/zkauth/project-team"
-        // This exact collection POST still fails closed in `admit()` via
-        // `fresh_user_claims`. Letting it reach that gate is what gives a
-        // missing/expired browser session the same structured
-        // `{error:{code,retryable}}` contract as every other admission denial;
-        // the middleware already inserted verified claims above when present.
-        // Item DELETE/accept routes remain protected here.
         || path == "/v1/browser/admissions"
-        // libsql/Hrana pipeline POSTs carry the DATABASE's own bearer
-        // (`DB_REST_TOKEN`), not a platform JWT — exactly the posture the
-        // `<slug>.{db_domain}` REST surface already has, which never passes
-        // through this middleware at all because it is served off the edge
-        // pipeline. `hrana::serve` fails closed on a wrong/absent token via
-        // `db_rest::credential_matches`, so letting the request reach it is
-        // what makes the two mount points behave identically instead of the
-        // platform-API one 401ing every legitimate libsql client.
         || path.starts_with("/v1/sqlite/")
-        // browser_db's libsql/Hrana + Upstash REST surface carries the
-        // project's own minted `browser_db_rest` bearer, not a platform
-        // JWT — exactly the `/v1/sqlite/` posture above.
-        // `browser_db_rest::serve` fails closed on a wrong/absent token via
-        // `browser_db_rest::credential_scope`.
         || path.starts_with("/v1/browser-db/")
-        // WebDAV clients (Finder/Explorer/davfs2) only speak HTTP
-        // Basic/Digest, never a bearer JWT — `drive_webdav.rs`'s own
-        // Basic-auth check (the project's hashed drive access token) fails
-        // closed with 401 before any filesystem call reaches `dav_server`,
-        // the same shape as `/v1/sqlite/`'s per-database bearer above.
-        || path.starts_with("/v1/drive/webdav/");
+        || path.starts_with("/v1/drive/webdav/")
+        || path.starts_with("/v1/scim/v2/")
+}
+
+/// Auth middleware. With a JWT secret configured a mutation (POST/PUT/DELETE/PATCH) needs a valid
+/// bearer and reads always pass; without one nothing is enforced (dev mode) and the middleware only
+/// binds claims.
+///
+/// Whenever a valid platform JWT or dashboard API key is presented (read or write) its verified
+/// [`Claims`] go into the request extensions (in-process only, never client-settable), so handlers
+/// resolve the tenant from the cryptographically-bound `tenant` claim, never from the spoofable
+/// `x-hive-team` header. A JWT wins over an API key (tenant-scoped, never `platform_admin`); key
+/// claims bind even in dev, since key verification is a self-contained hash lookup.
+///
+/// Routes carrying their OWN credential skip the mutation gate ([`is_open_route`]) and each fails
+/// closed in its own handler.
+///
+/// Every other authenticated request, a read included, then meets the team-role matrix
+/// ([`crate::roles::gate`]): this is the ONE place a role is decided, so no handler can forget it
+/// (a fleet token passes it, the workload's queue client token is confined to the queue, any other
+/// `service` claim is refused).
+///
+/// A GET/HEAD is never rejected for missing auth, but an unauthenticated one on a non-exempt route
+/// resolves to `admin::ANON_TENANT` (a namespace that owns nothing) and is stamped `x-hive-anon:
+/// 1`, which `ui/lib/api.ts` treats like a 401/403: a real 200 with an empty body would otherwise
+/// read as "you have zero X" after the session expired.
+pub async fn require_auth(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::CloudState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    let claims = extract_token(req.headers()).and_then(|t| principal(&state, &t));
+    let authed = claims.is_some();
+    if let Some(c) = &claims {
+        req.extensions_mut().insert(c.clone());
+    }
+    if !enforced() {
+        return next.run(req).await;
+    }
+    let method = req.method().clone();
+    let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+    let open = is_open_route(req.uri().path());
+    if let Some(c) = claims.as_ref().filter(|_| !open) {
+        if let Err(refusal) = crate::roles::gate(c, &method, req.uri().path()) {
+            return refusal.into_response();
+        }
+    }
     if !is_mutation || open {
         let mut resp = next.run(req).await;
-        // A GET/HEAD is never rejected for missing auth (reads stay reachable
-        // even mid-mint-race) — but an unauthenticated one silently resolves
-        // to `admin::ANON_TENANT` (`resolve_tenant`'s own fail-closed design:
-        // scope to a namespace that owns nothing, never leak the real
-        // tenant's data to a tokenless caller). That produces a real 200 with
-        // a wrongly-scoped empty/anonymous body, which is indistinguishable
-        // from "you really have zero X" to the caller and — critically —
-        // never a 401/403, the ONLY status `ui/lib/api.ts`'s `fetchWithTimeout`
-        // treats as "re-mint the session and retry." A cookie that expires
-        // mid-session (the 1h TTL, `SessionToken`'s 50-min proactive re-mint
-        // notwithstanding — a tab backgrounded past that cadence, a failed
-        // re-mint) or a genuine mint-race on a fresh load therefore renders a
-        // permanently-empty list with no error and nothing that ever
-        // corrects it (live-reported: API keys page). Stamping this header
-        // lets the client apply the exact same re-mint-and-retry it already
-        // has for 401/403, without weakening the read path's own
-        // stay-reachable posture (still a real 200; still whatever an
-        // exempted caller with no session is supposed to see).
         if !authed && !open {
             resp.headers_mut()
                 .insert("x-hive-anon", axum::http::HeaderValue::from_static("1"));

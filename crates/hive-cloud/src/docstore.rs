@@ -1,7 +1,6 @@
-//! Generic editable document store for the ops Data Browser — free-form JSON
-//! documents in named collections, with full CRUD. Persisted + audited so the
-//! data browser is a real (ACID-durable) admin tool, separate from the typed
-//! platform stores.
+//! Generic editable document store for the ops Data Browser: free-form JSON documents in named
+//! collections with full CRUD. Persisted and audited, so the data browser is a real (ACID-durable)
+//! admin tool, separate from the typed platform stores.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;

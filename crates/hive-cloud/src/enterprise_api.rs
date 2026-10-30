@@ -1,13 +1,19 @@
 //! HTTP surface for the enterprise feature suite ([`crate::enterprise`]).
 //!
-//! Every mutating endpoint is team-scoped (via [`crate::admin::tenant`]) and
-//! plan-gated (via `billing::plan_allows_*`). Secrets (SIEM/SCIM tokens,
-//! deployment passwords) are AEAD-encrypted at rest and never returned in the
-//! clear — list/get responses redact them to booleans / masks.
+//! Every mutating endpoint is team-scoped (via [`crate::admin::tenant`]), plan-gated (via
+//! `billing::plan_allows_*`) and role-gated by the matrix in [`crate::roles`] (IP blocks, SIEM,
+//! SAML, SCIM and deployment protection are written by an admin or owner, the microfrontend groups
+//! and the conformance policy by a member; every member reads). Secrets (SIEM/SCIM tokens,
+//! deployment passwords) are AEAD-encrypted at rest and never returned in the clear: list/get
+//! responses redact them to booleans or masks.
 //!
-//! Two endpoint families use *non-tenant* auth because an external IdP calls
-//! them: SCIM 2.0 (`/v1/scim/v2/*`, bearer = the per-team SCIM token) and the
-//! SAML ACS (`/v1/saml/:team/acs`, IdP form POST).
+//! Two endpoint families are called by an external IdP, not by a tenant: SCIM 2.0 (`/v1/scim/v2/*`,
+//! bearer = the per-team SCIM token) and the SAML ACS (`/v1/saml/:team/acs`, IdP form POST). SCIM is
+//! on `auth::is_open_route`'s list (the platform gate would refuse an IdP's JWT-less POST with 401)
+//! because every SCIM handler authenticates by its own bearer (`scim_auth`) and fails closed. The
+//! SAML ACS is NOT: it verifies no assertion signature, so it stays behind the platform gate AND
+//! answers only the team's own owner or admin (`saml_acs`): an anonymous caller is refused 401, a
+//! caller from another team or a plain member of this one 403.
 
 use std::sync::Arc;
 
@@ -26,32 +32,27 @@ use crate::enterprise::{
     ConformancePolicy, ConformanceReport, ConformanceResult, MfeChild, MfeGroup, SamlConfig, RULES,
 };
 use crate::state::CloudState;
-use crate::teams::Role;
+use crate::teams::{MemberRemoval, Role};
 use hive_core::now_ms;
 
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
 
 pub fn routes() -> Router<Arc<CloudState>> {
     Router::new()
-        // ---- Account-level IP blocking ----
         .route(
             "/v1/enterprise/ip-blocks",
             get(ip_blocks_list).post(ip_block_add),
         )
         .route("/v1/enterprise/ip-blocks/:id", delete(ip_block_delete))
-        // ---- SIEM audit-log streaming ----
         .route("/v1/enterprise/siem", get(siem_get).put(siem_put))
         .route("/v1/enterprise/siem/test", post(siem_test))
-        // ---- SAML SSO ----
         .route("/v1/enterprise/saml", get(saml_get).put(saml_put))
         .route("/v1/enterprise/saml/metadata", get(saml_metadata))
         .route("/v1/saml/:team/acs", post(saml_acs))
-        // ---- SCIM 2.0 directory sync (admin config) ----
         .route(
             "/v1/enterprise/scim",
             get(scim_get).post(scim_enable).delete(scim_disable),
         )
-        // ---- SCIM 2.0 protocol surface (IdP-facing, bearer-token auth) ----
         .route("/v1/scim/v2/ServiceProviderConfig", get(scim_spc))
         .route(
             "/v1/scim/v2/Users",
@@ -63,20 +64,16 @@ pub fn routes() -> Router<Arc<CloudState>> {
                 .patch(scim_user_patch)
                 .delete(scim_user_delete),
         )
-        // ---- Deployment protection (password / scope) ----
         .route(
             "/v1/enterprise/projects/:project/protection",
             get(protection_get).put(protection_put),
         )
-        // ---- Microfrontends ----
         .route(
             "/v1/enterprise/microfrontends",
             get(mfe_list).post(mfe_upsert),
         )
         .route("/v1/enterprise/microfrontends/:id", delete(mfe_delete))
-        // ---- Mesh-internal: edge-enforcement config replication ----
-        .route("/v1/enterprise/edge-export", get(edge_export))
-        // ---- Conformance ----
+        .route("/v1/enterprise/edge-export", get(edge_export_public))
         .route(
             "/v1/enterprise/conformance",
             get(conformance_get).put(conformance_put),
@@ -85,13 +82,8 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route("/v1/enterprise/conformance/run", post(conformance_run))
 }
 
-// --------------------------------------------------------------------------
-// helpers
-// --------------------------------------------------------------------------
-
-/// The team's plan tier. The team record is authoritative (it's what
-/// `team_set_plan`/`team_set_sso` gate on); fall back to the billing account,
-/// then "hobby".
+/// The team's plan tier. The team record is authoritative (it is what
+/// `team_set_plan`/`team_set_sso` gate on); fall back to the billing account, then "hobby".
 fn plan_of(c: &Arc<CloudState>, team: &str) -> String {
     c.teams
         .get(team)
@@ -105,10 +97,6 @@ fn forbid(feature: &str) -> (StatusCode, String) {
         format!("{feature} requires the Enterprise plan"),
     )
 }
-
-// ==========================================================================
-// Account-level IP blocking
-// ==========================================================================
 
 async fn ip_blocks_list(
     State(c): State<Arc<CloudState>>,
@@ -158,10 +146,6 @@ async fn ip_block_delete(
     crate::persist::persist(&c);
     Json(json!({ "ok": true }))
 }
-
-// ==========================================================================
-// SIEM streaming
-// ==========================================================================
 
 /// SIEM config with the token REDACTED (only whether one is configured).
 fn siem_view(cfg: &crate::enterprise::SiemConfig) -> Value {
@@ -223,7 +207,8 @@ async fn siem_put(
     }
     let cfg = c
         .enterprise
-        .set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled);
+        .set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled)
+        .map_err(|refused| (StatusCode::BAD_REQUEST, refused.to_string()))?;
     c.audit.record(
         &t,
         "user",
@@ -260,10 +245,6 @@ async fn siem_test(
         json!({ "ok": true, "note": "test event emitted to the SIEM stream" }),
     ))
 }
-
-// ==========================================================================
-// SAML SSO
-// ==========================================================================
 
 fn saml_view(cfg: &SamlConfig) -> Value {
     json!({
@@ -303,6 +284,8 @@ fn yes() -> bool {
     true
 }
 
+/// Stores the team's SAML config (Enterprise plan) and reflects `enabled` into the team's SSO flag
+/// (`teams.set_sso`), so the rest of the platform sees SSO on.
 async fn saml_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -325,7 +308,6 @@ async fn saml_put(
             updated_ms: 0,
         },
     );
-    // Reflect into the team SSO flag so the rest of the platform sees SSO on.
     c.teams.set_sso(&t, cfg.enabled);
     c.audit
         .record(&t, "user", "update", "saml", &t, &cfg.idp_entity_id);
@@ -363,19 +345,40 @@ struct AcsForm {
     relay_state: String,
 }
 
-/// SAML Assertion Consumer Service — the IdP POSTs the (base64) SAML response
-/// here after the user authenticates. We decode it, extract the NameID (email),
-/// optionally auto-provision the team member, then bounce to the dashboard.
+/// SAML Assertion Consumer Service: the IdP POSTs the (base64) SAML response here after the user
+/// authenticates. It decodes the response, extracts the NameID (email), optionally auto-provisions
+/// the team member (`auto_provision`), then bounces to the dashboard (`HIVE_DASHBOARD_URL`, else
+/// the API base) at `RelayState`, reduced to a same-origin path (`auth::same_origin_path`: an
+/// absolute, protocol-relative or `@host` RelayState lands on `/`, never on another host). It
+/// establishes NO session: it federates directory membership, and the dashboard's own auth signs
+/// the user in.
 ///
-/// NOTE: full XML-DSig signature verification against the IdP `x509_cert` is a
-/// production hardening TODO — we validate the config is present + enabled and
-/// extract the subject. This is called out honestly rather than silently
-/// pretending assertions are cryptographically verified.
+/// SECURITY GAP: the assertion's XML-DSig signature is NOT verified against the IdP `x509_cert`;
+/// the handler checks only that SAML is enabled for the team and extracts the subject, so it trusts
+/// any `NameID` posted to it (with `auto_provision`, that email becomes a team Member). Signature
+/// verification is the open hardening item, so until it exists the ACS is not a public endpoint:
+/// the platform gate refuses an anonymous POST and `require_team_floor` lets only the team's own
+/// owner or admin (who can already add members) through, so a signed-in caller of ANOTHER team, or
+/// a plain member of this one, can no longer forge an assertion into the roster. On an UNENFORCED
+/// dev node (no `HIVE_JWT_SECRET`, so no verified roles) the floor steps aside like every other
+/// role gate. Consequence: an IdP's browser POST (no platform JWT) cannot complete a sign-in on an
+/// enforced platform.
 async fn saml_acs(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
     Path(team): Path<String>,
     axum::extract::Form(form): axum::extract::Form<AcsForm>,
 ) -> Response {
+    if let Err((status, message)) = crate::admin::require_team_floor(
+        &c,
+        &headers,
+        claims.as_ref().map(|e| &e.0),
+        &team,
+        &["owner", "admin"],
+    ) {
+        return (status, message).into_response();
+    }
     let cfg = c.enterprise.saml(&team);
     if !cfg.enabled {
         return (StatusCode::FORBIDDEN, "SAML not enabled for this team").into_response();
@@ -383,8 +386,11 @@ async fn saml_acs(
     let Some(email) = decode_saml_nameid(&form.saml_response) else {
         return (StatusCode::BAD_REQUEST, "could not parse SAML assertion").into_response();
     };
-    if cfg.auto_provision && !c.teams.is_member(&team, &email) {
-        c.teams.add_member(&team, &email, Role::Member);
+    let provisioned = cfg.auto_provision
+        && c.teams
+            .add_member_if_absent(&team, &email, Role::Member)
+            .is_some_and(|(_, added)| added);
+    if provisioned {
         c.enterprise.scim_upsert_user(&team, &email, &email, true);
         c.audit.record(
             &team,
@@ -399,14 +405,8 @@ async fn saml_acs(
         c.audit
             .record(&team, "saml", "login", "member", &email, "SAML sign-in");
     }
-    // Land the user on the dashboard (session is established by the dashboard's
-    // own auth; this endpoint federates directory membership).
     let dash = std::env::var("HIVE_DASHBOARD_URL").unwrap_or_else(|_| c.api_base());
-    let next = if form.relay_state.is_empty() {
-        "/".to_string()
-    } else {
-        form.relay_state
-    };
+    let next = crate::auth::same_origin_path(&form.relay_state, "/");
     axum::response::Redirect::temporary(&format!("{}{}", dash.trim_end_matches('/'), next))
         .into_response()
 }
@@ -437,10 +437,6 @@ fn decode_saml_nameid(b64: &str) -> Option<String> {
     None
 }
 
-// ==========================================================================
-// SCIM directory sync — admin config
-// ==========================================================================
-
 async fn scim_get(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -458,7 +454,9 @@ async fn scim_get(
     }))
 }
 
-/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE.
+/// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE. Owner or admin only
+/// (the bearer is the directory's whole authority over the roster, and a re-mint invalidates the
+/// IdP's current token).
 async fn scim_enable(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -478,21 +476,18 @@ async fn scim_enable(
     ))
 }
 
+/// Disables the team's SCIM connection. Owner or admin only, like enabling it.
 async fn scim_disable(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     c.enterprise.scim_disable(&t);
     c.audit.record(&t, "user", "disable", "scim", &t, "");
     crate::persist::persist(&c);
-    Json(json!({ "ok": true }))
+    Ok(Json(json!({ "ok": true })))
 }
-
-// ==========================================================================
-// SCIM 2.0 protocol surface (IdP-facing, bearer = per-team SCIM token)
-// ==========================================================================
 
 fn scim_auth(c: &Arc<CloudState>, headers: &HeaderMap) -> Option<String> {
     let auth = headers.get("authorization")?.to_str().ok()?;
@@ -550,6 +545,10 @@ struct ScimCreate {
     active: bool,
 }
 
+/// Creates (or updates) a directory user and, when active, adds them to the team roster as a
+/// Member, so the directory drives real membership. Only when they are NOT on the roster yet
+/// (`add_member_if_absent`): the directory never changes an existing member's role, so provisioning
+/// an owner's, an admin's or a viewer's email is a no-op for the roster.
 async fn scim_users_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -566,9 +565,9 @@ async fn scim_users_create(
     let u = c
         .enterprise
         .scim_upsert_user(&team, &b.user_name, &display, b.active);
-    // Provision into the team roster so the directory drives real membership.
     if b.active {
-        c.teams.add_member(&team, &b.user_name, Role::Member);
+        c.teams
+            .add_member_if_absent(&team, &b.user_name, Role::Member);
     }
     c.audit.record(
         &team,
@@ -596,7 +595,31 @@ async fn scim_user_get(
     }
 }
 
+/// The answer to a deprovisioning (PATCH `active:false`, DELETE) of a user who is a team Owner or
+/// Admin: 403 in SCIM's error envelope, and NOTHING changed (the directory record and the roster
+/// both stay as they were, so the IdP sees an error rather than a deprovisioning that did not
+/// happen). Removing the people who run a team is a dashboard action by a person
+/// (`team_remove_member`), never a directory sync.
+fn scim_privileged_refusal(user_name: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "schemas": ["urn:ietf:params:scim:api:messages:2.0:Error"],
+            "status": "403",
+            "detail": format!(
+                "{user_name} is a team owner or admin: directory sync never removes one, remove them from the team in the dashboard"
+            ),
+        })),
+    )
+        .into_response()
+}
+
 /// SCIM PATCH — Okta/Azure use this to deactivate (`active:false`) on offboard.
+///
+/// Only `active:false` is honored, found in any operation either as `path: "active"` with a `false`
+/// value or as a `value` object carrying `active: false`; every other operation (re-activation
+/// included) is ignored and the current user is returned. Deactivating a user who is a team Owner
+/// or Admin is refused ([`scim_privileged_refusal`]); a plain member is removed from the roster.
 async fn scim_user_patch(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -606,7 +629,6 @@ async fn scim_user_patch(
     let Some(team) = scim_auth(&c, &headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
-    // Detect an `active:false` operation anywhere in the PATCH ops.
     let deactivate = body
         .get("Operations")
         .and_then(|o| o.as_array())
@@ -621,9 +643,11 @@ async fn scim_user_patch(
         })
         .unwrap_or(false);
     if deactivate {
-        c.enterprise.scim_deactivate_user(&team, &id);
         if let Some(u) = c.enterprise.scim_user(&team, &id) {
-            c.teams.remove_member(&team, &u.user_name);
+            if c.teams.remove_plain_member(&team, &u.user_name) == Some(MemberRemoval::Privileged) {
+                return scim_privileged_refusal(&u.user_name);
+            }
+            c.enterprise.scim_deactivate_user(&team, &id);
             c.audit.record(
                 &team,
                 "scim",
@@ -641,6 +665,10 @@ async fn scim_user_patch(
     }
 }
 
+/// Erases the user (`scim_purge_user`, not a soft deactivate: SCIM DELETE is deprovisioning, often
+/// an offboarding or a data-subject erasure request) and removes them from the team roster, unless
+/// they are a team Owner or Admin ([`scim_privileged_refusal`]: nothing is erased or removed). The
+/// audit trail still records WHO was removed (the `user_name` at deletion time).
 async fn scim_user_delete(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -650,13 +678,10 @@ async fn scim_user_delete(
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
     if let Some(u) = c.enterprise.scim_user(&team, &id) {
-        // A real erase, not a soft deactivate — SCIM DELETE is deprovisioning,
-        // often itself driven by an offboarding or data-subject erasure
-        // request; the audit trail still records WHO was removed (the
-        // historical user_name at time of deletion), matching how other
-        // erasures in this codebase are logged.
+        if c.teams.remove_plain_member(&team, &u.user_name) == Some(MemberRemoval::Privileged) {
+            return scim_privileged_refusal(&u.user_name);
+        }
         c.enterprise.scim_purge_user(&team, &id);
-        c.teams.remove_member(&team, &u.user_name);
         c.audit.record(
             &team,
             "scim",
@@ -670,17 +695,25 @@ async fn scim_user_delete(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Node-to-node: this node's locally-authored edge-enforcement config (IP blocks
-/// + deployment protection; no secrets — the password field is a one-way salted
-/// hash). Peers ingest it every gossip round so the gate works wherever a
-/// request enters or a deployment is hosted. Peer-authenticated QUIC transport.
+/// Node-to-node: this node's locally authored edge-enforcement config (IP blocks, deployment
+/// protection, microfrontend groups; no secrets, the password field is a one-way salted hash).
+/// Peers ingest it every gossip round so the gate works wherever a request enters or a deployment
+/// is hosted. Peer-authenticated QUIC transport.
 async fn edge_export(State(c): State<Arc<CloudState>>) -> Json<crate::enterprise::EdgeExport> {
     Json(c.enterprise.edge_export())
 }
 
-// ==========================================================================
-// Deployment protection
-// ==========================================================================
+/// Public HTTP mount for [`edge_export`]. CWE-306: the export carries every tenant's
+/// edge-enforcement config (IP blocks, deployment protection), so it must not answer an anonymous
+/// caller (`admin::require_fleet_read`). The gossip loop calls `edge_export` directly, so the gate
+/// is on this route wrapper, never inside the shared handler.
+async fn edge_export_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<crate::enterprise::EdgeExport>, (StatusCode, String)> {
+    crate::admin::require_fleet_read(claims.as_ref().map(|e| &e.0))?;
+    Ok(edge_export(State(c)).await)
+}
 
 fn protection_view(p: &crate::enterprise::DeployProtection) -> Value {
     json!({
@@ -766,10 +799,6 @@ async fn protection_put(
     Ok(Json(protection_view(&p)))
 }
 
-// ==========================================================================
-// Microfrontends
-// ==========================================================================
-
 async fn mfe_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -794,6 +823,12 @@ struct MfeChildReq {
     path_prefix: String,
 }
 
+/// Creates or updates a microfrontend group (Pro or Enterprise plan). Every referenced project,
+/// host and children, must belong to THIS team so a group never composes another tenant's
+/// deployments; the check is fleet-aware (`project_owned_by`) because settings rows are node-local,
+/// so a remotely placed project's ownership is judged from its deployment tenant tags. The request
+/// arrives in the legacy `children` shape and `set_mfe_group` normalizes it into the rich `members`
+/// model (default member plus child members with derived routing).
 async fn mfe_upsert(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -813,10 +848,6 @@ async fn mfe_upsert(
             "name and host_project required".into(),
         ));
     }
-    // Every referenced project (host + children) must belong to THIS team — a
-    // microfrontend group must never compose another tenant's deployments.
-    // Fleet-aware check: settings rows are node-local, so a remotely-placed
-    // project's ownership is judged from its deployment tenant tags.
     for p in std::iter::once(&b.host_project).chain(b.children.iter().map(|ch| &ch.project)) {
         if !crate::admin::project_owned_by(&c, p, &t) {
             return Err((
@@ -830,8 +861,6 @@ async fn mfe_upsert(
     } else {
         b.id
     };
-    // Build via the legacy `children` shape; `set_mfe_group` normalizes it into the
-    // rich `members` model (default member + child members with derived routing).
     let mut g = MfeGroup::new(id, b.name, b.host_project, now_ms());
     g.members.clear();
     g.children = b
@@ -868,10 +897,6 @@ async fn mfe_delete(
     crate::persist::persist(&c);
     Json(json!({ "ok": true }))
 }
-
-// ==========================================================================
-// Conformance
-// ==========================================================================
 
 async fn conformance_get(
     State(c): State<Arc<CloudState>>,
@@ -918,6 +943,11 @@ struct RunReq {
 
 /// Evaluate the built-in conformance rules against a project's latest deployment,
 /// using the service graph + project settings as evidence. Deterministic; no AI.
+///
+/// Evidence comes from THIS node's gateway (`c.gw`), so a deployment hosted only on another node is
+/// not seen. `env-no-plaintext-secrets` requires every env var whose name looks secret-ish
+/// (`SECRET`, `TOKEN`, `PASSWORD`, `APIKEY` or a `_KEY` suffix) to be flagged `sensitive` (masked
+/// and encrypted).
 async fn conformance_run(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -931,7 +961,6 @@ async fn conformance_run(
     let policy = c.enterprise.conformance_policy(&t);
     let required = |id: &str| policy.required.iter().any(|r| r == id);
 
-    // Gather evidence.
     let deployments = c.gw.list();
     let dep = deployments
         .iter()
@@ -947,8 +976,6 @@ async fn conformance_run(
     let waf_rules = c.waf.rules().len();
     let preview_protected = c.projects.preview_protected(&b.project)
         || c.enterprise.protection(&b.project).mode != "off";
-    // Sensitive env hygiene: every env var whose name looks secret-ish (KEY,
-    // SECRET, TOKEN, PASSWORD) must be flagged `sensitive` (→ masked/encrypted).
     let env_sensitive_ok = settings.env.iter().all(|e| {
         let k = e.key.to_uppercase();
         let secretish = k.contains("SECRET")

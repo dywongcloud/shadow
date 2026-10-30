@@ -6,17 +6,20 @@ import { Badge, Button, Card, Input, SettingCard, Switch, Triangle } from "@/com
 import { apiGet, apiSend } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-// ---- API shapes (mirror crate::microfrontends) ----
+/** Wire shapes of the backend's `crate::microfrontends` (`/v1/projects/:project/settings/microfrontends`). */
 type MfeRoute = { group?: string; flag?: string; paths: string[] };
 type MfeDevelopment = { local?: string; task?: string; fallback?: string };
+type MfeRole = "default" | "child";
+type MfeObservabilityRouting = "default_application" | "this_project";
+type MfeFallbackEnvironment = "same_environment" | "production" | "custom";
 type MfeMember = {
   project: string;
-  role: string; // "default" | "child"
+  role: MfeRole;
   routing: MfeRoute[];
   default_route?: string;
   package_name?: string;
   asset_prefix?: string;
-  observability_routing: string; // "default_application" | "this_project"
+  observability_routing: MfeObservabilityRouting;
   development?: MfeDevelopment;
 };
 type MfeGroup = {
@@ -25,7 +28,7 @@ type MfeGroup = {
   host_project: string;
   members: MfeMember[];
   enabled: boolean;
-  fallback_environment: string; // "same_environment" | "production" | "custom"
+  fallback_environment: MfeFallbackEnvironment;
   custom_fallback_environment_name?: string;
   disable_overrides: boolean;
   local_proxy_port?: number;
@@ -48,9 +51,7 @@ function errText(e: unknown): string {
     try {
       const j = JSON.parse(m[0]);
       return j.error || s;
-    } catch {
-      /* fall through */
-    }
+    } catch {}
   }
   return s;
 }
@@ -75,8 +76,6 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
     }
   }, [project]);
   useEffect(() => {
-    // Fetch-on-mount/project-change: load() sets state only after its
-    // internal await resolves, syncing external (server) settings into React.
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch effect; state is set only after an internal await, not synchronously
     load();
   }, [load]);
@@ -113,7 +112,6 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
       {err ? <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-500">{err}</div> : null}
       {notice ? <div className="rounded-lg border border-green-500/30 bg-green-500/5 p-3 text-sm text-green-600">{notice}</div> : null}
 
-      {/* ---- Groups ---- */}
       <SettingCard
         title="Groups"
         desc="Microfrontend groups visible to this team. A group composes one default application with child projects that own path routes."
@@ -147,7 +145,6 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
         )}
       </SettingCard>
 
-      {/* ---- Current project membership + config ---- */}
       {!data.in_group ? (
         <SettingCard
           title="This Project"
@@ -197,9 +194,6 @@ export function MicrofrontendsSettings({ paramsPromise }: { paramsPromise: Promi
   );
 }
 
-// ---------------------------------------------------------------------------
-// Group card (accordion)
-// ---------------------------------------------------------------------------
 function GroupCard({
   group,
   project,
@@ -293,9 +287,6 @@ function GroupCard({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Per-project membership configuration cards
-// ---------------------------------------------------------------------------
 function MembershipConfig({
   project,
   group,
@@ -453,7 +444,7 @@ function FallbackEnvironmentCard({ group, onSave }: { group: MfeGroup; onSave: (
       }
     >
       <div className="flex flex-col gap-3">
-        <select className={selectCls} value={env} onChange={(e) => setEnv(e.target.value)}>
+        <select className={selectCls} value={env} onChange={(e) => setEnv(e.target.value as MfeFallbackEnvironment)}>
           <option value="same_environment">Same Environment</option>
           <option value="production">Production</option>
           <option value="custom">Custom Environment</option>
@@ -567,9 +558,6 @@ function LocalDevelopmentCard({
   );
 }
 
-// ---------------------------------------------------------------------------
-// Dialogs
-// ---------------------------------------------------------------------------
 function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
   return (
     <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm" onClick={onClose}>
