@@ -1,0 +1,19 @@
+# Vendored from SolutionsAsService/shadw-core at 8fd03c563f1dda3c2c2c4547a7101d0fd33cb43b
+# (crates/shadw-core). Source is byte-identical; only this manifest is new, because
+# the upstream one inherits version, edition and dependencies from its workspace.
+[package]
+name = "shadw-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "Native append-only SHADW log with pinned-key verified proof transfer"
+
+[dependencies]
+hypercore = { version = "=0.16.0", default-features = false, features = ["tokio", "sparse"] }
+hypercore_schema = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+fs2 = "0.4"

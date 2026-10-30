@@ -128,6 +128,12 @@ memories/notes whose durable content it absorbed.
   Never let an address filter empty the set. Gossip bodies read against IDLE
   (`HIVE_P2P_FIRSTBYTE_MS` 15s, `HIVE_P2P_IDLE_MS` 45s); replies ≥256 KiB are
   lower priority.
+- Stream mode `0x06` (`STREAM_CORE`) carries signed-log replication (`hive-cores`,
+  feature `cores`, `HIVE_CORES_LISTEN=0` off): trusted peers only, every reply
+  opens with `hive_cores::MAGIC` so an old node's tunnel misparse fails the
+  pull, and readers verify every bundle (`shadw-core`) — never the transport.
+  Cores run only on the PATCHED `vendor/hypercore`; unpatched 0.16 appends over
+  its own data after a reopen. Mode bytes `0x00`–`0x06` are taken.
 - `hive_p2p::establish_stats` is served on operator-only `GET /v1/mesh/establish`,
   **never on the unauthenticated `/v1/mesh`**. `last_outbound_established_ms`
   frozen while dials time out and warm trunks still gossip IS the wedge;

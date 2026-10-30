@@ -130,6 +130,8 @@ openraft = { version = "0.9", optional = true }
 # Optional EXPERIMENT: anonymous team/role membership demo endpoints (`zkauth`
 # feature). Off by default; mounts /v1/zkauth/* and is not part of real auth.
 hive-zkauth = { workspace = true, optional = true }
+# Signed-log replication over STREAM_CORE (SHADW chain plan, Annex IV, L3). Opt-in.
+hive-cores = { workspace = true, optional = true }
 rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
 # shadw drive (bn-shadw-drive-v1): WebDAV protocol handler mounted at
 # /v1/drive/webdav/:project (drive_webdav.rs). A genuine new dependency (not
@@ -158,6 +160,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 default = ["zkauth"]
 raft = ["dep:openraft"]
 zkauth = ["dep:hive-zkauth"]
+# Serve and pull SHADW signed logs (Hypercore cores) over the mesh, stream mode
+# 0x06. Off by default until the chain plan's L3 exit test passes on staging.
+cores = ["dep:hive-cores"]
 
 # Heap profiling, Linux-only (the fleet is Linux; macOS is dev-only and
 # jemalloc's profiling support is not available there).
