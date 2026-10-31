@@ -13,9 +13,18 @@ It reproduces Hive's components — Control Plane, per-Hive API, Box Daemon, Cel
 Daemon, warm pools, scheduler, autoscaler, and the cell lifecycle — behind a
 pluggable isolation backend:
 
-- **litebox** — a cell is a sandboxed application kernel with complete syscall wrapping, cross architecture. Runs anywhere (incl.
-  Windows, Linux, macOS / Apple Silicon / x86 64, ARM) so you can exercise the whole control plane today.
-- **firecracker** — a cell is a real Firecracker microVM. (check out PVM below) This runs anywhere a KVM
+- **litebox** — **the backend the shadw.cloud fleet runs.** A cell is a host process under
+  [LiteBox](https://github.com/microsoft/litebox), an unprivileged library-OS sandbox that rewrites every
+  syscall into its own dispatcher behind a seccomp-bpf allowlist (we run the
+  [AnEntrypoint/litebox](https://github.com/AnEntrypoint/litebox) fork, pinned in `ansible/roles/litebox`).
+  Functions and sandbox `exec`/terminal sessions run inside it; builds run as host processes and
+  `__container__` cells use host podman. A node opts in after `hive-cloud --litebox-probe` passes, by
+  setting `HIVE_LITEBOX_VERIFIED=1` (the `litebox` Ansible role does this when `litebox_verified: true`).
+  LiteBox itself also runs Linux programs on Windows and macOS. See the module doc in
+  `crates/hive-backend/src/litebox.rs` for its security posture.
+- **firecracker** — optional, not used on the fleet. The backend is still in the code: a cell is a real
+  Firecracker microVM, and `hive-cloud` selects it ahead of LiteBox on a Linux host with `/dev/kvm` and a
+  `firecracker` binary unless `HIVE_FORCE_MOCK=1` is set. (check out PVM below) This runs anywhere a KVM
   interface is available: an **M3/M4 Mac** via a Lima nested-virt VM, a **bare-metal
   Linux box** with real `/dev/kvm`, or even an **ordinary cloud VM without nested
   virtualization** via **PVM** (see [Firecracker without KVM (PVM)](#firecracker-without-kvm-on-plain-cloud-vms-pvm)).
@@ -91,7 +100,7 @@ Observability, and Sandbox — dark/Geist, shadcn-style components, Tremor chart
 ```
 crates/
   hive-core         shared types: ids, jobs, lifecycle FSMs, wire/agent protocol
-  hive-backend      CellBackend trait + mock + firecracker + function-serving
+  hive-backend      CellBackend trait + mock + litebox + firecracker + function-serving
   hive-controlplane build scheduler, warm pool, autoscaler, lifecycle
   hive-api          per-Hive HTTP API (submit / status / stream logs)
   hive-cell-agent   the cell daemon (in-guest; build runner + function bridge)
@@ -109,7 +118,7 @@ crates/
   hive-cloud        the unified node binary (one cloud across MacBooks)
 ui/                 Vercel-style dashboard (Next.js + TypeScript + Tremor)
 examples/hello/     a deployable app (static page + Python function)
-scripts/            Lima config + guest bootstrap for the Firecracker path
+scripts/            Lima config + guest bootstrap for the optional Firecracker path
 ```
 
 ## Quick start (mock backend — works on your Mac now)
@@ -244,7 +253,11 @@ is reclaimed. (Routing here opens one connection per request for simplicity;
 real Fluid keeps persistent TCP tunnels and routes by function id for >99%
 connection reuse.)
 
-## Real microVMs (firecracker backend, on an M3/M4)
+## Real microVMs (optional firecracker backend, on an M3/M4)
+
+> The shadw.cloud fleet runs the **litebox** backend (see the backend list at the top). This section and
+> the PVM section below document the Firecracker backend, which is still in the code for hosts that want
+> microVM cells.
 
 Requires macOS 13+ on an M3/M4 (hardware nested virtualization) and
 [Lima](https://lima-vm.io) ≥ 1.0.
