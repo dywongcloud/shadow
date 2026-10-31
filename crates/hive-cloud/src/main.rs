@@ -127,6 +127,8 @@ mod world;
 mod world_queue;
 #[cfg(feature = "zkauth")]
 mod zkauth;
+#[cfg(feature = "cores")]
+mod cores;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -1391,6 +1393,17 @@ async fn async_main() -> anyhow::Result<()> {
                 |_| None,
             );
         hive_p2p::set_browser_meter(Some(crate::browser_metering::meter_handler(&cloud)));
+        // Signed-log replication (SHADW chain plan, Annex IV, L3): serve
+        // `STREAM_CORE` from this node's core store under `$HIVE_DATA/cores`.
+        // Compiled only with `--features cores`; HIVE_CORES_LISTEN=0 turns the
+        // serve arm off at runtime. Without either, `0x06` streams are reset.
+        #[cfg(feature = "cores")]
+        let core_handler = match std::env::var("HIVE_CORES_LISTEN") {
+            Ok(v) if v.trim() == "0" => None,
+            _ => crate::cores::handler().await,
+        };
+        #[cfg(not(feature = "cores"))]
+        let core_handler: Option<hive_p2p::CoreHandler> = None;
         tokio::spawn(hive_p2p::serve_tunnels_full(
             ep,
             gateway_addr,
@@ -1402,6 +1415,7 @@ async fn async_main() -> anyhow::Result<()> {
             Some(browser_admission),
             browser_crr,
             &[crate::store_sync::SNAPSHOT_PATH_PREFIX],
+            core_handler,
         ));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }

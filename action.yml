@@ -1,0 +1,78 @@
+name: "Deploy to Shadw"
+description: "Deploy a repository to Shadw from GitHub Actions, configured by a standard shadw.yml."
+author: "ThothDivision"
+branding:
+  icon: "upload-cloud"
+  color: "purple"
+
+inputs:
+  token:
+    description: "Shadw API key (shadw_...) from Shadw -> API keys. Store it as a repository secret."
+    required: true
+  api-url:
+    description: "Shadw API base URL of your deployment (the same value as SHADW_API_URL for the shadw CLI)."
+    required: true
+    default: ""
+  team:
+    description: "Team slug (x-hive-team). Usually inferred from the API key."
+    required: false
+    default: ""
+  config:
+    description: "Path to shadw.yml. Missing file = all defaults."
+    required: false
+    default: "shadw.yml"
+  project:
+    description: "Override shadw.yml project."
+    required: false
+    default: ""
+  target:
+    description: "Override target: auto | production | preview."
+    required: false
+    default: ""
+  env:
+    description: "Extra runtime env, one KEY=VALUE per line (use secrets here). Merged over shadw.yml env."
+    required: false
+    default: ""
+  wait:
+    description: "Wait for the build to finish and fail the job if it errors (true/false). Overrides shadw.yml."
+    required: false
+    default: ""
+  dry-run:
+    description: "Print the deploy request without calling Shadw."
+    required: false
+    default: "false"
+
+outputs:
+  build-id:
+    description: "Shadw build id"
+    value: ${{ steps.deploy.outputs.build-id }}
+  project:
+    description: "Shadw project name"
+    value: ${{ steps.deploy.outputs.project }}
+  state:
+    description: "Final build state (ready/error) when waiting, otherwise queued"
+    value: ${{ steps.deploy.outputs.state }}
+  url:
+    description: "Deployment URL when Shadw reports one"
+    value: ${{ steps.deploy.outputs.url }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        SHADW_TOKEN: ${{ inputs.token }}
+        SHADW_API_URL: ${{ inputs.api-url }}
+        SHADW_TEAM: ${{ inputs.team }}
+        SHADW_CONFIG: ${{ inputs.config }}
+        SHADW_PROJECT: ${{ inputs.project }}
+        SHADW_TARGET: ${{ inputs.target }}
+        SHADW_EXTRA_ENV: ${{ inputs.env }}
+        SHADW_WAIT: ${{ inputs.wait }}
+        SHADW_DRY_RUN: ${{ inputs.dry-run }}
+        SHADW_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        SHADW_BRANCH: ${{ github.head_ref || github.ref_name }}
+        SHADW_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        SHADW_EVENT: ${{ github.event_name }}
+      run: python3 "${{ github.action_path }}/scripts/shadw-action/deploy.py"

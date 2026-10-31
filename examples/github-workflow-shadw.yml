@@ -1,0 +1,22 @@
+# Copy to .github/workflows/shadw.yml in your app repository.
+name: Deploy to Shadw
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dywongcloud/shadow@main
+        with:
+          token: ${{ secrets.SHADW_TOKEN }}
+          api-url: ${{ vars.SHADW_API_URL }}
+          # env: |
+          #   DATABASE_URL=${{ secrets.DATABASE_URL }}

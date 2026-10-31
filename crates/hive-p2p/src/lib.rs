@@ -249,6 +249,18 @@ const STREAM_JOIN: u8 = 0x04;
 /// the opener can fail over without having consumed client bytes), then an opaque splice for `tcp`
 /// or `[u32 len][bytes]` datagram frames (≤ [`RAW_MAX_DATAGRAM`]) for `udp`.
 const STREAM_RAW_TARGET: u8 = 0x05;
+/// SIGNED-LOG replication (SHADW chain plan, Annex IV, L3): the stream is handed
+/// whole to the [`CoreHandler`] (hive-cores), which pulls Hypercore proof bundles.
+/// TRUSTED PEERS ONLY: it sits behind the same per-stream trust check as every
+/// non-JOIN mode, so an untrusted connection's `0x06` stream is dropped unread.
+/// The handler also gets the [`Connection`] so it can bind its capability to the
+/// session's exported TLS keying material. No handler configured: the stream is
+/// reset, never misrouted to the tunnel arm.
+/// MIXED-FLEET NOTE: an old receiver misparses this byte as a tunnel session.
+/// The handler's first reply begins with a fixed magic (`hive-cores`' `MAGIC`),
+/// so an opener that lands on an old peer times out or sees a mismatch and
+/// fails; it never applies garbage.
+pub const STREAM_CORE: u8 = 0x06;
 const GOSSIP_METHOD_GET: u8 = 0;
 const GOSSIP_METHOD_POST: u8 = 1;
 /// Domain separator for gossip signatures (versioned; bump on format change).
@@ -403,6 +415,36 @@ pub type RawTargetResolver = Arc<
         + Send
         + Sync,
 >;
+
+/// One [`STREAM_CORE`] stream, mode byte already consumed (accept side) or
+/// written (open side). `conn` is the authenticated connection it rides, so the
+/// protocol can derive session-bound keying material with
+/// `Connection::export_keying_material`.
+pub struct CoreStream {
+    pub send: iroh::endpoint::SendStream,
+    pub recv: iroh::endpoint::RecvStream,
+    pub remote_id: String,
+    pub conn: Connection,
+}
+
+/// Serves one inbound [`STREAM_CORE`] stream. Provided by hive-cloud from its
+/// `hive-cores` store; this transport crate knows nothing about logs.
+pub type CoreHandler = Arc<
+    dyn Fn(CoreStream) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Opener side of [`STREAM_CORE`] on an already-established connection: a new bi
+/// stream with the mode byte written. Callers that hold a [`PeerPool`] use
+/// [`PeerPool::open_core`] instead, which also dials and re-dials.
+pub async fn open_core_stream(conn: &Connection) -> Result<CoreStream> {
+    let (mut send, recv) = tokio::time::timeout(open_budget(), conn.open_bi())
+        .await
+        .map_err(|_| anyhow::anyhow!("open core stream: timed out"))??;
+    send.write_all(&[STREAM_CORE]).await?;
+    Ok(CoreStream { send, recv, remote_id: conn.remote_id().to_string(), conn: conn.clone() })
+}
 
 /// Gossip signature-verification mode, `HIVE_GOSSIP_VERIFY` = `off` | `log` (default: verify,
 /// count, warn, still serve) | `enforce` (only a valid signature from the connected peer); staged
@@ -3255,6 +3297,32 @@ impl PeerPool {
         }
     }
 
+    /// Open a [`STREAM_CORE`] stream to `node_id` on the reused trunk (signed-log
+    /// replication; see hive-cores). Re-dials once if the cached trunk is dead.
+    pub async fn open_core(&self, node_id: &str, addr_json: &str) -> Result<CoreStream> {
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let acquired = match self.acquire(node_id, addr_json).await {
+                Ok(acquired) => acquired,
+                Err(e) if attempt < 2 => {
+                    tracing::debug!(peer = node_id, error = %e, "open_core: acquire failed, retrying");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match open_core_stream(&acquired.conn).await {
+                Ok(stream) => return Ok(stream),
+                Err(e) => {
+                    self.evict_acquired(&acquired).await;
+                    if attempt >= 2 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     /// Control-plane gossip over the mesh: tunnel an HTTP-shaped request (`method` =
     /// [`GOSSIP_GET`]/[`GOSSIP_POST`]) to the peer's local admin over a new bi stream on the reused
     /// trunk, returning the response body; re-dials once if the trunk is dead.
@@ -3886,6 +3954,7 @@ pub async fn serve_tunnels_with_join(
         None,
         None,
         &[],
+        None,
     )
     .await
 }
@@ -3893,6 +3962,8 @@ pub async fn serve_tunnels_with_join(
 /// [`serve_tunnels_with_join`] plus the raw-target surface (a [`RawTargetResolver`] serves
 /// [`STREAM_RAW_TARGET`], else [`RAW_TARGET_NOT_FOUND`]) and the gossip request-path prefixes whose
 /// bulk responses are never deprioritized ([`BulkExemptPrefixes`]).
+/// `core`: the [`STREAM_CORE`] handler (signed-log replication), trusted peers
+/// only; `None` resets such streams.
 pub async fn serve_tunnels_full(
     ep: Endpoint,
     local_http: String,
@@ -3904,6 +3975,7 @@ pub async fn serve_tunnels_full(
     browser_admission: Option<BrowserAdmissionHandler>,
     browser_crr: Option<BrowserCrrHandler>,
     bulk_exempt: BulkExemptPrefixes,
+    core: Option<CoreHandler>,
 ) {
     let browser_resources = BrowserInboundResources::new();
     let budgets = establish::InboundBudgets {
@@ -3944,6 +4016,7 @@ pub async fn serve_tunnels_full(
         let gossip = gossip.clone();
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
+        let core = core.clone();
         let browser_admission = browser_admission.clone();
         let browser_crr = browser_crr.clone();
         let browser_resources = browser_resources.clone();
@@ -4044,6 +4117,7 @@ pub async fn serve_tunnels_full(
                 join,
                 raw_resolver,
                 bulk_exempt,
+                core,
             )
             .await;
         });
@@ -4133,6 +4207,7 @@ async fn serve_fleet_conn(
     join: Option<JoinHandler>,
     raw_resolver: Option<RawTargetResolver>,
     bulk_exempt: BulkExemptPrefixes,
+    core: Option<CoreHandler>,
 ) {
     let remote_id = conn.remote_id().to_string();
     if let Some(trust) = &trust {
@@ -4146,6 +4221,8 @@ async fn serve_fleet_conn(
         let gossip = gossip.clone();
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
+        let core = core.clone();
+        let core_conn = conn.clone();
         let rid = remote_id.clone();
         let trust = trust.clone();
         tokio::spawn(async move {
@@ -4184,6 +4261,16 @@ async fn serve_fleet_conn(
                 }
                 STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
                 STREAM_RAW_TARGET => serve_raw_target(recv, send, raw_resolver).await,
+                STREAM_CORE => match core {
+                    Some(core) => {
+                        core(CoreStream { send, recv, remote_id: rid, conn: core_conn }).await
+                    }
+                    None => {
+                        let (mut send, mut recv) = (send, recv);
+                        let _ = send.reset(0u32.into());
+                        let _ = recv.stop(0u32.into());
+                    }
+                },
                 _ => {
                     fluid_tunnel::TunnelServer::serve(
                         tokio::io::join(recv, send),

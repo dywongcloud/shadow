@@ -14,6 +14,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+# shadw.yml (same version hive-cloud already uses; no new lockfile package)
+serde_yaml = "0.9"
 
 [dev-dependencies]
 # Test-only: the `bun_fixtures` integration test cross-checks a parsed

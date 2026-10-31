@@ -1,5 +1,38 @@
 # Changelog
 
+## 2026-10-30 — Stream mode 0x06: signed-log replication (opt-in)
+
+The SHADW chain plan (shadw-planning, Annex IV, phase L3) puts its signed logs (KeyForge registries, receipts, and later
+the quorum-signed ledger) on the mesh the fleet already runs instead of a second network.
+
+- **`hive-p2p`: `STREAM_CORE = 0x06`.**
+  - Sits behind the same per-stream trust check as every non-JOIN mode.
+  - Handed whole, with its `Connection`, to a `CoreHandler` that `serve_tunnels_full` now takes as a last argument.
+  - With no handler, the stream is reset. It never falls through to the tunnel arm.
+  - `PeerPool::open_core` and `open_core_stream` open the stream from the dialing side.
+- **`hive-cores` (new): a node's store of Hypercore cores**, kept under `$HIVE_DATA/cores`, one directory per core
+  named by the hex of its key.
+  - The pull protocol has the reader present a capability: SHA-256 over the core key and TLS keying material exported
+    from that connection, so it is useless on any other connection.
+  - Every writer reply opens with `MAGIC`, so a pull that lands on an older node fails cleanly.
+  - Every bundle is verified by `shadw-core` against the pinned key and signed head before it is stored.
+  - Requests are capped at 64 blocks. Measured import cost is about 12 ms per block on SSD and about 270 ms on a
+    spinning disk, and the writer's 45 s wait has to cover one bundle.
+- **`hive-cloud`: feature `cores`, off by default.** It opens the store and serves `0x06`; `HIVE_CORES_LISTEN=0`
+  turns serving off at runtime. Nothing pulls automatically yet: the replication policy (who follows what, and from
+  whom) is the next step.
+- **Vendored crates.**
+  - `vendor/shadw-core`: the store and bundle format.
+  - `vendor/hypercore`: 0.16.0 with shadw-core's three persistence fixes, enforced through `[patch.crates-io]`.
+    Unpatched, a reopened store appends over its own data.
+- **Witness:** `cargo run -p hive-cores --example core_witness`, 8 lines:
+  - The writer is reopened mid-way through its log.
+  - A 600-block verified pull, then an incremental pull.
+  - An untrusted peer's stream is dropped; an unknown core is refused.
+  - A replayed capability is refused.
+  - The replica reopens and keeps pulling.
+  - A node with no handler resets the stream.
+
 ## 2026-10-14 — a build that is not live production reads as preview, so the edge preview gate protects superseded production URLs and a protected body is never cached (daa7493, e6da54f, ebcb99fcdb)
 
 A deployment record wrote `target` from the caller's production argument while `production` ANDed `publish_routes` and

@@ -144,6 +144,7 @@ async fn main() -> anyhow::Result<()> {
         Some(admission),
         None,
         &[],
+        None,
     ));
     let pool = hive_p2p::BrowserPool::new(fleet_ep);
 

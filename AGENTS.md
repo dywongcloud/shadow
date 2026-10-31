@@ -83,6 +83,10 @@ load-bearing, delete the memories it absorbs. Nested files load where you work: 
   NEGOTIATED ALPN, and never evicts an established trunk**: `HIVE_P2P_ACCEPT_DEADLINE_MS` (40 s); pre-handshake the
   ClientHello picks the budget; `hive_p2p::establish_stats` is served on operator-only `GET /v1/mesh/establish`, never
   the public `/v1/mesh`.
+- Stream mode `0x06` (`STREAM_CORE`) carries signed-log replication (`hive-cores`, feature `cores`,
+  `HIVE_CORES_LISTEN=0` off): trusted peers only, every reply opens with `hive_cores::MAGIC` so an old node's tunnel
+  misparse fails the pull, and readers verify every bundle (`shadw-core`), never the transport. Cores run only on the
+  PATCHED `vendor/hypercore`; unpatched 0.16 appends over its own data after a reopen. Mode bytes `0x00`-`0x06` are taken.
 - `vendor/iroh` keeps two patches across pin bumps (relay "read before send", `PendingRebind`); a publicly dialable
   address needs `HIVE_PUBLIC_IP` AND `HIVE_IROH_PORT`.
 - **A gossip round never waits on a dead peer, and one stale reading never withdraws one.** Rounds end at

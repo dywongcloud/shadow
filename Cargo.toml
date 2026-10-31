@@ -22,6 +22,7 @@ members = [
     "crates/hive-cloud",
     "crates/hive-wg",
     "crates/hive-zkauth",
+    "crates/hive-cores",
     "crates/hive-crsql",
     "crates/hive-outbound",
 ]
@@ -34,7 +35,7 @@ members = [
 # SQLite extension .dylib/.so, loaded at runtime by hive-crsql via rusqlite's
 # load_extension. Excluded so its nested core/rs/*/Cargo.toml files (several,
 # each its own crate) don't trip the same nested-workspace conflict.
-exclude = ["vendor/guardian-db", "crates/hive-browser", "vendor/cr-sqlite"]
+exclude = ["vendor/guardian-db", "crates/hive-browser", "vendor/cr-sqlite", "vendor/hypercore", "vendor/shadw-core"]
 
 [workspace.package]
 version = "0.1.0"
@@ -92,6 +93,7 @@ hive-p2p = { path = "crates/hive-p2p" }
 hive-browser-proto = { path = "crates/hive-browser-proto" }
 hive-crsql = { path = "crates/hive-crsql" }
 hive-zkauth = { path = "crates/hive-zkauth" }
+hive-cores = { path = "crates/hive-cores" }
 hive-outbound = { path = "crates/hive-outbound" }
 
 # Local fork of guardian-db 0.18.0 (vendor/guardian-db): its Iroh endpoint was
@@ -117,6 +119,11 @@ iroh-mdns-address-lookup = { path = "vendor/guardian-db/iroh-mdns-address-lookup
 # 1.0.2 otherwise — re-diff against the next iroh bump before updating the
 # version pin, the same discipline as the guardian-db patch above.
 iroh = { path = "vendor/iroh" }
+# hypercore 0.16.0 with three bounded persistence fixes from shadw-core
+# (vendor/hypercore/SHADW_PATCHES.md): oplog flag masks, append offset after
+# reopen, and trailing-partial recovery. Unpatched, a reopened store appends over
+# its own data. Used by hive-cores through vendor/shadw-core.
+hypercore = { path = "vendor/hypercore" }
 
 [profile.release]
 opt-level = 3
