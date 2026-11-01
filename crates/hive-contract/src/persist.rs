@@ -35,7 +35,7 @@
 use crate::checkpoint::{Checkpoint, SignedCheckpoint, TrustedCheckpoint};
 use crate::exec::{index_hash, Index};
 use crate::merkle;
-use crate::oplog::{LogEntry, OpLog};
+use crate::oplog::{Ack, LogEntry, OpLog};
 use crate::signing::{verify_ed25519, CheckpointSigner};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +62,22 @@ pub struct PersistConfig {
     /// unsigned checkpoint: an unsigned checkpoint asserts nothing, and an artefact shaped like a
     /// checkpoint but carrying no signature is how a forged history would be smuggled in.
     pub signer: Option<Arc<dyn CheckpointSigner>>,
+    /// Whether one entry's `write_all` is followed by a `sync_data` before [`Store::append`]
+    /// returns.
+    ///
+    /// `true` is the strict claim -- "committed" means "on disk", so a power loss cannot take an
+    /// entry the caller was already told had committed -- and it costs one fsync per op, measured
+    /// on the authoring machine at ~5.5 ms/op against ~0.08 ms for the same op with no fsync
+    /// (`contract-cost`). That is the right setting for a control-plane op (a `db.create`), and the
+    /// wrong one for an op on a hot request path, where paying it per request is a latency tax, not
+    /// a durability property.
+    ///
+    /// `false` does NOT mean "unsynced forever": the open segment is synced before every window
+    /// closes (so a checkpoint never attests entries that were not flushed), by [`Store::sync`],
+    /// and by [`crate::Engine::flush`]. The exposure is therefore bounded by how long a caller lets
+    /// a window or a flush interval stay open -- never by the log growing. A process death still
+    /// loses nothing, because a completed `write_all` survives the writer.
+    pub sync: bool,
 }
 
 impl Default for PersistConfig {
@@ -70,6 +86,7 @@ impl Default for PersistConfig {
             checkpoint_every: DEFAULT_CHECKPOINT_EVERY,
             retain_checkpoints: DEFAULT_RETAIN_CHECKPOINTS,
             signer: None,
+            sync: true,
         }
     }
 }
@@ -158,10 +175,17 @@ pub struct SegmentLine {
     pub sig: String,
 }
 
-/// The bytes a stored entry's signature covers.
-pub fn entry_sig_preimage(entry_hash: &str) -> Vec<u8> {
+/// The bytes a stored entry's signature covers: the entry hash AND the ack it was published with.
+///
+/// The entry hash alone binds the operation, its position and its predecessor -- but not what the
+/// executor SAID about the operation, because `ack.log_head` is the entry hash and the two cannot
+/// commit to each other. Folding the ack in here is what makes an accusation of equivocation
+/// sound: see [`crate::oplog::Ack::canonical`] and [`crate::fraud::Equivocation`].
+pub fn entry_sig_preimage(entry_hash: &str, ack: &Ack) -> Vec<u8> {
     let mut out = crate::oplog::ENTRY_SIG_DOMAIN.to_vec();
     out.extend_from_slice(entry_hash.as_bytes());
+    out.push(b'\x1c');
+    out.extend_from_slice(&ack.canonical());
     out
 }
 
@@ -323,7 +347,8 @@ fn verify_line(l: &SegmentLine, file: &str, public_key: Option<&[u8]>) -> Result
             })
         }
     };
-    if !verify_ed25519(pk, &entry_sig_preimage(&l.entry.entry_hash), &sig) {
+    let preimage = entry_sig_preimage(&l.entry.entry_hash, &l.entry.ack);
+    if !verify_ed25519(pk, &preimage, &sig) {
         return Err(StoreError::BadEntry {
             file: file.to_string(),
             seq: l.entry.op.seq,
@@ -416,6 +441,8 @@ pub struct Store {
     window: usize,
     retain: usize,
     signer: Option<Arc<dyn CheckpointSigner>>,
+    /// Whether one append is synced before [`Store::append`] returns. See [`PersistConfig::sync`].
+    sync: bool,
     /// The segment currently open for append, and the window index it belongs to.
     seg: Option<tokio::fs::File>,
     seg_base: Option<u64>,
@@ -512,6 +539,7 @@ impl Store {
             window,
             retain,
             signer: Some(signer),
+            sync: cfg.sync,
             seg: None,
             seg_base: None,
             pending_start: if log.is_empty() { None } else { Some(log.base()) },
@@ -594,7 +622,7 @@ impl Store {
         let signer = self.signer.as_ref().ok_or(StoreError::NoSigner)?;
         let sig = hex::encode(
             signer
-                .sign(&entry_sig_preimage(&entry.entry_hash))
+                .sign(&entry_sig_preimage(&entry.entry_hash, &entry.ack))
                 .map_err(StoreError::SignFailed)?,
         );
         let mut line = serde_json::to_string(&SegmentLine {
@@ -610,7 +638,9 @@ impl Store {
         f.write_all(line.as_bytes())
             .await
             .map_err(io("append entry"))?;
-        f.sync_data().await.map_err(io("sync entry"))?;
+        if self.sync {
+            f.sync_data().await.map_err(io("sync entry"))?;
+        }
 
         self.pending.push(entry.entry_hash.clone());
         let mut step = AppendStep::default();
@@ -619,6 +649,21 @@ impl Store {
         }
         self.close_window(entry, index, ts_ms, &mut step).await?;
         Ok(step)
+    }
+
+    /// Flush whatever has been written to the open segment without closing the window.
+    ///
+    /// The batched counterpart of the per-entry sync: a caller that cannot pay an fsync per op
+    /// still has to pay it SOMETIME, and this is the sometime. It syncs the segment only -- no
+    /// checkpoint is minted, nothing is reclaimed -- so it is cheap enough to call on a timer and
+    /// its worst-case exposure is the interval between calls, not the size of the log.
+    pub async fn sync(&mut self) -> Result<(), StoreError> {
+        match self.seg.as_mut() {
+            Some(f) => f.sync_data().await.map_err(io("sync segment")),
+            // Nothing written since the last checkpoint: there is no dirty data to flush, and
+            // opening a segment just to sync it would create a file for an empty window.
+            None => Ok(()),
+        }
     }
 
     /// Attest the window that just closed, then reclaim what it supersedes.
@@ -653,6 +698,15 @@ impl Store {
             file: checkpoint_name(end),
             detail: e.to_string(),
         })?;
+        // The window is about to be ATTESTED, and an attestation of entries still sitting in the
+        // page cache is a claim a power loss could falsify -- the checkpoint would survive the
+        // entries it vouches for. Flush the segment first, on every run, including when
+        // [`PersistConfig::sync`] is false: that is exactly what bounds the unsynced window there.
+        if let Some(f) = self.seg.as_mut() {
+            f.sync_data()
+                .await
+                .map_err(io("sync segment before checkpoint"))?;
+        }
         write_atomic(&self.dir.join(checkpoint_name(end)), &bytes).await?;
 
         // Reclaim: keep the newest `retain` checkpoints and every segment they still need. Segments

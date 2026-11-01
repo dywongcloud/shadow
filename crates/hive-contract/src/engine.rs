@@ -373,6 +373,37 @@ impl Engine {
         }
     }
 
+    /// Flush every open segment without closing a window: the timer-driven half of durability when
+    /// [`PersistConfig::sync`] is off.
+    ///
+    /// Returns the number of contracts whose segment was actually synced. An error is reported per
+    /// contract and never stops the rest: one unwritable log directory must not keep another
+    /// contract's entries unsynced. `Ok(0)` for an engine with no store -- there is nothing to
+    /// flush, and that is the honest answer rather than a silent success.
+    pub async fn flush(&self) -> Result<usize, Vec<(String, StoreError)>> {
+        let handles: Vec<(String, Arc<Mutex<Store>>)> = {
+            let guard = self.stores.read().await;
+            guard
+                .iter()
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect()
+        };
+        let mut synced = 0usize;
+        let mut failed = Vec::new();
+        for (id, handle) in handles {
+            let mut store = handle.lock().await;
+            match store.sync().await {
+                Ok(()) => synced += 1,
+                Err(e) => failed.push((id, e)),
+            }
+        }
+        if failed.is_empty() {
+            Ok(synced)
+        } else {
+            Err(failed)
+        }
+    }
+
     /// Snapshot one contract's log under the shard read lock: writers on OTHER contracts in the
     /// same shard still proceed, writers on THIS contract wait.
     pub async fn snapshot_log(&self, contract_id: &str) -> Option<OpLog> {

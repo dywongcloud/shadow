@@ -1139,6 +1139,51 @@ async fn async_main() -> anyhow::Result<()> {
     persist::spawn_persister(cloud.clone());
     deployment_ledger::spawn_outbox(cloud.clone());
     spawn_metrics_persist_loop(cloud.clone());
+    // Open the contract log AT BOOT rather than at the first mutation that needs it: a log that
+    // cannot be opened (an unverifiable stored checkpoint, an unwritable data dir, no signing
+    // identity) has to be loud at start-up, not discovered afterwards as a missing audit trail.
+    // Boot continues either way -- canonical state is the platform's, not the contract's -- but
+    // every later submit then fails closed and says why, rather than recording nothing quietly.
+    if let Err(error) = cloud
+        .contract_engine
+        .register(cloud.managed_db_contract.clone())
+        .await
+    {
+        tracing::error!(
+            %error,
+            "managed-db contract log could not be opened; contract entries will NOT be recorded"
+        );
+    } else {
+        tracing::info!(
+            contract = %cloud.managed_db_contract.id,
+            "managed-db contract log ready"
+        );
+    }
+    {
+        // The timer-driven half of contract durability: when per-entry fsync is off (the default,
+        // because `db.write` sits on a request path), this is what bounds how long a written entry
+        // can go unflushed. It syncs open segments only -- no checkpoint, no reclaim -- so the
+        // exposure is this interval, never the size of the log.
+        let flush_cloud = cloud.clone();
+        crate::bulkhead::spawn(async move {
+            let secs = env_u64("HIVE_CONTRACT_FLUSH_SECS", 5).max(1);
+            loop {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                match flush_cloud.contract_engine.flush().await {
+                    Ok(_) => {}
+                    Err(failed) => {
+                        for (contract, error) in failed {
+                            tracing::error!(
+                                %contract,
+                                %error,
+                                "contract log segment flush failed"
+                            );
+                        }
+                    }
+                }
+            }
+        });
+    }
     let controlled_restart = ControlledRestart::new();
     {
         let flush_cloud = cloud.clone();
@@ -1238,6 +1283,36 @@ async fn async_main() -> anyhow::Result<()> {
             };
             restart_audit::mark_clean_exit(&flush_node_name);
             flush_cloud.dns_geo.flush_blocking();
+            // Attest the contract tail before the process goes away. A forced checkpoint closes the
+            // open window, which is what makes the entries after the last one replayable from the
+            // checkpoint instead of from genesis, and it syncs the segment first so the attestation
+            // cannot outlive the entries it vouches for. Best-effort: a node that cannot write its
+            // contract log still has to shut down cleanly.
+            if let Err(failed) = flush_cloud.contract_engine.flush().await {
+                for (contract, error) in failed {
+                    tracing::error!(
+                        %contract,
+                        %error,
+                        "contract log shutdown flush failed; the tail is unsynced"
+                    );
+                }
+            }
+            match flush_cloud
+                .contract_engine
+                .checkpoint_now(&flush_cloud.managed_db_contract.id, hive_core::now_ms())
+                .await
+            {
+                Ok(Some(cp)) => tracing::info!(
+                    window_end = cp.checkpoint.window_end,
+                    index_hash = %cp.checkpoint.index_hash,
+                    "contract log checkpointed on shutdown"
+                ),
+                Ok(None) => tracing::info!("contract log has no open window to checkpoint"),
+                Err(error) => tracing::error!(
+                    %error,
+                    "contract log shutdown checkpoint failed; the tail stays replayable from the last checkpoint"
+                ),
+            }
             if let Err(error) = crate::guardian::shutdown(final_guardian_generation).await {
                 tracing::error!(%error, "Guardian shutdown did not complete cleanly; exiting anyway");
             }

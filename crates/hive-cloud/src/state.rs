@@ -324,8 +324,20 @@ pub struct CloudState {
     /// The contract's execution engine: one append-only, hash-chained oplog plus the index `apply`
     /// produces, sharded by contract id (`crates/hive-contract/src/engine.rs`). It records a
     /// mutation the platform already authorized and already performed -- it never decides one.
-    /// In-process and node-local today (persistence is its own open row), so a restart replays from
-    /// an empty log rather than from a history that never happened.
+    ///
+    /// DURABLE: opened against `$HIVE_DATA/contract-oplog`, so a restart rebuilds from the newest
+    /// VERIFIED checkpoint plus the tail and lands on the index hash it had before it stopped; a
+    /// stored checkpoint or entry that does not verify is refused, never adopted. Each checkpoint is
+    /// signed with this node's own [`crate::integrity_signer::IntegritySigner`] -- the same Ed25519
+    /// keypair, in the same file, resolved by the same fail-closed `open_or_create`, so there is no
+    /// second key to rotate and no way to tell which identity signed an artefact.
+    ///
+    /// The per-entry fsync is behind `HIVE_CONTRACT_ENTRY_SYNC` rather than always on, because
+    /// `db.write` is recorded from the `/v1/storage/*` request paths and one fsync per request is a
+    /// latency tax on a serving path; the default still loses nothing across a restart (the segment
+    /// is flushed on a timer, before a window closes, and before shutdown), and the exposure is
+    /// bounded by an interval rather than by the log growing. See `contract-cost` for the measured
+    /// per-op cost of each mode.
     pub contract_engine: hive_contract::Engine,
     pub queues: Arc<crate::queues::QueueStore>,
     /// Managed-inference runtime (this node's own llama-server children +
@@ -773,6 +785,12 @@ impl CloudState {
         let region_for_sandboxes = region.clone();
         let node_name_for_sandboxes = node_name.clone();
         let http = reqwest::Client::new();
+        // The contract's signer, taken BEFORE `integrity_signer` is moved into the state below: the
+        // node's existing Ed25519 identity, handed to the crate's `CheckpointSigner` seam. Same
+        // keypair, same `integrity_signing.key`, same fail-closed resolution -- boot already refuses
+        // to continue if that key is unreadable or unparsable. No new key, no new algorithm.
+        let contract_signer: Arc<dyn hive_contract::signing::CheckpointSigner> =
+            integrity_signer.clone();
         let state = Arc::new(CloudState {
             region,
             node_name,
@@ -852,7 +870,46 @@ impl CloudState {
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             managed_db_contract: hive_contract::managed_db_contract(),
-            contract_engine: hive_contract::Engine::new(hive_contract::DEFAULT_SHARDS),
+            contract_engine: {
+                // The contract log is DURABLE and every checkpoint it writes is signed by this
+                // node's EXISTING integrity key -- the same Ed25519 identity that signs the
+                // deployment integrity chain, resolved by the same fail-closed `open_or_create`
+                // above. There is deliberately no fallback to `Engine::new` here: an in-memory
+                // engine is a node that loses 100% of its audit trail on every restart, which is
+                // the exact gap this wiring closes. `Store::open` refuses a `None` signer rather
+                // than emitting an unsigned checkpoint, so a signer that failed to resolve stops
+                // the log instead of silently degrading it.
+                // taken above, before the signer was moved into this state.
+                let signer: std::sync::Arc<dyn hive_contract::signing::CheckpointSigner> =
+                    std::sync::Arc::clone(&contract_signer);
+                // Per-entry fsync is OFF by default, because the managed-db contract sits on the
+                // tenant data plane (`db.write` is recorded from `/v1/storage/*` handlers) and one
+                // fsync per request is a latency tax on a request path, not a durability property.
+                // What is on by default is still durability: the segment is flushed on a timer,
+                // before every window closes, and before shutdown, so a restart loses nothing and
+                // the unsynced exposure is bounded by an interval, never by the log growing.
+                // `HIVE_CONTRACT_ENTRY_SYNC=1` buys per-entry power-loss durability at a measured
+                // ~5.5 ms/op on the authoring machine (vs ~0.08 ms): an operator decision, not a
+                // default.
+                let sync = std::env::var("HIVE_CONTRACT_ENTRY_SYNC")
+                    .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+                    .unwrap_or(false);
+                tracing::info!(
+                    dir = %crate::persist::data_dir().join("contract-oplog").display(),
+                    entry_sync = sync,
+                    "managed-db contract log opened against the node data dir"
+                );
+                hive_contract::Engine::open(
+                    hive_contract::DEFAULT_SHARDS,
+                    crate::persist::data_dir().join("contract-oplog"),
+                    hive_contract::PersistConfig {
+                        checkpoint_every: hive_contract::DEFAULT_CHECKPOINT_EVERY,
+                        retain_checkpoints: hive_contract::DEFAULT_RETAIN_CHECKPOINTS,
+                        signer: Some(signer),
+                        sync,
+                    },
+                )
+            },
             queues: crate::queues::QueueStore::new(),
             inference: crate::inference::InferenceRuntime::default(),
             metrics: crate::metrics::MetricsStore::new(),
