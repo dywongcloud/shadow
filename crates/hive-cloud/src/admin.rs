@@ -13944,6 +13944,18 @@ async fn blob_put(
     let nsb = format!("{team}::{bucket}");
     let size = body.len();
     c.databases.blob_put(&nsb, &key, body.to_vec());
+    // The write already happened; the contract records it. `db_contract` never authorizes, never
+    // performs the mutation and never fails the request -- it appends one entry and returns.
+    crate::db_contract::wrote(
+        &c,
+        &team,
+        &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+        crate::databases::DbKind::Blob,
+        &bucket,
+        size as u64,
+        Ok(()),
+    )
+    .await;
     native_tally(
         &c,
         crate::databases::DbKind::Blob,
@@ -14084,6 +14096,16 @@ async fn queue_push(
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsq = format!("{team}::{queue}");
     let depth = c.databases.queue_push(&nsq, b.message.to_string());
+    crate::db_contract::wrote(
+        &c,
+        &team,
+        &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+        crate::databases::DbKind::Queue,
+        &queue,
+        b.message.to_string().len() as u64,
+        Ok(()),
+    )
+    .await;
     native_tally(
         &c,
         crate::databases::DbKind::Queue,
@@ -14198,6 +14220,16 @@ async fn vector_upsert(
         serde_json::to_vec(&json!({ "id": b.id, "vector": b.vector, "metadata": b.metadata }))
             .unwrap_or_default();
     c.databases.vector_upsert(&nsi, &b.id, b.vector, b.metadata);
+    crate::db_contract::wrote(
+        &c,
+        &team,
+        &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+        crate::databases::DbKind::Vector,
+        &index,
+        mirror_body.len() as u64,
+        Ok(()),
+    )
+    .await;
     native_tally(
         &c,
         crate::databases::DbKind::Vector,
@@ -14351,6 +14383,16 @@ async fn pubsub_publish(
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nst = format!("{team}::{topic}");
     let delivered = c.databases.publish(&nst, b.message.to_string());
+    crate::db_contract::wrote(
+        &c,
+        &team,
+        &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+        crate::databases::DbKind::Pubsub,
+        &topic,
+        b.message.to_string().len() as u64,
+        Ok(()),
+    )
+    .await;
     native_tally(
         &c,
         crate::databases::DbKind::Pubsub,

@@ -72,8 +72,11 @@ pub struct ScopeEntry {
 /// including the three that remove a row without a request for it (a project purge, an incarnation
 /// discard, an operator console row delete) plus workflow storage that lost its project authority;
 /// each of them used to remove a `databases` row in silence, which left the index asserting a
-/// database canonical state no longer had. The four data-plane write paths are not wired, and until
-/// they are a `db.write` moves tenant data with no entry in the log.
+/// database canonical state no longer had. So are the four data-plane write paths: each of the
+/// `/v1/storage/*` mutation handlers records a `db.write` through `db_contract::wrote`, which
+/// resolves the managed database owning the payload name the lane is addressed by. An unwired path
+/// is a mutation the log is silent about, and silence is the one failure this contract cannot
+/// detect on its own.
 pub const DECLARED_SCOPE: &[ScopeEntry] = &[
     ScopeEntry { op_kind: "db.create", file: "crates/hive-cloud/src/admin.rs", line: 13071, wired: true },
     ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 13557, wired: true },
@@ -84,11 +87,14 @@ pub const DECLARED_SCOPE: &[ScopeEntry] = &[
     ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 12973, wired: true },
     ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 17213, wired: true },
     ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/git.rs", line: 3793, wired: true },
-    // The four data-plane writes, all of which pass through `write_scope`.
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13935, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14076, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14187, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14343, wired: false },
+    // The four data-plane writes, all of which pass through `write_scope`. Every one of them now
+    // records through the seam (`db_contract::wrote`), so a `db.write` moves tenant data WITH an
+    // entry in the log -- before this, an entire write plane was invisible to the contract and
+    // reconciled as `in_sync` on its own absence.
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13949, wired: true },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14099, wired: true },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14223, wired: true },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14386, wired: true },
 ];
 
 pub fn scope_report() -> (usize, usize) {

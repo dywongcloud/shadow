@@ -459,12 +459,38 @@ impl Broker {
 
 /// Durable snapshot of the in-process data stores (persisted with the platform
 /// snapshot so queue/vector data survives restarts).
+/// Canonical state's account of the WRITE PLANE for one managed database: how many writes this
+/// node recorded against it, and the size of the last one.
+///
+/// This exists because `db.write` is a mutation of tenant data, and a contract index that counts
+/// writes is making a claim canonical state is the only authority able to check. Left unattested,
+/// the count is either ignored -- which is how an entire unauthorized write plane once reconciled
+/// as `in_sync` on its own absence -- or reported as a divergence on every database ever written
+/// to. It is NODE-LOCAL and deliberately not part of the replicated [`Database`] record: it counts
+/// the writes THIS node served, which is exactly what this node's contract log counts, so the two
+/// sides a reconciler compares are always measured over the same thing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct WritePlane {
+    /// Writes this node recorded. `None` (no entry) means "no writes recorded", never "zero
+    /// writes": a database that was never written to has no write plane to attest, and
+    /// manufacturing a zero would make the reconciler compare a real claim against an invented one.
+    #[serde(default)]
+    pub writes: u64,
+    /// The `bytes` value of the last write, in the same form the contract's payload carries it.
+    #[serde(default)]
+    pub last_bytes: Option<String>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct DataSnapshot {
     #[serde(default)]
     pub queues: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub vectors: HashMap<String, HashMap<String, (Vec<f32>, serde_json::Value)>>,
+    /// The write plane, so it survives a restart like the rest of this snapshot. Persisted with the
+    /// node's own state and never replicated: see [`WritePlane`].
+    #[serde(default)]
+    pub write_plane: std::collections::BTreeMap<String, WritePlane>,
 }
 
 /// How long a deletion is remembered: long enough that every node, including one down or
@@ -505,6 +531,8 @@ pub struct DatabaseStore {
     queue: QueueStore,
     vector: VectorStore,
     broker: Broker,
+    /// id -> this node's write plane for that database. See [`WritePlane`].
+    write_plane: RwLock<std::collections::BTreeMap<String, WritePlane>>,
 }
 
 impl DatabaseStore {
@@ -518,6 +546,7 @@ impl DatabaseStore {
             queue: QueueStore::default(),
             vector: VectorStore::default(),
             broker: Broker::default(),
+            write_plane: RwLock::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -717,6 +746,7 @@ impl DatabaseStore {
                     )
                 })
                 .collect(),
+            write_plane: self.write_plane_snapshot(),
         }
     }
 
@@ -731,6 +761,7 @@ impl DatabaseStore {
             .into_iter()
             .map(|(idx, m)| (idx, m.into_iter().collect()))
             .collect();
+        *self.write_plane.write() = snap.write_plane;
     }
 
     pub fn count(&self) -> usize {
@@ -1074,12 +1105,15 @@ impl DatabaseStore {
         (idx.len(), dim)
     }
 
-    /// The database RECORD that owns a platform-native payload name (`bucket`/`queue`/`index`/
-    /// `topic`/`room`), so a `/v1/storage/*` request can be attributed to an INSTANCE rather than
-    /// merely to a tenant. The platform-native lanes are addressed by name, not by database id, and
-    /// per-instance metrics need the bridge. `team` is matched normalized and the payload name is
-    /// matched EXACTLY, so one tenant can never resolve another tenant's instance.
-    pub fn native_db_id(&self, kind: DbKind, team: &str, name: &str) -> Option<String> {
+    /// The database RECORD that owns a platform-native payload name: [`DatabaseStore::native_db_id`]
+    /// for the caller that needs the whole row, not just its id.
+    ///
+    /// The contract layer is that caller: a `db.write` records the DATABASE a payload name lands in,
+    /// and the row is also where the platform's ownership verdict for that write comes from (the
+    /// stored `team` tag, matched normalized here, is the tenant the record belongs to). A clone is
+    /// returned rather than a reference so the caller never holds the store's read lock across an
+    /// await -- the contract record below is one.
+    pub fn native_db(&self, kind: DbKind, team: &str, name: &str) -> Option<Database> {
         let key = match kind {
             DbKind::Blob => "bucket",
             DbKind::Queue => "queue",
@@ -1100,7 +1134,40 @@ impl DatabaseStore {
                     && crate::admin::norm(&d.team) == t
                     && d.connection.get(key).map(String::as_str) == Some(name)
             })
-            .map(|d| d.id.clone())
+            .cloned()
+    }
+
+    /// The database RECORD that owns a platform-native payload name (`bucket`/`queue`/`index`/
+    /// `topic`/`room`), so a `/v1/storage/*` request can be attributed to an INSTANCE rather than
+    /// merely to a tenant. The platform-native lanes are addressed by name, not by database id, and
+    /// per-instance metrics need the bridge. `team` is matched normalized and the payload name is
+    /// matched EXACTLY, so one tenant can never resolve another tenant's instance.
+    pub fn native_db_id(&self, kind: DbKind, team: &str, name: &str) -> Option<String> {
+        self.native_db(kind, team, name).map(|d| d.id)
+    }
+
+    /// Count one write THIS NODE performed against a managed database, and remember its size.
+    ///
+    /// Returns the count after this write. Called only for a write that actually landed: a write
+    /// that never landed changed nothing, so it must not move canonical state's account any more
+    /// than it moves the contract's index.
+    pub fn record_write(&self, db_id: &str, bytes: &str) -> u64 {
+        let mut wp = self.write_plane.write();
+        let e = wp.entry(db_id.to_string()).or_default();
+        e.writes = e.writes.saturating_add(1);
+        e.last_bytes = Some(bytes.to_string());
+        e.writes
+    }
+
+    /// Canonical state's write plane for one database. `None` when this node has recorded no write
+    /// against it -- a fact, not a zero.
+    pub fn write_plane(&self, db_id: &str) -> Option<WritePlane> {
+        self.write_plane.read().get(db_id).cloned()
+    }
+
+    /// The whole write plane, for a reconciler that projects canonical state in one pass.
+    pub fn write_plane_snapshot(&self) -> std::collections::BTreeMap<String, WritePlane> {
+        self.write_plane.read().clone()
     }
 
     /// Size of ONE object in bytes, so the console's `HEAD` can report a size without reading an

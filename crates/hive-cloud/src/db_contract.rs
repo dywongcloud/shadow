@@ -63,7 +63,7 @@ fn owns(tenant: &str) -> bool {
 
 /// Record one managed-database mutation on the contract's oplog.
 ///
-/// `kind` is one of the contract's declared ops (`db.create`, `db.delete`); `extra` carries the
+/// `kind` is one of the contract's declared ops (`db.create`, `db.write`, `db.delete`); `extra` carries the
 /// payload keys beyond `db_id` and `project` that the declared key set demands exactly -- a missing
 /// or unexpected key is refused by `contract::validate` and recorded as a refusal, so a payload
 /// built by hand cannot silently widen the contract's schema. `target` is always the database id,
@@ -173,6 +173,69 @@ pub(crate) async fn created(
 /// The actor recorded for a removal with no request in flight: a project purge, an incarnation
 /// discard, or an operator console row delete.
 pub(crate) const PLATFORM_ACTOR: &str = "platform";
+
+/// [`record`] for a `db.write` that landed through a platform-native storage lane
+/// (`/v1/storage/blob|queue|vector|pubsub`).
+///
+/// Those lanes are addressed by PAYLOAD NAME, never by database id, so the database the write landed
+/// in is resolved here (`DatabaseStore::native_db`) from the same `(kind, team, name)` triple the
+/// lane itself writes under. That lookup is also the platform's ownership verdict for this write: a
+/// record found this way is one whose stored tenant IS the tenant the request resolved to, so
+/// `owns_target` below is that comparison made explicitly rather than assumed -- the same expression
+/// [`created`] uses, and an untagged or foreign row therefore records a REFUSAL instead of an
+/// attested write.
+///
+/// A lane no database record owns is not a managed-database write: there is no database id to
+/// attest, so nothing is recorded rather than an entry invented for one. A standalone bucket or
+/// queue is outside this contract's scope, and a log that claims otherwise is worse than a log that
+/// is silent about it.
+///
+/// `bytes` is the size of the payload that moved, and `outcome` is the platform's own result: an
+/// `Err` is recorded with `success: false` and applies NO state change, so a write that never landed
+/// is never asserted as one that did.
+pub(crate) async fn wrote(
+    c: &Arc<CloudState>,
+    tenant: &str,
+    actor: &str,
+    kind: crate::databases::DbKind,
+    name: &str,
+    bytes: u64,
+    outcome: Result<(), String>,
+) -> Option<Receipt> {
+    let db = c.databases.native_db(kind, tenant, name)?;
+    let tenant_owns = crate::admin::record_tenant(&db.team) == tenant;
+    let bytes = bytes.to_string();
+    // Canonical state records the write plane for a write that actually landed, so the count and
+    // the last-bytes value the contract's index claims are claims canonical state can attest. Only
+    // on `Ok`: a write that never landed changed nothing, and moving the counter for it would make
+    // the two accounts disagree for a reason that is not a divergence.
+    //
+    // It counts the write even when the CONTRACT refuses it, and that is deliberate: canonical state
+    // accounts for what the platform actually DID, while the contract accounts for what it can
+    // attest. A write the contract refuses therefore shows up as a divergence -- canonical has it,
+    // the contract does not -- which is exactly the finding. Suppressing the count here would leave
+    // the unattested write with nothing to be compared against, which is the silence this layer
+    // exists to end.
+    //
+    // Recording it HERE, next to the contract entry, is what keeps the two sides of a
+    // reconciliation measured over the same event: they cannot drift because one path forgot the
+    // other.
+    if outcome.is_ok() {
+        c.databases.record_write(&db.id, &bytes);
+    }
+    record(
+        c,
+        tenant,
+        actor,
+        "db.write",
+        &db.id,
+        &db.project,
+        &[("bytes", &bytes)],
+        tenant_owns,
+        outcome,
+    )
+    .await
+}
 
 /// [`record`] for a `db.delete` the PLATFORM performs on its own authority, with no request in
 /// flight.
