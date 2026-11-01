@@ -37,6 +37,7 @@ use crate::exec::{index_hash, Index};
 use crate::merkle;
 use crate::oplog::{Ack, LogEntry, OpLog};
 use crate::signing::{verify_ed25519, CheckpointSigner};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -89,6 +90,35 @@ impl Default for PersistConfig {
             sync: true,
         }
     }
+}
+
+/// How many filled windows may wait for a drain before [`Store::append`] closes them inline.
+///
+/// One. A window that fills is closed on the next drain pass, and the debt this bounds is what a
+/// crash can leave behind: at most one unattested window, so the tail a restart has to replay is at
+/// most two windows. Exceeding it means no drain is running, and the answer to that is to do the
+/// work where the caller already is rather than to let the debt -- and the memory held by the log --
+/// grow without bound.
+pub const MAX_DEFERRED_CLOSES: usize = 1;
+
+/// What a completed window's close needs, captured at the instant the window filled.
+///
+/// Captured rather than recomputed later because a checkpoint commits to the index AS OF the
+/// window's last entry, and by the time a drain runs the index has moved on. Recomputing then would
+/// attest a state the log never had, which is the one thing a checkpoint exists to make impossible.
+struct PendingClose {
+    /// Entry hashes of the window, in seq order: what the Merkle root is taken over.
+    hashes: Vec<String>,
+    /// Seq of the window's first entry. Not always a multiple of `checkpoint_every`: a window closed
+    /// early starts wherever the previous one ended.
+    base: u64,
+    /// `prev_hash` of the window's first entry: the `prev_head` the checkpoint carries.
+    prev: String,
+    /// The window's last entry: supplies `log_head` and `window_end`.
+    last: LogEntry,
+    /// The index as of `last`.
+    index: Index,
+    ts_ms: u64,
 }
 
 /// What appending one entry did.
@@ -360,6 +390,11 @@ fn verify_line(l: &SegmentLine, file: &str, public_key: Option<&[u8]>) -> Result
 /// The entries of one window `[base, end)`: what an inclusion proof is cut against after compaction
 /// has dropped them from memory. Filtered by seq rather than by file, because a window that was
 /// closed early shares a segment file with the one that follows it.
+///
+/// Every segment the range touches is read, not just the one `base` falls in: a checkpoint's window
+/// is a range of SEQ, and a range that spans a segment boundary is still one claim. Reading one file
+/// and filtering it would silently under-count such a window, and the Merkle root recomputed at load
+/// would then disagree with a root the writer honestly took over the whole range.
 pub async fn read_window(
     dir: &Path,
     base: u64,
@@ -368,24 +403,36 @@ pub async fn read_window(
     public_key: Option<&[u8]>,
 ) -> Result<Vec<LogEntry>, StoreError> {
     let window = window.max(1) as u64;
-    let path = dir.join(segment_name((base / window) * window));
-    let name = path.display().to_string();
-    let text = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(io("read segment"))?;
     let mut out = Vec::new();
-    for (i, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+    if end <= base {
+        return Ok(out);
+    }
+    let first = (base / window) * window;
+    let last = ((end - 1) / window) * window;
+    let mut b = first;
+    loop {
+        let path = dir.join(segment_name(b));
+        let name = path.display().to_string();
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(io("read segment"))?;
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let l: SegmentLine = serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
+                file: name.clone(),
+                detail: format!("line {}: {err}", i + 1),
+            })?;
+            verify_line(&l, &name, public_key)?;
+            if l.entry.op.seq >= base && l.entry.op.seq < end {
+                out.push(l.entry);
+            }
         }
-        let l: SegmentLine = serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
-            file: name.clone(),
-            detail: format!("line {}: {err}", i + 1),
-        })?;
-        verify_line(&l, &name, public_key)?;
-        if l.entry.op.seq >= base && l.entry.op.seq < end {
-            out.push(l.entry);
+        if b == last {
+            break;
         }
+        b += window;
     }
     out.sort_by_key(|e| e.op.seq);
     Ok(out)
@@ -453,6 +500,15 @@ pub struct Store {
     pending_start: Option<u64>,
     /// `prev_hash` of the first pending entry: the `prev_head` a checkpoint over this window carries.
     pending_prev: String,
+    /// Windows that have filled and are waiting for a drain, oldest first.
+    ///
+    /// Closing a window is bulk work -- a Merkle root, a signature, a checkpoint written and synced
+    /// atomically, then a directory listing and a reclaim. It is not work a caller that has just been
+    /// told "committed" should wait for: the entry is already on disk, and the checkpoint is an
+    /// attestation over entries that are already durable, not the thing that makes them durable. So
+    /// [`Store::append`] leaves a [`PendingClose`] here and returns; [`Store::close_pending`] does the
+    /// work, called from a drain that is not on a request path.
+    closes: VecDeque<PendingClose>,
 }
 
 impl Store {
@@ -545,6 +601,7 @@ impl Store {
             pending_start: if log.is_empty() { None } else { Some(log.base()) },
             pending,
             pending_prev: log.base_prev().to_string(),
+            closes: VecDeque::new(),
         };
         Ok(Opened {
             store,
@@ -579,14 +636,54 @@ impl Store {
         ((self.pending_base() / window) + 1) * window
     }
 
-    /// Append one entry, and close the window if this entry completes it.
+    /// Whether the pending window is already complete.
     ///
-    /// The write is flushed and synced before this returns, so "committed" means "on disk". One
-    /// `write_all` of one JSON line is the whole cost per op; the heavier work -- taking a Merkle
-    /// root, signing, writing a checkpoint, deleting superseded files -- happens once per window.
+    /// False in steady state: a window that fills is closed by a drain almost immediately. True only
+    /// when a crash or a kill landed between the window filling and its close, which is exactly the
+    /// state [`Store::open`] has to repair -- a tail holding a complete window with no checkpoint
+    /// attesting it. [`Engine::ensure`] asks this once per contract, at rebuild, and attests the tail
+    /// when it says true.
+    pub fn has_complete_window(&self) -> bool {
+        if self.pending.is_empty() {
+            return false;
+        }
+        let need = self.pending_boundary().saturating_sub(self.pending_base());
+        self.pending.len() as u64 >= need
+    }
+
+    /// How many filled windows are waiting for a drain.
+    pub fn deferred_closes(&self) -> usize {
+        self.closes.len()
+    }
+
+    /// Take the window being filled out of the store as a [`PendingClose`], leaving the store ready
+    /// to start the next one.
+    fn take_window(&mut self, last: &LogEntry, index: &Index, ts_ms: u64) -> PendingClose {
+        PendingClose {
+            hashes: std::mem::take(&mut self.pending),
+            base: self.pending_start.take().unwrap_or(last.op.seq),
+            prev: std::mem::take(&mut self.pending_prev),
+            last: last.clone(),
+            index: index.clone(),
+            ts_ms,
+        }
+    }
+
+    /// Append one entry, and hand off the window if this entry completes it.
+    ///
+    /// The write is flushed (and, when [`PersistConfig::sync`] is set, synced) before this returns, so
+    /// "committed" means "on disk" -- one `write_all` of one JSON line is the whole cost per op, and
+    /// that cost is the durability, so it stays here on purpose.
+    ///
+    /// Closing the window does NOT stay here. A close is a Merkle root, a signature, an atomic
+    /// checkpoint write carrying three fsyncs, a directory listing and a reclaim: bulk work measured
+    /// on the authoring machine in tens of milliseconds at the tail, against tens of MICROseconds for
+    /// the append itself. None of it is what makes the entry durable -- the entry is already on disk
+    /// before the close is even considered -- so it is captured as a [`PendingClose`] and returned to
+    /// the caller immediately. [`Store::close_pending`] does it, off the request path.
     ///
     /// `index` is the index as of THIS entry, which is the value a closing checkpoint attests; it is
-    /// only read when the window closes.
+    /// only read when the window completes.
     pub async fn append(
         &mut self,
         entry: &LogEntry,
@@ -643,11 +740,21 @@ impl Store {
         }
 
         self.pending.push(entry.entry_hash.clone());
-        let mut step = AppendStep::default();
         if seq + 1 < self.pending_boundary() {
-            return Ok(step);
+            return Ok(AppendStep::default());
         }
-        self.close_window(entry, index, ts_ms, &mut step).await?;
+        // The window is complete. Capture it and hand the caller its entry back immediately; the
+        // attestation is a drain's job.
+        let pc = self.take_window(entry, index, ts_ms);
+        self.closes.push_back(pc);
+        if self.closes.len() <= MAX_DEFERRED_CLOSES {
+            return Ok(AppendStep::default());
+        }
+        // Nothing is draining (or it is not keeping up). Do the work here rather than accumulate
+        // debt: a checkpoint that lags arbitrarily far behind the log is a log that cannot be
+        // compacted and a restart that cannot resume from anything recent.
+        let mut step = AppendStep::default();
+        self.close_all_inline(&mut step).await?;
         Ok(step)
     }
 
@@ -666,102 +773,209 @@ impl Store {
         }
     }
 
-    /// Attest the window that just closed, then reclaim what it supersedes.
-    async fn close_window(
-        &mut self,
-        last: &LogEntry,
-        index: &Index,
-        ts_ms: u64,
-        step: &mut AppendStep,
-    ) -> Result<(), StoreError> {
-        let window = self.window.max(1) as u64;
-        let wbase = self.pending_base();
-        // The range actually covered, not an assumed one: a window closed early ends at `last.seq+1`.
-        let end = last.op.seq + 1;
-        let merkle_root = merkle::merkle_root(&self.pending);
-        let cp = Checkpoint {
+    /// Close every waiting window here and now: the fallback for when nothing is draining.
+    ///
+    /// [`MAX_DEFERRED_CLOSES`] bounds how often that can be, and the cost is the one the caller
+    /// already paid before the close was deferred -- so this is a bound on the damage a missing
+    /// drain can do, not a path the platform takes.
+    async fn close_all_inline(&mut self, step: &mut AppendStep) -> Result<(), StoreError> {
+        while let Some(job) = self.take_close() {
+            match run_close(&job).await {
+                Ok((s, keep_from)) => {
+                    step.checkpoint = s.checkpoint;
+                    step.truncate_to = s.truncate_to;
+                    step.truncate_prev = s.truncate_prev;
+                    step.reclaimed_segments += s.reclaimed_segments;
+                    step.reclaimed_checkpoints += s.reclaimed_checkpoints;
+                    self.finish_close(keep_from);
+                }
+                Err(e) => {
+                    // Put it back rather than drop it: a window that is never attested is a window
+                    // that can never be compacted, and the caller is being told why instead.
+                    self.requeue_close(job);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hand the oldest waiting window to a drain. `None` when nothing is waiting -- the common call,
+    /// and the cheap one.
+    ///
+    /// The job owns a copy of everything the close reads, so the caller can drop the store lock
+    /// before doing any of the work. That is the whole point: [`run_close`] takes `&CloseJob`, never
+    /// `&Store`, so no lock is held across the fsyncs.
+    pub fn take_close(&mut self) -> Option<CloseJob> {
+        let pc = self.closes.pop_front()?;
+        Some(CloseJob {
+            dir: self.dir.clone(),
             contract_id: self.contract_id.clone(),
             contract_version: self.contract_version,
-            window_base: wbase,
-            window_end: end,
-            prev_head: self.pending_prev.clone(),
-            log_head: last.entry_hash.clone(),
-            merkle_root,
-            index_hash: index_hash(index),
-            index: index.clone(),
-            ts_ms,
-        };
-        let signer = self.signer.as_ref().ok_or(StoreError::NoSigner)?;
-        let signed = SignedCheckpoint::sign(cp, signer.as_ref(), ts_ms)
-            .map_err(|e| StoreError::SignFailed(e.to_string()))?;
-        let bytes = serde_json::to_vec_pretty(&signed).map_err(|e| StoreError::Corrupt {
-            file: checkpoint_name(end),
-            detail: e.to_string(),
-        })?;
-        // The window is about to be ATTESTED, and an attestation of entries still sitting in the
-        // page cache is a claim a power loss could falsify -- the checkpoint would survive the
-        // entries it vouches for. Flush the segment first, on every run, including when
-        // [`PersistConfig::sync`] is false: that is exactly what bounds the unsynced window there.
-        if let Some(f) = self.seg.as_mut() {
-            f.sync_data()
-                .await
-                .map_err(io("sync segment before checkpoint"))?;
-        }
-        write_atomic(&self.dir.join(checkpoint_name(end)), &bytes).await?;
+            window: self.window,
+            retain: self.retain,
+            signer: self.signer.clone(),
+            pc,
+        })
+    }
 
-        // Reclaim: keep the newest `retain` checkpoints and every segment they still need. Segments
-        // are cut on window boundaries, so a segment is either fully covered or fully droppable --
-        // nothing here rewrites a log file.
-        let ends = list_checkpoint_ends(&self.dir).await?;
-        if ends.len() > self.retain {
-            let drop = &ends[..ends.len() - self.retain];
-            for e in drop {
-                let p = self.dir.join(checkpoint_name(*e));
-                let _ = tokio::fs::remove_file(&p).await;
-                step.reclaimed_checkpoints += 1;
-            }
-        }
-        let kept = &ends[ends.len().saturating_sub(self.retain)..];
-        // The oldest retained checkpoint's own window is the oldest one still needed: an inclusion
-        // proof can be cut for it, and a replay can resume from it.
-        let keep_from = kept.first().copied().unwrap_or(wbase);
-        for b in list_segment_bases(&self.dir).await? {
-            if b + window <= keep_from {
-                let p = self.dir.join(segment_name(b));
-                let _ = tokio::fs::remove_file(&p).await;
-                step.reclaimed_segments += 1;
-            }
-        }
-        // Also drop the open segment handle if its file was reclaimed, so the next append reopens the
-        // right one instead of appending to an unlinked inode.
+    /// Put a close that failed back at the front of the queue, so the next drain retries it in order
+    /// instead of attesting a later window first.
+    pub fn requeue_close(&mut self, job: CloseJob) {
+        self.closes.push_front(job.pc);
+    }
+
+    /// Apply the one part of a finished close the store itself owns: drop the open segment handle if
+    /// the reclaim deleted the file it was appending to, so the next append reopens the right one
+    /// rather than writing to an unlinked inode.
+    pub fn finish_close(&mut self, keep_from: u64) {
+        let window = self.window.max(1) as u64;
         if let Some(sb) = self.seg_base {
             if sb + window <= keep_from {
                 self.seg = None;
                 self.seg_base = None;
             }
         }
-
-        step.checkpoint = Some(signed);
-        step.truncate_to = Some(end);
-        step.truncate_prev = Some(last.entry_hash.clone());
-        self.pending.clear();
-        self.pending_start = None;
-        Ok(())
     }
 
     /// Force a checkpoint over whatever is pending, even though the window is not full: the shutdown
     /// and pre-roll path, where the tail matters more than the window being tidy.
+    ///
+    /// A window that filled earlier is closed first, so a forced checkpoint never attests a later
+    /// range while an earlier one is still unattested -- the ordering is what lets a replay resume
+    /// from any retained checkpoint.
     pub async fn checkpoint_now(
         &mut self,
         last: &LogEntry,
         index: &Index,
         ts_ms: u64,
     ) -> Result<Option<SignedCheckpoint>, StoreError> {
-        if self.pending.is_empty() {
-            return Ok(None);
-        }
         let mut step = AppendStep::default();
-        self.close_window(last, index, ts_ms, &mut step).await?;
+        self.close_all_inline(&mut step).await?;
+        if self.pending.is_empty() {
+            return Ok(step.checkpoint);
+        }
+        let pc = self.take_window(last, index, ts_ms);
+        self.closes.push_back(pc);
+        self.close_all_inline(&mut step).await?;
         Ok(step.checkpoint)
     }
+}
+
+/// One completed window's close, taken out of the store.
+///
+/// It exists so the close can run WITHOUT the store: the store's lock is what an appender waits on,
+/// and the close is three fsyncs and two directory walks. A [`CloseJob`] owns its own copy of every
+/// store field the close reads, so [`run_close`] can hold it across arbitrary I/O and an appender
+/// can still be appending.
+pub struct CloseJob {
+    dir: PathBuf,
+    contract_id: String,
+    contract_version: u32,
+    window: usize,
+    retain: usize,
+    signer: Option<Arc<dyn CheckpointSigner>>,
+    pc: PendingClose,
+}
+
+/// Attest one completed window and reclaim what it supersedes.
+///
+/// A free function over paths and captured state, deliberately NOT a method on [`Store`] -- and that
+/// is the fix, not a style choice. A method would borrow the store; the borrow would be held across
+/// `write_atomic`'s three fsyncs; and the request path, which takes the same lock to append a single
+/// line, would wait for all three. Measured on the authoring machine: the append is tens of
+/// microseconds, the close is tens of milliseconds at the tail.
+///
+/// Returns the step for the caller to apply, plus the lowest window base still needed on disk, which
+/// the caller hands to [`Store::finish_close`] under a lock held for microseconds.
+pub async fn run_close(job: &CloseJob) -> Result<(AppendStep, u64), StoreError> {
+    let mut step = AppendStep::default();
+    let window = job.window.max(1) as u64;
+    let pc = &job.pc;
+    let last = &pc.last;
+    // The range actually covered, not an assumed one: a window closed early ends at `last.seq+1`.
+    let end = last.op.seq + 1;
+    let merkle_root = merkle::merkle_root(&pc.hashes);
+    let cp = Checkpoint {
+        contract_id: job.contract_id.clone(),
+        contract_version: job.contract_version,
+        window_base: pc.base,
+        window_end: end,
+        prev_head: pc.prev.clone(),
+        log_head: last.entry_hash.clone(),
+        merkle_root,
+        index_hash: index_hash(&pc.index),
+        index: pc.index.clone(),
+        ts_ms: pc.ts_ms,
+    };
+    let signer = job.signer.as_ref().ok_or(StoreError::NoSigner)?;
+    let signed = SignedCheckpoint::sign(cp, signer.as_ref(), pc.ts_ms)
+        .map_err(|e| StoreError::SignFailed(e.to_string()))?;
+    let bytes = serde_json::to_vec_pretty(&signed).map_err(|e| StoreError::Corrupt {
+        file: checkpoint_name(end),
+        detail: e.to_string(),
+    })?;
+    // The window is about to be ATTESTED, and an attestation of entries still sitting in the
+    // page cache is a claim a power loss could falsify -- the checkpoint would survive the
+    // entries it vouches for. Flush every segment holding part of the window first, on every run,
+    // including when [`PersistConfig::sync`] is false: that is exactly what bounds the unsynced
+    // window there. These are opened by path, not borrowed from the store, so an appender can hold
+    // its own handle to the same file at the same time.
+    let first = (pc.base / window) * window;
+    let final_seg = (last.op.seq / window) * window;
+    let mut b = first;
+    loop {
+        let path = job.dir.join(segment_name(b));
+        // Opened for WRITE, not read: an fsync is only guaranteed to mean anything on a writable
+        // descriptor, and a checkpoint that attests entries it did not flush is worse than no
+        // checkpoint. `create` is deliberately absent -- a segment that is not there has no dirty
+        // data, and inventing one would add a file a later inclusion proof would have to explain.
+        match tokio::fs::OpenOptions::new().write(true).open(&path).await {
+            Ok(f) => f
+                .sync_data()
+                .await
+                .map_err(io("sync segment before checkpoint"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(StoreError::Io {
+                    op: "open segment".to_string(),
+                    detail: format!("{}: {e}", path.display()),
+                })
+            }
+        }
+        if b == final_seg {
+            break;
+        }
+        b += window;
+    }
+    write_atomic(&job.dir.join(checkpoint_name(end)), &bytes).await?;
+
+    // Reclaim: keep the newest `retain` checkpoints and every segment they still need. Segments
+    // are cut on window boundaries, so a segment is either fully covered or fully droppable --
+    // nothing here rewrites a log file.
+    let ends = list_checkpoint_ends(&job.dir).await?;
+    if ends.len() > job.retain {
+        let drop = &ends[..ends.len() - job.retain];
+        for e in drop {
+            let p = job.dir.join(checkpoint_name(*e));
+            let _ = tokio::fs::remove_file(&p).await;
+            step.reclaimed_checkpoints += 1;
+        }
+    }
+    let kept = &ends[ends.len().saturating_sub(job.retain)..];
+    // The oldest retained checkpoint's own window is the oldest one still needed: an inclusion
+    // proof can be cut for it, and a replay can resume from it.
+    let keep_from = kept.first().copied().unwrap_or(pc.base);
+    for b in list_segment_bases(&job.dir).await? {
+        if b + window <= keep_from {
+            let p = job.dir.join(segment_name(b));
+            let _ = tokio::fs::remove_file(&p).await;
+            step.reclaimed_segments += 1;
+        }
+    }
+
+    step.checkpoint = Some(signed);
+    step.truncate_to = Some(end);
+    step.truncate_prev = Some(last.entry_hash.clone());
+    Ok((step, keep_from))
 }

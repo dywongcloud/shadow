@@ -13,8 +13,15 @@
 //!      `write_all` plus one `sync_data` of a single JSON line. The I/O is deliberately INSIDE the
 //!      critical section: an entry has to be on disk before the caller is told it committed, so
 //!      moving it out would trade durability for latency. It is one small append and one sync per
-//!      op, never a rewrite; the expensive half of persistence (Merkle root, sign, checkpoint
-//!      write, reclaim) happens once per window, and `checkpoint_every` is the knob for how often.
+//!      op, never a rewrite.
+//!   2b. What is NOT inside the lock is the window close. That is the expensive half of persistence
+//!      (Merkle root, sign, a checkpoint written and synced atomically, a directory listing, a
+//!      reclaim): measured at tens of milliseconds on the tail against tens of microseconds for the
+//!      append. It attests entries that are ALREADY durable, so it is never the reason an op can be
+//!      acked. [`Engine::submit`] therefore leaves a filled window to a drain -- a background task,
+//!      plus the platform's own flush loop through [`Engine::flush`] -- and returns. A request path
+//!      that submits an op waits for its own entry and nothing else. `checkpoint_every` is still the
+//!      knob for how often a close happens; it no longer decides who pays for it.
 //!   3. NOT on reads: [`Engine::replay_contract`] takes the shard read lock, so monitors audit
 //!      concurrently with writers. It is CPU-bound and long, so callers must run it off the serving
 //!      runtime (`tokio::task::block_in_place` + `spawn_blocking`), per the repo's bulkhead rule.
@@ -26,14 +33,23 @@ use crate::checkpoint::SignedCheckpoint;
 use crate::contract::{validate, Caller, Contract, OpError};
 use crate::exec::{index_hash, Executor, Index};
 use crate::oplog::{Op, OpLog};
-use crate::persist::{PersistConfig, Store, StoreError};
+use crate::persist::{run_close, PersistConfig, Store, StoreError};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use std::time::Duration;
+use tokio::sync::{Mutex, Notify, RwLock};
 
 /// Default shard count. More shards = less false sharing between unrelated contracts.
 pub const DEFAULT_SHARDS: usize = 16;
+
+/// How long the background drain sleeps when no window is waiting to be closed.
+///
+/// Short, but a sleep and not a spin. A window fills once every `checkpoint_every` ops, so a drain
+/// that only woke on a timer would still be prompt; this is the bound on how long a filled window
+/// stays unattested when the log is idle, which is also the bound on what a crash can leave behind.
+const DRAIN_IDLE_MS: u64 = 20;
 
 type Shard = RwLock<BTreeMap<String, Executor>>;
 
@@ -72,6 +88,19 @@ pub struct Engine {
     /// One writer per contract, held under that contract's shard lock. Kept apart from the executor
     /// so an `Executor` stays a plain serializable value.
     stores: Arc<RwLock<BTreeMap<String, Arc<Mutex<Store>>>>>,
+    /// Whether the background close-drain has been spawned. Started lazily from [`Engine::submit`],
+    /// because [`Engine::open`] is a plain constructor and a `tokio::spawn` there would panic in any
+    /// caller that is not already inside a runtime.
+    drain_started: Arc<AtomicBool>,
+    /// Failures from the drain, which has no caller to return them to. Reported by the next
+    /// [`Engine::flush`] -- the platform's flush loop logs them -- so a window that could not be
+    /// attested is never silently dropped.
+    drain_errors: Arc<Mutex<Vec<(String, StoreError)>>>,
+    /// Wakes the drain the moment a window is handed to it. Polling alone would not keep up: 256 ops
+    /// at request-path speed is a few milliseconds, so a timer long enough to be cheap is also long
+    /// enough for a second window to fill and hit the inline fallback -- which is the stall this
+    /// deferral exists to remove, doubled.
+    close_notify: Arc<Notify>,
 }
 
 impl Engine {
@@ -85,6 +114,9 @@ impl Engine {
             shards: Arc::new(v),
             persist: None,
             stores: Arc::new(RwLock::new(BTreeMap::new())),
+            drain_started: Arc::new(AtomicBool::new(false)),
+            drain_errors: Arc::new(Mutex::new(Vec::new())),
+            close_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -111,6 +143,114 @@ impl Engine {
 
     pub fn persists(&self) -> bool {
         self.persist.is_some()
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Spawn the close-drain, once: the task that closes windows [`Engine::submit`] deferred.
+    ///
+    /// It is a background task and not the serving runtime: its whole job is the fsync-heavy half of
+    /// a checkpoint, which is exactly the work the repo's bulkhead rule keeps off a request path.
+    fn start_drain(&self) {
+        if self.persist.is_none() {
+            return;
+        }
+        if self.drain_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let drain = self.clone();
+        tokio::spawn(async move { drain.drain_loop().await });
+    }
+
+    async fn drain_loop(&self) {
+        loop {
+            // Drain until nothing is waiting, THEN wait. Waiting first would leave a window queued
+            // behind a sleep for no reason.
+            if self.drain_pending().await {
+                continue;
+            }
+            tokio::select! {
+                _ = self.close_notify.notified() => {}
+                // The timer is the safety net, not the trigger: it retries a close that failed and
+                // reaps a window whose notification raced with the drain falling asleep.
+                _ = tokio::time::sleep(Duration::from_millis(DRAIN_IDLE_MS)) => {}
+            }
+        }
+    }
+
+    /// Close every window that has filled, for every contract: the deferred half of
+    /// [`Engine::submit`]. Returns whether anything was closed.
+    ///
+    /// Deliberately two phases. Closing needs only the store lock; applying the compaction it
+    /// licenses needs only the shard write lock. Taking the shard lock while a store lock is held
+    /// would invert the order `submit` uses (shard, then store) and deadlock the two against each
+    /// other, so every close runs first and the compaction runs after, with nothing held across.
+    async fn drain_pending(&self) -> bool {
+        let handles: Vec<(String, Arc<Mutex<Store>>)> = {
+            let guard = self.stores.read().await;
+            guard
+                .iter()
+                .map(|(id, h)| (id.clone(), h.clone()))
+                .collect()
+        };
+        let mut compact: Vec<(String, u64, String)> = Vec::new();
+        let mut any = false;
+        for (id, handle) in handles {
+            loop {
+                // Take the job under the lock, then DROP the guard: the close is three fsyncs and two
+                // directory walks, and an appender waiting on this same lock is exactly what deferring
+                // it was supposed to save. What comes back is owned by nobody but this loop.
+                let job = {
+                    let mut store = handle.lock().await;
+                    store.take_close()
+                };
+                let job = match job {
+                    Some(j) => j,
+                    None => break,
+                };
+                match run_close(&job).await {
+                    Ok((step, keep_from)) => {
+                        any = true;
+                        handle.lock().await.finish_close(keep_from);
+                        if let (Some(to), Some(prev)) = (step.truncate_to, step.truncate_prev) {
+                            compact.push((id.clone(), to, prev));
+                        }
+                    }
+                    Err(e) => {
+                        // Requeued, not dropped: a window that is never attested is a window that can
+                        // never be compacted. The next pass retries it, and the error is reported.
+                        handle.lock().await.requeue_close(job);
+                        self.drain_errors.lock().await.push((id.clone(), e));
+                        break;
+                    }
+                }
+            }
+        }
+        for (id, to, prev) in compact {
+            let mut shard = self.shard(&id).write().await;
+            if let Some(ex) = shard.get_mut(&id) {
+                if let Err(e) = ex.log.truncate_front(to, &prev) {
+                    self.drain_errors.lock().await.push((
+                        id,
+                        StoreError::BrokenChain {
+                            detail: format!("compaction after a deferred close refused: {e}"),
+                        },
+                    ));
+                }
+            }
+        }
+        any
+    }
+
+    /// Take whatever the background drain has failed to close. Reported by [`Engine::flush`], so a
+    /// window that could not be attested reaches the platform's log instead of disappearing.
+    pub async fn take_drain_errors(&self) -> Vec<(String, StoreError)> {
+        std::mem::take(&mut *self.drain_errors.lock().await)
     }
 
     fn shard(&self, contract_id: &str) -> &Shard {
@@ -161,11 +301,24 @@ impl Engine {
                 .map_err(|e| StoreError::BrokenChain {
                     detail: e.to_string(),
                 })?;
+                let mut store = opened.store;
+                let log = opened.log;
+                // A kill between a window filling and its close leaves the tail holding a complete
+                // window that no checkpoint attests -- the deferral makes that reachable where it
+                // used to take a crash inside the close itself. Repair it here, at rebuild: the index
+                // just replayed IS the index as of the tail's last entry, so it is exactly what such
+                // a checkpoint commits to. Left unrepaired, the tail would keep growing across
+                // restarts and the log could never be compacted again.
+                if store.has_complete_window() {
+                    if let Some(last) = log.entries().last().cloned() {
+                        store.checkpoint_now(&last, &index, Self::now_ms()).await?;
+                    }
+                }
                 self.stores.write().await.insert(
                     contract.id.clone(),
-                    Arc::new(Mutex::new(opened.store)),
+                    Arc::new(Mutex::new(store)),
                 );
-                Executor::from_parts(contract.clone(), opened.log, index)
+                Executor::from_parts(contract.clone(), log, index)
             }
         };
         shard.insert(contract.id.clone(), ex);
@@ -234,6 +387,11 @@ impl Engine {
                     if let Err(e) = ex.log.truncate_front(to, &prev) {
                         return Some(format!("compaction refused: {e}"));
                     }
+                }
+                if store.deferred_closes() > 0 {
+                    // Wake the drain now, while this caller goes back to its response. A poll would
+                    // get here eventually; this gets here before the NEXT window can fill.
+                    self.close_notify.notify_one();
                 }
                 None
             }
@@ -304,6 +462,9 @@ impl Engine {
         ts_ms: u64,
         outcome: Result<(), String>,
     ) -> Result<SubmitResult, OpError> {
+        // The window close this op may complete is not done here; make sure something exists to do
+        // it. Idempotent, and a no-op once the drain is running.
+        self.start_drain();
         let op = Op {
             seq: 0,
             contract: contract.id.clone(),
@@ -373,14 +534,20 @@ impl Engine {
         }
     }
 
-    /// Flush every open segment without closing a window: the timer-driven half of durability when
-    /// [`PersistConfig::sync`] is off.
+    /// Flush every open segment, and close every window that has filled since the last pass: the
+    /// timer-driven half of durability when [`PersistConfig::sync`] is off, and the second drain for
+    /// a deferred close.
     ///
     /// Returns the number of contracts whose segment was actually synced. An error is reported per
     /// contract and never stops the rest: one unwritable log directory must not keep another
     /// contract's entries unsynced. `Ok(0)` for an engine with no store -- there is nothing to
     /// flush, and that is the honest answer rather than a silent success.
+    ///
+    /// The background drain also closes windows, so this is belt and braces rather than the only
+    /// route: a platform loop that calls `flush` on a timer gets a close bound it controls, and a
+    /// shutdown that calls it leaves no window unattested.
     pub async fn flush(&self) -> Result<usize, Vec<(String, StoreError)>> {
+        self.start_drain();
         let handles: Vec<(String, Arc<Mutex<Store>>)> = {
             let guard = self.stores.read().await;
             guard
@@ -397,6 +564,8 @@ impl Engine {
                 Err(e) => failed.push((id, e)),
             }
         }
+        self.drain_pending().await;
+        failed.extend(self.take_drain_errors().await);
         if failed.is_empty() {
             Ok(synced)
         } else {
