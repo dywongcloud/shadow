@@ -13359,6 +13359,22 @@ pub(crate) async fn database_provision_local(
     Ok(Json(json!(db)))
 }
 
+/// The 8-byte suffix of a platform-issued database id (`db_<hex>`) that every container and named
+/// volume in a database's backing stack is templated from.
+///
+/// ONE derivation, shared by both teardown paths below: they used to be two independent
+/// `&id[3..11]` slices, which is the same shape of drift that already made real blob writes
+/// unattributable (`databases::native_payload_name` exists because of it) -- move one of them and
+/// one teardown family silently stops matching the names provisioning actually created, so those
+/// containers leak while the delete reports success.
+///
+/// `None` for an id too short to derive from, answered WITHOUT a panic instead of slicing out of
+/// bounds: `teardown_db_backing` used to panic on such an id while only the blind path guarded.
+fn db_container_short(id: &str) -> Option<&str> {
+    let tail = id.get(3..)?;
+    tail.get(..8.min(tail.len())).filter(|s| !s.is_empty())
+}
+
 /// Best-effort teardown of a database's backing containers, volume and SQLite file: the part of
 /// delete that only means something ON THE NODE THAT HOSTS THEM, split out so it runs locally (this
 /// node IS `host_node`) or is dispatched to the real owner over the mesh
@@ -13410,7 +13426,9 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
     // the platform-templated names by kind: a delete racing an in-flight provision reads
     // `container` while it is still None and would leak the container the provision starts seconds
     // later. `-v` is the podman lock-pool rule.
-    let short = &id[3..11.min(id.len())];
+    let Some(short) = db_container_short(id) else {
+        return;
+    };
     let names: Vec<String> = match d.container.as_deref() {
         Some(container) => container
             .split(',')
@@ -13474,11 +13492,10 @@ async fn teardown_db_backing(d: &crate::databases::Database) {
 /// its named volume). Every removal is idempotent best-effort; a name that never existed is a
 /// no-op.
 async fn teardown_db_backing_blind(id: &str) {
-    if id.len() <= 3 {
+    let Some(short) = db_container_short(id) else {
         return;
-    }
+    };
     crate::databases::note_teardown_request(id);
-    let short = &id[3..11.min(id.len())];
     let path_env = format!(
         "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
         std::env::var("PATH").unwrap_or_default()
@@ -13840,7 +13857,32 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
                             .as_str()
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| msg.to_string());
-                        c.databases.publish(&format!("{team}::{room}"), text);
+                        let nsr = format!("{team}::{room}");
+                        let before = c.databases.published_count(&nsr);
+                        c.databases.publish(&nsr, text.clone());
+                        // Same shape as the local path: measured on the broker's own counter after
+                        // the mutation, because a frame replicated into a room with no subscriber
+                        // on THIS node delivered nothing here and still landed.
+                        let after = c.databases.published_count(&nsr);
+                        let outcome = if after > before {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "realtime publish did not land: published count {before} before, {after} after"
+                            ))
+                        };
+                        // A mirrored frame has no request in flight, so it is recorded under the
+                        // platform actor with the tenant the signed mirror proof bound.
+                        crate::db_contract::wrote(
+                            c,
+                            &team,
+                            crate::db_contract::PLATFORM_ACTOR,
+                            crate::databases::DbKind::Realtime,
+                            room,
+                            text.len() as u64,
+                            outcome,
+                        )
+                        .await;
                     }
                 }
             }
@@ -14573,7 +14615,36 @@ async fn ws_realtime(
                 },
                 client = socket.recv() => match client {
                     Some(Ok(Message::Text(t))) => {
+                        // The mutation first, then the record: `db_contract` never authorizes,
+                        // never performs the write and never fails the request -- it appends one
+                        // entry and returns, and a REFUSED entry is a RECORD that this frame was
+                        // not attested, never a prevention of it.
+                        //
+                        // The outcome is the broker's own published counter measured AFTER the
+                        // mutation, never an assumption and never the delivery count: a frame into
+                        // a room whose subscribers all sit on other nodes delivered nothing HERE
+                        // and still landed, so delivery is not the outcome -- the counter the
+                        // publish moves is.
+                        let before = db.published_count(&room);
                         db.publish(&room, t.clone());
+                        let after = db.published_count(&room);
+                        let outcome = if after > before {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "realtime publish did not land: published count {before} before, {after} after"
+                            ))
+                        };
+                        crate::db_contract::wrote(
+                            &cloud,
+                            &team,
+                            &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+                            crate::databases::DbKind::Realtime,
+                            &raw_room,
+                            t.len() as u64,
+                            outcome,
+                        )
+                        .await;
                         crate::db_replicate::fanout_all(
                             &cloud,
                             false,

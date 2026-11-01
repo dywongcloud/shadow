@@ -190,7 +190,11 @@ pub(crate) async fn created(
 pub(crate) const PLATFORM_ACTOR: &str = "platform";
 
 /// [`record`] for a `db.write` that landed through a platform-native storage lane
-/// (`/v1/storage/blob|queue|vector|pubsub`).
+/// (`/v1/storage/blob|queue|vector|pubsub`, and the realtime room lane at `/v1/ws/realtime/:room`).
+///
+/// Realtime is the fifth lane and reaches the seam from two places, both of which publish into the
+/// same tenant-namespaced room: the WebSocket handler that receives a client frame, and the
+/// mirrored-write arm that replays a fanned-out frame on a peer.
 ///
 /// Those lanes are addressed by PAYLOAD NAME, never by database id, so the database the write landed
 /// in is resolved here (`DatabaseStore::native_db`) from the same `(kind, team, name)` triple the
