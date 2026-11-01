@@ -3788,6 +3788,9 @@ async fn run_build(
                     cloud
                         .databases
                         .remove_db_and_purge_data(&workflow_database.id, &workflow_database.team);
+                    // The record is gone, so the contract index loses it too: an unrecorded removal
+                    // leaves the index asserting a database canonical state no longer has.
+                    crate::db_contract::purged(&cloud, &workflow_database).await;
                     tracing::warn!(
                         %project,
                         database = %workflow_database.id,

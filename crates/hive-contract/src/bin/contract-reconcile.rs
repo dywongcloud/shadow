@@ -381,10 +381,20 @@ async fn main() {
         );
     }
     println!("declared={declared_n} wired={wired_n}");
+    // The map is a finding, not a constant: it grew from 6 to 10 when the three silent removal
+    // paths plus workflow storage were located and wired, so a hard count is a maintenance trap --
+    // a probe that fails every time coverage improves. What must hold is monotonicity (the map
+    // never shrinks below the surface originally located) and closure: no path that removes or
+    // creates a `databases` row may sit unwired again, because an unrecorded removal leaves the
+    // index asserting a database canonical state no longer has.
+    let unwired_mutations = reconcile::DECLARED_SCOPE
+        .iter()
+        .filter(|e| e.op_kind != "db.write" && !e.wired)
+        .count();
     probe(&mut failures,
-        declared_n == 6,
-        "the declared mutation surface is the one the map located",
-        format!("{declared_n} paths"),
+        declared_n >= 6 && unwired_mutations == 0,
+        "the declared mutation surface is the one the map located, and every create/delete in it is wired",
+        format!("{declared_n} declared, {wired_n} wired, {unwired_mutations} unwired create/delete paths"),
     );
 
     // ---- P10: the write plane is inside coverage ---------------------------------------------

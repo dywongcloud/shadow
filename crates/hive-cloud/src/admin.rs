@@ -4827,6 +4827,10 @@ async fn purge_project_resources(
         }
         c.databases
             .remove_db_and_purge_data(&database.id, &database.team);
+        // The row is gone from the catalog, so the contract index has to lose it too: an unrecorded
+        // removal leaves the index asserting a database that no longer exists, which is exactly the
+        // divergence `hive_contract::reconcile` exists to surface.
+        crate::db_contract::purged(&c, database).await;
     }
 
     residuals.extend(
@@ -13010,6 +13014,8 @@ fn database_ready_callback(
                         .databases
                         .remove_db_and_purge_data(&database.id, &database.team);
                     crate::persist::persist(&cloud);
+                    // Same rule as the purge above: the record was discarded, so the index loses it.
+                    crate::db_contract::purged(&cloud, &database).await;
                     return;
                 }
             }
@@ -17229,12 +17235,19 @@ async fn data_delete(
             None => false,
         },
         "databases" => {
-            let owner = c
-                .databases
-                .get_raw(&id)
-                .map(|d| d.team)
+            // Read the record before the purge consumes it: the contract's `db.delete` payload
+            // carries its project, and after the removal there is no row left to read.
+            let record = c.databases.get_raw(&id);
+            let owner = record
+                .as_ref()
+                .map(|d| d.team.clone())
                 .unwrap_or_else(|| t.clone());
             c.databases.remove_db_and_purge_data(&id, &owner);
+            // An operator console delete is a real catalog removal like any other: without an entry
+            // the index keeps a database canonical state no longer has.
+            if let Some(d) = record {
+                crate::db_contract::purged(&c, &d).await;
+            }
             true
         }
         "secure_links" => {

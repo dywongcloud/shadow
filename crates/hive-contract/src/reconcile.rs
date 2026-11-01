@@ -68,17 +68,27 @@ pub struct ScopeEntry {
 /// Every entry is a mutation path that already enforces tenancy; the contract layer records the
 /// decision, it does not replace it. `wired` is true only for a path whose handler actually calls
 /// `Engine::submit` through `hive-cloud`'s one seam (`src/db_contract.rs`) -- and only from the
-/// commit in which that call landed, never in anticipation of it. `db.create` and `db.delete` are
-/// wired; the four data-plane write paths are not, and until they are a `db.write` moves tenant
-/// data with no entry in the log.
+/// commit in which that call landed, never in anticipation of it. Every `db.delete` path is wired,
+/// including the three that remove a row without a request for it (a project purge, an incarnation
+/// discard, an operator console row delete) plus workflow storage that lost its project authority;
+/// each of them used to remove a `databases` row in silence, which left the index asserting a
+/// database canonical state no longer had. The four data-plane write paths are not wired, and until
+/// they are a `db.write` moves tenant data with no entry in the log.
 pub const DECLARED_SCOPE: &[ScopeEntry] = &[
-    ScopeEntry { op_kind: "db.create", file: "crates/hive-cloud/src/admin.rs", line: 13065, wired: true },
-    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 13551, wired: true },
-    // `write_scope` (admin.rs:13876) is the gate all four data-plane writes pass through.
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13929, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14070, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14181, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14337, wired: false },
+    ScopeEntry { op_kind: "db.create", file: "crates/hive-cloud/src/admin.rs", line: 13071, wired: true },
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 13557, wired: true },
+    // Removals with no request for one database in flight. Recorded under the tenant the STORED
+    // record names, because that is the only tenant identity bound to the target and a refusal
+    // would apply no mutation -- leaving the index holding a database that is already gone.
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 4721, wired: true },
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 12973, wired: true },
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 17213, wired: true },
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/git.rs", line: 3793, wired: true },
+    // The four data-plane writes, all of which pass through `write_scope`.
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13935, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14076, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14187, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14343, wired: false },
 ];
 
 pub fn scope_report() -> (usize, usize) {

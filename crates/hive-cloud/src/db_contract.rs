@@ -170,6 +170,35 @@ pub(crate) async fn created(
     .await
 }
 
+/// The actor recorded for a removal with no request in flight: a project purge, an incarnation
+/// discard, or an operator console row delete.
+pub(crate) const PLATFORM_ACTOR: &str = "platform";
+
+/// [`record`] for a `db.delete` the PLATFORM performs on its own authority, with no request in
+/// flight.
+///
+/// Why the caller is the record's own tenant, and why `owns_target` is true: both decide the INDEX,
+/// not access. The platform is removing a row whose only bound tenant identity is the one stored on
+/// it (`admin::record_tenant(&db.team)`), and a project purge or an incarnation discard is done
+/// under that tenant's authority. A `db.delete` recorded as a refusal goes through
+/// `Executor::commit_refusal`, which applies NO mutation -- so the index would keep a database that
+/// canonical state no longer has. That is exactly the divergence the contract exists to surface,
+/// and it is what every unwired removal path silently produced.
+pub(crate) async fn purged(c: &Arc<CloudState>, db: &crate::databases::Database) -> Option<Receipt> {
+    record(
+        c,
+        crate::admin::record_tenant(&db.team),
+        PLATFORM_ACTOR,
+        "db.delete",
+        &db.id,
+        &db.project,
+        &[],
+        true,
+        Ok(()),
+    )
+    .await
+}
+
 /// [`record`] for a `db.delete`: the catalog entry was removed and its payload data purged.
 pub(crate) async fn deleted(
     c: &Arc<CloudState>,
