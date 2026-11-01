@@ -30,6 +30,8 @@ struct RealDb {
     team: String,
     #[serde(default)]
     status: String,
+    #[serde(default)]
+    created_ms: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -183,6 +185,7 @@ fn err_label(e: &MergeError) -> &'static str {
         MergeError::ContractMismatch { .. } => "ContractMismatch",
         MergeError::Empty => "Empty",
         MergeError::Unparsable => "Unparsable",
+        MergeError::Checkpoint(_) => "Checkpoint",
     }
 }
 
@@ -217,6 +220,7 @@ async fn main() {
             team: d.team.clone(),
             project: d.project.clone(),
             status: d.status.clone(),
+            created_ms: d.created_ms,
             write_count: None,
             last_bytes: None,
         })
@@ -245,7 +249,7 @@ async fn main() {
     // ---- P2: the owner executes the real mutation set -------------------------------------------
     let contract: Contract = managed_db_contract();
     let engine = Engine::new(hive_contract::engine::DEFAULT_SHARDS);
-    engine.register(contract.clone()).await;
+    engine.register(contract.clone()).await.expect("register contract");
 
     let mut plan: Vec<PlanOp> = Vec::new();
     for d in &dbs {
@@ -495,7 +499,7 @@ async fn main() {
 
     // A real fork: a second honest writer executing the SAME plan in a rotated order.
     let alt_engine = Engine::new(hive_contract::engine::DEFAULT_SHARDS);
-    alt_engine.register(contract.clone()).await;
+    alt_engine.register(contract.clone()).await.expect("register contract");
     let mut alt_plan = plan.clone();
     alt_plan.rotate_left(1);
     run_plan(&alt_engine, &contract, &alt_plan, 1_790_000_000_000u64).await;

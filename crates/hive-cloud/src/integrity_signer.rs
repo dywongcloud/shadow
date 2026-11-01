@@ -91,3 +91,25 @@ impl IntegritySigner {
         }
     }
 }
+
+/// The platform's own key IS the contract layer's checkpoint signer.
+///
+/// hive-contract defines the seam ([`hive_contract::CheckpointSigner`]) and refuses to own a key of
+/// its own; this impl is the other half, so a contract checkpoint is signed by the same Ed25519
+/// identity that signs this node's deployment integrity chain, persisted in the same
+/// `integrity_signing.key`, resolved by the same fail-closed `open_or_create`. A second key would be
+/// a second thing to rotate, a second thing to leak, and no way to tell which one signed a given
+/// artefact -- so there isn't one.
+impl hive_contract::signing::CheckpointSigner for IntegritySigner {
+    fn signer_id(&self) -> &str {
+        &self.node
+    }
+
+    fn public_key(&self) -> Vec<u8> {
+        self.keypair.public_key().as_ref().to_vec()
+    }
+
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(self.keypair.sign(msg).as_ref().to_vec())
+    }
+}

@@ -7,7 +7,13 @@
 //! (ed25519 gossip envelopes, `IntegritySigner`); this log is the CONTENT commitment, not a
 //! replacement for transport authentication.
 //!
-//! Entries are never mutated and never removed. [`OpLog::append`] is the only writer.
+/// Entries are never mutated: [`OpLog::append`] and [`OpLog::append_entry`] are the only writers, and
+/// neither can change an entry already stored.
+///
+/// They can be DROPPED, but only from the front, only by [`OpLog::truncate_front`], and only against
+/// a head a signed checkpoint attests. That is compaction, and it is a different claim from "the log
+/// is unbounded": the retained window shrinks to what is still needed to recompute the index, while
+/// the seq space, the chain and the checkpoints over the dropped windows stay exactly as they were.
 
 use crate::contract::{Caller, OpSpec};
 use std::collections::BTreeMap;
@@ -105,6 +111,11 @@ pub struct Ack {
 }
 
 /// One log entry: the operation, the ack the executor produced for it, and the chain commitment.
+///
+/// `entry_hash` is a stored fact AND a recomputable one: [`LogEntry::expected_hash`] derives it from
+/// `prev_hash` and `op`, which is what lets a verifier catch an entry whose OPERATION was rewritten
+/// under a hash copied from the original. Comparing the stored field to itself proves nothing, so
+/// nothing here does.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     pub op: Op,
@@ -114,11 +125,45 @@ pub struct LogEntry {
     pub prev_hash: String,
 }
 
+impl LogEntry {
+    /// The entry hash its own contents produce: `chain_hash(prev_hash, op)`.
+    ///
+    /// This is the binding a verifier actually checks. An entry is offered as evidence, and the hash
+    /// it carries is only meaningful if it is the hash of THIS op over THIS prev -- otherwise a
+    /// rewritten payload travels under the original entry's hash and every proof cut for it still
+    /// "verifies".
+    pub fn expected_hash(&self) -> String {
+        OpLog::chain_hash(&self.prev_hash, &self.op)
+    }
+
+    /// Whether the entry's stored hash is the one its own contents produce.
+    pub fn hash_is_self_consistent(&self) -> bool {
+        self.expected_hash() == self.entry_hash
+    }
+}
+
 /// Append-only operation log for one contract.
+///
+/// `entries` is the RETAINED window, not the whole history: compaction drops the entries a signed
+/// checkpoint has already attested, and [`OpLog::base`] is the seq of the first entry that is still
+/// here. Sequence numbers are never renumbered by a compaction -- an entry's `seq` is its identity
+/// for as long as any checkpoint or replica cites it -- so `base` is carried instead: the log is a
+/// half-open range `[base, base + entries.len())` over the contract's seq space.
+///
+/// `base_prev` is the head the first retained entry links to. It is what keeps the chain verifiable
+/// across a cut: without it, dropping the entries before `base` would leave `entries[0].prev_hash`
+/// pointing at a hash nobody can check. It comes from the signed checkpoint that authorized the cut,
+/// so the value is attested rather than remembered.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct OpLog {
     entries: Vec<LogEntry>,
     head: String,
+    /// Seq of `entries[0]`. Zero for a log that has never been compacted.
+    #[serde(default)]
+    base: u64,
+    /// The head `entries[0].prev_hash` must equal: the log head just before `base`.
+    #[serde(default)]
+    base_prev: String,
 }
 
 impl OpLog {
@@ -130,6 +175,20 @@ impl OpLog {
         &self.head
     }
 
+    /// Seq of the first RETAINED entry. Everything before this was compacted away under a signed
+    /// checkpoint; it is not "gone from history", it is no longer needed to recompute the index.
+    pub fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// The log head immediately before [`OpLog::base`]: what the first retained entry links to.
+    pub fn base_prev(&self) -> &str {
+        &self.base_prev
+    }
+
+    /// How many entries are retained here. NOT the contract's seq count -- that is
+    /// [`OpLog::next_seq`]. Comparing two logs by `len()` compares two different windows and means
+    /// nothing; compare by seq.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -142,10 +201,21 @@ impl OpLog {
         &self.entries
     }
 
+    /// The entry at `seq`, wherever the retained window starts. `None` for a seq that has been
+    /// compacted away or that has not been written yet -- and those two are indistinguishable ON
+    /// PURPOSE: a log that has dropped a prefix must not claim to know what was in it.
+    pub fn entry_at(&self, seq: u64) -> Option<&LogEntry> {
+        let i = seq.checked_sub(self.base)? as usize;
+        self.entries.get(i)
+    }
+
     /// The next sequence number. Assigned by the single writer, which is the only caller of
     /// [`OpLog::append`], so concurrent submitters can never race for the same seq.
+    ///
+    /// `base + len`, never `len`: after a compaction the retained window does not start at zero, and
+    /// numbering a new entry as if it did would give it a seq an earlier entry already holds.
     pub fn next_seq(&self) -> u64 {
-        self.entries.len() as u64
+        self.base + self.entries.len() as u64
     }
 
     /// The hash an entry linking `prev` to `op` must carry. One construction, used by
@@ -180,22 +250,94 @@ impl OpLog {
     }
 
     /// Entries at or after `seq`: the unit a replica offers a peer that is behind.
+    ///
+    /// Keyed on SEQ, not position: a compacted peer's first retained entry is not at position 0, and
+    /// slicing by position would hand out the wrong entries.
     pub fn entries_from(&self, seq: u64) -> &[LogEntry] {
-        let start = (seq as usize).min(self.entries.len());
+        let start = seq
+            .saturating_sub(self.base)
+            .min(self.entries.len() as u64) as usize;
         &self.entries[start..]
     }
 
-    /// Whether `prefix` is a byte-identical head of this log: the test that distinguishes "a peer
-    /// that is merely behind" (harmless, merge is a no-op) from "a peer holding a different history"
-    /// (a fork, never merged).
+    /// Rebuild a log from a retained window: the load path after a restart and after a compaction.
+    ///
+    /// The window is validated, not trusted -- the chain is recomputed from `base_prev` and the head
+    /// is re-derived -- so a segment file that was truncated, reordered or edited does not become a
+    /// log that quietly verifies.
+    pub fn restore(base: u64, base_prev: &str, entries: Vec<LogEntry>) -> Result<OpLog, ChainBreak> {
+        let log = OpLog {
+            head: entries.last().map(|e| e.entry_hash.clone()).unwrap_or_default(),
+            entries,
+            base,
+            base_prev: base_prev.to_string(),
+        };
+        log.verify_chain()?;
+        Ok(log)
+    }
+
+    /// Drop every entry before `keep_from`: the compaction primitive.
+    ///
+    /// Refused unless a checkpoint actually attests the cut, which is what `prev_at` is: the head the
+    /// log had at `keep_from - 1`, taken from the signed checkpoint, not remembered by this process.
+    /// Compaction without that value would leave `entries[0].prev_hash` unverifiable, so the log's
+    /// chain would have a hole in it that [`OpLog::verify_chain`] could no longer detect -- the one
+    /// thing an append-only log must never have.
+    pub fn truncate_front(
+        &mut self,
+        keep_from: u64,
+        prev_at: &str,
+    ) -> Result<usize, TruncateError> {
+        if keep_from < self.base {
+            return Err(TruncateError::BelowBase {
+                keep_from,
+                base: self.base,
+            });
+        }
+        let next = self.next_seq();
+        if keep_from > next {
+            return Err(TruncateError::BeyondHead { keep_from, next });
+        }
+        let drop = (keep_from - self.base) as usize;
+        if drop == 0 {
+            return Ok(0);
+        }
+        self.entries.drain(..drop);
+        self.base = keep_from;
+        self.base_prev = prev_at.to_string();
+        Ok(drop)
+    }
+
+    /// Whether the retained part of this log is a byte-identical head of `self`.
+    ///
+    /// Two logs whose retained windows differ can still be compared, over the range they both hold:
+    /// that is the only evidence either of them has. A peer that is merely behind, or that is behind
+    /// a compaction the other side has already performed, still compares equal over the overlap,
+    /// which is what keeps "merge a peer that is behind" working after a compaction.
+    ///
+    /// `false` when there is no overlap at all: an offer that begins past our head is not a prefix of
+    /// anything we hold, it is a gap.
     pub fn starts_with(&self, prefix: &OpLog) -> bool {
-        if prefix.len() > self.len() {
+        if prefix.next_seq() > self.next_seq() {
             return false;
         }
-        self.entries
-            .iter()
-            .zip(prefix.entries.iter())
-            .all(|(a, b)| a.entry_hash == b.entry_hash && a.op.canonical() == b.op.canonical())
+        let from = self.base.max(prefix.base);
+        // A prefix that retains NO entries (a fresh log, or one compacted down to nothing) has
+        // nothing to compare -- and it is still a prefix of everything that reaches at least as far.
+        // Without this the empty case fell through to "no seq in common", which made a brand-new
+        // replica unable to merge the head it was offered and reported it as a fork.
+        if prefix.base >= prefix.next_seq() {
+            return prefix.next_seq() <= self.next_seq();
+        }
+        if prefix.next_seq() <= from {
+            return false;
+        }
+        (from..prefix.next_seq()).all(|seq| match (self.entry_at(seq), prefix.entry_at(seq)) {
+            (Some(a), Some(b)) => {
+                a.entry_hash == b.entry_hash && a.op.canonical() == b.op.canonical()
+            }
+            _ => false,
+        })
     }
 
     /// Append one entry a peer offered. The only remote-fed writer, and it RE-DERIVES the entry hash
@@ -238,13 +380,35 @@ impl OpLog {
 
     /// Walk the chain and recompute every entry hash. Any rewrite, reorder or truncation of a
     /// stored entry shows up as a `ChainBreak` at the first diverging seq.
+    ///
+    /// Starts from `base_prev`, not from the empty string: after a compaction the first retained
+    /// entry links to a head this log no longer holds, and walking from `""` would report a break at
+    /// every entry of every compacted log.
     pub fn verify_chain(&self) -> Result<(), ChainBreak> {
-        let mut prev = String::new();
-        for (i, e) in self.entries.iter().enumerate() {
+        self.verify_chain_from(self.base, &self.base_prev)
+    }
+
+    /// Walk the chain from an attested starting point: the replay-from-a-checkpoint path, where the
+    /// head at `start_seq - 1` comes from the signed checkpoint rather than from this log's own
+    /// `base_prev`. Every retained entry is checked either way; only the anchor differs.
+    pub fn verify_chain_from(&self, start_seq: u64, start_prev: &str) -> Result<(), ChainBreak> {
+        let start = match start_seq.checked_sub(self.base) {
+            Some(i) => i as usize,
+            None => {
+                return Err(ChainBreak {
+                    seq: start_seq,
+                    expected: start_seq.to_string(),
+                    stored: format!("log window starts at {}", self.base),
+                })
+            }
+        };
+        let mut prev = start_prev.to_string();
+        for (i, e) in self.entries.iter().enumerate().skip(start) {
+            let seq = self.base + i as u64;
             let expect = OpLog::chain_hash(&prev, &e.op);
             if expect != e.entry_hash || e.prev_hash != prev {
                 return Err(ChainBreak {
-                    seq: i as u64,
+                    seq,
                     expected: expect,
                     stored: e.entry_hash.clone(),
                 });
@@ -253,7 +417,7 @@ impl OpLog {
         }
         if prev != self.head {
             return Err(ChainBreak {
-                seq: self.entries.len() as u64,
+                seq: self.next_seq(),
                 expected: prev,
                 stored: self.head.clone(),
             });
@@ -268,6 +432,31 @@ pub struct ChainBreak {
     pub seq: u64,
     pub expected: String,
     pub stored: String,
+}
+
+/// Why a compaction could not be applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TruncateError {
+    /// `keep_from` is before the window's own start: those entries are already gone, so this is a
+    /// second compaction of the same range, not a new one.
+    BelowBase { keep_from: u64, base: u64 },
+    /// `keep_from` is past the head: it would drop entries that do not exist yet.
+    BeyondHead { keep_from: u64, next: u64 },
+}
+
+impl std::fmt::Display for TruncateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TruncateError::BelowBase { keep_from, base } => write!(
+                f,
+                "cannot compact to seq {keep_from}: window already starts at {base}"
+            ),
+            TruncateError::BeyondHead { keep_from, next } => write!(
+                f,
+                "cannot compact to seq {keep_from}: log head is {next}"
+            ),
+        }
+    }
 }
 
 /// Why an offered entry could not be appended.

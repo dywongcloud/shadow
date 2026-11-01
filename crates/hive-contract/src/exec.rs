@@ -10,7 +10,7 @@
 //! apply arguments (whitepaper 3.3, vm-runtime "Restricted Mode").
 
 use crate::contract::{Contract, Effect};
-use crate::oplog::{canonical_map, Ack, Op, OpLog, INDEX_DOMAIN};
+use crate::oplog::{canonical_map, Ack, LogEntry, Op, OpLog, INDEX_DOMAIN};
 use std::collections::BTreeMap;
 
 /// The contract's current state: a sorted key -> value map, the Vitra "index".
@@ -133,9 +133,11 @@ impl std::fmt::Display for ExecError {
 
 /// Bound on a failure string recorded in an ack.
 ///
-/// The failure text comes from the backend, and the log is append-only with no checkpoint and no
-/// compaction, so an unbounded string is an unbounded growth path. A longer message is cut rather
-/// than stored whole.
+/// The failure text comes from the backend, and every byte of it is written to an append-only log, so
+/// an unbounded string is an unbounded growth path. A longer message is cut rather than stored whole.
+///
+/// This caps ONE entry, not the log: the log is bounded by checkpointing and compaction
+/// ([`crate::persist`]), which is a separate mechanism and the one that actually stops growth.
 pub const MAX_ERROR_CHARS: usize = 256;
 
 fn bounded(msg: &str) -> String {
@@ -151,7 +153,12 @@ fn bounded(msg: &str) -> String {
 ///
 /// Not internally synchronized: the caller ([`crate::engine::Engine`]) holds the per-contract write
 /// lock, so "single writer per surface" is a property of the engine's sharding, not of this struct.
-#[derive(Clone, Debug)]
+///
+/// Serializable, so a snapshot of the whole runtime is a value that can be written out and compared.
+/// The durable copy is not this struct, though -- it is the segment files plus signed checkpoints in
+/// [`crate::persist`], which is what survives a restart and what bounds the log. Serializing an
+/// `Executor` is for inspection and reconciliation, never for durability.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Executor {
     pub contract: Contract,
     pub log: OpLog,
@@ -171,6 +178,25 @@ impl Executor {
 
     pub fn acks(&self) -> &[Ack] {
         &self.acks
+    }
+
+    /// The entry most recently appended: what a caller persists after a commit. `None` only for a
+    /// fresh executor that has never committed.
+    pub fn last_entry(&self) -> Option<&LogEntry> {
+        self.log.entries().last()
+    }
+
+    /// Rebuild from parts: the inverse of serialization, and the shape a restored log+index arrives
+    /// in. `acks` is re-derived from the log rather than taken from the caller, so a restored
+    /// executor's ack history can never disagree with the entries it holds.
+    pub fn from_parts(contract: Contract, log: OpLog, index: Index) -> Executor {
+        let acks = log.entries().iter().map(|e| e.ack.clone()).collect();
+        Executor {
+            contract,
+            log,
+            index,
+            acks,
+        }
     }
 
     pub fn index_hash(&self) -> String {

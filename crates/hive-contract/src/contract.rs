@@ -181,6 +181,13 @@ pub enum OpError {
     /// recorded under the submitted one: otherwise the op the contract authorized and the state the
     /// op moves are two different databases.
     TargetMismatch { target: String, expected: String },
+    /// The operation could not be RECORDED: the durable log would not open, because a stored
+    /// checkpoint failed to verify or the log directory is unwritable.
+    ///
+    /// This is a refusal to act, not a note. An op the log cannot hold is indistinguishable from an
+    /// op that never happened, which is precisely the silence [`crate::reconcile`] exists to detect --
+    /// so it is refused before the operation is applied rather than reported afterwards.
+    Store(String),
 }
 
 impl std::fmt::Display for OpError {
@@ -201,6 +208,7 @@ impl std::fmt::Display for OpError {
                 f,
                 "target {target} is not the {expected} the payload names"
             ),
+            OpError::Store(d) => write!(f, "contract log is not recordable: {d}"),
         }
     }
 }

@@ -21,20 +21,32 @@
 //! else here is the machinery that validates and executes it.
 
 pub mod audit;
+pub mod checkpoint;
 pub mod contract;
 pub mod contracts;
 pub mod engine;
 pub mod exec;
+pub mod merkle;
 pub mod oplog;
+pub mod persist;
 pub mod reconcile;
 pub mod replicate;
+pub mod signing;
 
-pub use audit::{verify, Breach};
+pub use audit::{adjudicate, replay, replay_from, verify, Breach, Dispute, Verdict};
+pub use checkpoint::{
+    Checkpoint, CheckpointVerifyError, SignedCheckpoint, SignError, CHECKPOINT_DOMAIN,
+};
 pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
 pub use contracts::managed_db_contract;
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
 pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
-pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, OP_DOMAIN};
+pub use merkle::{merkle_prove, merkle_root, merkle_verify, MerklePath, Sibling};
+pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, TruncateError, OP_DOMAIN};
+pub use persist::{
+    read_entries_from, read_latest_checkpoint, read_window, AppendStep, PersistConfig, Store,
+    StoreError, DEFAULT_CHECKPOINT_EVERY, DEFAULT_RETAIN_CHECKPOINTS,
+};
 pub use reconcile::{
     reconcile, scope_report, CanonicalDb, Divergence, DivergenceKind, ReconcileReport, ScopeEntry,
     DECLARED_SCOPE,
@@ -42,3 +54,4 @@ pub use reconcile::{
 pub use replicate::{
     AdoptSource, MergeError, Replica, ReplicaSnapshot, SyncReport, SNAPSHOT_DOMAIN,
 };
+pub use signing::{verify_ed25519, CheckpointSigner, KeyedSigner, KeyError};

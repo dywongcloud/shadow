@@ -12,3 +12,8 @@ fluid-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+# Ed25519 only, and only two uses: signing a checkpoint with the node's EXISTING identity, and
+# verifying one without any key at all. Same algorithm the platform's IntegritySigner already uses;
+# no new primitive, and no key of this crate's own.
+ring = "0.17"
+hex = "0.4"

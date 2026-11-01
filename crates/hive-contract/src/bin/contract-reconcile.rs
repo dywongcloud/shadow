@@ -110,6 +110,7 @@ async fn main() {
             team: d.team.clone(),
             project: d.project.clone(),
             status: d.status.clone(),
+            created_ms: d.created_ms,
             write_count: None,
             last_bytes: None,
         })
@@ -260,6 +261,7 @@ async fn main() {
         team: snap.databases[0].team.clone(),
         project: snap.databases[0].project.clone(),
         status: "ready".to_string(),
+        created_ms: 0,
         write_count: Some(0),
         last_bytes: Some("0".to_string()),
     });
@@ -450,6 +452,7 @@ async fn main() {
             team: "victim".to_string(),
             project: "proj-victim".to_string(),
             status: "ready".to_string(),
+            created_ms: 0,
             write_count: Some(0),
             last_bytes: Some("0".to_string()),
         }],
@@ -492,6 +495,7 @@ async fn main() {
             team: "victim".to_string(),
             project: "proj-victim".to_string(),
             status: "ready".to_string(),
+            created_ms: 0,
             write_count: Some(500),
             last_bytes: Some("1048576".to_string()),
         }],

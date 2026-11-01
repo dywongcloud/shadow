@@ -87,48 +87,54 @@ impl Replica {
         if offered.is_empty() {
             return Err(MergeError::Empty);
         }
-        let before = self.log.len();
+        // Lengths are SEQ counts, never retained-entry counts: after a compaction a replica's window
+        // is shorter than its history, and comparing two windows by `len()` would call a compacted
+        // peer "behind" and refuse a history it already agrees with.
+        let before = self.log.next_seq();
+        let theirs = offered.next_seq();
 
         // A peer that is behind, or holding a different history of the same or shorter length.
-        if offered.len() <= before {
+        if theirs <= before {
             if self.log.starts_with(offered) {
                 return Ok(SyncReport {
                     appended: 0,
                     duplicates: offered.len(),
-                    skipped_stale: offered.len() < before,
-                    len_before: before,
-                    len_after: before,
+                    skipped_stale: theirs < before,
+                    len_before: before as usize,
+                    len_after: before as usize,
                 });
             }
-            let seq = first_divergence(self.log.entries(), offered.entries());
-            return Err(if offered.len() < before {
+            let seq = first_divergence(&self.log, offered);
+            return Err(if theirs < before {
                 MergeError::Regress {
-                    held: before,
-                    offered: offered.len(),
+                    held: before as usize,
+                    offered: theirs as usize,
                 }
             } else {
                 MergeError::Fork {
                     seq,
-                    held: hash_at(self.log.entries(), seq),
-                    offered: hash_at(offered.entries(), seq),
+                    held: hash_at(&self.log, seq),
+                    offered: hash_at(offered, seq),
                 }
             });
         }
 
         if !offered.starts_with(&self.log) {
-            let seq = first_divergence(self.log.entries(), offered.entries());
+            let seq = first_divergence(&self.log, offered);
             return Err(MergeError::Fork {
                 seq,
-                held: hash_at(self.log.entries(), seq),
-                offered: hash_at(offered.entries(), seq),
+                held: hash_at(&self.log, seq),
+                offered: hash_at(offered, seq),
             });
         }
 
         // Verify the whole tail against a shadow copy: entry linkage, contract shape, and the ack.
+        // The tail starts at OUR next seq, by seq: `before` is a seq, and `entries_from` is keyed on
+        // one, so a compacted publisher hands over exactly the entries we lack.
         let mut shadow_log = self.log.clone();
         let mut shadow_index = self.index.clone();
         let mut appended = 0usize;
-        for entry in offered.entries_from(before as u64) {
+        for entry in offered.entries_from(before) {
             shadow_log.append_entry(entry.clone())?;
             self.verify_against(&mut shadow_index, entry)?;
             appended += 1;
@@ -139,8 +145,8 @@ impl Replica {
             appended,
             duplicates: 0,
             skipped_stale: false,
-            len_before: before,
-            len_after: self.log.len(),
+            len_before: before as usize,
+            len_after: self.log.next_seq() as usize,
         })
     }
 
@@ -242,45 +248,48 @@ impl Replica {
         }
         snap.log.verify_chain().map_err(MergeError::BrokenChain)?;
 
-        let before = self.log.len();
-        if snap.log.len() < before {
+        // Seq counts again: an authority's snapshot may be compacted, and `len()` would make a
+        // compacted authority look like a peer that is behind.
+        let before = self.log.next_seq();
+        let theirs = snap.log.next_seq();
+        if theirs < before {
             if self.log.starts_with(&snap.log) {
                 return Ok(SyncReport {
                     appended: 0,
                     duplicates: snap.log.len(),
                     skipped_stale: true,
-                    len_before: before,
-                    len_after: before,
+                    len_before: before as usize,
+                    len_after: before as usize,
                 });
             }
             return Err(MergeError::Regress {
-                held: before,
-                offered: snap.log.len(),
+                held: before as usize,
+                offered: theirs as usize,
             });
         }
-        if snap.log.len() == before && !self.log.starts_with(&snap.log) {
-            let seq = first_divergence(self.log.entries(), snap.log.entries());
+        if theirs == before && !self.log.starts_with(&snap.log) {
+            let seq = first_divergence(&self.log, &snap.log);
             return Err(MergeError::Fork {
                 seq,
-                held: hash_at(self.log.entries(), seq),
-                offered: hash_at(snap.log.entries(), seq),
+                held: hash_at(&self.log, seq),
+                offered: hash_at(&snap.log, seq),
             });
         }
-        if snap.log.len() == before {
+        if theirs == before {
             return Ok(SyncReport {
                 appended: 0,
-                duplicates: before,
+                duplicates: before as usize,
                 skipped_stale: false,
-                len_before: before,
-                len_after: before,
+                len_before: before as usize,
+                len_after: before as usize,
             });
         }
         self.log = snap.log.clone();
         let mut report = self.rebuild()?;
-        report.appended = self.log.len() - before;
-        report.duplicates = before;
-        report.len_before = before;
-        report.len_after = self.log.len();
+        report.appended = (self.log.next_seq() - before) as usize;
+        report.duplicates = before as usize;
+        report.len_before = before as usize;
+        report.len_after = self.log.next_seq() as usize;
         Ok(report)
     }
 }
@@ -412,11 +421,18 @@ pub enum MergeError {
     /// legitimate short history.
     Empty,
     Unparsable,
+    /// A checkpoint the publisher's log fails to honour: its index does not hash to what it names,
+    /// its head is not the head its own entries reach, it resumes where this log has already
+    /// compacted past, or a compaction was attempted with no head attesting the cut. Carried whole,
+    /// because each of those is a different refusal and a merge that swallowed the difference would
+    /// leave an operator nothing to act on.
+    Checkpoint(Breach),
 }
 
 impl std::fmt::Display for MergeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MergeError::Checkpoint(b) => write!(f, "{b}"),
             MergeError::Regress { held, offered } => write!(
                 f,
                 "offered log is shorter ({offered}) than held ({held}) and not a prefix: refusing to regress"
@@ -483,20 +499,42 @@ impl From<Breach> for MergeError {
                 offered: ack_seq,
             }),
             Breach::UndeclaredOp { seq, kind } => MergeError::UndeclaredOp { seq, kind },
+            // The checkpoint cases, which only exist once a log can be compacted: a publisher whose
+            // attestation does not survive its own entries offers nothing admissible.
+            Breach::BadCheckpoint { .. }
+            | Breach::CheckpointHeadMismatch { .. }
+            | Breach::CheckpointGap { .. }
+            | Breach::BadCompaction(_) => MergeError::Checkpoint(b),
         }
     }
 }
 
-fn first_divergence(held: &[LogEntry], offered: &[LogEntry]) -> u64 {
-    held.iter()
-        .zip(offered.iter())
-        .position(|(a, b)| a.entry_hash != b.entry_hash || a.op.canonical() != b.op.canonical())
-        .unwrap_or_else(|| held.len().min(offered.len())) as u64
+/// The first seq at which two logs disagree, compared BY SEQ.
+///
+/// Positional comparison is wrong the moment either log has been compacted: `entries[0]` on one is
+/// not `entries[0]` on the other, and zipping the two windows would call every seq after the cut a
+/// divergence. Both logs are asked for the same seq instead, and a seq only one of them still holds
+/// is reported at face value rather than compared -- a peer that compacted a prefix is not thereby
+/// forked.
+fn first_divergence(held: &OpLog, offered: &OpLog) -> u64 {
+    let from = held.base().max(offered.base());
+    let to = held.next_seq().min(offered.next_seq());
+    for seq in from..to {
+        match (held.entry_at(seq), offered.entry_at(seq)) {
+            (Some(a), Some(b)) => {
+                if a.entry_hash != b.entry_hash || a.op.canonical() != b.op.canonical() {
+                    return seq;
+                }
+            }
+            _ => return seq,
+        }
+    }
+    to
 }
 
-fn hash_at(entries: &[LogEntry], seq: u64) -> String {
-    entries
-        .get(seq as usize)
+/// The entry hash one log holds at `seq`, empty when it does not hold it.
+fn hash_at(log: &OpLog, seq: u64) -> String {
+    log.entry_at(seq)
         .map(|e| e.entry_hash.clone())
         .unwrap_or_default()
 }

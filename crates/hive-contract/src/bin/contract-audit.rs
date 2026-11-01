@@ -150,7 +150,7 @@ async fn main() {
 
     // ---- P2..P5: the authorization seam. Refusals must be recorded, not dropped. ----
     let engine = Arc::new(Engine::new(DEFAULT_SHARDS));
-    engine.register(contract.clone()).await;
+    engine.register(contract.clone()).await.expect("register contract");
     let probe_target = dbs[0].id.clone();
     let probe_project = dbs[0].project.clone();
     let probe_team = if dbs[0].team.is_empty() {
@@ -385,7 +385,7 @@ async fn main() {
     let work = dbs.len() * rounds;
     for shards in [1usize, 4, 16, 64] {
         let e = Arc::new(Engine::new(shards));
-        e.register(contract.clone()).await;
+        e.register(contract.clone()).await.expect("register contract");
         let t = Instant::now();
         let mut hs = Vec::new();
         for round in 0..rounds {
@@ -458,7 +458,7 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
     for shards in [1usize, 4, 16, 64] {
         let e = Arc::new(Engine::new(shards));
         for c in &scoped {
-            e.register(c.clone()).await;
+            e.register(c.clone()).await.expect("register contract");
         }
         let t = Instant::now();
         let mut hs = Vec::new();
@@ -532,7 +532,7 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
     // ---- P12: the backend is DOWN. An ack must record EXECUTION, not admission. ----
     println!("\n== P12 the backend is down: an ack records execution, not admission ==");
     let down_engine = Engine::new(DEFAULT_SHARDS);
-    down_engine.register(contract.clone()).await;
+    down_engine.register(contract.clone()).await.expect("register contract");
     let down_db = "db-down-0001";
     let mut reported_committed = 0usize;
     for i in 0..50u64 {
@@ -790,7 +790,7 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
     // ---- P17: the properties that already held still hold. ----
     println!("\n== P17 preserved properties ==");
     let e17 = Engine::new(DEFAULT_SHARDS);
-    e17.register(contract.clone()).await;
+    e17.register(contract.clone()).await.expect("register contract");
     for i in 0..500u64 {
         let t = format!("db-{}", i % 5);
         e17.submit(
