@@ -13805,6 +13805,15 @@ pub(crate) async fn database_replica(
 /// pub/sub topics, so a fanned-out room frame is published to it like a topic message (room frames
 /// are raw text on the wire, kept raw so a mirrored frame is byte-identical to a locally published
 /// one).
+///
+/// Every one of the five arms is now a recorded mutation, not just a replayed one. A mirrored write
+/// is a real mutation of THIS node's store, so an arm that applied it and recorded nothing left the
+/// write invisible on every node except the origin -- the audit trail claimed a coverage it did not
+/// have. Each arm therefore follows the seam's rule exactly as its local counterpart does: mutate
+/// FIRST, then record the outcome the store measured afterwards. `db_contract` never authorizes
+/// (the tenant is the one the signed mirror proof bound), never performs the mutation and never
+/// fails the request; a REFUSED entry is a RECORD that this write was unattested, never a
+/// prevention of it -- the bytes have already moved.
 pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: &[u8]) {
     let team = qs(path, "team").unwrap_or_else(|| "personal".into());
     let no_q = path.split('?').next().unwrap_or(path);
@@ -13813,16 +13822,60 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
     match kind {
         "blob" => {
             if let (Some(bucket), Some(key)) = (segs.get(3), segs.get(4)) {
-                c.databases
-                    .blob_put(&format!("{team}::{bucket}"), key, body.to_vec());
+                let nsb = format!("{team}::{bucket}");
+                let size = body.len() as u64;
+                c.databases.blob_put(&nsb, key, body.to_vec());
+                // Measured after the mutation, never assumed: a durable blob write is best-effort
+                // (`BlobStore::put` swallows its I/O error), so the honest report is whether the
+                // object is really there at the size submitted.
+                let outcome = match c.databases.blob_object_size(&nsb, key) {
+                    Some(n) if n == size => Ok(()),
+                    other => Err(format!(
+                        "mirrored blob write did not land: {size} bytes submitted, object reads back as {other:?}"
+                    )),
+                };
+                // No request in flight: recorded under the platform actor with the tenant the
+                // signed mirror proof bound.
+                crate::db_contract::wrote(
+                    c,
+                    &team,
+                    crate::db_contract::PLATFORM_ACTOR,
+                    crate::databases::DbKind::Blob,
+                    bucket,
+                    size,
+                    outcome,
+                )
+                .await;
             }
         }
         "queue" => {
             if let Some(queue) = segs.get(3) {
                 if let Ok(v) = serde_json::from_slice::<Value>(body) {
                     if let Some(msg) = v.get("message") {
-                        c.databases
-                            .queue_push(&format!("{team}::{queue}"), msg.to_string());
+                        let nsq = format!("{team}::{queue}");
+                        let payload = msg.to_string();
+                        let size = payload.len() as u64;
+                        let before = c.databases.queue_depth(&nsq);
+                        c.databases.queue_push(&nsq, payload);
+                        // Depth moved is the measurement; the push's own return is not re-read.
+                        let after = c.databases.queue_depth(&nsq);
+                        let outcome = if after > before {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "mirrored queue push did not land: depth {before} before, {after} after"
+                            ))
+                        };
+                        crate::db_contract::wrote(
+                            c,
+                            &team,
+                            crate::db_contract::PLATFORM_ACTOR,
+                            crate::databases::DbKind::Queue,
+                            queue,
+                            size,
+                            outcome,
+                        )
+                        .await;
                     }
                 }
             }
@@ -13830,12 +13883,29 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
         "vector" => {
             if let Some(index) = segs.get(3) {
                 if let Ok(v) = serde_json::from_slice::<VectorUpsert>(body) {
-                    c.databases.vector_upsert(
-                        &format!("{team}::{index}"),
-                        &v.id,
-                        v.vector,
-                        v.metadata,
-                    );
+                    let nsi = format!("{team}::{index}");
+                    let before = c.databases.vector_stats(&nsi).0;
+                    c.databases.vector_upsert(&nsi, &v.id, v.vector, v.metadata);
+                    // Re-upserting an existing id leaves the count where it was, which is why the
+                    // floor is `before.max(1)` and not `before + 1`.
+                    let after = c.databases.vector_stats(&nsi).0;
+                    let outcome = if after >= before.max(1) {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "mirrored vector upsert did not land: index held {before} entries before, {after} after"
+                        ))
+                    };
+                    crate::db_contract::wrote(
+                        c,
+                        &team,
+                        crate::db_contract::PLATFORM_ACTOR,
+                        crate::databases::DbKind::Vector,
+                        index,
+                        body.len() as u64,
+                        outcome,
+                    )
+                    .await;
                 }
             }
         }
@@ -13843,8 +13913,32 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
             if let Some(topic) = segs.get(3) {
                 if let Ok(v) = serde_json::from_slice::<Value>(body) {
                     if let Some(msg) = v.get("message") {
-                        c.databases
-                            .publish(&format!("{team}::{topic}"), msg.to_string());
+                        let nst = format!("{team}::{topic}");
+                        let payload = msg.to_string();
+                        let size = payload.len() as u64;
+                        let before = c.databases.published_count(&nst);
+                        c.databases.publish(&nst, payload);
+                        // The broker's own PUBLISHED counter, never the delivery count: a frame
+                        // whose subscribers sit on other nodes delivered nothing here and still
+                        // landed.
+                        let after = c.databases.published_count(&nst);
+                        let outcome = if after > before {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "mirrored publish did not land: published count {before} before, {after} after"
+                            ))
+                        };
+                        crate::db_contract::wrote(
+                            c,
+                            &team,
+                            crate::db_contract::PLATFORM_ACTOR,
+                            crate::databases::DbKind::Pubsub,
+                            topic,
+                            size,
+                            outcome,
+                        )
+                        .await;
                     }
                 }
             }

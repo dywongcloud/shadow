@@ -192,9 +192,14 @@ pub(crate) const PLATFORM_ACTOR: &str = "platform";
 /// [`record`] for a `db.write` that landed through a platform-native storage lane
 /// (`/v1/storage/blob|queue|vector|pubsub`, and the realtime room lane at `/v1/ws/realtime/:room`).
 ///
-/// Realtime is the fifth lane and reaches the seam from two places, both of which publish into the
-/// same tenant-namespaced room: the WebSocket handler that receives a client frame, and the
-/// mirrored-write arm that replays a fanned-out frame on a peer.
+/// Realtime is the fifth lane. ALL FIVE lanes now reach the seam from two places: the handler that
+/// serves a local request, and the arm of `apply_mirrored_write` that replays the same write on a
+/// peer. The second half is what made a replicated write visible: a mirrored write is a real
+/// mutation of the receiving node's store, so an arm that applied it and recorded nothing left the
+/// write on every node except the origin -- coverage the audit trail claimed and did not have.
+/// A mirrored replay has no request in flight, so it is recorded under [`PLATFORM_ACTOR`] with the
+/// tenant the signed mirror proof bound; fan-out excludes this node by name, so a write is never
+/// recorded twice.
 ///
 /// Those lanes are addressed by PAYLOAD NAME, never by database id, so the database the write landed
 /// in is resolved here (`DatabaseStore::native_db`) from the same `(kind, team, name)` triple the
