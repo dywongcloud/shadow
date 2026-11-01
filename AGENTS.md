@@ -186,6 +186,30 @@ stranded databases are reported, never re-hosted (re-provisioning under the same
 `PendingTable` EVICTS the oldest stuck connection, so a few addresses cannot starve the rest; `splice` copies each direction itself,
 never `copy_bidirectional` or a `select!` over two copies.
 
+## Contract and execution transparency (managed-db)
+
+- `crates/hive-contract`: a contract is DATA, not code. Per op kind it declares who may emit it (`AuthPolicy`) and whether it may
+change contract state (`Effect`); `OpenParticipation` + `StateWrite` is unrepresentable by construction. Instance:
+`contracts/managed_database.rs` (`hive.managed-db.v1`).
+- `crates/hive-cloud/src/db_contract.rs` is the ONLY seam into the platform. It does NOT authorize, does NOT perform the mutation,
+and does NOT fail the request: every caller mutates FIRST, then records. A REFUSED entry is a RECORD that a write was unattested,
+never a prevention of it -- never describe this layer as refusing an unauthorized write (authorization is `auth::require_auth` +
+the roles matrix + the ownership check).
+- A caller's outcome is a MEASUREMENT, never a constant `Ok(())`: blob reads back at the submitted size, queue depth moved, vector
+index retained the entry, pubsub uses the broker's PUBLISHED counter (`delivered` is 0 with no subscribers and still a landed
+write). A write no managed database attests is recorded as an unattributed REFUSED `db.write` against
+`unattributed:<kind>:<tenant>::<name>`, never silently dropped.
+- Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>` (`canonical_fields`/`canonical_map`). A bare separator join is NOT injective:
+a payload containing the separator reproduces a different field list's encoding, so a crafted payload travels under an entry hash
+the executor never signed and an adjudication cut from it convicts an honest executor.
+- `Ack::canonical` folds the ack into the signed preimage. `entry_hash` is BLAKE3(prev||op) and CANNOT cover the ack, because
+`ack.log_head` IS that entry hash -- without the fold, anyone who has seen one signed line copies its signature onto a conflicting
+ack and frames an honest executor.
+- Adjudication with no PINNED identity returns Inadmissible, never Dishonest: a structural check alone is satisfied by any keypair.
+- A checkpoint window close must never run inline in `submit`, because `db_contract::wrote` awaits it on the request path; it is
+deferred to the bulkhead drain. Reading a window must read EVERY segment its range touches, not only the segment its base falls
+in, or a legitimate window spanning a boundary is refused as a forged checkpoint at boot.
+
 ## Browser lane
 
 - `fluid_core::browser_policy_digest` and `policyDigest` in `crates/hive-browser/www/artifact-policy.js` are ONE contract with TWO
