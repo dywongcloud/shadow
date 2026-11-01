@@ -86,6 +86,27 @@ impl Checkpoint {
     }
 }
 
+/// What a checkpoint must claim before it is adopted as THIS contract's history.
+///
+/// [`SignedCheckpoint::verify`] is deliberately weak on its own: it proves the artefact is
+/// self-consistent and that the signature verifies under the key the artefact carries. Anybody can
+/// mint a keypair and satisfy both, so an artefact that only ever had to satisfy `verify` asserts
+/// nothing about who signed it or which contract it describes. Adoption -- a restart rebuilding its
+/// index from a checkpoint it found on disk -- is the moment that matters, and it passes one of
+/// these: the identity allowed to have signed it, and the contract it is allowed to describe.
+///
+/// A verifier with no out-of-band knowledge of the signer passes `None` and gets the structural
+/// check; it then decides for itself whether it trusts the key it was handed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrustedCheckpoint<'a> {
+    /// Hex Ed25519 public key of the only identity allowed to have signed the artefact.
+    pub public_key_hex: &'a str,
+    /// The contract id the artefact must name.
+    pub contract_id: &'a str,
+    /// The contract version the artefact must name.
+    pub contract_version: u32,
+}
+
 /// Why a checkpoint could not be signed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SignError {
@@ -143,9 +164,55 @@ impl SignedCheckpoint {
     ///   1. the stored `index` really hashes to `index_hash` (the index is not a lie about itself);
     ///   2. the signature over [`Checkpoint::canonical`] verifies under the carried public key;
     ///   3. an optional inclusion path really lands on `merkle_root`.
-    pub fn verify(&self) -> Result<(), CheckpointVerifyError> {
+    ///
+    /// This is the STRUCTURAL check, and on its own it is not enough to adopt a checkpoint: it is
+    /// satisfied by an artefact signed by a key the verifier has never heard of, because the key it
+    /// verifies against is the one the artefact carries. Adoption goes through
+    /// [`SignedCheckpoint::verify`] with a [`TrustedCheckpoint`].
+    /// `None` means the caller has NOT been told whose key to expect; see [`TrustedCheckpoint`].
+    ///
+    /// `Some(trust)` adds the two bindings [`SignedCheckpoint::verify`] cannot make, because neither
+    /// is a fact about the artefact alone:
+    ///   * **Who signed it.** The signature is checked against the carried key by `verify`; here the
+    ///     carried key is checked against the identity the caller was configured with. A rotation is
+    ///     therefore visible as a refusal, never as a silently re-attested history.
+    ///   * **Which contract it describes.** The `contract_id`/`contract_version` are inside the
+    ///     signed bytes, so a genuine checkpoint for one contract is a validly-signed artefact -- and
+    ///     adopting it as another contract's history would publish that contract's index from a
+    ///     foreign log.
+    pub fn verify(
+        &self,
+        trusted: Option<&TrustedCheckpoint<'_>>,
+    ) -> Result<(), CheckpointVerifyError> {
         self.verify_index()?;
-        self.verify_signature()
+        self.verify_signature()?;
+        let Some(t) = trusted else {
+            return Ok(());
+        };
+        // Public keys are public: an ordinary comparison, and the full hex is carried in the error so
+        // an operator can see which identity was offered. Nothing here compares a secret.
+        if !self.public_key_hex.eq_ignore_ascii_case(t.public_key_hex) {
+            return Err(CheckpointVerifyError::UntrustedSigner {
+                window_end: self.checkpoint.window_end,
+                signer_id: self.signer_id.clone(),
+                public_key: self.public_key_hex.clone(),
+            });
+        }
+        if self.checkpoint.contract_id != t.contract_id {
+            return Err(CheckpointVerifyError::ContractMismatch {
+                window_end: self.checkpoint.window_end,
+                published: self.checkpoint.contract_id.clone(),
+                expected: t.contract_id.to_string(),
+            });
+        }
+        if self.checkpoint.contract_version != t.contract_version {
+            return Err(CheckpointVerifyError::ContractMismatch {
+                window_end: self.checkpoint.window_end,
+                published: self.checkpoint.contract_version.to_string(),
+                expected: t.contract_version.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Check 1: the index the artefact carries is the index it names.
@@ -203,6 +270,26 @@ impl SignedCheckpoint {
                 end: self.checkpoint.window_end,
             });
         }
+        // The window's leaf count is signed in the checkpoint (as `window_base`/`window_end`), so a
+        // proof that names some other count is not a proof about THIS window. `merkle_verify` derives
+        // the tree shape from the count the path carries, so without this the shape is chosen by the
+        // artefact rather than by the attestation.
+        let window = self.checkpoint.window_end - self.checkpoint.window_base;
+        if path.leaves != window {
+            return Err(CheckpointVerifyError::WindowShapeMismatch {
+                seq,
+                leaves: path.leaves,
+                window,
+            });
+        }
+        // The entry must be the entry at THIS seq: an op carries its own seq, so a proof cut at one
+        // position cannot be offered for an entry that belongs at another.
+        if entry.op.seq != seq {
+            return Err(CheckpointVerifyError::EntrySeqMismatch {
+                seq,
+                op_seq: entry.op.seq,
+            });
+        }
         if path.leaf != entry.entry_hash {
             return Err(CheckpointVerifyError::ProofEntryMismatch {
                 seq,
@@ -239,8 +326,27 @@ pub enum CheckpointVerifyError {
     BadSignature { window_end: u64 },
     /// The public key is not decodable, so there is nothing to verify against.
     BadPublicKey { window_end: u64 },
+    /// The signature verifies, but under an identity that is not the one this contract's log is
+    /// configured to trust. A correctly-signed artefact from a key nobody pinned is a forgery with a
+    /// valid signature, which is exactly the shape a forged history takes.
+    UntrustedSigner {
+        window_end: u64,
+        signer_id: String,
+        public_key: String,
+    },
+    /// A validly-signed checkpoint for a DIFFERENT contract (id or version). Genuine, and still not
+    /// this contract's history.
+    ContractMismatch {
+        window_end: u64,
+        published: String,
+        expected: String,
+    },
     /// The entry a proof names is not inside this checkpoint's window.
     OutsideWindow { seq: u64, base: u64, end: u64 },
+    /// The proof claims a leaf count this checkpoint's signed window does not have.
+    WindowShapeMismatch { seq: u64, leaves: u64, window: u64 },
+    /// The entry's op is at a different seq than the position the proof was cut for.
+    EntrySeqMismatch { seq: u64, op_seq: u64 },
     /// The proof's leaf is not the entry it was offered for.
     ProofEntryMismatch {
         seq: u64,
@@ -276,6 +382,34 @@ impl std::fmt::Display for CheckpointVerifyError {
             CheckpointVerifyError::BadPublicKey { window_end } => write!(
                 f,
                 "checkpoint at {window_end} carries an undecodable public key"
+            ),
+            CheckpointVerifyError::UntrustedSigner {
+                window_end,
+                signer_id,
+                public_key,
+            } => write!(
+                f,
+                "checkpoint at {window_end} was signed by an untrusted identity {signer_id} (key {public_key})"
+            ),
+            CheckpointVerifyError::ContractMismatch {
+                window_end,
+                published,
+                expected,
+            } => write!(
+                f,
+                "checkpoint at {window_end} is for contract {published}, not {expected}"
+            ),
+            CheckpointVerifyError::WindowShapeMismatch {
+                seq,
+                leaves,
+                window,
+            } => write!(
+                f,
+                "proof at seq {seq} claims {leaves} leaves, checkpoint window holds {window}"
+            ),
+            CheckpointVerifyError::EntrySeqMismatch { seq, op_seq } => write!(
+                f,
+                "proof at seq {seq} was offered for an op carrying seq {op_seq}"
             ),
             CheckpointVerifyError::OutsideWindow { seq, base, end } => write!(
                 f,

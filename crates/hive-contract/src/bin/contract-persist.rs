@@ -218,6 +218,15 @@ async fn main() {
     }
     let signer: Arc<dyn CheckpointSigner> =
         Arc::new(KeyedSigner::from_pkcs8("witness-node", &pkcs8).expect("load generated key"));
+    // What a stored checkpoint must claim to be adopted: signed by THIS identity, for THIS contract.
+    // A stranger's artefact is not made acceptable by being internally consistent.
+    let node_pk = signer.public_key();
+    let node_pk_hex = hex::encode(&node_pk);
+    let trust = hive_contract::checkpoint::TrustedCheckpoint {
+        public_key_hex: &node_pk_hex,
+        contract_id: &contract.id,
+        contract_version: contract.version,
+    };
 
     let targets = targets(&state, 12);
     let ts0 = now_ms();
@@ -317,7 +326,7 @@ async fn main() {
     {
         // Resume from a checkpoint the way a third party would: read it, verify it, read the tail
         // from disk, replay. Nothing here touches the in-memory log.
-        let read = futures_lite_block_on(read_checkpoint(&compact_store, end));
+        let read = futures_lite_block_on(read_checkpoint(&compact_store, end, Some(&trust)));
         let signed = match read {
             Ok(s) => s,
             Err(e) => {
@@ -326,7 +335,7 @@ async fn main() {
                 continue;
             }
         };
-        let tail = futures_lite_block_on(read_entries_from(&compact_store, end)).unwrap_or_default();
+        let tail = futures_lite_block_on(read_entries_from(&compact_store, end, Some(&node_pk))).unwrap_or_default();
         let log = match OpLog::restore(end, &signed.checkpoint.log_head, tail) {
             Ok(l) => l,
             Err(e) => {
@@ -385,10 +394,10 @@ async fn main() {
 
     // ---- P5: a stranger verifies a checkpoint, an inclusion path and a dispute ------------------
     println!("\n== P5 cryptographic binding ==");
-    let latest = futures_lite_block_on(read_latest_checkpoint(&compact_store))
+    let latest = futures_lite_block_on(read_latest_checkpoint(&compact_store, Some(&trust)))
         .expect("latest checkpoint readable")
         .expect("a checkpoint exists");
-    let p5_verify = latest.verify().is_ok();
+    let p5_verify = latest.verify(Some(&trust)).is_ok();
     println!("  checkpoint verifies (signature + own index hash): {p5_verify}");
     if !p5_verify {
         failures += 1;
@@ -396,7 +405,7 @@ async fn main() {
 
     // Inclusion: cut a path for an entry inside the newest checkpoint's own window and check it.
     let cp = &latest.checkpoint;
-    let win = futures_lite_block_on(read_window(&compact_store, cp.window_base, cp.window_end, window))
+    let win = futures_lite_block_on(read_window(&compact_store, cp.window_base, cp.window_end, window, Some(&node_pk)))
         .unwrap_or_default();
     let mut p5_inclusion = false;
     let mut p5_forged = false;
@@ -439,7 +448,7 @@ async fn main() {
     // The segment is what follows the checkpoint, not what it covers: an accusation says "from this
     // attested state, these entries led to that ack".
     let segment: Vec<LogEntry> =
-        futures_lite_block_on(read_entries_from(&compact_store, cp.window_end)).unwrap_or_default();
+        futures_lite_block_on(read_entries_from(&compact_store, cp.window_end, Some(&node_pk))).unwrap_or_default();
     let disputed_seq = segment.last().map(|e| e.op.seq).unwrap_or(0);
     println!(
         "  dispute segment : {} entries from seq {} to {}",
@@ -454,6 +463,7 @@ async fn main() {
             segment: segment.clone(),
             disputed_seq,
         },
+        Some(&node_pk_hex),
     );
     println!("  dispute over an honest ack: {} at seq {:?}", honest.label(), seq_of(&honest));
     let mut tampered = segment.clone();
@@ -467,6 +477,7 @@ async fn main() {
             segment: tampered,
             disputed_seq,
         },
+        Some(&node_pk_hex),
     );
     println!("  dispute over a rewritten ack: {}", dishonest.label());
     let p5_dispute = matches!(honest, Verdict::Honest { .. })
@@ -494,7 +505,7 @@ async fn main() {
         serde_json::to_vec_pretty(&forged_cp).expect("serialize"),
     )
     .expect("write forged");
-    let tamper_caught = futures_lite_block_on(read_checkpoint(&tamper_dir, cp.window_end)).is_err();
+    let tamper_caught = futures_lite_block_on(read_checkpoint(&tamper_dir, cp.window_end, Some(&trust))).is_err();
     println!("  checkpoint with an edited index: {}", if tamper_caught { "refused" } else { "ACCEPTED (bad)" });
     if !tamper_caught {
         failures += 1;
@@ -584,6 +595,13 @@ async fn reopen(dir: &std::path::Path, window: usize, retain: usize) {
     let signer: Arc<dyn CheckpointSigner> = Arc::new(
         KeyedSigner::from_hex_file("witness-node", &key_path).expect("reopen: load signing key"),
     );
+    let node_pk = signer.public_key();
+    let node_pk_hex = hex::encode(&node_pk);
+    let trust = hive_contract::checkpoint::TrustedCheckpoint {
+        public_key_hex: &node_pk_hex,
+        contract_id: &contract.id,
+        contract_version: contract.version,
+    };
     let hash = async {
         let engine = Engine::open(
             4,
@@ -603,11 +621,11 @@ async fn reopen(dir: &std::path::Path, window: usize, retain: usize) {
         println!("reopen chain     : verifies from base_prev");
         let live = engine.index_hash(&contract.id).await.expect("reopen index hash");
         // And the same thing the long way: from the newest checkpoint plus the tail off disk.
-        let latest = read_latest_checkpoint(&store_dir)
+        let latest = read_latest_checkpoint(&store_dir, Some(&trust))
             .await
             .expect("reopen: checkpoint readable")
             .expect("reopen: a checkpoint exists");
-        let tail = read_entries_from(&store_dir, latest.checkpoint.window_end)
+        let tail = read_entries_from(&store_dir, latest.checkpoint.window_end, Some(&node_pk))
             .await
             .unwrap_or_default();
         let rebuilt = OpLog::restore(

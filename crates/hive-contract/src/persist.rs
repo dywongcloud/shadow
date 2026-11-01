@@ -32,11 +32,11 @@
 //! checkpoints are, so a segment is either entirely covered by retained checkpoints or entirely
 //! droppable. Nothing has to read-modify-write a log file.
 
-use crate::checkpoint::{Checkpoint, SignedCheckpoint};
+use crate::checkpoint::{Checkpoint, SignedCheckpoint, TrustedCheckpoint};
 use crate::exec::{index_hash, Index};
 use crate::merkle;
 use crate::oplog::{LogEntry, OpLog};
-use crate::signing::CheckpointSigner;
+use crate::signing::{verify_ed25519, CheckpointSigner};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -100,6 +100,9 @@ pub enum StoreError {
     /// A stored checkpoint did not verify: forged, tampered with, or signed by a key that is not the
     /// node's. Refused at load, so a bad checkpoint can never become the basis of a replay.
     BadCheckpoint { file: String, detail: String },
+    /// A stored entry's signature does not verify under the node's key, or the entry carries none:
+    /// it was not written by this node, so it is not part of the history.
+    BadEntry { file: String, seq: u64 },
     /// The rebuilt log does not chain.
     BrokenChain { detail: String },
     /// An I/O failure. Carried as text so this type stays `Clone` and `Send` across await points.
@@ -117,6 +120,10 @@ impl std::fmt::Display for StoreError {
             StoreError::BadCheckpoint { file, detail } => {
                 write!(f, "{file} does not verify: {detail}")
             }
+            StoreError::BadEntry { file, seq } => write!(
+                f,
+                "{file}: entry at seq {seq} does not carry a signature this node made"
+            ),
             StoreError::BrokenChain { detail } => write!(f, "rebuilt log does not chain: {detail}"),
             StoreError::Io { op, detail } => write!(f, "{op} failed: {detail}"),
         }
@@ -130,6 +137,32 @@ fn io(op: &str) -> impl Fn(std::io::Error) -> StoreError + '_ {
         op: op.to_string(),
         detail: e.to_string(),
     }
+}
+
+/// One line of a segment: the entry, plus the signature that binds it to the node's identity.
+///
+/// The chain alone does not stop an entry that was never submitted: `chain_hash` is computable by
+/// anybody, so a hand-written line that links to the head and carries the hash its own op produces is
+/// indistinguishable from a real one on replay -- it simply becomes part of the history the next
+/// checkpoint attests. The signature is what makes "the log says this happened" a statement the node
+/// can be held to, and it is checked on every read that will be adopted.
+///
+/// The signature is NOT inside [`LogEntry`], and it is not inside `entry_hash`: both are pure
+/// functions of the operation and its predecessor, so a monitor without any key can still recompute
+/// every hash and every Merkle root. What is signed is `entry_hash`, under
+/// [`crate::oplog::ENTRY_SIG_DOMAIN`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SegmentLine {
+    pub entry: LogEntry,
+    /// Hex Ed25519 signature over `ENTRY_SIG_DOMAIN || entry.entry_hash`.
+    pub sig: String,
+}
+
+/// The bytes a stored entry's signature covers.
+pub fn entry_sig_preimage(entry_hash: &str) -> Vec<u8> {
+    let mut out = crate::oplog::ENTRY_SIG_DOMAIN.to_vec();
+    out.extend_from_slice(entry_hash.as_bytes());
+    out
 }
 
 /// Segment file for the window starting at `base`. Zero-padded: sorted file order is seq order.
@@ -153,17 +186,36 @@ fn parse_segment_name(name: &str) -> Option<u64> {
 }
 
 /// The most recent signed checkpoint in `dir`, verified before it is handed out.
-pub async fn read_latest_checkpoint(dir: &Path) -> Result<Option<SignedCheckpoint>, StoreError> {
+///
+/// `trust` is what turns "this artefact is internally consistent" into "this artefact is MY
+/// history". Pass `Some(..)` on every path that will adopt the checkpoint -- a restart rebuilding an
+/// index from disk -- and `None` only when the caller is a stranger that has not been told whose key
+/// to expect and will decide that itself.
+pub async fn read_latest_checkpoint(
+    dir: &Path,
+    trust: Option<&TrustedCheckpoint<'_>>,
+) -> Result<Option<SignedCheckpoint>, StoreError> {
     let ends = list_checkpoint_ends(dir).await?;
     let end = match ends.into_iter().max() {
         Some(e) => e,
         None => return Ok(None),
     };
-    read_checkpoint(dir, end).await.map(Some)
+    read_checkpoint(dir, end, trust).await.map(Some)
 }
 
 /// Read and verify the checkpoint for the window ending at `end`.
-pub async fn read_checkpoint(dir: &Path, end: u64) -> Result<SignedCheckpoint, StoreError> {
+///
+/// Beyond the artefact's own checks, two bindings come from WHERE it was found rather than from what
+/// it says:
+///   * the file that carries it names the window, so a checkpoint stored under another window's name
+///     (a rollback by rename) is refused -- the name is not decoration, it is the index the reader
+///     used to find it;
+///   * `trust`, when given, pins the signing identity and the contract.
+pub async fn read_checkpoint(
+    dir: &Path,
+    end: u64,
+    trust: Option<&TrustedCheckpoint<'_>>,
+) -> Result<SignedCheckpoint, StoreError> {
     let path = dir.join(checkpoint_name(end));
     let name = path.display().to_string();
     let bytes = tokio::fs::read(&path).await.map_err(io("read checkpoint"))?;
@@ -171,7 +223,16 @@ pub async fn read_checkpoint(dir: &Path, end: u64) -> Result<SignedCheckpoint, S
         file: name.clone(),
         detail: e.to_string(),
     })?;
-    cp.verify()
+    if cp.checkpoint.window_end != end {
+        return Err(StoreError::BadCheckpoint {
+            file: name,
+            detail: format!(
+                "file is named for window {end}, artefact attests window {}",
+                cp.checkpoint.window_end
+            ),
+        });
+    }
+    cp.verify(trust)
         .map_err(|e| StoreError::BadCheckpoint {
             file: name,
             detail: e.to_string(),
@@ -209,7 +270,11 @@ async fn list_segment_bases(dir: &Path) -> Result<Vec<u64>, StoreError> {
 ///
 /// Used to rebuild after a restart and to materialise a window an inclusion proof needs after the
 /// in-memory log has moved on.
-pub async fn read_entries_from(dir: &Path, from: u64) -> Result<Vec<LogEntry>, StoreError> {
+pub async fn read_entries_from(
+    dir: &Path,
+    from: u64,
+    public_key: Option<&[u8]>,
+) -> Result<Vec<LogEntry>, StoreError> {
     let bases = list_segment_bases(dir).await?;
     // Every segment is read and filtered by seq: a segment's window size is not knowable from its
     // name, so the only safe filter is the one applied per line below.
@@ -222,18 +287,49 @@ pub async fn read_entries_from(dir: &Path, from: u64) -> Result<Vec<LogEntry>, S
             if line.trim().is_empty() {
                 continue;
             }
-            let e: LogEntry =
+            let l: SegmentLine =
                 serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
                     file: name.clone(),
                     detail: format!("line {}: {err}", i + 1),
                 })?;
-            if e.op.seq >= from {
-                out.push(e);
+            verify_line(&l, &name, public_key)?;
+            if l.entry.op.seq >= from {
+                out.push(l.entry);
             }
         }
     }
     out.sort_by_key(|e| e.op.seq);
     Ok(out)
+}
+
+/// Check one stored line's signature against the node's Ed25519 public key.
+///
+/// `None` skips the check, for a caller that has not been told whose key to expect -- a stranger
+/// reading a log it was handed verifies the entries only as content, because it cannot tell a real
+/// signature from one made by a key it has never heard of. Every path that ADOPTS entries passes the
+/// key.
+fn verify_line(l: &SegmentLine, file: &str, public_key: Option<&[u8]>) -> Result<(), StoreError> {
+    let Some(pk) = public_key else {
+        return Ok(());
+    };
+    let sig = match hex::decode(&l.sig) {
+        Ok(s) if !s.is_empty() => s,
+        // An entry with no signature is not "an old entry", it is an entry this node did not write.
+        // Nothing in this format ever wrote one, so there is no legacy case to accommodate.
+        _ => {
+            return Err(StoreError::BadEntry {
+                file: file.to_string(),
+                seq: l.entry.op.seq,
+            })
+        }
+    };
+    if !verify_ed25519(pk, &entry_sig_preimage(&l.entry.entry_hash), &sig) {
+        return Err(StoreError::BadEntry {
+            file: file.to_string(),
+            seq: l.entry.op.seq,
+        });
+    }
+    Ok(())
 }
 
 /// The entries of one window `[base, end)`: what an inclusion proof is cut against after compaction
@@ -244,6 +340,7 @@ pub async fn read_window(
     base: u64,
     end: u64,
     window: usize,
+    public_key: Option<&[u8]>,
 ) -> Result<Vec<LogEntry>, StoreError> {
     let window = window.max(1) as u64;
     let path = dir.join(segment_name((base / window) * window));
@@ -256,12 +353,13 @@ pub async fn read_window(
         if line.trim().is_empty() {
             continue;
         }
-        let e: LogEntry = serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
+        let l: SegmentLine = serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
             file: name.clone(),
             detail: format!("line {}: {err}", i + 1),
         })?;
-        if e.op.seq >= base && e.op.seq < end {
-            out.push(e);
+        verify_line(&l, &name, public_key)?;
+        if l.entry.op.seq >= base && l.entry.op.seq < end {
+            out.push(l.entry);
         }
     }
     out.sort_by_key(|e| e.op.seq);
@@ -351,7 +449,45 @@ impl Store {
         let window = cfg.checkpoint_every.max(1);
         let retain = cfg.retain_checkpoints.max(1);
 
-        let latest = read_latest_checkpoint(&dir).await?;
+        // The identity this log is allowed to have been written by. Taken from the CONFIGURED
+        // signer, never from the artefact: a checkpoint that names its own key and verifies against
+        // it proves only that somebody signed something. Rotating the signing key therefore makes
+        // every stored checkpoint untrusted, and this refuses rather than re-attesting history under
+        // a new key -- the honest failure for a log whose whole job is non-repudiation.
+        let signer = cfg.signer.expect("checked above");
+        let pinned_key = signer.public_key();
+        let trust = TrustedCheckpoint {
+            public_key_hex: &hex::encode(signer.public_key()),
+            contract_id,
+            contract_version,
+        };
+
+        let latest = read_latest_checkpoint(&dir, Some(&trust)).await?;
+        // A checkpoint is also a commitment to the ENTRIES of its window, and the tail after it is
+        // never replayed over them -- so the only thing standing between a rewrite inside an attested
+        // window and an adopted forgery is the signed Merkle root. Recompute it whenever the window's
+        // entries are still on disk (they are, for every window whose segment has not been reclaimed);
+        // when they are gone there is nothing to compare, and the signature is all that is left.
+        if let Some(cp) = &latest {
+            let c = &cp.checkpoint;
+            let entries = read_window(&dir, c.window_base, c.window_end, window, Some(&pinned_key))
+                .await
+                .unwrap_or_default();
+            if !entries.is_empty() {
+                let computed = merkle::merkle_root(
+                    &entries.iter().map(|e| e.entry_hash.clone()).collect::<Vec<_>>(),
+                );
+                if computed != c.merkle_root {
+                    return Err(StoreError::BadCheckpoint {
+                        file: checkpoint_name(c.window_end),
+                        detail: format!(
+                            "window [{}, {}) on disk commits to {computed}, checkpoint names {}",
+                            c.window_base, c.window_end, c.merkle_root
+                        ),
+                    });
+                }
+            }
+        }
         let (index, base, base_prev) = match &latest {
             Some(cp) => {
                 let c = &cp.checkpoint;
@@ -359,7 +495,7 @@ impl Store {
             }
             None => (Index::new(), 0u64, String::new()),
         };
-        let entries = read_entries_from(&dir, base).await?;
+        let entries = read_entries_from(&dir, base, Some(&pinned_key)).await?;
         let log = OpLog::restore(base, &base_prev, entries).map_err(|e| StoreError::BrokenChain {
             detail: format!("at seq {}: stored {} expected {}", e.seq, e.stored, e.expected),
         })?;
@@ -375,7 +511,7 @@ impl Store {
             contract_version,
             window,
             retain,
-            signer: cfg.signer,
+            signer: Some(signer),
             seg: None,
             seg_base: None,
             pending_start: if log.is_empty() { None } else { Some(log.base()) },
@@ -451,7 +587,21 @@ impl Store {
             self.seg = Some(f);
             self.seg_base = Some(wbase);
         }
-        let mut line = serde_json::to_string(entry).map_err(|e| StoreError::Corrupt {
+        // Sign the entry as it is stored. The signature is over `entry_hash`, which is already a
+        // function of `(prev, op)`, so it binds the operation, its position and its predecessor in
+        // one go -- and it is the only thing on the line that a writer without the node's key cannot
+        // produce.
+        let signer = self.signer.as_ref().ok_or(StoreError::NoSigner)?;
+        let sig = hex::encode(
+            signer
+                .sign(&entry_sig_preimage(&entry.entry_hash))
+                .map_err(StoreError::SignFailed)?,
+        );
+        let mut line = serde_json::to_string(&SegmentLine {
+            entry: entry.clone(),
+            sig,
+        })
+        .map_err(|e| StoreError::Corrupt {
             file: segment_name(wbase),
             detail: format!("entry {seq} does not serialize: {e}"),
         })?;

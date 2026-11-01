@@ -8,7 +8,9 @@
 //!   * [`verify_chain`] -- the log is append-only and un-forked (the `LogForkFraudProof` case).
 //!   * [`replay`] -- the executor applied the contract honestly (the contract-breach case).
 
-use crate::checkpoint::{Checkpoint, CheckpointVerifyError, SignedCheckpoint};
+use crate::checkpoint::{
+    Checkpoint, CheckpointVerifyError, SignedCheckpoint, TrustedCheckpoint,
+};
 use crate::contract::Contract;
 use crate::exec::{apply, index_hash, Index};
 use crate::oplog::{ChainBreak, LogEntry, OpLog, TruncateError};
@@ -278,14 +280,29 @@ impl Verdict {
     }
 }
 
-/// Settle a [`Dispute`].
+/// Settle a [`Dispute`] against a known signing identity.
 ///
-/// The third party checks, in order: the checkpoint's signature and its own index (so the starting
-/// state is attested, not asserted); that the segment chains onto the checkpoint's `log_head` (so the
-/// entries are the ones that followed it); and then replays. It never asks the monitor or the
-/// executor anything, and it never copies an index -- it recomputes one, exactly as replication does.
-pub fn adjudicate(contract: &Contract, dispute: &Dispute) -> Verdict {
-    if let Err(e) = dispute.checkpoint.verify() {
+/// The third party checks, in order: the checkpoint's signature, its own index, and -- when
+/// `trusted_public_key_hex` is given -- that the key that signed the starting state is the node's
+/// (so the state everyone agrees on was attested, not merely asserted, and a dispute built on an
+/// attacker-signed checkpoint settles nothing at all); that the segment chains onto the checkpoint's
+/// `log_head` (so the entries are the ones that followed it); and then replays. It never asks the
+/// monitor or the executor anything, and it never copies an index -- it recomputes one, exactly as
+/// replication does.
+///
+/// The contract is bound here too: a genuine checkpoint for one contract is a validly-signed
+/// artefact, and settling another contract's dispute against it would compare the wrong history.
+pub fn adjudicate(
+    contract: &Contract,
+    dispute: &Dispute,
+    trusted_public_key_hex: Option<&str>,
+) -> Verdict {
+    let trust = trusted_public_key_hex.map(|pk| TrustedCheckpoint {
+        public_key_hex: pk,
+        contract_id: &contract.id,
+        contract_version: contract.version,
+    });
+    if let Err(e) = dispute.checkpoint.verify(trust.as_ref()) {
         return Verdict::Inadmissible {
             reason: format!("checkpoint does not verify: {e}"),
         };

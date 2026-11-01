@@ -22,6 +22,10 @@ use std::collections::BTreeMap;
 /// per the repo's hashing rule (`fluid_core::content_hash`); these are new, so BLAKE3 it is.
 pub const OP_DOMAIN: &[u8] = b"hive-contract/oplog/v1";
 pub const INDEX_DOMAIN: &[u8] = b"hive-contract/index/v1";
+/// Domain separator for the bytes a stored entry's SIGNATURE covers. The signature is not part of the
+/// entry hash -- the hash stays a pure function of `(prev, op)` so a monitor can recompute it without
+/// any key -- so the signature binds `entry_hash` under its own domain instead.
+pub const ENTRY_SIG_DOMAIN: &[u8] = b"hive-contract/oplog-entry/v1";
 
 /// Canonical bytes for a value: a hand-rolled, feature-independent serialization.
 ///
@@ -266,8 +270,17 @@ impl OpLog {
     /// is re-derived -- so a segment file that was truncated, reordered or edited does not become a
     /// log that quietly verifies.
     pub fn restore(base: u64, base_prev: &str, entries: Vec<LogEntry>) -> Result<OpLog, ChainBreak> {
+        // With no retained entries the log's head IS the head before `base`: a store that was
+        // checkpointed and compacted down to an empty tail (`checkpoint_now` on shutdown does exactly
+        // this) has nothing left to replay, and defaulting the head to "" made `verify_chain` report a
+        // break at the one moment the log was most provably consistent -- so an honest restart was
+        // refused, and the refusal masked every check that ran after it.
+        let head = entries
+            .last()
+            .map(|e| e.entry_hash.clone())
+            .unwrap_or_else(|| base_prev.to_string());
         let log = OpLog {
-            head: entries.last().map(|e| e.entry_hash.clone()).unwrap_or_default(),
+            head,
             entries,
             base,
             base_prev: base_prev.to_string(),

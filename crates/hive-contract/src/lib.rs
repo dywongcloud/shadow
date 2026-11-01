@@ -35,7 +35,8 @@ pub mod signing;
 
 pub use audit::{adjudicate, replay, replay_from, verify, Breach, Dispute, Verdict};
 pub use checkpoint::{
-    Checkpoint, CheckpointVerifyError, SignedCheckpoint, SignError, CHECKPOINT_DOMAIN,
+    Checkpoint, CheckpointVerifyError, SignedCheckpoint, SignError, TrustedCheckpoint,
+    CHECKPOINT_DOMAIN,
 };
 pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
 pub use contracts::managed_db_contract;
@@ -44,8 +45,9 @@ pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
 pub use merkle::{merkle_prove, merkle_root, merkle_verify, MerklePath, Sibling};
 pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, TruncateError, OP_DOMAIN};
 pub use persist::{
-    read_entries_from, read_latest_checkpoint, read_window, AppendStep, PersistConfig, Store,
-    StoreError, DEFAULT_CHECKPOINT_EVERY, DEFAULT_RETAIN_CHECKPOINTS,
+    entry_sig_preimage, read_entries_from, read_latest_checkpoint, read_window, AppendStep,
+    PersistConfig, SegmentLine, Store, StoreError, DEFAULT_CHECKPOINT_EVERY,
+    DEFAULT_RETAIN_CHECKPOINTS,
 };
 pub use reconcile::{
     reconcile, scope_report, CanonicalDb, Divergence, DivergenceKind, ReconcileReport, ScopeEntry,
