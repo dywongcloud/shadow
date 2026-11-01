@@ -8,13 +8,26 @@
 //!
 //! What this module does NOT do:
 //!   * It does not authorize. `tenant` is the cryptographically-bound tenant the platform already
-//!     resolved (`admin::tenant`) and `owns_target` is the verdict of the platform's own ownership
-//!     check for this database. Both are handed to `contract::validate`, which fails CLOSED when
-//!     either is missing: an untagged or non-owning caller produces a REFUSED entry, never a
-//!     committed one. So adding a call here cannot open a path that was closed before it.
-//!   * It does not perform the mutation. The caller has already done it and passes its result as
-//!     `outcome`; an `Err` is recorded with `success: false` and applies NO state change, so a
-//!     database write that never landed is not asserted as one that did.
+//!     resolved (`admin::tenant`, `admin::write_scope` for a mirrored write) and `owns_target` is
+//!     the verdict of the platform's own ownership check for this database. Both are handed to
+//!     `contract::validate`, which fails CLOSED when either is missing: an untagged or non-owning
+//!     caller produces a REFUSED entry, never a committed one. So adding a call here cannot open a
+//!     path that was closed before it.
+//!   * It does not perform the mutation, and it does not run BEFORE it. Every caller here mutates
+//!     first and records afterwards: `blob_put` has already written to disk by the time `wrote` is
+//!     called, and `queue_push`/`vector_upsert`/`publish` have already moved their store. A REFUSED
+//!     entry is therefore a RECORD that the platform's write was not attested -- never a prevention
+//!     of it. The bytes have already moved. Do not describe this layer as refusing an unauthorized
+//!     write: the platform's authorization is `auth::require_auth` plus the roles matrix and the
+//!     ownership check, and this module only reports what those already decided, after the fact.
+//!     What the refusal buys is visibility -- canonical state holds a write the contract refuses to
+//!     attest, which is exactly the divergence `hive_contract::reconcile` exists to surface.
+//!   * It does not perform the mutation. The caller has already done it and passes the result it
+//!     MEASURED afterwards as `outcome`; an `Err` is recorded with `success: false` and applies NO
+//!     state change, so a database write that never landed is not asserted as one that did. Passing
+//!     `Ok(())` unconditionally would leave that guarantee unexercised on every live path, so a
+//!     caller's `outcome` is a measurement (an object that reads back, a counter that moved), never
+//!     a constant.
 //!   * It does not fail the request. A contract recording problem is reported and dropped: the
 //!     platform's own mutation has already happened, and losing an audit entry is strictly better
 //!     than answering an error for work that succeeded.
@@ -119,6 +132,7 @@ pub(crate) async fn record(
                 Some(e) => tracing::warn!(
                     op = kind,
                     db = %db_id,
+                    tenant = %tenant,
                     seq = receipt.seq,
                     error = %e,
                     "contract: managed-db op refused"
@@ -126,6 +140,7 @@ pub(crate) async fn record(
                 None => tracing::info!(
                     op = kind,
                     db = %db_id,
+                    tenant = %tenant,
                     seq = receipt.seq,
                     committed = receipt.committed,
                     index_hash = %receipt.index_hash,
@@ -185,10 +200,11 @@ pub(crate) const PLATFORM_ACTOR: &str = "platform";
 /// [`created`] uses, and an untagged or foreign row therefore records a REFUSAL instead of an
 /// attested write.
 ///
-/// A lane no database record owns is not a managed-database write: there is no database id to
-/// attest, so nothing is recorded rather than an entry invented for one. A standalone bucket or
-/// queue is outside this contract's scope, and a log that claims otherwise is worse than a log that
-/// is silent about it.
+/// A lane no database record owns is NOT silently dropped: [`unattributed`] records it, refused,
+/// against the storage address the platform actually wrote under. The platform really did move those
+/// bytes (under `<tenant>::<name>`), and an audit trail that loses the write cannot answer "did this
+/// data land?" -- while a refusal applies NO index mutation, so the entry says "the platform wrote
+/// bytes no managed database attests" without minting a database that owns them.
 ///
 /// `bytes` is the size of the payload that moved, and `outcome` is the platform's own result: an
 /// `Err` is recorded with `success: false` and applies NO state change, so a write that never landed
@@ -205,21 +221,22 @@ pub(crate) async fn wrote(
     let db = c.databases.native_db(kind, tenant, name)?;
     let tenant_owns = crate::admin::record_tenant(&db.team) == tenant;
     let bytes = bytes.to_string();
-    // Canonical state records the write plane for a write that actually landed, so the count and
-    // the last-bytes value the contract's index claims are claims canonical state can attest. Only
-    // on `Ok`: a write that never landed changed nothing, and moving the counter for it would make
-    // the two accounts disagree for a reason that is not a divergence.
-    //
-    // It counts the write even when the CONTRACT refuses it, and that is deliberate: canonical state
-    // accounts for what the platform actually DID, while the contract accounts for what it can
-    // attest. A write the contract refuses therefore shows up as a divergence -- canonical has it,
-    // the contract does not -- which is exactly the finding. Suppressing the count here would leave
-    // the unattested write with nothing to be compared against, which is the silence this layer
-    // exists to end.
-    //
-    // Recording it HERE, next to the contract entry, is what keeps the two sides of a
-    // reconciliation measured over the same event: they cannot drift because one path forgot the
-    // other.
+            // Canonical state records the write plane for a write that actually landed, so the count
+            // and the last-bytes value the contract's index claims are claims canonical state can
+            // attest. Only on `Ok`: a write that never landed changed nothing, and moving the
+            // counter for it would make the two accounts disagree for a reason that is not a
+            // divergence.
+            //
+            // It counts the write even when the CONTRACT refuses it, and that is deliberate: canonical
+            // state accounts for what the platform actually DID, while the contract accounts for what
+            // it can attest. A write the contract refuses therefore shows up as a divergence --
+            // canonical has it, the contract does not -- which is exactly the finding. Suppressing the
+            // count here would leave the unattested write with nothing to be compared against, which
+            // is the silence this layer exists to end.
+            //
+            // Recording it HERE, next to the contract entry, is what keeps the two sides of a
+            // reconciliation measured over the same event: they cannot drift because one path forgot
+            // the other.
     if outcome.is_ok() {
         c.databases.record_write(&db.id, &bytes);
     }
@@ -235,6 +252,65 @@ pub(crate) async fn wrote(
         outcome,
     )
     .await
+}
+
+/// Marker prefix of an [`unattributed`] write's target: a target carrying it is a STORAGE ADDRESS,
+/// never a database id, so an entry can never be mistaken for an attestation about a database.
+pub(crate) const UNATTRIBUTED: &str = "unattributed";
+
+/// [`record`] for a write the platform performed that NO managed database record owns.
+///
+/// The seam's three rules hold exactly as they do for an attributed write: it does not authorize
+/// (`owns_target` is `false` by construction -- there is no target database for this tenant to own),
+/// it does not perform the mutation (the caller already did and passes its `outcome`), and it does
+/// not fail the request (a recording problem is reported and dropped).
+///
+/// The entry is therefore always a REFUSAL -- `contract::validate` answers `OpError::TenantMismatch`,
+/// or `OpError::UntaggedTenant` for a caller with no bound tenant -- and `Executor::commit_refusal`
+/// appends it WITHOUT applying a mutation. So the log carries the write (its address, its size, its
+/// actor, whether it landed) and the index keeps no database it cannot vouch for: honest about what
+/// happened, silent about nothing, and never an invented attestation.
+///
+/// Canonical state's write plane is deliberately NOT counted here: it is the per-DATABASE account a
+/// reconciler compares against the contract's index, and a key for a database that does not exist
+/// would make that comparison a claim about a phantom. The refusal entry is the record.
+async fn unattributed(
+    c: &Arc<CloudState>,
+    tenant: &str,
+    actor: &str,
+    kind: crate::databases::DbKind,
+    name: &str,
+    bytes: &str,
+    outcome: Result<(), String>,
+) -> Option<Receipt> {
+    // The address the lane wrote under, which is also the address a reader of the log must look for.
+    let target = format!("{UNATTRIBUTED}:{}:{}::{}", kind.label(), tenant, name);
+    let receipt = record(
+        c,
+        tenant,
+        actor,
+        "db.write",
+        &target,
+        // No project: the write did not land in a project's managed database, and naming one would
+        // assert an ownership the platform never established.
+        "",
+        &[("bytes", bytes)],
+        false,
+        outcome,
+    )
+    .await;
+    let seq = receipt.as_ref().map(|r| r.seq).unwrap_or(0);
+    tracing::warn!(
+        op = "db.write",
+        kind = %kind.label(),
+        tenant = %tenant,
+        name = %name,
+        bytes = %bytes,
+        seq = seq,
+        recorded = receipt.is_some(),
+        "contract: managed-db write is UNATTRIBUTED (no database record owns this payload name)"
+    );
+    receipt
 }
 
 /// [`record`] for a `db.delete` the PLATFORM performs on its own authority, with no request in

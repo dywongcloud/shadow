@@ -13877,8 +13877,13 @@ fn ns(
 /// short-lived signed token (minted like `mesh_team_qs`:
 /// `crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)`),
 /// which only a caller holding `HIVE_JWT_SECRET` can produce, closing the cross-tenant write
-/// bypass. When JWT enforcement is off (dev/single-node) the raw header is trusted (nothing to
-/// forge against). Normal writes resolve the tenant as usual.
+/// bypass. When JWT enforcement is off (no `HIVE_JWT_SECRET`) the SAME binding rule applies: the
+/// tenant comes from a mirror token that still verifies, else from this request's own bound
+/// identity (JWT claim > platform API key), else from `UNTAGGED_TENANT` -- never from
+/// `x-hive-team` and never from a `"personal"` default. A node without a signing secret is not a
+/// node where the header becomes trustworthy: the header is caller-controlled on the public API
+/// host either way, and a tenant field anyone can set is a tenant field that attests nothing.
+/// Normal writes resolve the tenant as usual.
 fn write_scope(
     c: &Arc<CloudState>,
     h: &HeaderMap,
@@ -13900,12 +13905,29 @@ fn write_scope(
                 }
             };
         }
+        // No signing secret here, so there is nothing to verify a mirror token AGAINST -- and
+        // nothing that makes `x-hive-team` trustworthy either: this router is bound to the public
+        // API host, so the header is caller-controlled whether or not auth is enforced, and it
+        // feeds the contract entry that attests this write. Take the tenant only from a source the
+        // platform bound: a mirror token that still verifies (a node holding the secret issues one
+        // even when it runs unenforced), then THIS request's own JWT claim, then its platform API
+        // key. With none of those there is no bound tenant, so the write is scoped to
+        // UNTAGGED_TENANT -- which owns nothing, and which `contract::validate` refuses, so the
+        // mutation is recorded as an unattested one rather than attested for a tenant the caller
+        // named in a header.
         let team = h
-            .get("x-hive-team")
+            .get("x-hive-mirror-tok")
             .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "personal".into());
+            .and_then(|tok| crate::auth::verify(tok).ok())
+            .map(|claims| claims.tenant)
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| {
+                claims
+                    .map(|c| norm(&c.tenant).to_string())
+                    .filter(|t| !t.trim().is_empty())
+            })
+            .or_else(|| api_key_team(c, h))
+            .unwrap_or_else(|| UNTAGGED_TENANT.to_string());
         (team, true)
     } else {
         (tenant(c, h, claims), false)
@@ -13946,6 +13968,18 @@ async fn blob_put(
     c.databases.blob_put(&nsb, &key, body.to_vec());
     // The write already happened; the contract records it. `db_contract` never authorizes, never
     // performs the mutation and never fails the request -- it appends one entry and returns.
+    //
+    // The outcome is what the store reports AFTER the mutation, never an assumption: a durable
+    // blob write is best-effort (`BlobStore::put` swallows its I/O error), so the honest report is
+    // whether the object is really there at the size submitted. A write that is not there is
+    // recorded as `success: false` and moves no canonical state, instead of being attested as one
+    // that landed -- the guarantee the seam makes, exercised rather than assumed.
+    let outcome = match c.databases.blob_object_size(&nsb, &key) {
+        Some(n) if n == size as u64 => Ok(()),
+        other => Err(format!(
+            "blob write did not land: {size} bytes submitted, object reads back as {other:?}"
+        )),
+    };
     crate::db_contract::wrote(
         &c,
         &team,
@@ -13953,7 +13987,7 @@ async fn blob_put(
         crate::databases::DbKind::Blob,
         &bucket,
         size as u64,
-        Ok(()),
+        outcome,
     )
     .await;
     native_tally(
@@ -14095,7 +14129,16 @@ async fn queue_push(
     let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nsq = format!("{team}::{queue}");
+    let before = c.databases.queue_depth(&nsq);
     let depth = c.databases.queue_push(&nsq, b.message.to_string());
+    // Same rule as the blob lane: the outcome is measured after the mutation, so a push the store
+    // did not keep is recorded as `success: false` rather than attested.
+    let after = c.databases.queue_depth(&nsq);
+    let outcome = if after > before {
+        Ok(())
+    } else {
+        Err(format!("queue push did not land: depth {before} before, {after} after"))
+    };
     crate::db_contract::wrote(
         &c,
         &team,
@@ -14103,7 +14146,7 @@ async fn queue_push(
         crate::databases::DbKind::Queue,
         &queue,
         b.message.to_string().len() as u64,
-        Ok(()),
+        outcome,
     )
     .await;
     native_tally(
@@ -14219,7 +14262,19 @@ async fn vector_upsert(
     let mirror_body =
         serde_json::to_vec(&json!({ "id": b.id, "vector": b.vector, "metadata": b.metadata }))
             .unwrap_or_default();
+    let before = c.databases.vector_stats(&nsi).0;
     c.databases.vector_upsert(&nsi, &b.id, b.vector, b.metadata);
+    // Measured after the mutation: an index that did not gain the entry did not keep the write.
+    // Re-upserting an existing id leaves the count where it was, which is why the floor is
+    // `before.max(1)` and not `before + 1`.
+    let after = c.databases.vector_stats(&nsi).0;
+    let outcome = if after >= before.max(1) {
+        Ok(())
+    } else {
+        Err(format!(
+            "vector upsert did not land: index held {before} entries before, {after} after"
+        ))
+    };
     crate::db_contract::wrote(
         &c,
         &team,
@@ -14227,7 +14282,7 @@ async fn vector_upsert(
         crate::databases::DbKind::Vector,
         &index,
         mirror_body.len() as u64,
-        Ok(()),
+        outcome,
     )
     .await;
     native_tally(
@@ -14382,7 +14437,19 @@ async fn pubsub_publish(
     let started = std::time::Instant::now();
     let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
     let nst = format!("{team}::{topic}");
+    let before = c.databases.published_count(&nst);
     let delivered = c.databases.publish(&nst, b.message.to_string());
+    // Measured after the mutation, on the broker's own counter rather than on `delivered`: a
+    // publish to zero live subscribers delivered nothing and still landed, so the delivery count
+    // is not the outcome -- the counter the publish moves is.
+    let after = c.databases.published_count(&nst);
+    let outcome = if after > before {
+        Ok(())
+    } else {
+        Err(format!(
+            "publish did not land: published count {before} before, {after} after"
+        ))
+    };
     crate::db_contract::wrote(
         &c,
         &team,
@@ -14390,7 +14457,7 @@ async fn pubsub_publish(
         crate::databases::DbKind::Pubsub,
         &topic,
         b.message.to_string().len() as u64,
-        Ok(()),
+        outcome,
     )
     .await;
     native_tally(
