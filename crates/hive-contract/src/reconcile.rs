@@ -3,7 +3,7 @@
 //!
 //! Why this module exists. The contract layer is additive: a database mutation reaches the platform
 //! through `crates/hive-cloud/src/admin.rs` and its gates (`tenant()` at `admin.rs:3284`,
-//! `require_project` at `admin.rs:3368`, `write_scope` at `admin.rs:13831`) and only records into the
+//! `require_project` at `admin.rs:3368`, `write_scope` at `admin.rs:13876`) and only records into the
 //! oplog afterwards. Nothing about that ordering is enforced by the type system, so the failure mode
 //! is not "the log lies" -- it is "the log is silent": a new mutation path that skips `submit` moves
 //! canonical state and the oplog keeps claiming the old truth forever. AGENTS.md names the canonical
@@ -36,6 +36,11 @@ pub struct CanonicalDb {
     pub team: String,
     pub project: String,
     pub status: String,
+    /// When the record was created. Load-bearing for tombstone adjudication: a tombstone is only the
+    /// erasure of the records that existed when it was written, so a record created LATER survives
+    /// one. A `CanonicalDb` built without it projects as created at the epoch, which loses to every
+    /// tombstone -- fail-closed, never fail-open.
+    pub created_ms: u64,
     /// Canonical state's own count of writes to this database: the write plane, which is the part of
     /// a `db.write` this projection used to be silent about. `None` means the platform records no
     /// write count for this database, so any count the contract claims is unattested.
@@ -61,16 +66,19 @@ pub struct ScopeEntry {
 /// The mutation surface the managed-db contract claims, located by `path:line`.
 ///
 /// Every entry is a mutation path that already enforces tenancy; the contract layer records the
-/// decision, it does not replace it. `wired` is false for all of them today because the wiring lands
-/// inside `admin.rs`, which is a shared file -- see the blocker note in the slice report.
+/// decision, it does not replace it. `wired` is true only for a path whose handler actually calls
+/// `Engine::submit` through `hive-cloud`'s one seam (`src/db_contract.rs`) -- and only from the
+/// commit in which that call landed, never in anticipation of it. `db.create` and `db.delete` are
+/// wired; the four data-plane write paths are not, and until they are a `db.write` moves tenant
+/// data with no entry in the log.
 pub const DECLARED_SCOPE: &[ScopeEntry] = &[
-    ScopeEntry { op_kind: "db.create", file: "crates/hive-cloud/src/admin.rs", line: 13065, wired: false },
-    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 13528, wired: false },
-    // `write_scope` (admin.rs:13831) is the gate all four data-plane writes pass through.
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13884, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14025, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14136, wired: false },
-    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14292, wired: false },
+    ScopeEntry { op_kind: "db.create", file: "crates/hive-cloud/src/admin.rs", line: 13065, wired: true },
+    ScopeEntry { op_kind: "db.delete", file: "crates/hive-cloud/src/admin.rs", line: 13551, wired: true },
+    // `write_scope` (admin.rs:13876) is the gate all four data-plane writes pass through.
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 13929, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14070, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14181, wired: false },
+    ScopeEntry { op_kind: "db.write", file: "crates/hive-cloud/src/admin.rs", line: 14337, wired: false },
 ];
 
 pub fn scope_report() -> (usize, usize) {
@@ -102,6 +110,14 @@ pub fn last_bytes_key(tenant: &str, target: &str) -> String {
 /// written at :742) has none. Tombstones are permanent there ("absence never erases a row" is the
 /// row-merge rule; a tombstone is the erasure), so they are the platform's delete-of-record here.
 ///
+/// A tombstone is adjudicated BY TIMESTAMP, not by presence, because that is the platform's own
+/// rule: `merge_synced` (`databases.rs:822`) keeps a record whose `created_ms` is LATER than the
+/// tombstone's ms, so an id that was deleted and then created again under the same id is live.
+/// Skipping every id that appears in the tombstone map -- what this did before -- reported those
+/// rows as deleted and produced divergences on live databases: measured on a real snapshot, 2 of 21
+/// databases were both present and tombstoned (created 1792720000000, tombstoned 1792715805869),
+/// which cost 2 status keys and 6 divergences on state that was in fact in sync.
+///
 /// The write plane is projected too, and only where the platform actually recorded it: a `None` is
 /// left out rather than defaulted to zero, so the reconciler never manufactures a canonical value it
 /// was not given -- it reports the contract's claim as unattested instead.
@@ -109,8 +125,12 @@ pub fn project(dbs: &[CanonicalDb], tombstones: &BTreeMap<String, u64>) -> Index
     let mut out = Index::new();
     for d in dbs {
         let tenant = crate::contract::record_tenant(Some(&d.team));
-        if tombstones.contains_key(&d.id) {
-            continue;
+        // Deleted only when the record predates the deletion: the platform's own comparator
+        // (`databases.rs:822`, `d.created_ms > *deleted_ms`), applied here rather than re-derived.
+        if let Some(deleted_ms) = tombstones.get(&d.id) {
+            if d.created_ms <= *deleted_ms {
+                continue;
+            }
         }
         let value = match d.status.as_str() {
             "ready" | "provisioning" | "live" => "live".to_string(),
