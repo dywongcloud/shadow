@@ -1986,6 +1986,7 @@ dependencies = [
  "redb 4.1.0",
  "rust-stemmers",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_cbor",
  "serde_json",
