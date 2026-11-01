@@ -316,6 +316,17 @@ pub struct CloudState {
     pub container_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
+    /// The managed-database CONTRACT instance: the declared op table every recorded database
+    /// mutation is validated against (`crates/hive-contract/src/contracts/managed_database.rs`).
+    /// Built once at boot from a `const` table, so no two callers can validate against different
+    /// terms. Data, not code: nothing here can widen an authorization decision.
+    pub managed_db_contract: hive_contract::Contract,
+    /// The contract's execution engine: one append-only, hash-chained oplog plus the index `apply`
+    /// produces, sharded by contract id (`crates/hive-contract/src/engine.rs`). It records a
+    /// mutation the platform already authorized and already performed -- it never decides one.
+    /// In-process and node-local today (persistence is its own open row), so a restart replays from
+    /// an empty log rather than from a history that never happened.
+    pub contract_engine: hive_contract::Engine,
     pub queues: Arc<crate::queues::QueueStore>,
     /// Managed-inference runtime (this node's own llama-server children +
     /// endpoint statuses) — see `inference::spawn_reconcile`.
@@ -840,6 +851,8 @@ impl CloudState {
             container_holders: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
+            managed_db_contract: hive_contract::managed_db_contract(),
+            contract_engine: hive_contract::Engine::new(hive_contract::DEFAULT_SHARDS),
             queues: crate::queues::QueueStore::new(),
             inference: crate::inference::InferenceRuntime::default(),
             metrics: crate::metrics::MetricsStore::new(),

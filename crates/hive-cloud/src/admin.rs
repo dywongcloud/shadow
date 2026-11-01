@@ -13071,6 +13071,10 @@ async fn database_create(
     let cloud = c.clone();
     req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let project = req.project.clone();
+    // The identity the contract will record for this create. The actor is a label, never a gate:
+    // the contract's tenancy decision comes from `req.team` plus the platform's own ownership
+    // check, both below.
+    let contract_actor = crate::db_contract::actor(claims.as_ref().map(|e| &e.0));
     let _lifecycle = if project.is_empty() {
         None
     } else {
@@ -13200,8 +13204,13 @@ async fn database_create(
                         .claim_database_exact(&project, expected, db.id.clone())
                         .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
                 }
-                c.databases.upsert_replica(db);
+                c.databases.upsert_replica(db.clone());
                 crate::persist::persist(&c);
+                // Recorded here as well as on the local-provisioning tail: the database now exists
+                // and its record is adopted into this node's store, so this is the same mutation
+                // the contract covers. The PEER's own `database_provision_local` does NOT record,
+                // so one create is one entry, not two.
+                crate::db_contract::created(&c, &req.team, &contract_actor, &db, Ok(())).await;
                 return Ok(Json(v));
             }
         }
@@ -13229,6 +13238,17 @@ async fn database_create(
             .projects
             .claim_database_exact(&project, expected, db.id.clone())
         {
+            // The database was provisioned and then torn down: the op ran and FAILED. Recorded with
+            // the failure rather than skipped, because an append-only log that only holds
+            // successes is not an audit trail.
+            crate::db_contract::created(
+                &c,
+                &req.team,
+                &contract_actor,
+                &db,
+                Err(error.to_string()),
+            )
+            .await;
             teardown_db_backing(&db).await;
             c.databases.remove_db_and_purge_data(&db.id, &db.team);
             return Err((StatusCode::CONFLICT, error.to_string()));
@@ -13242,6 +13262,9 @@ async fn database_create(
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
     );
+    // The last step, after the record is durable: the contract records a mutation that already
+    // happened, never one it is about to cause.
+    crate::db_contract::created(&c, &req.team, &contract_actor, &db, Ok(())).await;
     Ok(Json(json!(db)))
 }
 
@@ -13542,6 +13565,12 @@ async fn database_delete(
             }
         }
     }
+    // The project the removed row names, read before the teardown block below consumes it: the
+    // contract's `db.delete` payload carries it, and after the purge there is no row left to read.
+    let removed_project = record
+        .as_ref()
+        .map(|d| d.project.clone())
+        .unwrap_or_default();
     if let Some(d) = record {
         if record_tenant(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
@@ -13597,7 +13626,23 @@ async fn database_delete(
     }
     c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
-    Ok(Json(json!({ "removed": id })))
+    // Ownership was decided above (`record_tenant(&d.team) != t` is a 404), so the verdict handed
+    // to the contract is the platform's, never one recomputed here.
+    let receipt = crate::db_contract::deleted(
+        &c,
+        &t,
+        &crate::db_contract::actor(claims.as_ref().map(|e| &e.0)),
+        &id,
+        &removed_project,
+        true,
+    )
+    .await;
+    let mut body = json!({ "removed": id });
+    if let Some(r) = receipt {
+        body["contract_seq"] = json!(r.seq);
+        body["contract_head"] = json!(r.log_head);
+    }
+    Ok(Json(body))
 }
 
 /// Regenerates a Blob database's access credentials without touching the underlying data or bucket

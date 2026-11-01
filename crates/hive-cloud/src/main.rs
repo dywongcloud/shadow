@@ -28,6 +28,7 @@ mod coi;
 mod compose;
 mod databases;
 mod db_console;
+mod db_contract;
 mod db_gateway;
 mod db_metrics;
 mod db_replicate;

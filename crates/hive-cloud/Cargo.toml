@@ -23,6 +23,7 @@ hive-p2p = { workspace = true }
 hive-browser-proto = { workspace = true }
 hive-crsql = { workspace = true }
 hive-outbound = { workspace = true }
+hive-contract = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 axum = { workspace = true }

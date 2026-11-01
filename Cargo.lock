@@ -2734,6 +2734,7 @@ dependencies = [
  "hickory-resolver",
  "hive-backend",
  "hive-browser-proto",
+ "hive-contract",
  "hive-controlplane",
  "hive-core",
  "hive-crsql",
@@ -2788,6 +2789,8 @@ name = "hive-contract"
 version = "0.1.0"
 dependencies = [
  "fluid-core",
+ "hex",
+ "ring",
  "serde",
  "serde_json",
  "tokio",
