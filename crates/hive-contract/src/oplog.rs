@@ -25,6 +25,12 @@ pub const INDEX_DOMAIN: &[u8] = b"hive-contract/index/v1";
 /// Domain separator for the bytes a stored entry's SIGNATURE covers. The signature is not part of the
 /// entry hash -- the hash stays a pure function of `(prev, op)` so a monitor can recompute it without
 /// any key -- so the signature binds `entry_hash` under its own domain instead.
+///
+/// The preimage covers the ACK as well as `entry_hash`. That is the difference between a signed entry
+/// being EVIDENCE and being a FRAUD PROOF: `entry_hash` is a function of `(prev, op)` alone, so two
+/// acks for one op produce the same hash and -- before this binding -- the same signature, and an
+/// executor could hand two monitors two different accounts of one operation with nothing to tell
+/// them apart. Verified in [`crate::persist::entry_sig_preimage`]; see [`crate::audit`].
 pub const ENTRY_SIG_DOMAIN: &[u8] = b"hive-contract/oplog-entry/v1";
 
 /// Canonical bytes for a value: a hand-rolled, feature-independent serialization.
@@ -112,6 +118,30 @@ pub struct Ack {
     pub index_hash: String,
     /// The oplog head hash after this entry was appended.
     pub log_head: String,
+}
+
+impl Ack {
+    /// Bytes the entry SIGNATURE commits to, alongside the entry hash.
+    ///
+    /// Why the ack is in the signed preimage at all: `entry_hash` is a function of `(prev, op)` and
+    /// CANNOT cover the ack, because `ack.log_head` is the entry hash itself. So an entry's ack is
+    /// the one field of a stored line that a signature over `entry_hash` alone does not bind -- and
+    /// it is the field that says what the executor claims happened. Left unbound, anybody who has
+    /// ever seen one signed line can copy its signature onto a second, conflicting ack and accuse
+    /// an honest executor of equivocation; the accusation would verify, and the proof would convict
+    /// the innocent. Binding the ack makes the accusation sound: two conflicting acks at one seq
+    /// now require two different signatures from the node, so only the executor could have
+    /// published both (see [`crate::fraud::Equivocation`]).
+    pub fn canonical(&self) -> Vec<u8> {
+        canonical_fields(&[
+            &self.seq.to_string(),
+            &self.ts_ms.to_string(),
+            &self.success.to_string(),
+            self.error.as_deref().unwrap_or_default(),
+            &self.index_hash,
+            &self.log_head,
+        ])
+    }
 }
 
 /// One log entry: the operation, the ack the executor produced for it, and the chain commitment.

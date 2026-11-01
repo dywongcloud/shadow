@@ -107,6 +107,7 @@ async fn reopen(root: &Path, contract: &Contract, signer: Arc<dyn CheckpointSign
             checkpoint_every: WINDOW,
             retain_checkpoints: RETAIN,
             signer: Some(signer),
+            sync: true,
         },
     );
     match engine.register(contract.clone()).await {
@@ -167,6 +168,7 @@ async fn main() {
             checkpoint_every: WINDOW,
             retain_checkpoints: RETAIN,
             signer: Some(node.clone()),
+            sync: true,
         },
     );
     engine.register(contract.clone()).await.expect("register");
@@ -636,7 +638,10 @@ async fn main() {
         // Signed by the attacker: internally consistent, correctly signed, and not by the node.
         let sig = hex::encode(
             attacker
-                .sign(&hive_contract::persist::entry_sig_preimage(&forged.entry_hash))
+                .sign(&hive_contract::persist::entry_sig_preimage(
+                    &forged.entry_hash,
+                    &forged.ack,
+                ))
                 .expect("attacker signs"),
         );
         let mut text = std::fs::read_to_string(dir.join(&seg)).expect("read tail segment");
@@ -659,6 +664,221 @@ async fn main() {
                 Err(e) => format!("refused: {e}"),
             },
             ok: out.is_err(),
+        });
+    }
+
+    // ---- fraud proofs: two conflicting acks for one op -----------------------------------------
+    // Evidence is not a proof. The artefact below is the smallest thing that lets a STRANGER settle
+    // "this executor published two different claims about one seq": one checkpoint, the run-up to
+    // the disputed seq, and the two publications. It asks neither side anything and it replays one
+    // window, never the whole log.
+    let tail: Vec<LogEntry> = segment.clone();
+    let prefix: Vec<LogEntry> = tail
+        .iter()
+        .take(tail.len().saturating_sub(1))
+        .cloned()
+        .collect();
+    if let Some(last_entry) = tail.last().cloned() {
+        let sign_by_node = |e: &LogEntry| {
+            hive_contract::sign_entry(e, node.as_ref()).expect("node signs its own entry")
+        };
+        // C6: two IDENTICAL publications are not an accusation. Without this gate an honest
+        // executor could be "convicted" by handing a verifier the same entry twice.
+        let same_twice = hive_contract::adjudicate_equivocation(
+            &contract,
+            &hive_contract::Equivocation {
+                checkpoint: genuine.clone(),
+                prefix: prefix.clone(),
+                a: sign_by_node(&last_entry),
+                b: sign_by_node(&last_entry),
+            },
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "C6",
+            what: format!("two identical publications for seq {}", last_entry.op.seq),
+            expect: "inadmissible",
+            observed: match &same_twice {
+                Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+                other => format!("{} (an honest executor is convicted)", other.label()),
+            },
+            ok: matches!(same_twice, Verdict::Inadmissible { .. }),
+        });
+
+        // The two conflicting acks: the node's own entry, and the same op acked differently.
+        let mut conflicting = last_entry.clone();
+        conflicting.ack.index_hash = "0".repeat(64);
+        conflicting.ack.success = false;
+        conflicting.ack.error = Some("the executor's second story".to_string());
+
+        // F13: the FORGED accusation. The accuser copies a real entry and its real signature and
+        // edits the ack. Before the ack was bound into the signed preimage this VERIFIED, and any
+        // observer of one signed line could convict an honest executor. Now the signature no
+        // longer covers the artefact it is offered with.
+        let copied_sig = sign_by_node(&last_entry).sig;
+        let forged_accusation = hive_contract::SignedEntry {
+            entry: conflicting.clone(),
+            sig: copied_sig,
+            public_key_hex: node_pk.clone(),
+        };
+        let f13 = hive_contract::adjudicate_equivocation(
+            &contract,
+            &hive_contract::Equivocation {
+                checkpoint: genuine.clone(),
+                prefix: prefix.clone(),
+                a: sign_by_node(&last_entry),
+                b: forged_accusation,
+            },
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "F13",
+            what: format!(
+                "an accusation built by editing the ack of a signed entry at seq {}",
+                last_entry.op.seq
+            ),
+            expect: "inadmissible",
+            observed: match &f13 {
+                Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+                other => format!("{} (forged accusation verified)", other.label()),
+            },
+            ok: matches!(f13, Verdict::Inadmissible { .. }),
+        });
+
+        // F14: a GENUINE equivocation -- the node itself signed both publications.
+        let f14 = hive_contract::adjudicate_fraud(
+            &contract,
+            &hive_contract::FraudProof::EquivocatedAcks(hive_contract::Equivocation {
+                checkpoint: genuine.clone(),
+                prefix: prefix.clone(),
+                a: sign_by_node(&last_entry),
+                b: sign_by_node(&conflicting),
+            }),
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "F14",
+            what: format!(
+                "two conflicting acks the node itself signed for seq {}",
+                last_entry.op.seq
+            ),
+            expect: "dishonest",
+            observed: match &f14 {
+                Verdict::Dishonest { seq, published, recomputed } => format!(
+                    "dishonest at seq {seq}: published {}, the log supports {}",
+                    &published[..published.len().min(16)],
+                    &recomputed[..recomputed.len().min(16)]
+                ),
+                other => format!("{} (equivocation not proven)", other.label()),
+            },
+            ok: matches!(f14, Verdict::Dishonest { .. }),
+        });
+
+        // F15: both publications signed by an identity the verifier does not trust.
+        let f15 = hive_contract::adjudicate_equivocation(
+            &contract,
+            &hive_contract::Equivocation {
+                checkpoint: genuine.clone(),
+                prefix: prefix.clone(),
+                a: hive_contract::sign_entry(&last_entry, attacker.as_ref())
+                    .expect("attacker signs"),
+                b: hive_contract::sign_entry(&conflicting, attacker.as_ref())
+                    .expect("attacker signs"),
+            },
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "F15",
+            what: "an equivocation whose publications the attacker signed".to_string(),
+            expect: "inadmissible",
+            observed: match &f15 {
+                Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+                other => format!("{} (forgery verified)", other.label()),
+            },
+            ok: matches!(f15, Verdict::Inadmissible { .. }),
+        });
+
+        // F16: two real entries at DIFFERENT seqs are not an equivocation.
+        if let Some(earlier) = tail.iter().rev().nth(1).cloned() {
+            let f16 = hive_contract::adjudicate_equivocation(
+                &contract,
+                &hive_contract::Equivocation {
+                    checkpoint: genuine.clone(),
+                    prefix: prefix.clone(),
+                    a: sign_by_node(&last_entry),
+                    b: sign_by_node(&earlier),
+                },
+                Some(&node_pk),
+            );
+            probes.push(Probe {
+                name: "F16",
+                what: format!(
+                    "two entries offered as one equivocation (seq {} and {})",
+                    last_entry.op.seq, earlier.op.seq
+                ),
+                expect: "inadmissible",
+                observed: match &f16 {
+                    Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+                    other => format!("{} (forgery verified)", other.label()),
+                },
+                ok: matches!(f16, Verdict::Inadmissible { .. }),
+            });
+        }
+
+        // F17: the run-up does not reach the position the two entries claim.
+        let short_prefix: Vec<LogEntry> = prefix.iter().skip(1).cloned().collect();
+        let f17 = hive_contract::adjudicate_equivocation(
+            &contract,
+            &hive_contract::Equivocation {
+                checkpoint: genuine.clone(),
+                prefix: short_prefix,
+                a: sign_by_node(&last_entry),
+                b: sign_by_node(&conflicting),
+            },
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "F17",
+            what: "an equivocation whose run-up is missing its first entry".to_string(),
+            expect: "inadmissible",
+            observed: match &f17 {
+                Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+                other => format!("{} (forgery verified)", other.label()),
+            },
+            ok: matches!(f17, Verdict::Inadmissible { .. }),
+        });
+    }
+
+    // ---- F18: the other kind of fraud, through the same entry point ------------------------------
+    // One published state the log does not support: the enum routes it to `audit::adjudicate`, so a
+    // verifier that mishandles one kind cannot do so by calling the wrong function.
+    {
+        let mut tampered2 = segment.clone();
+        if let Some(last) = tampered2.last_mut() {
+            last.ack.index_hash = "0".repeat(64);
+        }
+        let f18 = hive_contract::adjudicate_fraud(
+            &contract,
+            &hive_contract::FraudProof::UnsupportedState(Dispute {
+                checkpoint: genuine.clone(),
+                segment: tampered2,
+                disputed_seq,
+            }),
+            Some(&node_pk),
+        );
+        probes.push(Probe {
+            name: "F18",
+            what: format!("FraudProof::UnsupportedState over seq {disputed_seq}"),
+            expect: "dishonest",
+            observed: match &f18 {
+                Verdict::Dishonest { seq, published, recomputed } => format!(
+                    "dishonest at seq {seq}: published {}, the log supports {}",
+                    &published[..published.len().min(16)],
+                    &recomputed[..recomputed.len().min(16)]
+                ),
+                other => format!("{} (breach not proven)", other.label()),
+            },
+            ok: matches!(f18, Verdict::Dishonest { .. }),
         });
     }
 

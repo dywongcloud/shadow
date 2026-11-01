@@ -248,6 +248,7 @@ async fn main() {
             checkpoint_every: ops + 1,
             retain_checkpoints: retain,
             signer: Some(signer.clone()),
+            sync: true,
         },
     );
     let compacted = Engine::open(
@@ -257,6 +258,7 @@ async fn main() {
             checkpoint_every: window,
             retain_checkpoints: retain,
             signer: Some(signer.clone()),
+            sync: true,
         },
     );
     control
@@ -610,6 +612,7 @@ async fn reopen(dir: &std::path::Path, window: usize, retain: usize) {
                 checkpoint_every: window,
                 retain_checkpoints: retain,
                 signer: Some(signer),
+                sync: true,
             },
         );
         engine.register(contract.clone()).await.expect("reopen register");

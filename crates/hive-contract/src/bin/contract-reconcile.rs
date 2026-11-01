@@ -36,13 +36,40 @@ struct RealDb {
     created_ms: u64,
 }
 
+/// The write plane a real node persists: canonical state's own count of the writes it served
+/// against each managed database (`crates/hive-cloud/src/databases.rs`, `WritePlane`).
+#[derive(serde::Deserialize, Default)]
+struct RealWritePlane {
+    #[serde(default)]
+    writes: u64,
+    #[serde(default)]
+    last_bytes: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct RealDatabaseData {
+    #[serde(default)]
+    write_plane: BTreeMap<String, RealWritePlane>,
+}
+
 #[derive(serde::Deserialize)]
 struct Snapshot {
     #[serde(default)]
     databases: Vec<RealDb>,
     #[serde(default)]
     database_tombstones: BTreeMap<String, u64>,
+    /// What makes the write plane attestable at all. Absent in a synthetic snapshot and present in
+    /// one copied off a node that has served writes, so P11 reports the difference rather than
+    /// assuming it.
+    #[serde(default)]
+    database_data: RealDatabaseData,
 }
+
+/// Bounds on P11, so a snapshot taken off a busy node cannot turn a reconciliation into an
+/// unbounded replay. Databases beyond the cap, or carrying more writes than the cap, are reported as
+/// skipped rather than compared with a count the harness would have to invent.
+const WRITE_PLANE_DBS: usize = 8;
+const WRITE_PLANE_MAX: u64 = 256;
 
 fn arg(name: &str, default: &str) -> String {
     let mut it = std::env::args();
@@ -151,8 +178,17 @@ async fn main() {
     let contract = managed_db_contract();
     let engine = Engine::new(hive_contract::engine::DEFAULT_SHARDS);
     let mut writes_per_db: BTreeMap<String, u64> = BTreeMap::new();
+    // A row with no tenant bound cannot emit a `TenantAuthorized` op at all -- the contract refuses
+    // it by construction -- so it is not submitted rather than panicking the harness on the first
+    // real snapshot that carries one. Reported as a count: an untagged row is a finding, not a
+    // silent omission.
+    let mut untagged_skipped = 0usize;
     for d in &snap.databases {
         let tenant = record_tenant(Some(&d.team));
+        if tenant == UNTAGGED_TENANT {
+            untagged_skipped += 1;
+            continue;
+        }
         let r = engine
             .submit(
                 &contract,
@@ -203,6 +239,11 @@ async fn main() {
             .get(&d.id)
             .copied()
             .map(|_| "1024".to_string());
+    }
+    if untagged_skipped > 0 {
+        println!(
+            "  untagged rows skipped: {untagged_skipped} (no bound tenant: the contract cannot emit a              tenant-authorized op for them)"
+        );
     }
     let canonical = reconcile::project(&dbs, &snap.database_tombstones);
     let log_len = engine.snapshot_log(&contract.id).await.unwrap().len();
@@ -521,6 +562,125 @@ async fn main() {
             r10b.compared
         ),
     );
+
+    // ---- P11: the write plane a real node recorded is the write plane that reconciles ----------
+    // Canonical state can only attest what it stores. When a node records no write plane, every
+    // `/writes` and `/last_bytes` key the contract holds is unattested, and 500 unauthorized writes
+    // once reconciled as in_sync on that absence. P11 takes the plane a real node persisted, replays
+    // exactly those writes through the real contract, and reconciles -- so the claim being checked is
+    // the platform's own account, not a number this harness invented.
+    {
+        let mut included = 0usize;
+        let mut skipped = 0usize;
+        let mut compared = 0usize;
+        let mut diverged = 0usize;
+        let contract11 = managed_db_contract();
+        let engine11 = Engine::new(hive_contract::engine::DEFAULT_SHARDS);
+        let mut dbs11: Vec<CanonicalDb> = Vec::new();
+        for d in &snap.databases {
+            let Some(wp) = snap.database_data.write_plane.get(&d.id) else {
+                continue;
+            };
+            if wp.writes > WRITE_PLANE_MAX || included >= WRITE_PLANE_DBS {
+                skipped += 1;
+                continue;
+            }
+            let tenant = record_tenant(Some(&d.team));
+            if tenant == UNTAGGED_TENANT {
+                skipped += 1;
+                continue;
+            }
+            engine11
+                .submit(
+                    &contract11,
+                    admitted(&tenant),
+                    "db.create",
+                    payload(&[
+                        ("db_id", &d.id),
+                        ("kind", &d.kind),
+                        ("project", &d.project),
+                    ]),
+                    &d.id,
+                    d.created_ms,
+                    Ok(()),
+                )
+                .await
+                .expect("submit");
+            for _ in 0..wp.writes {
+                engine11
+                    .submit(
+                        &contract11,
+                        admitted(&tenant),
+                        "db.write",
+                        payload(&[
+                            (
+                                "bytes",
+                                wp.last_bytes.as_deref().unwrap_or("0"),
+                            ),
+                            ("db_id", &d.id),
+                            ("project", &d.project),
+                        ]),
+                        &d.id,
+                        d.created_ms,
+                        Ok(()),
+                    )
+                    .await
+                    .expect("submit");
+            }
+            dbs11.push(CanonicalDb {
+                id: d.id.clone(),
+                team: d.team.clone(),
+                project: d.project.clone(),
+                status: d.status.clone(),
+                created_ms: d.created_ms,
+                write_count: Some(wp.writes),
+                last_bytes: wp.last_bytes.clone(),
+            });
+            included += 1;
+        }
+        if included > 0 {
+            let contract_index = hive_contract::audit::replay(
+                &contract11,
+                &engine11.snapshot_log(&contract11.id).await.unwrap_or_default(),
+            )
+            .expect("replays clean");
+            let r11 = reconcile::reconcile(
+                &reconcile::project(&dbs11, &snap.database_tombstones),
+                &contract_index,
+            );
+            compared = r11.compared;
+            diverged = r11.divergences.len();
+            for d in r11.divergences.iter().take(4) {
+                println!(
+                    "  {} {} canonical={:?} contract={:?}",
+                    d.kind.label(),
+                    d.key,
+                    d.canonical,
+                    d.contract
+                );
+            }
+        }
+        println!("\n== P11 write plane a real node recorded ==");
+        println!("databases included : {included} (skipped {skipped})");
+        println!("attested keys      : {compared}");
+        println!("divergences        : {diverged}");
+        // The claim under test is that canonical state CAN attest the write plane and that the two
+        // accounts then agree. A snapshot with no write plane at all has nothing to attest, so it
+        // reports the fact rather than failing a probe it was never in a position to run.
+        if included > 0 {
+            probe(
+                &mut failures,
+                diverged == 0 && compared == included * 3,
+                "canonical state's own write plane reconciles against the contract index",
+                format!("{diverged} divergences over {compared} attested keys for {included} databases"),
+            );
+        } else {
+            println!(
+                "NOTE no database in this snapshot carries a persisted write plane: the write \
+                 plane is unattested here, and every /writes key the contract holds would                  reconcile as stale_in_contract"
+            );
+        }
+    }
 
     if failures == 0 {
         println!("ALL PROBES PASSED");

@@ -26,6 +26,7 @@ pub mod contract;
 pub mod contracts;
 pub mod engine;
 pub mod exec;
+pub mod fraud;
 pub mod merkle;
 pub mod oplog;
 pub mod persist;
@@ -42,6 +43,9 @@ pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError,
 pub use contracts::managed_db_contract;
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
 pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
+pub use fraud::{
+    adjudicate_equivocation, adjudicate_fraud, sign_entry, Equivocation, FraudProof, SignedEntry,
+};
 pub use merkle::{merkle_prove, merkle_root, merkle_verify, MerklePath, Sibling};
 pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, TruncateError, OP_DOMAIN};
 pub use persist::{
