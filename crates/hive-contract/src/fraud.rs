@@ -187,8 +187,21 @@ pub fn adjudicate_equivocation(
     eq: &Equivocation,
     trusted_public_key_hex: Option<&str>,
 ) -> Verdict {
-    let trust = trusted_public_key_hex.map(|pk| TrustedCheckpoint {
-        public_key_hex: pk,
+    // A verdict of Dishonest names a publisher, so an adjudication handed no trusted identity has
+    // nobody to convict. Passing `None` used to fall through to the structural check alone, which
+    // ANY keypair satisfies: a stranger could mint a checkpoint and two entries, hand them in, and
+    // walk away with a `Dishonest` verdict against a node that signed none of it -- a proof that
+    // convicts the innocent. Settling nothing is the only honest answer here, so this is
+    // Inadmissible rather than a weaker-but-passing check.
+    let Some(trusted_public_key_hex) = trusted_public_key_hex else {
+        return Verdict::Inadmissible {
+            reason: "no trusted identity was supplied: a verdict of dishonesty cannot be pinned to \
+                     a publisher"
+                .to_string(),
+        };
+    };
+    let trust = Some(TrustedCheckpoint {
+        public_key_hex: trusted_public_key_hex,
         contract_id: &contract.id,
         contract_version: contract.version,
     });
@@ -207,15 +220,13 @@ pub fn adjudicate_equivocation(
             ),
         };
     }
-    if let Some(pk) = trusted_public_key_hex {
-        if eq.a.public_key_hex != pk {
-            return Verdict::Inadmissible {
-                reason: format!(
-                    "entries were published by {}, which is not the trusted identity",
-                    eq.a.public_key_hex
-                ),
-            };
-        }
+    if eq.a.public_key_hex != trusted_public_key_hex {
+        return Verdict::Inadmissible {
+            reason: format!(
+                "entries were published by {}, which is not the trusted identity",
+                eq.a.public_key_hex
+            ),
+        };
     }
     for (label, cand) in [("first", &eq.a), ("second", &eq.b)] {
         // A copied entry_hash under a rewritten op convicts nobody: the entry has to be what its

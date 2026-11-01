@@ -297,8 +297,18 @@ pub fn adjudicate(
     dispute: &Dispute,
     trusted_public_key_hex: Option<&str>,
 ) -> Verdict {
-    let trust = trusted_public_key_hex.map(|pk| TrustedCheckpoint {
-        public_key_hex: pk,
+    // Same pin as [`crate::fraud::adjudicate_equivocation`]: a verdict has to name a publisher, so
+    // an adjudication with no trusted identity settles nothing. Without this, `None` degraded to the
+    // structural check alone and an artefact minted entirely by a stranger -- checkpoint and entries
+    // both signed by a key nobody trusted -- still returned `Dishonest` against the node it accused.
+    let Some(trusted_public_key_hex) = trusted_public_key_hex else {
+        return Verdict::Inadmissible {
+            reason: "no trusted identity was supplied: a verdict cannot be pinned to a publisher"
+                .to_string(),
+        };
+    };
+    let trust = Some(TrustedCheckpoint {
+        public_key_hex: trusted_public_key_hex,
         contract_id: &contract.id,
         contract_version: contract.version,
     });

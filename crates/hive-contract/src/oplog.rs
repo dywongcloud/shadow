@@ -39,27 +39,51 @@ pub const ENTRY_SIG_DOMAIN: &[u8] = b"hive-contract/oplog-entry/v1";
 /// could turn on and silently change every digest this crate mints. Hashing therefore never goes
 /// through a `HashMap`/`serde_json::Value`: payload and index are `BTreeMap` (sorted by
 /// construction) and are written out here with explicit separators.
+///
+/// Every field is LENGTH-PREFIXED (`<len>:<bytes>`). A bare separator join is not injective: a
+/// value that contains the separator (or an `=`) reproduces the encoding of a DIFFERENT field list,
+/// so two genuinely different values mint one digest. That is not a cosmetic collision -- it lets a
+/// hand-built payload travel under an entry hash the executor never signed, and an adjudication cut
+/// from it then convicts an honest executor. The prefix makes the encoding parseable left to right,
+/// so each field list has exactly one encoding.
 pub fn canonical_fields(fields: &[&str]) -> Vec<u8> {
     let mut out = String::new();
+    write_canonical_fields(&mut out, fields);
+    out.into_bytes()
+}
+
+/// [`canonical_fields`] appending into an existing buffer, for a caller that is already building one
+/// string (so the length-prefix rule lives in exactly one place).
+fn write_canonical_fields(out: &mut String, fields: &[&str]) {
     for (i, f) in fields.iter().enumerate() {
         if i > 0 {
             out.push('\x1f');
         }
-        out.push_str(f);
+        push_field(out, f);
     }
-    out.into_bytes()
 }
 
-/// Canonical bytes for a `BTreeMap`: `k=v` lines, keys already sorted.
+/// One length-prefixed field: `<len>:<bytes>`.
+fn push_field(out: &mut String, f: &str) {
+    out.push_str(&f.len().to_string());
+    out.push(':');
+    out.push_str(f);
+}
+
+/// Canonical bytes for a `BTreeMap`: length-prefixed `k=v` lines, keys already sorted.
+///
+/// Both the key and the value are length-prefixed for the same reason
+/// [`canonical_fields`] prefixes: a value containing `\x1e` or `=` must not be able to stand in for
+/// a field boundary.
 pub fn canonical_map(m: &BTreeMap<String, String>) -> Vec<u8> {
     let mut out = String::new();
     for (i, (k, v)) in m.iter().enumerate() {
         if i > 0 {
             out.push('\x1e');
         }
-        out.push_str(k);
+        push_field(&mut out, k);
         out.push('=');
-        out.push_str(v);
+        push_field(&mut out, v);
     }
     out.into_bytes()
 }
@@ -132,12 +156,25 @@ impl Ack {
     /// the innocent. Binding the ack makes the accusation sound: two conflicting acks at one seq
     /// now require two different signatures from the node, so only the executor could have
     /// published both (see [`crate::fraud::Equivocation`]).
+    ///
+    /// `error` is written as a PRESENCE TAG plus the value, not as `error.unwrap_or_default()`.
+    /// Flattening an `Option<String>` to a bare string is not injective: `None` and `Some("")` both
+    /// encode to the empty field, so one signature covers both, while
+    /// [`crate::fraud::conflict`] compares the typed field and sees them as different. That gap is
+    /// exactly the forgery this function exists to close -- flipping `None` to `Some("")` on a
+    /// genuine signed entry kept the signature valid and produced an artefact that convicted a node
+    /// that had done nothing wrong. `0`/`1` can never collide with a value's own bytes.
     pub fn canonical(&self) -> Vec<u8> {
+        let (present, value) = match &self.error {
+            None => ("0", ""),
+            Some(e) => ("1", e.as_str()),
+        };
         canonical_fields(&[
             &self.seq.to_string(),
             &self.ts_ms.to_string(),
             &self.success.to_string(),
-            self.error.as_deref().unwrap_or_default(),
+            present,
+            value,
             &self.index_hash,
             &self.log_head,
         ])
