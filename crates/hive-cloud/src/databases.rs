@@ -311,6 +311,51 @@ fn mask(v: &str) -> String {
     format!("••••••••{tail}")
 }
 
+/// The `Database::connection` key a platform-native lane's payload name lives under.
+///
+/// Those lanes (blob, queue, vector, pub/sub, realtime) are addressed by NAME -- a bucket, a queue,
+/// an index, a topic, a room -- never by database id, so this key is the bridge from the address a
+/// request carried to the record that owns the payload. `None` for a kind with no platform-native
+/// payload: a Postgres or Redis instance is reached through its own DSN, not through a name this
+/// store keys on.
+pub fn native_payload_key(kind: DbKind) -> Option<&'static str> {
+    match kind {
+        DbKind::Blob => Some("bucket"),
+        DbKind::Queue => Some("queue"),
+        DbKind::Vector => Some("index"),
+        DbKind::Pubsub => Some("topic"),
+        DbKind::Realtime => Some("room"),
+        _ => None,
+    }
+}
+
+/// The payload name the platform mints for a native database from its OWN PLATFORM-ISSUED id
+/// (`db_<hex>`): `hive-<hex8>` for a bucket, `queue-<hex8>`, `index-<hex8>`, `topic-<hex8>`,
+/// `room-<hex8>`.
+///
+/// ONE derivation, shared by the writer of the name (`provision_backing`, which stores it in the
+/// record's connection map) and by its reader (`DatabaseStore::native_db`, which matches a write
+/// back to the record). They used to be two independent `&id[3..11]` slices, which is exactly the
+/// shape of drift that makes a real write unresolvable: move one of them and every write still
+/// addressed the old way silently stops being attributable while the platform goes on performing it
+/// under `<tenant>::<name>`.
+///
+/// `None` for a kind with no native payload, or for an id too short to derive from -- unreachable
+/// for a platform-issued id, and answered without a panic instead of slicing out of bounds.
+pub fn native_payload_name(kind: DbKind, id: &str) -> Option<String> {
+    let prefix = match kind {
+        DbKind::Blob => "hive-",
+        DbKind::Queue => "queue-",
+        DbKind::Vector => "index-",
+        DbKind::Pubsub => "topic-",
+        DbKind::Realtime => "room-",
+        _ => return None,
+    };
+    let tail = id.get(3..)?;
+    let n = 8.min(tail.len());
+    Some(format!("{prefix}{}", tail.get(..n)?))
+}
+
 /// DURABLE blob store: objects are written to disk under `$HIVE_DATA/blob/<bucket>/<hex(key)>.bin`
 /// with atomic temp+rename writes, so content survives restarts.
 struct BlobStore {
@@ -1113,26 +1158,43 @@ impl DatabaseStore {
     /// stored `team` tag, matched normalized here, is the tenant the record belongs to). A clone is
     /// returned rather than a reference so the caller never holds the store's read lock across an
     /// await -- the contract record below is one.
+    ///
+    /// RESOLUTION TAKES EVERY ADDRESS THE PLATFORM WRITES A NATIVE PAYLOAD UNDER, because the lanes
+    /// are addressed by name and the name a caller holds is not always the one the record carries:
+    ///   * the bare payload name the record's connection map holds (`hive-<hex>`, `queue-<hex>` ...);
+    ///   * the TENANT-SCOPED address the durable stores actually key the payload by
+    ///     (`<tenant>::<name>`, what `admin.rs`'s `ns`/`nsb`/`nsq`/`nsi`/`nst` wrote to);
+    ///   * the name the platform derives from the record's own id ([native_payload_name]) when the
+    ///     connection map carries no payload key -- a record adopted or restored before provisioning
+    ///     filled it in. That arm is a fallback for a MISSING key, never an override of a stored one:
+    ///     a record that names some other payload is not silently re-addressed.
+    /// Neither arm widens tenancy: the record's stored team must still match, normalized.
+    ///
+    /// A name no record owns still resolves to `None`, and `db_contract::wrote` turns that into a
+    /// RECORDED unattributed entry rather than a write the log is silent about.
     pub fn native_db(&self, kind: DbKind, team: &str, name: &str) -> Option<Database> {
-        let key = match kind {
-            DbKind::Blob => "bucket",
-            DbKind::Queue => "queue",
-            DbKind::Vector => "index",
-            DbKind::Pubsub => "topic",
-            DbKind::Realtime => "room",
-            _ => return None,
-        };
+        let key = native_payload_key(kind)?;
         if name.is_empty() {
             return None;
         }
         let t = crate::admin::norm(team);
+        // `<tenant>::<name>` is the address the lane really wrote under, so a caller holding the
+        // scoped form resolves too. Only a prefix that IS this tenant is stripped, so no tenant's
+        // namespace can be read as another tenant's payload name.
+        let bare = match name.split_once("::") {
+            Some((prefix, rest)) if !rest.is_empty() && crate::admin::norm(prefix) == t => rest,
+            _ => name,
+        };
         self.dbs
             .read()
             .iter()
             .find(|d| {
                 d.kind == kind
                     && crate::admin::norm(&d.team) == t
-                    && d.connection.get(key).map(String::as_str) == Some(name)
+                    && match d.connection.get(key).map(String::as_str) {
+                        Some(stored) => stored == bare,
+                        None => native_payload_name(kind, &d.id).as_deref() == Some(bare),
+                    }
             })
             .cloned()
     }
@@ -1683,7 +1745,9 @@ async fn provision_backing(
         DbKind::Sqlite => provision_sqlite(id, api_base).await,
         DbKind::Supabase => provision_supabase(store, id, &req, db_host).await,
         DbKind::Blob => {
-            let bucket = format!("hive-{}", &id[3..11.min(id.len())]);
+            // ONE derivation (shared with `native_db`, which resolves a write back to this
+            // record): provisioning and attribution cannot drift apart.
+            let bucket = native_payload_name(DbKind::Blob, id).unwrap_or_else(|| format!("hive-{id}"));
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Blob (S3-compatible)".into());
             c.insert("endpoint".into(), "/v1/storage/blob".into());
@@ -1694,7 +1758,7 @@ async fn provision_backing(
             Ok(("live".into(), c, None))
         }
         DbKind::Queue => {
-            let q = format!("queue-{}", &id[3..11.min(id.len())]);
+            let q = native_payload_name(DbKind::Queue, id).unwrap_or_else(|| format!("queue-{id}"));
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Queue (FIFO)".into());
             c.insert("endpoint".into(), "/v1/storage/queue".into());
@@ -1703,7 +1767,7 @@ async fn provision_backing(
             Ok(("live".into(), c, None))
         }
         DbKind::Vector => {
-            let idx = format!("index-{}", &id[3..11.min(id.len())]);
+            let idx = native_payload_name(DbKind::Vector, id).unwrap_or_else(|| format!("index-{id}"));
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Vector".into());
             c.insert("endpoint".into(), "/v1/storage/vector".into());
@@ -1714,7 +1778,7 @@ async fn provision_backing(
             Ok(("live".into(), c, None))
         }
         DbKind::Pubsub => {
-            let topic = format!("topic-{}", &id[3..11.min(id.len())]);
+            let topic = native_payload_name(DbKind::Pubsub, id).unwrap_or_else(|| format!("topic-{id}"));
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Pub/Sub".into());
             c.insert(
@@ -1727,7 +1791,7 @@ async fn provision_backing(
             Ok(("live".into(), c, None))
         }
         DbKind::Realtime => {
-            let room = format!("room-{}", &id[3..11.min(id.len())]);
+            let room = native_payload_name(DbKind::Realtime, id).unwrap_or_else(|| format!("room-{id}"));
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Realtime (WSS)".into());
             c.insert("channel_ws".into(), format!("/v1/ws/realtime/{room}"));

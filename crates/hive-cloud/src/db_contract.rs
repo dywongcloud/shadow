@@ -218,9 +218,10 @@ pub(crate) async fn wrote(
     bytes: u64,
     outcome: Result<(), String>,
 ) -> Option<Receipt> {
-    let db = c.databases.native_db(kind, tenant, name)?;
-    let tenant_owns = crate::admin::record_tenant(&db.team) == tenant;
     let bytes = bytes.to_string();
+    match c.databases.native_db(kind, tenant, name) {
+        Some(db) => {
+            let tenant_owns = crate::admin::record_tenant(&db.team) == tenant;
             // Canonical state records the write plane for a write that actually landed, so the count
             // and the last-bytes value the contract's index claims are claims canonical state can
             // attest. Only on `Ok`: a write that never landed changed nothing, and moving the
@@ -237,21 +238,26 @@ pub(crate) async fn wrote(
             // Recording it HERE, next to the contract entry, is what keeps the two sides of a
             // reconciliation measured over the same event: they cannot drift because one path forgot
             // the other.
-    if outcome.is_ok() {
-        c.databases.record_write(&db.id, &bytes);
+            if outcome.is_ok() {
+                c.databases.record_write(&db.id, &bytes);
+            }
+            record(
+                c,
+                tenant,
+                actor,
+                "db.write",
+                &db.id,
+                &db.project,
+                &[("bytes", &bytes)],
+                tenant_owns,
+                outcome,
+            )
+            .await
+        }
+        // No managed database owns this payload name. The write still happened, so it is recorded as
+        // what it is instead of vanishing between the platform's data plane and its audit trail.
+        None => unattributed(c, tenant, actor, kind, name, &bytes, outcome).await,
     }
-    record(
-        c,
-        tenant,
-        actor,
-        "db.write",
-        &db.id,
-        &db.project,
-        &[("bytes", &bytes)],
-        tenant_owns,
-        outcome,
-    )
-    .await
 }
 
 /// Marker prefix of an [`unattributed`] write's target: a target carrying it is a STORAGE ADDRESS,
