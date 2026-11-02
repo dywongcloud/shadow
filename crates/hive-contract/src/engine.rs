@@ -32,8 +32,12 @@ use crate::audit::{replay, Breach};
 use crate::checkpoint::SignedCheckpoint;
 use crate::contract::{validate, Caller, Contract, OpError};
 use crate::exec::{index_hash, Executor, Index};
+use crate::inclusion::{self, InclusionProof, WindowProof};
 use crate::oplog::{Op, OpLog};
-use crate::persist::{run_close, PersistConfig, Store, StoreError};
+use crate::persist::{
+    read_latest_checkpoint, read_window, run_close, PersistConfig, Store, StoreError,
+};
+use crate::signing::CheckpointSigner;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +81,17 @@ impl Persist {
             name = "contract".to_string();
         }
         self.dir.join(name)
+    }
+
+    /// The node's signing identity. `None` for a store configured without one, which
+    /// [`Store::open`] refuses -- so on a live engine this is always `Some`.
+    fn signer(&self) -> Option<&Arc<dyn CheckpointSigner>> {
+        self.cfg.signer.as_ref()
+    }
+
+    /// Entries per checkpoint window: the size of the range an inclusion path is cut over.
+    fn window(&self) -> usize {
+        self.cfg.checkpoint_every.max(1)
     }
 }
 
@@ -498,6 +513,9 @@ impl Engine {
                     index_hash: ex.index_hash(),
                     log_head: ack.log_head,
                     persist_error,
+                    // A refusal is published too, so it is provable too: the point of an audit trail
+                    // that records refusals is that a caller can show the refusal happened.
+                    proof: self.proof_for(contract, ex, ack.seq),
                 });
             }
         }
@@ -514,6 +532,7 @@ impl Engine {
                     index_hash: ex.index_hash(),
                     log_head: ack.log_head,
                     persist_error,
+                    proof: self.proof_for(contract, ex, ack.seq),
                 })
             }
             Err(e) => {
@@ -529,9 +548,104 @@ impl Engine {
                     index_hash: ex.index_hash(),
                     log_head: ack.log_head,
                     persist_error,
+                    proof: self.proof_for(contract, ex, ack.seq),
                 })
             }
         }
+    }
+
+    /// The caller's copy of one just-published entry: signed now, under the shard write lock the
+    /// caller already holds.
+    ///
+    /// Signing is deterministic Ed25519 over the same preimage [`crate::persist::Store::append`]
+    /// signed when it stored the line, so this reproduces the stored signature rather than minting a
+    /// second one for the same entry -- the proof a caller holds and the log on disk cannot disagree.
+    ///
+    /// The window half is left empty here on purpose. A checkpoint is only minted when a window
+    /// closes, so most entries have no signed root over them at the moment they are published; the
+    /// signature over the entry is the inclusion proof, and [`Engine::inclusion_proof`] attaches the
+    /// window later for a caller that wants the O(log n) path.
+    fn proof_for(&self, contract: &Contract, ex: &Executor, seq: u64) -> Option<InclusionProof> {
+        let signer = self.persist.as_ref()?.signer()?.clone();
+        let entry = ex.log.entry_at(seq)?;
+        inclusion::prove(contract, entry, signer.as_ref(), None).ok()
+    }
+
+    /// The inclusion proof for any seq in this contract's log, with the window half attached when a
+    /// signed checkpoint already covers it (whitepaper 2.7).
+    ///
+    /// This is the monitor's and the participant's route to a proof AFTER the fact: [`SubmitResult::proof`]
+    /// covers the caller of [`Engine::submit`] at the moment of publication, and this covers everyone
+    /// else -- a client replaying an old transaction, or a monitor that wants an entry tied to a
+    /// signed Merkle root rather than only to the executor's signature.
+    ///
+    /// `None` when the engine has no store (no signing identity), or when this node holds no copy of
+    /// `seq` at all -- neither in the retained window nor in a retained segment. A proof about an
+    /// entry this node does not hold would have to be invented, and the whole point of the artefact
+    /// is that it is not.
+    ///
+    /// Reads a window of entries from disk when a checkpoint covers `seq`, so it is I/O-bound and
+    /// bounded by one window -- call it off the serving runtime.
+    pub async fn inclusion_proof(&self, contract: &Contract, seq: u64) -> Option<InclusionProof> {
+        let (dir, signer, window_size, in_memory) = {
+            let shard = self.shard(&contract.id).read().await;
+            let in_memory = shard
+                .get(&contract.id)
+                .and_then(|ex| ex.log.entry_at(seq).cloned());
+            let p = self.persist.as_ref()?;
+            (
+                p.dir_for(&contract.id),
+                p.signer()?.clone(),
+                p.window(),
+                in_memory,
+            )
+        };
+        // An entry the in-memory log has compacted past is still on disk while its segment is
+        // retained, and being able to prove it is most of why the segments are kept: a monitor
+        // asking about an entry inside an attested window must not be told "not held" when the
+        // bytes are right there.
+        let entry = match in_memory {
+            Some(e) => e,
+            None => read_window(&dir, seq, seq + 1, window_size, None)
+                .await
+                .ok()?
+                .into_iter()
+                .next()?,
+        };
+        let mut proof = inclusion::prove(contract, &entry, signer.as_ref(), None).ok()?;
+        // The window is an addition, never a requirement: an entry in the open tail has no signed
+        // root over it yet, and its own signature is still the proof the whitepaper describes.
+        if let Ok(Some(cp)) = read_latest_checkpoint(&dir, None).await {
+            if cp.checkpoint.covers(seq) {
+                let base = cp.checkpoint.window_base;
+                let end = cp.checkpoint.window_end;
+                if let Ok(entries) = read_window(&dir, base, end, window_size, None).await {
+                    let hashes: Vec<String> =
+                        entries.iter().map(|e| e.entry_hash.clone()).collect();
+                    if let Some(w) = WindowProof::cut(cp, &hashes, seq) {
+                        // Cannot fail: `cut` already established that the checkpoint covers `seq`.
+                        let _ = proof.attach_window(w);
+                    }
+                }
+            }
+        }
+        Some(proof)
+    }
+
+    /// Whether what this engine SERVES covers what the executor has ATTESTED (whitepaper 4.1): the
+    /// monitor-side availability check, run against the log this node currently holds.
+    ///
+    /// A monitor that cannot obtain part of the history cannot validate at all, and the paper's
+    /// answer is to treat that as a reason to distrust the executor rather than as a retry. This is
+    /// that judgement stated as a check over two artefacts, so it can be cited.
+    pub async fn check_availability(
+        &self,
+        contract: &Contract,
+        a: &crate::appendonly::Availability,
+        trusted_public_key_hex: Option<&str>,
+    ) -> Result<(), crate::appendonly::Withheld> {
+        let log = self.snapshot_log(&contract.id).await.unwrap_or_default();
+        crate::appendonly::check_availability(contract, a, &log, trusted_public_key_hex)
     }
 
     /// Flush every open segment, and close every window that has filled since the last pass: the
@@ -610,6 +724,21 @@ pub struct SubmitResult {
     pub log_head: String,
     /// Non-empty when the entry could not be made durable. Never silently dropped.
     pub persist_error: Option<String>,
+    /// The caller's own copy of the publication: the entry plus the executor's signature over it
+    /// (whitepaper 2.7, and the "oplog root proof" + "index root proof" of 3.4).
+    ///
+    /// This is what lets a participant demonstrate the transaction to a third party afterwards.
+    /// Without it the caller is told "committed" and holds nothing but its own memory of being told
+    /// -- so a dispute about whether this write ever happened is settled by asking the executor.
+    /// With it the caller holds an artefact the executor cannot repudiate and anybody can check.
+    ///
+    /// `None` only for an engine with no store: there is no signing identity to publish with, and a
+    /// proof nobody signed asserts nothing.
+    ///
+    /// Freshness is not part of it, and that is the whitepaper's own caveat rather than an omission:
+    /// a proof says the entry WAS published, never that the log still ends there. A caller that needs
+    /// currency asks for the current head too.
+    pub proof: Option<InclusionProof>,
 }
 
 /// Index hash of a freshly replayed log, used by the audit binary to compare two independent

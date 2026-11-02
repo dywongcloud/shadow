@@ -20,6 +20,7 @@
 //! their payload schema -- is one declarative table in [`contracts::managed_database`]. Everything
 //! else here is the machinery that validates and executes it.
 
+pub mod appendonly;
 pub mod audit;
 pub mod checkpoint;
 pub mod contract;
@@ -27,6 +28,7 @@ pub mod contracts;
 pub mod engine;
 pub mod exec;
 pub mod fraud;
+pub mod inclusion;
 pub mod merkle;
 pub mod oplog;
 pub mod persist;
@@ -34,6 +36,9 @@ pub mod reconcile;
 pub mod replicate;
 pub mod signing;
 
+pub use appendonly::{
+    adjudicate_fork, check_availability, Availability, ForkedHistory, Withheld,
+};
 pub use audit::{adjudicate, replay, replay_from, verify, Breach, Dispute, Verdict};
 pub use checkpoint::{
     Checkpoint, CheckpointVerifyError, SignedCheckpoint, SignError, TrustedCheckpoint,
@@ -46,12 +51,13 @@ pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
 pub use fraud::{
     adjudicate_equivocation, adjudicate_fraud, sign_entry, Equivocation, FraudProof, SignedEntry,
 };
+pub use inclusion::{prove, InclusionError, InclusionProof, WindowProof};
 pub use merkle::{merkle_prove, merkle_root, merkle_verify, MerklePath, Sibling};
 pub use oplog::{Ack, AppendEntryError, LogEntry, Op, OpLog, TruncateError, OP_DOMAIN};
 pub use persist::{
-    entry_sig_preimage, read_entries_from, read_latest_checkpoint, read_window, AppendStep,
-    PersistConfig, SegmentLine, Store, StoreError, DEFAULT_CHECKPOINT_EVERY,
-    DEFAULT_RETAIN_CHECKPOINTS,
+    entry_sig_preimage, read_entries_from, read_latest_checkpoint, read_signed_entries_from,
+    read_window, AppendStep, PersistConfig, SegmentLine, Store, StoreError,
+    DEFAULT_CHECKPOINT_EVERY, DEFAULT_RETAIN_CHECKPOINTS,
 };
 pub use reconcile::{
     reconcile, scope_report, CanonicalDb, Divergence, DivergenceKind, ReconcileReport, ScopeEntry,

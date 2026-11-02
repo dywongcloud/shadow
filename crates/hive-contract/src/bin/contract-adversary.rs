@@ -22,7 +22,9 @@ use hive_contract::contract::Caller;
 use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::Engine;
 use hive_contract::exec::index_hash;
-use hive_contract::persist::{read_entries_from, read_latest_checkpoint, PersistConfig};
+use hive_contract::persist::{
+    read_entries_from, read_latest_checkpoint, read_signed_entries_from, PersistConfig,
+};
 use hive_contract::signing::{CheckpointSigner, KeyedSigner};
 use hive_contract::{
     adjudicate, adjudicate_equivocation, apply, checkpoint, Ack, Checkpoint, Dispute, Equivocation,
@@ -248,11 +250,23 @@ async fn main() {
             b.payload = colliding.clone();
             a.canonical() == b.canonical()
         };
-        let mut swapped = last.clone();
-        swapped.op.payload = colliding;
-        let mut segment = tail.clone();
+        // Kept only to compute the collision for the report; the artefact below edits the monitor's
+        // own signed copy in place.
+        let _swapped = {
+            let mut s = last.clone();
+            s.op.payload = colliding.clone();
+            s
+        };
+        // The monitor's own copy of the tail, carrying the signature each entry was published under.
+        // The attack leaves that signature in place and swaps the payload: the accuser is asserting
+        // that the executor published an entry it never did, and an adjudication that accepts an
+        // unsigned -- or stale-signed -- segment cannot tell the difference.
+        let mut segment: Vec<SignedEntry> =
+            read_signed_entries_from(&store_dir, cp.window_end, &node_pk_bytes)
+                .await
+                .expect("read signed tail");
         if let Some(l) = segment.last_mut() {
-            *l = swapped.clone();
+            l.entry.op.payload = colliding.clone();
         }
         let v = adjudicate(
             &contract,

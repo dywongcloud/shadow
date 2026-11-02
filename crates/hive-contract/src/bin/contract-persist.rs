@@ -29,12 +29,13 @@ use hive_contract::contract::{Caller, Contract};
 use hive_contract::contracts::managed_database::managed_db_contract;
 use hive_contract::engine::Engine;
 use hive_contract::merkle;
-use hive_contract::oplog::{LogEntry, OpLog};
+use hive_contract::oplog::OpLog;
 use hive_contract::persist::{
-    read_checkpoint, read_entries_from, read_latest_checkpoint, read_window, PersistConfig,
-    DEFAULT_RETAIN_CHECKPOINTS,
+    read_checkpoint, read_entries_from, read_latest_checkpoint, read_signed_entries_from,
+    read_window, PersistConfig, DEFAULT_RETAIN_CHECKPOINTS,
 };
 use hive_contract::signing::{CheckpointSigner, KeyedSigner};
+use hive_contract::SignedEntry;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -449,9 +450,11 @@ async fn main() {
     // as dishonest. Both are decided from the artefact alone.
     // The segment is what follows the checkpoint, not what it covers: an accusation says "from this
     // attested state, these entries led to that ack".
-    let segment: Vec<LogEntry> =
-        futures_lite_block_on(read_entries_from(&compact_store, cp.window_end, Some(&node_pk))).unwrap_or_default();
-    let disputed_seq = segment.last().map(|e| e.op.seq).unwrap_or(0);
+    // Signed, not bare: an accusation carries the signature the executor published each entry under.
+    let segment: Vec<SignedEntry> =
+        futures_lite_block_on(read_signed_entries_from(&compact_store, cp.window_end, &node_pk))
+            .unwrap_or_default();
+    let disputed_seq = segment.last().map(|e| e.entry.op.seq).unwrap_or(0);
     println!(
         "  dispute segment : {} entries from seq {} to {}",
         segment.len(),
@@ -468,21 +471,44 @@ async fn main() {
         Some(&node_pk_hex),
     );
     println!("  dispute over an honest ack: {} at seq {:?}", honest.label(), seq_of(&honest));
-    let mut tampered = segment.clone();
-    if let Some(last) = tampered.last_mut() {
-        last.ack.index_hash = "0".repeat(64);
+
+    // The same segment with the disputed ack rewritten BY THE ACCUSER. The entry still carries the
+    // signature the executor published over the ack it actually published, so the artefact no longer
+    // verifies -- a monitor cannot convict an executor by inventing an ack.
+    let mut fabricated = segment.clone();
+    if let Some(last) = fabricated.last_mut() {
+        last.entry.ack.index_hash = "0".repeat(64);
+    }
+    let rewritten = adjudicate(
+        &contract,
+        &Dispute {
+            checkpoint: latest.clone(),
+            segment: fabricated,
+            disputed_seq,
+        },
+        Some(&node_pk_hex),
+    );
+    println!("  dispute over an accuser-rewritten ack: {}", rewritten.label());
+
+    // The same false ack, but re-signed by the executor: a real second publication is still a
+    // conviction, so refusing the forgery above cannot be confused with refusing everything.
+    let mut published_false = segment.clone();
+    if let Some(last) = published_false.last_mut() {
+        last.entry.ack.index_hash = "0".repeat(64);
+        *last = hive_contract::sign_entry(&last.entry, signer.as_ref()).expect("node signs");
     }
     let dishonest = adjudicate(
         &contract,
         &Dispute {
             checkpoint: latest.clone(),
-            segment: tampered,
+            segment: published_false,
             disputed_seq,
         },
         Some(&node_pk_hex),
     );
-    println!("  dispute over a rewritten ack: {}", dishonest.label());
+    println!("  dispute over a false ack the executor signed: {}", dishonest.label());
     let p5_dispute = matches!(honest, Verdict::Honest { .. })
+        && matches!(rewritten, Verdict::Inadmissible { .. })
         && matches!(dishonest, Verdict::Dishonest { .. });
     if !p5_dispute {
         failures += 1;

@@ -7,12 +7,18 @@
 //! Two things are checked, and they are different claims:
 //!   * [`verify_chain`] -- the log is append-only and un-forked (the `LogForkFraudProof` case).
 //!   * [`replay`] -- the executor applied the contract honestly (the contract-breach case).
+//!
+//! A third is checked in [`crate::appendonly`], because it is a claim about the log AT A LENGTH
+//! rather than about one entry: two signed checkpoints that cannot both be true
+//! ([`crate::appendonly::adjudicate_fork`]), and whether the executor serves the history it attests
+//! ([`crate::appendonly::check_availability`], whitepaper 4.1).
 
 use crate::checkpoint::{
     Checkpoint, CheckpointVerifyError, SignedCheckpoint, TrustedCheckpoint,
 };
 use crate::contract::Contract;
 use crate::exec::{apply, index_hash, Index};
+use crate::fraud::SignedEntry;
 use crate::oplog::{ChainBreak, LogEntry, OpLog, TruncateError};
 
 /// A detected divergence. The monitor publishes this instead of trusting the executor.
@@ -242,13 +248,24 @@ pub fn verify(
 // (each bound by its own hash and by the chain), and the disputed ack (inside the last entry).
 
 /// One monitor's accusation, in the smallest form that can be settled by someone who was not there.
+///
+/// Every entry in the segment carries the signature the EXECUTOR published it with, and that is the
+/// difference between an accusation and a forgery. An unsigned entry is a claim a monitor invented:
+/// anybody can take a genuine signed checkpoint -- they are the artefact that leaves the node -- read
+/// the genuine entries that follow it, rewrite one `ack`, and hand the result in. Replay then
+/// disagrees with the rewritten ack and returns `Dishonest`, convicting an executor that published
+/// nothing of the sort. Whitepaper 2.6 says the notice shares "the inclusion proofs (root hash and
+/// signature) of the relevant messages"; the signature half is what makes the notice the executor's
+/// own statement rather than the accuser's, so [`adjudicate`] refuses a segment that does not carry
+/// it.
 #[derive(Clone, Debug)]
 pub struct Dispute {
     /// The last signed checkpoint at or before the disputed seq: the agreed starting state.
     pub checkpoint: SignedCheckpoint,
-    /// The entries from `checkpoint.window_end` through `disputed_seq`, inclusive. Bounded by the
-    /// checkpoint window plus one window of tail, so an accusation is never "here is my whole log".
-    pub segment: Vec<LogEntry>,
+    /// The entries from `checkpoint.window_end` through `disputed_seq`, inclusive, each with the
+    /// executor's signature over its hash and its ack. Bounded by the checkpoint window plus one
+    /// window of tail, so an accusation is never "here is my whole log".
+    pub segment: Vec<SignedEntry>,
     /// The seq whose ack is being disputed.
     pub disputed_seq: u64,
 }
@@ -323,7 +340,40 @@ pub fn adjudicate(
             reason: "dispute carries no entries".to_string(),
         };
     }
-    let first = &dispute.segment[0];
+    // Every entry has to BE a publication of the executor's, not a claim about one. The chain and the
+    // entry hashes are both recomputable by anybody, so a segment of hand-written entries links to a
+    // genuine checkpoint perfectly well; only the signature separates "the executor said this" from
+    // "the accuser says the executor said this". Without this check a monitor fabricates one ack,
+    // replay disagrees with it, and an honest executor is convicted by an artefact it never signed.
+    for cand in dispute.segment.iter() {
+        if !cand.entry.hash_is_self_consistent() {
+            return Verdict::Inadmissible {
+                reason: format!(
+                    "segment entry {} carries a hash its own op does not produce",
+                    cand.entry.op.seq
+                ),
+            };
+        }
+        if !cand.verify() {
+            return Verdict::Inadmissible {
+                reason: format!(
+                    "segment entry {} does not carry the publisher's signature over its ack",
+                    cand.entry.op.seq
+                ),
+            };
+        }
+        // And the publisher has to be the identity under dispute: a segment stitched together from
+        // two histories, or signed by a key nobody pinned, settles nothing about THIS executor.
+        if !cand.public_key_hex.eq_ignore_ascii_case(trusted_public_key_hex) {
+            return Verdict::Inadmissible {
+                reason: format!(
+                    "segment entry at seq {} was published by {}, which is not the trusted identity",
+                    cand.entry.op.seq, cand.public_key_hex
+                ),
+            };
+        }
+    }
+    let first = &dispute.segment[0].entry;
     if first.op.seq != cp.window_end {
         return Verdict::Inadmissible {
             reason: format!(
@@ -343,7 +393,9 @@ pub fn adjudicate(
     let last = dispute
         .segment
         .last()
-        .expect("segment is non-empty: checked above");
+        .expect("segment is non-empty: checked above")
+        .entry
+        .clone();
     if last.op.seq != dispute.disputed_seq {
         return Verdict::Inadmissible {
             reason: format!(
@@ -352,7 +404,8 @@ pub fn adjudicate(
             ),
         };
     }
-    let log = match OpLog::restore(first.op.seq, &first.prev_hash, dispute.segment.clone()) {
+    let entries: Vec<LogEntry> = dispute.segment.iter().map(|s| s.entry.clone()).collect();
+    let log = match OpLog::restore(first.op.seq, &first.prev_hash, entries) {
         Ok(l) => l,
         Err(e) => {
             return Verdict::Inadmissible {

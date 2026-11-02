@@ -50,6 +50,22 @@ pub struct Receipt {
     pub log_head: String,
     /// Why the op was refused or its execution failed; `None` on a clean commit.
     pub error: Option<String>,
+    /// The caller's copy of the publication: the entry plus the executor's signature over its hash
+    /// and its ack (whitepaper 2.7, and the "oplog root proof" + "index root proof" the
+    /// participant's transaction flow returns in 3.4).
+    ///
+    /// This is what makes a recorded write provable to somebody who was not watching. The platform
+    /// has always had the log; without this the caller -- and therefore the tenant -- has only the
+    /// platform's word that the write was published, and any dispute about whether it happened is
+    /// settled by asking the executor that recorded it. With it, the receipt is an artefact the
+    /// executor cannot repudiate and a third party can check against the node's public key alone.
+    ///
+    /// `None` on an engine with no store: there is no signing identity to publish with, and a proof
+    /// nobody signed asserts nothing.
+    ///
+    /// Freshness is not part of it, and that is the whitepaper's own caveat: the proof says the entry
+    /// WAS published, never that the log still ends there.
+    pub proof: Option<hive_contract::InclusionProof>,
 }
 
 /// The actor string recorded for a request: the JWT subject, or a marker that no subject was bound.
@@ -127,7 +143,11 @@ pub(crate) async fn record(
                 index_hash: r.index_hash,
                 log_head: r.log_head,
                 error: r.error,
+                proof: r.proof,
             };
+            // Carried through rather than recomputed: the receipt is the one artefact a caller can
+            // hand to a third party, and it has to be the bytes the executor published.
+            let proof_seq = receipt.proof.as_ref().map(|p| p.seq());
             match &receipt.error {
                 Some(e) => tracing::warn!(
                     op = kind,
@@ -145,6 +165,8 @@ pub(crate) async fn record(
                     committed = receipt.committed,
                     index_hash = %receipt.index_hash,
                     log_head = %receipt.log_head,
+                    proof_seq = proof_seq.unwrap_or(0),
+                    proof = receipt.proof.is_some(),
                     "contract: managed-db op recorded"
                 ),
             }

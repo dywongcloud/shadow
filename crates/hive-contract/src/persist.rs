@@ -34,6 +34,7 @@
 
 use crate::checkpoint::{Checkpoint, SignedCheckpoint, TrustedCheckpoint};
 use crate::exec::{index_hash, Index};
+use crate::fraud::SignedEntry;
 use crate::merkle;
 use crate::oplog::{Ack, LogEntry, OpLog};
 use crate::signing::{verify_ed25519, CheckpointSigner};
@@ -353,6 +354,61 @@ pub async fn read_entries_from(
         }
     }
     out.sort_by_key(|e| e.op.seq);
+    Ok(out)
+}
+
+/// Every entry at or after `from`, in seq order, read from the segment files WITH the signature each
+/// was stored under.
+///
+/// This is the monitor's read path, and it is the one [`read_entries_from`] is not: that one returns
+/// bare entries and drops `sig`, so a monitor syncing through it loses the only thing that
+/// distinguishes "the executor published this ack" from "somebody wrote this ack". Whitepaper 2.6
+/// has the notice carry "the inclusion proofs (root hash and signature) of the relevant messages",
+/// and a monitor that cannot lay its hands on the signature cannot build a notice at all -- it can
+/// only make an assertion, which [`crate::audit::adjudicate`] now refuses.
+///
+/// `public_key` is required, not optional. A [`SignedEntry`] with no key on it asserts nothing: the
+/// signature is only checkable against the key that made it, and an artefact carrying a signature
+/// with no idea whose it is would let a verifier be told the wrong key later. Every caller here is
+/// adopting these entries as this node's history, so every caller knows the key.
+pub async fn read_signed_entries_from(
+    dir: &Path,
+    from: u64,
+    public_key: &[u8],
+) -> Result<Vec<SignedEntry>, StoreError> {
+    // One pass over the segment files, keeping the signature each line was stored with. The
+    // signature is re-read, never re-signed: re-signing would produce a NEW artefact that happens to
+    // verify, and an accusation has to carry the bytes the executor actually published, not bytes
+    // this reader could have made for itself.
+    let bases = list_segment_bases(dir).await?;
+    let mut out = Vec::new();
+    for b in bases {
+        let path = dir.join(segment_name(b));
+        let name = path.display().to_string();
+        let text = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(io("read segment"))?;
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let l: SegmentLine =
+                serde_json::from_str(line).map_err(|err| StoreError::Corrupt {
+                    file: name.clone(),
+                    detail: format!("line {}: {err}", i + 1),
+                })?;
+            verify_line(&l, &name, Some(public_key))?;
+            if l.entry.op.seq < from {
+                continue;
+            }
+            out.push(SignedEntry {
+                entry: l.entry,
+                sig: l.sig,
+                public_key_hex: hex::encode(public_key),
+            });
+        }
+    }
+    out.sort_by_key(|s| s.entry.op.seq);
     Ok(out)
 }
 

@@ -26,10 +26,11 @@ use hive_contract::exec::index_hash;
 use hive_contract::merkle;
 use hive_contract::oplog::LogEntry;
 use hive_contract::persist::{
-    checkpoint_name, read_checkpoint, read_entries_from, read_latest_checkpoint, read_window,
-    PersistConfig, DEFAULT_RETAIN_CHECKPOINTS,
+    checkpoint_name, read_checkpoint, read_entries_from, read_latest_checkpoint,
+    read_signed_entries_from, read_window, PersistConfig, DEFAULT_RETAIN_CHECKPOINTS,
 };
 use hive_contract::signing::{CheckpointSigner, KeyedSigner};
+use hive_contract::SignedEntry;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -467,10 +468,13 @@ async fn main() {
     }
 
     // ---- disputes -----------------------------------------------------------------------------------
-    let segment: Vec<LogEntry> = read_entries_from(&store_dir, cp.window_end, Some(&node_pk_bytes))
+    // Signed, not bare: an accusation carries the signature the executor published each entry under
+    // (whitepaper 2.6). Without it the "accusation" is a claim about what the executor said, and a
+    // monitor could convict an honest node by writing an ack it never published.
+    let segment: Vec<SignedEntry> = read_signed_entries_from(&store_dir, cp.window_end, &node_pk_bytes)
         .await
         .unwrap_or_default();
-    let disputed_seq = segment.last().map(|e| e.op.seq).unwrap_or(cp.window_end);
+    let disputed_seq = segment.last().map(|e| e.entry.op.seq).unwrap_or(cp.window_end);
 
     // C3: an honest segment settles as honest.
     let honest = adjudicate(
@@ -490,12 +494,16 @@ async fn main() {
         ok: matches!(honest, Verdict::Honest { .. }),
     });
 
-    // F7: the same dispute with one ack rewritten settles as dishonest.
+    // F7: the same dispute with the disputed ack REWRITTEN BY THE ACCUSER. The entry still carries
+    // the signature the executor published -- over the ack it actually published -- so the artefact
+    // no longer verifies and settles nothing. This is the case that used to return Dishonest: the
+    // segment carried no signatures at all, so a monitor could name any ack it liked and convict an
+    // honest executor with it.
     let mut tampered = segment.clone();
     if let Some(last) = tampered.last_mut() {
-        last.ack.index_hash = "0".repeat(64);
+        last.entry.ack.index_hash = "0".repeat(64);
     }
-    let dishonest = adjudicate(
+    let fabricated = adjudicate(
         &contract,
         &Dispute {
             checkpoint: genuine.clone(),
@@ -506,7 +514,38 @@ async fn main() {
     );
     probes.push(Probe {
         name: "F7",
-        what: "a dispute over a rewritten ack".to_string(),
+        what: "a dispute whose disputed ack was rewritten by the accuser".to_string(),
+        expect: "inadmissible",
+        observed: match &fabricated {
+            Verdict::Inadmissible { reason } => format!("inadmissible: {reason}"),
+            other => format!(
+                "{} (an honest executor is convicted by an artefact it never signed)",
+                other.label()
+            ),
+        },
+        ok: matches!(fabricated, Verdict::Inadmissible { .. }),
+    });
+
+    // F7b: the same false ack, but SIGNED BY THE EXECUTOR -- a real second publication, which is the
+    // only shape an accusation of this kind can honestly take. It must still convict. Without this
+    // probe, "everything is inadmissible now" would look identical to "forgeries are refused".
+    let mut published_false = segment.clone();
+    if let Some(last) = published_false.last_mut() {
+        last.entry.ack.index_hash = "0".repeat(64);
+        *last = hive_contract::sign_entry(&last.entry, node.as_ref()).expect("node signs");
+    }
+    let dishonest = adjudicate(
+        &contract,
+        &Dispute {
+            checkpoint: genuine.clone(),
+            segment: published_false,
+            disputed_seq,
+        },
+        Some(&node_pk),
+    );
+    probes.push(Probe {
+        name: "F7b",
+        what: "a dispute over a false ack the executor itself signed".to_string(),
         expect: "dishonest",
         observed: dishonest.label().to_string(),
         ok: matches!(dishonest, Verdict::Dishonest { .. }),
@@ -538,7 +577,7 @@ async fn main() {
     // F10: a segment that does not link to the checkpoint it is offered against.
     let mut unlinked = segment.clone();
     if let Some(first) = unlinked.first_mut() {
-        first.prev_hash = "0".repeat(64);
+        first.entry.prev_hash = "0".repeat(64);
     }
     let unlinked_v = adjudicate(
         &contract,
@@ -672,7 +711,7 @@ async fn main() {
     // "this executor published two different claims about one seq": one checkpoint, the run-up to
     // the disputed seq, and the two publications. It asks neither side anything and it replays one
     // window, never the whole log.
-    let tail: Vec<LogEntry> = segment.clone();
+    let tail: Vec<LogEntry> = segment.iter().map(|s| s.entry.clone()).collect();
     let prefix: Vec<LogEntry> = tail
         .iter()
         .take(tail.len().saturating_sub(1))
@@ -855,7 +894,10 @@ async fn main() {
     {
         let mut tampered2 = segment.clone();
         if let Some(last) = tampered2.last_mut() {
-            last.ack.index_hash = "0".repeat(64);
+            last.entry.ack.index_hash = "0".repeat(64);
+            // Re-signed by the executor: F18 exercises the ROUTING (one entry point, two kinds), so
+            // the artefact has to be admissible for the routing to be observable.
+            *last = hive_contract::sign_entry(&last.entry, node.as_ref()).expect("node signs");
         }
         let f18 = hive_contract::adjudicate_fraud(
             &contract,

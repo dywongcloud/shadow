@@ -6,17 +6,22 @@
 //! has to be interpreted by somebody and a proof does not: a proof is checked by re-deriving a
 //! number, and any two parties who check it reach the same answer.
 //!
-//! Two claims are provable here, and they are the two ways an executor can lie:
+//! Three claims are provable here, and they are the three ways an executor can lie:
 //!
 //!   1. [`FraudProof::UnsupportedState`] -- the executor published a state the log does not
 //!      support: the index hash it acked at a seq is not the hash replaying that seq produces.
 //!   2. [`FraudProof::EquivocatedAcks`] -- the executor published TWO CONFLICTING ACKS for one
 //!      operation: two entries at the same seq, both signed by it, that disagree.
+//!   3. [`FraudProof::ForkedHistory`] -- the executor signed TWO DIVERGENT HISTORIES: two
+//!      statements about the log at a length that cannot both be true. This is the append-only
+//!      violation of whitepaper 2.4/2.6, and it is the only one of the three that is invisible to a
+//!      per-entry check -- every entry in both histories is individually well-formed and
+//!      individually signed.
 //!
-//! Both are settled by [`adjudicate_fraud`], which trusts nobody: it is handed an artefact and a
-//! public key, and it recomputes. Neither side is asked anything, and neither check replays the
-//! whole log -- the artefact carries one checkpoint window plus the tail after it, so the work is
-//! bounded by the window, not by the history.
+//! All three are settled by [`adjudicate_fraud`], which trusts nobody: it is handed an artefact and a
+//! public key, and it recomputes. Neither side is asked anything, and no check replays the whole log
+//! -- the artefact carries one checkpoint window plus the tail after it, so the work is bounded by
+//! the window, not by the history.
 //!
 //! What this module deliberately does NOT contain: a bond, a slash, a challenge period, or any
 //! economic mechanism. Those are product decisions about what a breach COSTS, and none of them
@@ -28,6 +33,7 @@
 //! seen an entry could convict an honest executor. [`SignedEntry::verify`] is what keeps a forged
 //! accusation out.
 
+use crate::appendonly::{adjudicate_fork, ForkedHistory};
 use crate::audit::{adjudicate, replay_from, Dispute, Verdict};
 use crate::checkpoint::{SignedCheckpoint, TrustedCheckpoint};
 use crate::contract::Contract;
@@ -108,6 +114,10 @@ pub enum FraudProof {
     EquivocatedAcks(Equivocation),
     /// The executor published a state the log does not support.
     UnsupportedState(Dispute),
+    /// The executor signed two statements about the log's history that cannot both be true: the
+    /// append-only violation of whitepaper 2.4/2.6, which no per-entry check can see because every
+    /// entry in both histories is individually well-formed and individually signed.
+    ForkedHistory(ForkedHistory),
 }
 
 impl FraudProof {
@@ -116,14 +126,21 @@ impl FraudProof {
         match self {
             FraudProof::EquivocatedAcks(_) => "equivocated_acks",
             FraudProof::UnsupportedState(_) => "unsupported_state",
+            FraudProof::ForkedHistory(_) => "forked_history",
         }
     }
 
-    /// The seq under dispute, whichever kind this is.
+    /// The seq under dispute, whichever kind this is. A fork is a claim about the log at a length, so
+    /// it names the later of the two windows.
     pub fn seq(&self) -> u64 {
         match self {
             FraudProof::EquivocatedAcks(e) => e.a.entry.op.seq,
             FraudProof::UnsupportedState(d) => d.disputed_seq,
+            FraudProof::ForkedHistory(f) => f
+                .a
+                .checkpoint
+                .window_end
+                .max(f.b.checkpoint.window_end),
         }
     }
 }
@@ -351,5 +368,6 @@ pub fn adjudicate_fraud(
             adjudicate_equivocation(contract, e, trusted_public_key_hex)
         }
         FraudProof::UnsupportedState(d) => adjudicate(contract, d, trusted_public_key_hex),
+        FraudProof::ForkedHistory(f) => adjudicate_fork(contract, f, trusted_public_key_hex),
     }
 }
