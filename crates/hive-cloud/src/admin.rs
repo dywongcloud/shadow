@@ -6650,8 +6650,10 @@ struct RedeployBody {
     target: Option<String>,
     #[serde(default = "default_true_b")]
     use_cache: bool,
-    /// GitHub token for a private-repo redeploy, attached server-side by the
-    /// dashboard's /api/projects/:project/redeploy route (never sent by the browser).
+    /// GitHub token for a private-repo redeploy. LAST RESORT: `git::run_build` resolves the clone
+    /// credential server-side first (GitHub App installation token for the repo, then the node's
+    /// GITHUB_TOKEN) and only falls back to this value when nothing server-side can read the repo,
+    /// so a redeploy never depends on the one browser that holds the `gh_app_tok` cookie.
     #[serde(default)]
     git_token: Option<String>,
 }
@@ -7686,27 +7688,9 @@ async fn git_webhook(
     let want = crate::gitops::norm_repo(&repo_full);
     tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, fork = ?head_repo_url, "git_webhook: received");
 
-    let webhook_git_token: Option<String> = if crate::github_app_auth::configured() {
-        match repo_full.split_once('/') {
-            Some((owner, repo)) => {
-                match crate::github_app_auth::installation_token_for_repo(owner, repo).await {
-                    Ok(Some(tok)) => Some(tok),
-                    Ok(None) => {
-                        tracing::info!(repo = %want, "git_webhook: GitHub App not installed on this repo — falling back to node GITHUB_TOKEN");
-                        None
-                    }
-                    Err(e) => {
-                        tracing::warn!(repo = %want, error = %e, "git_webhook: GitHub App installation-token mint failed — falling back to node GITHUB_TOKEN");
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-
+    // No `git_token` is attached here: `git::run_build` resolves the clone credential
+    // SERVER-SIDE on whichever node runs the build (GitHub App installation token for that repo,
+    // then the node-wide GITHUB_TOKEN), so a push-triggered deploy needs no browser session.
     let candidates: Vec<String> = if !c.git_index.is_empty() {
         c.git_index.projects_for(&want)
     } else {
@@ -7775,7 +7759,7 @@ async fn git_webhook(
             image_cpus: None,
             image_pids: None,
             image_ports: None,
-            git_token: webhook_git_token.clone(),
+            git_token: None,
         };
         let webhook_team = norm(&c.projects.team_of(&project)).to_string();
         let build_id = crate::git::start_build(c.clone(), req, None, Some(webhook_team))

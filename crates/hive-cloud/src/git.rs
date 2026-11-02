@@ -604,6 +604,197 @@ fn apply_credential(
     }
 }
 
+/// Where a clone credential came from. The variant is logged and is the only part of a credential
+/// that ever reaches a build log, a tracing field or an error body: the token itself never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitCredentialSource {
+    /// A GitHub App installation token, minted SERVER-SIDE from `GITHUB_APP_ID` /
+    /// `GITHUB_APP_PRIVATE_KEY` (see `github_app_auth`). Device- and session-independent: it is
+    /// minted by whichever node runs the build, so an unattended, cross-device or webhook deploy
+    /// uses exactly the credential a signed-in browser's deploy would.
+    AppInstallation,
+    /// The node-wide `GITHUB_TOKEN` PAT from this process's environment.
+    NodeEnv,
+    /// A credential the deploy REQUEST carried (`GitDeployRequest.git_token`). LAST RESORT only:
+    /// `ui/app/api/git/deploy/route.ts` sources it from the `gh_app_tok` browser cookie, so it
+    /// exists only in the one browser that ran the OAuth and is absent for a webhook, a git poll,
+    /// a node-death redeploy or a second device.
+    CallerSupplied,
+}
+
+impl GitCredentialSource {
+    /// Tenant-visible and log-safe name of this source.
+    fn label(self) -> &'static str {
+        match self {
+            Self::AppInstallation => "GitHub App installation token",
+            Self::NodeEnv => "node GITHUB_TOKEN",
+            Self::CallerSupplied => "credential supplied with the request",
+        }
+    }
+}
+
+/// Why a source yielded no credential. Carries no secret: a GitHub App failure carries only the
+/// HTTP status, never a response body, a key or a token.
+#[derive(Clone, Debug)]
+pub(crate) enum GitCredentialGap {
+    /// Not a `https://github.com/` URL: no platform credential applies, and a GitHub token is
+    /// deliberately never offered to a foreign host.
+    NotGithub,
+    /// `GITHUB_APP_ID` / `GITHUB_APP_PRIVATE_KEY` are absent from this node's environment.
+    AppNotConfigured,
+    /// The App is configured but GitHub reports no installation covering this repo (HTTP 404 on
+    /// `/repos/{owner}/{repo}/installation`).
+    AppNotInstalled { owner: String, repo: String },
+    /// The App is configured and an installation exists, but minting its token failed.
+    AppMintFailed { detail: String },
+    /// No `GITHUB_TOKEN` in this process's environment.
+    NoNodeToken,
+    /// The request carried no credential.
+    NoCallerCredential,
+}
+
+impl GitCredentialGap {
+    /// The operator-facing fix for this gap, joined into the clone-failure message.
+    fn hint(&self) -> String {
+        match self {
+            Self::NotGithub => {
+                "not a github.com repository, so no platform credential applies".to_string()
+            }
+            Self::AppNotConfigured => {
+                "the GitHub App is not configured on this node (set GITHUB_APP_ID and \
+                 GITHUB_APP_PRIVATE_KEY in hive-cloud's environment, or set a node-wide \
+                 GITHUB_TOKEN)"
+                    .to_string()
+            }
+            Self::AppNotInstalled { owner, repo } => format!(
+                "the GitHub App is configured but is NOT installed on {owner}/{repo} — install it \
+                 on that owner, or set a node-wide GITHUB_TOKEN"
+            ),
+            Self::AppMintFailed { detail } => {
+                format!("minting a GitHub App installation token failed ({detail})")
+            }
+            Self::NoNodeToken => "this node has no GITHUB_TOKEN in its environment".to_string(),
+            Self::NoCallerCredential => {
+                "the request carried no credential — a browser-only GitHub session lives in one \
+                 browser cookie and cannot serve a deploy triggered from another device or \
+                 unattended"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// One credential a clone may use, labelled by its source.
+pub(crate) struct CloneCredential {
+    source: GitCredentialSource,
+    token: String,
+}
+
+/// Every credential a clone may try, SERVER-SIDE FIRST, plus why each durable source was empty.
+/// Resolved per clone and never persisted: an App installation token is minted on demand and lives
+/// about an hour, and the node PAT is read from the environment.
+pub(crate) struct CloneCredentials {
+    candidates: Vec<CloneCredential>,
+    gaps: Vec<GitCredentialGap>,
+}
+
+/// `https://github.com/owner/repo[.git]` -> `("owner", "repo")`; `None` for any other host or a
+/// malformed path, so a GitHub token is never resolved for — or offered to — a foreign host.
+fn github_owner_repo(url: &str) -> Option<(String, String)> {
+    let path = url.strip_prefix("https://github.com/")?;
+    let (owner, repo) = path.trim_end_matches(".git").split_once('/')?;
+    let repo = repo.trim_end_matches('/');
+    (!owner.is_empty() && !repo.is_empty()).then(|| (owner.to_string(), repo.to_string()))
+}
+
+/// Resolves every credential a clone of `repo_url` may use, in priority order:
+/// 1. a GitHub App installation token, minted server-side on this node (device-independent);
+/// 2. the node-wide `GITHUB_TOKEN`;
+/// 3. the credential the REQUEST carried — last, because the dashboard fills it from the
+///    `gh_app_tok` browser cookie and it therefore exists only in one browser on one device.
+///
+/// A build whose repo is covered by (1) or (2) is identical from every device and from an
+/// unattended trigger; (3) only ever helps a repo nothing server-side can read.
+pub(crate) async fn resolve_clone_credentials(
+    repo_url: &str,
+    caller_token: Option<&str>,
+) -> CloneCredentials {
+    let mut out = CloneCredentials {
+        candidates: Vec::new(),
+        gaps: Vec::new(),
+    };
+    let Some((owner, repo)) = github_owner_repo(repo_url) else {
+        out.gaps.push(GitCredentialGap::NotGithub);
+        return out;
+    };
+    if crate::github_app_auth::configured() {
+        match crate::github_app_auth::installation_token_for_repo(&owner, &repo).await {
+            Ok(Some(token)) => out.candidates.push(CloneCredential {
+                source: GitCredentialSource::AppInstallation,
+                token,
+            }),
+            Ok(None) => out.gaps.push(GitCredentialGap::AppNotInstalled {
+                owner: owner.clone(),
+                repo: repo.clone(),
+            }),
+            Err(e) => out.gaps.push(GitCredentialGap::AppMintFailed {
+                detail: format!("{e:#}"),
+            }),
+        }
+    } else {
+        out.gaps.push(GitCredentialGap::AppNotConfigured);
+    }
+    match std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty()) {
+        Some(token) => out.candidates.push(CloneCredential {
+            source: GitCredentialSource::NodeEnv,
+            token,
+        }),
+        None => out.gaps.push(GitCredentialGap::NoNodeToken),
+    }
+    match caller_token.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(token) => out.candidates.push(CloneCredential {
+            source: GitCredentialSource::CallerSupplied,
+            token: token.to_string(),
+        }),
+        None => out.gaps.push(GitCredentialGap::NoCallerCredential),
+    }
+    out
+}
+
+/// The actionable clone-failure text: it names which sources the node tried and the real reason
+/// none authenticated, instead of a generic "connect GitHub". Never carries a token — `stderr` is
+/// already scrubbed by the caller and every candidate is a `GitCredentialSource` label.
+fn clone_auth_failure_message(
+    plan: &CloneCredentials,
+    repo_url: &str,
+    stderr: &str,
+) -> String {
+    let gaps = plan
+        .gaps
+        .iter()
+        .map(|g| g.hint())
+        .collect::<Vec<_>>()
+        .join("; ");
+    let detail = if plan.candidates.is_empty() {
+        format!(
+            "git clone failed: no GitHub credential is available for {repo_url} on this node, so \
+             the clone went anonymous and a private repository cannot be read — {gaps}"
+        )
+    } else {
+        let tried = plan
+            .candidates
+            .iter()
+            .map(|c| c.source.label())
+            .collect::<Vec<_>>()
+            .join(", then ");
+        format!(
+            "git clone failed: GitHub rejected every credential this node could offer for \
+             {repo_url} (tried {tried}) — {gaps}"
+        )
+    };
+    format!("{detail}. (git: {stderr})")
+}
+
 /// Marker error: `run_build` returned `Err` because the user cancelled, not because a step failed,
 /// so the driving task sets `DeployState::Cancelled` instead of `Error` without string-matching the
 /// message.
@@ -2795,20 +2986,28 @@ async fn run_build(
                 .unwrap_or_else(|| "HEAD".into())
         ));
         let t0 = now_ms();
-        let git_token: Option<String> = match req.git_token.clone().filter(|t| !t.is_empty()) {
-            Some(token) => Some(token),
-            None => match std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()) {
-                Some(token) => Some(token),
-                None => resolve_git_poll_token(&clone_source_url).await,
-            },
+        // SERVER-SIDE first: a build must not depend on the one browser holding the `gh_app_tok`
+        // cookie, so the App installation token this node mints itself and the node-wide
+        // GITHUB_TOKEN are resolved before the token the request happened to carry.
+        let credentials = resolve_clone_credentials(&clone_source_url, req.git_token.as_deref()).await;
+        for gap in &credentials.gaps {
+            if matches!(
+                gap,
+                GitCredentialGap::AppNotInstalled { .. } | GitCredentialGap::AppMintFailed { .. }
+            ) {
+                tracing::warn!(
+                    repo = %short_repo,
+                    reason = %gap.hint(),
+                    "clone credential: the GitHub App yielded no token for this repo"
+                );
+            }
         }
-        .filter(|_| clone_source_url.starts_with("https://github.com/"));
 
-        let run_clone = |use_token: bool| {
+        let run_clone = |token: Option<String>| {
             let (dir, branch, token, commit, ccloud, cbid, clone_url) = (
                 dir.clone(),
                 branch.clone(),
-                if use_token { git_token.clone() } else { None },
+                token,
                 pinned_commit.clone(),
                 cloud.clone(),
                 bid.to_string(),
@@ -2974,7 +3173,6 @@ async fn run_build(
                 || s.contains("Repository not found")
         };
 
-        let used_token = git_token.is_some();
         struct AbortOnDrop(tokio::task::JoinHandle<()>);
         impl Drop for AbortOnDrop {
             fn drop(&mut self) {
@@ -2993,13 +3191,39 @@ async fn run_build(
                 }
             })
         });
-        let mut with_token = used_token;
-        let (mut ok, mut stderr) = run_clone(with_token).await;
-        if !ok && used_token && auth_failed(&stderr) {
+        let mut tried = 0usize;
+        let mut with_token: Option<String> = credentials.candidates.first().map(|c| c.token.clone());
+        if let Some(first) = credentials.candidates.first() {
+            log(format!("Cloning with the {}.", first.source.label()));
+            if first.source == GitCredentialSource::CallerSupplied {
+                log(
+                    "No server-side GitHub credential covers this repo — this clone depends on \
+                     the credential the request carried."
+                        .to_string(),
+                );
+            }
+        }
+        let (mut ok, mut stderr) = run_clone(with_token.clone()).await;
+        // A credential GitHub rejects advances to the next one: the App installation, the node PAT
+        // and the request's own token cover different repos, so one 403 is not yet a clone failure.
+        while !ok && auth_failed(&stderr) && tried + 1 < credentials.candidates.len() {
+            let next = &credentials.candidates[tried + 1];
             let _ = tokio::fs::remove_dir_all(&dir).await;
-            log("Retrying clone without the stored GitHub credential…".into());
-            with_token = false;
-            let (ok2, stderr2) = run_clone(false).await;
+            log(format!(
+                "Clone credential rejected — retrying with the {}.",
+                next.source.label()
+            ));
+            tried += 1;
+            with_token = Some(next.token.clone());
+            let (ok2, stderr2) = run_clone(with_token.clone()).await;
+            ok = ok2;
+            stderr = stderr2;
+        }
+        if !ok && with_token.is_some() && auth_failed(&stderr) {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            log("Retrying clone without a credential…".into());
+            with_token = None;
+            let (ok2, stderr2) = run_clone(None).await;
             ok = ok2;
             stderr = stderr2;
         }
@@ -3015,7 +3239,7 @@ async fn run_build(
             ));
             tokio::time::sleep(Duration::from_secs(5 * (attempt as u64 - 1))).await;
             let _ = tokio::fs::remove_dir_all(&dir).await;
-            let (ok2, stderr2) = run_clone(with_token).await;
+            let (ok2, stderr2) = run_clone(with_token.clone()).await;
             ok = ok2;
             stderr = stderr2;
         }
@@ -3026,18 +3250,7 @@ async fn run_build(
             ok,
             "{}",
             if auth_failed(&stderr) {
-                if used_token {
-                    format!(
-                        "git clone failed: GitHub rejected the stored credential — it may be expired \
-                         or lack access to this repository. Reconnect GitHub and redeploy. ({stderr})"
-                    )
-                } else {
-                    format!(
-                        "git clone failed: this repository is private or inaccessible over anonymous \
-                         HTTPS. Connect GitHub on the Integrations page (or set GITHUB_TOKEN on the node) \
-                         and redeploy — private repositories need a credential. ({stderr})"
-                    )
-                }
+                clone_auth_failure_message(&credentials, &clone_source_url, &stderr)
             } else {
                 format!("git clone failed: {stderr}")
             }
@@ -11061,7 +11274,10 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_cpus: None,
         image_pids: None,
         image_ports: None,
-        git_token: token,
+        // No credential is attached: `run_build` resolves one server-side on the node that runs
+        // the build, from the same primitive the poll used for `ls-remote` above, so a poll
+        // deploy is not pinned to this coordinator's credential (and mints no second token).
+        git_token: None,
     };
     let build_id = match start_build(cloud.clone(), req, None, None).await {
         Ok(id) => id,
@@ -11155,50 +11371,45 @@ async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -
 
 /// Token for polling/cloning a PRIVATE github repo: a GitHub App installation token (minted
 /// server-side, no user session) first, else a node-wide `GITHUB_TOKEN`; `None` for a public repo
-/// or a non-github host. Mirrors `git_webhook`'s resolution so both auto-deploy paths authenticate
-/// identically. A working App key with the App not INSTALLED on the repo's org is named (once per
+/// or a non-github host. Shares `resolve_clone_credentials` with the interactive clone path so
+/// every auto-deploy and every user-triggered deploy authenticate identically. A working App key with the App not INSTALLED on the repo's org is named (once per
 /// repo) rather than swallowed, because it otherwise reads like "no credential configured"
 /// (`had_token=false`) and mis-steers the diagnosis toward installing keys that already exist.
 async fn resolve_git_poll_token(repo_url: &str) -> Option<String> {
-    if !repo_url.starts_with("https://github.com/") {
-        return None;
-    }
-    if crate::github_app_auth::configured() {
-        let path = repo_url
-            .trim_start_matches("https://github.com/")
-            .trim_end_matches(".git");
-        if let Some((owner, repo)) = path.split_once('/') {
-            match crate::github_app_auth::installation_token_for_repo(owner, repo).await {
-                Ok(Some(tok)) => return Some(tok),
-                Ok(None) => {
-                    static REPORTED: std::sync::OnceLock<
-                        parking_lot::Mutex<std::collections::HashSet<String>>,
-                    > = std::sync::OnceLock::new();
-                    let repo_key = format!("{owner}/{repo}");
-                    if REPORTED
-                        .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
-                        .lock()
-                        .insert(repo_key)
-                    {
-                        tracing::warn!(
-                            owner,
-                            repo,
-                            "GitHub App is configured but NOT INSTALLED on this repo's \
-                             owner — install the App on the org (Settings → GitHub Apps) \
-                             or set GITHUB_TOKEN"
-                        );
-                    }
+    let plan = resolve_clone_credentials(repo_url, None).await;
+    for gap in &plan.gaps {
+        match gap {
+            // A working App key with the App not INSTALLED on the repo's owner is named (once per
+            // repo) rather than swallowed, because it otherwise reads like "no credential
+            // configured" and mis-steers the diagnosis toward installing keys that already exist.
+            GitCredentialGap::AppNotInstalled { owner, repo } => {
+                static REPORTED: std::sync::OnceLock<
+                    parking_lot::Mutex<std::collections::HashSet<String>>,
+                > = std::sync::OnceLock::new();
+                let repo_key = format!("{owner}/{repo}");
+                if REPORTED
+                    .get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+                    .lock()
+                    .insert(repo_key)
+                {
+                    tracing::warn!(
+                        owner,
+                        repo,
+                        "GitHub App is configured but NOT INSTALLED on this repo's \
+                         owner — install the App on the org (Settings → GitHub Apps) \
+                         or set GITHUB_TOKEN"
+                    );
                 }
-                Err(e) => tracing::warn!(
-                    owner,
-                    repo,
-                    error = %e,
-                    "GitHub App installation-token mint failed (key/parse/API)"
-                ),
             }
+            GitCredentialGap::AppMintFailed { detail } => tracing::warn!(
+                repo = %repo_url,
+                reason = %detail,
+                "GitHub App installation-token mint failed (key/parse/API)"
+            ),
+            _ => {}
         }
     }
-    std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty())
+    plan.candidates.into_iter().next().map(|c| c.token)
 }
 
 #[cfg(test)]
