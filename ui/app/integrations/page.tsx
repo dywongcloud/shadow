@@ -32,6 +32,17 @@ interface GhDetail {
   via?: "user-token" | "installation" | "composio";
   /** Where to install/configure the App on orgs (github-app provider only). */
   installUrl?: string;
+  /** Whether THIS request holds a credential at all, independent of whether GitHub was reached: the two facts fail for
+   *  different reasons and collapsing them is what made one network blip read as "not connected". */
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected";
+  /** Whether the live probe got an ANSWER: "reachable" = GitHub answered for this credential, "unavailable" = no answer
+   *  (network/timeout/5xx/rate limit, which says nothing about it), "rejected" = answered and refused it, "unknown" = the
+   *  status handler's own deadline beat the probe. */
+  reachability?: "reachable" | "unavailable" | "rejected" | "unknown";
+  /** True when the answer is honest but incomplete: a credential is held and GitHub could not confirm it just now. */
+  degraded?: boolean;
+  /** Why the probe did not confirm the connection; human-readable and never a token. */
+  reachabilityError?: string;
 }
 interface GhOrg { login: string; name?: string }
 
@@ -341,12 +352,37 @@ export default function IntegrationsPage() {
   );
 }
 
+/** True when the status answer is honest but incomplete: a credential is HELD and GitHub could not confirm it just now, so
+ *  a bare "connected" would be a claim about a check that never ran. */
+function isDegraded(gh: GhDetail): boolean {
+  return !!gh.degraded || gh.reachability === "unavailable" || gh.reachability === "unknown";
+}
+
+/** The honest one-line GitHub state. `connected` alone lies while the reachability check did not run, and an
+ *  undecryptable cookie is an actionable deployment fault (a round-robin host whose key differs), never a silent
+ *  "not connected". Never renders a token, a cookie or a secret. */
+function githubSubtitle(gh: GhDetail): string {
+  if (!gh.configured) return "not configured";
+  if (gh.credential === "unreadable") return "credential unreadable on this host — reconnect GitHub";
+  // "rejected" is the one class that is really not connected: GitHub ANSWERED and refused the credential.
+  const rejected = gh.reachability === "rejected" || gh.credential === "rejected";
+  if (!gh.connected) return (gh.scopes ?? []).length > 0 || rejected ? "reconnect needed" : "not connected";
+  const who = gh.login
+    ? `@${gh.login}${gh.via === "installation" ? " · app installation" : ""}`
+    : gh.via === "installation"
+    ? "connected via app installation"
+    : "connected";
+  return isDegraded(gh) ? `${who} · connected (status check unavailable)` : who;
+}
+
 /** The GitHub connection management card: the HONEST state (ACTIVE and live), granted scopes as badges, accessible organizations, and real
  *  Disconnect/Configure actions; a dead-but-ACTIVE token shows a red "reconnect needed" banner, never a false green. */
 function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRefresh: () => void }) {
   const [busy, setBusy] = useState<null | "connect" | "reconnect" | "disconnect">(null);
   const scopes = gh.scopes ?? [];
-  const needsReconnect = gh.configured && !gh.connected && scopes.length > 0;
+  // GitHub ANSWERED and refused the credential: really not connected, and the one class that must read as "reconnect".
+  const rejected = gh.reachability === "rejected" || gh.credential === "rejected";
+  const needsReconnect = gh.configured && !gh.connected && (scopes.length > 0 || rejected);
 
   async function connect(kind: "connect" | "reconnect") {
     setBusy(kind);
@@ -377,17 +413,9 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
   }
 
   const active = gh.connected;
-  const subtitle = !gh.configured
-    ? "not configured"
-    : active
-    ? gh.login
-      ? `@${gh.login}${gh.via === "installation" ? " · app installation" : ""}`
-      : gh.via === "installation"
-      ? "connected via app installation"
-      : "connected"
-    : needsReconnect
-    ? "reconnect needed"
-    : "not connected";
+  const degraded = isDegraded(gh);
+  const unreadable = gh.credential === "unreadable";
+  const subtitle = githubSubtitle(gh);
 
   return (
     <Card className="p-5">
@@ -399,8 +427,16 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             <div className="text-xs text-muted">{subtitle}</div>
           </div>
         </div>
-        <Badge tone={active ? "green" : needsReconnect ? "red" : "default"}>
-          {active ? <><Check className="h-3 w-3" /> Active</> : needsReconnect ? "Reconnect" : "Inactive"}
+        <Badge tone={degraded ? "amber" : active ? "green" : needsReconnect || unreadable ? "red" : "default"}>
+          {degraded ? (
+            "Degraded"
+          ) : active ? (
+            <><Check className="h-3 w-3" /> Active</>
+          ) : needsReconnect || unreadable ? (
+            "Reconnect"
+          ) : (
+            "Inactive"
+          )}
         </Badge>
       </div>
 
@@ -422,6 +458,26 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             <div className="mb-3 flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>Your GitHub authorization is no longer valid (the token was revoked or expired). Reconnect to restore access.</span>
+            </div>
+          ) : null}
+
+          {degraded ? (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                {gh.reachabilityError ||
+                  "GitHub could not be reached just now — your authorization is still held, but this check did not run."}
+              </span>
+            </div>
+          ) : null}
+
+          {unreadable ? (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                This host cannot decrypt the stored GitHub credential (it was sealed by another host), so the connection
+                cannot be read here. Reconnect GitHub on this host — or retry, another host may answer.
+              </span>
             </div>
           ) : null}
 

@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
-import { Github, GitBranch, Check, Loader2, X, ArrowRight, ExternalLink } from "lucide-react";
+import { Github, GitBranch, Check, Loader2, X, ArrowRight, ExternalLink, AlertTriangle } from "lucide-react";
 import { currentTeam, useCan } from "@/lib/api";
 import { roleHint, roleNote } from "@/lib/team-role";
 
@@ -15,6 +15,14 @@ interface GhStatus {
   hasPrivateAccess?: boolean;
   hasOrgScope?: boolean;
   live?: boolean;
+  /** Whether a credential is held at all, separate from whether GitHub answered for it. */
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected";
+  /** Whether the live probe got an ANSWER: "unavailable"/"unknown" say nothing about the credential. */
+  reachability?: "reachable" | "unavailable" | "rejected" | "unknown";
+  /** True when a credential is held but GitHub could not confirm it just now. */
+  degraded?: boolean;
+  /** Why the check did not run; human-readable and never a token. */
+  reachabilityError?: string;
 }
 interface Repo { name: string; full_name: string; default_branch: string; private: boolean; owner?: string }
 interface GhOrg { login: string; name?: string }
@@ -51,6 +59,21 @@ const syncInFlight = new Map<string, boolean>();
 const syncPending = new Map<string, boolean>();
 
 const RETRY_DELAYS_MS = [2000, 4000, 8000];
+
+/** `/api/github/status` bounds itself at 3500 ms and then answers honestly from the stored credential, so the client's
+ *  abort must sit ABOVE that bound: aborting inside it is what turned "GitHub did not answer in time" into "not
+ *  connected". The slack covers a slow hop, not a hung server. */
+const STATUS_TIMEOUT_MS = 6000;
+
+/** Why the repo step can legitimately show an empty list: a credential that is HELD but unconfirmed yields no token, so
+ *  `/api/github/repos` answers `[]`. The UI owes the user that reason, never a bare "No repositories found". */
+function degradedNote(s: GhStatus): string {
+  if (!s.degraded && s.reachability !== "unavailable" && s.reachability !== "unknown") return "";
+  return (
+    s.reachabilityError ||
+    "GitHub could not be reached just now — your connection is still held, but this check did not run."
+  );
+}
 
 function wait(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -147,6 +170,9 @@ export function GitOps() {
   const [done, setDone] = useState(false);
   const [result, setResult] = useState<{ repo: string; created: boolean; files: number } | null>(null);
   const [error, setError] = useState("");
+  /** Set when the status answer is degraded: the repo step still opens (the connection is real) but says why the
+   *  repository list may be empty. */
+  const [statusNote, setStatusNote] = useState("");
   const [approveUrl, setApproveUrl] = useState("");
   const inited = useRef(false);
   const pathname = usePathname();
@@ -180,12 +206,14 @@ export function GitOps() {
       setDone(false);
       setError("");
       setApproveUrl("");
+      setStatusNote("");
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 4000);
+      const timer = setTimeout(() => ctrl.abort(), STATUS_TIMEOUT_MS);
       fetch("/api/github/status", { signal: ctrl.signal })
         .then((r) => r.json())
         .then((s: GhStatus) => {
           setStatus(s);
+          setStatusNote(degradedNote(s));
           if (s.connected) { setStep("repo"); loadRepos(); }
           else setStep("intro");
         })
@@ -213,11 +241,12 @@ export function GitOps() {
     }
 
     const statusCtrl = new AbortController();
-    const statusTimer = setTimeout(() => statusCtrl.abort(), 4000);
+    const statusTimer = setTimeout(() => statusCtrl.abort(), STATUS_TIMEOUT_MS);
     fetch("/api/github/status", { signal: statusCtrl.signal })
       .then((r) => r.json())
       .then((s: GhStatus) => {
         setStatus(s);
+        setStatusNote(degradedNote(s));
         if (justConnected && s.connected) {
           setStep("repo");
           loadRepos();
@@ -445,9 +474,16 @@ export function GitOps() {
               </div>
             ) : (
               <>
+                {statusNote ? (
+                  <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{statusNote}</span>
+                  </div>
+                ) : null}
+
                 <p className="text-sm text-secondary">
-                  GitHub connected. We&apos;ll generate the OpenEdge spec, configs &amp; meta artifacts and
-                  commit them to a repo.
+                  GitHub connected{statusNote ? " (status check unavailable)" : ""}. We&apos;ll generate the
+                  OpenEdge spec, configs &amp; meta artifacts and commit them to a repo.
                 </p>
 
                 <div className="mt-4 grid grid-cols-2 gap-2">
@@ -530,7 +566,11 @@ export function GitOps() {
                           {r.full_name} {r.private ? "(private)" : ""}
                         </option>
                       ))}
-                      {!loadingRepos && repos.length === 0 ? <option value="">No repositories found</option> : null}
+                      {!loadingRepos && repos.length === 0 ? (
+                        <option value="">
+                          {statusNote ? "No repositories listed — status check unavailable" : "No repositories found"}
+                        </option>
+                      ) : null}
                     </select>
                   </>
                 )}

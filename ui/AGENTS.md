@@ -73,11 +73,12 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   to the project's owner. The proof URL is built only for a platform-issued host (`isKnownDeploymentHost`),
   `http` only for `localhost`.
 - GitHub connect state (`githubConnectionDetail`): only a token GitHub itself just answered for may report
-  `connected`; the GLOBAL `GET /app/installations` list spans every customer and is never evidence for THIS
-  browser's user. The App user token lives ENCRYPTED in an httpOnly cookie and `getGithubAppToken()` is
-  called ONLY from a Route Handler (a refresh from a Server Component burns GitHub's single-use refresh
-  token). The OAuth `state` signs `returnTo` + the Clerk uid and a 10-min nonce cookie binds it; the
-  callback always consumes the nonce.
+  `connected` — HELD but unchecked: `connected`+`degraded`; `unreadable` never "not connected". The
+  GLOBAL `GET /app/installations` list spans every customer, never evidence for THIS browser's user. The
+  App user token lives ENCRYPTED in an httpOnly cookie and `getGithubAppToken()` is
+  called ONLY from a Route Handler (a Server Component refresh burns GitHub's single-use refresh token). The
+  OAuth `state` signs `returnTo` + the Clerk uid and a 10-min nonce cookie binds it; the callback always
+  consumes the nonce.
 - Committed GitOps artifacts never carry secrets (`databaseNode` is an explicit field allowlist,
   `projectNode` serializes env KEYS only). `composio.commitFiles` and `github-rest.ghCommitFiles` are ONE
   contract with TWO implementations (a branch whose tree cannot be resolved REFUSES: a tree without
