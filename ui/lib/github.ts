@@ -1,6 +1,15 @@
 import * as composio from "./composio";
 import type { CommitResult, CreateRepoResult, GhRepo, GithubConnectionDetail } from "./composio";
-import { getGithubAppToken, githubAppConfigured, readTokenBundle, updateBundleMeta } from "./github-app";
+import {
+  type CredentialState,
+  getGithubAppToken,
+  getGithubAppTokenResult,
+  githubAppConfigured,
+  probeGithubUser,
+  readTokenBundle,
+  readTokenBundleResult,
+  updateBundleMeta,
+} from "./github-app";
 import * as rest from "./github-rest";
 import { installationAuthConfigured, installationTokenForRepo, listAppInstallations } from "./github-installation";
 
@@ -32,28 +41,87 @@ export interface GithubDetail extends GithubConnectionDetail {
   installationError?: string;
   /** Accounts (logins) the App is installed on, when installationState==="present". */
   installations?: string[];
+  /** Whether THIS request holds a GitHub credential at all (`CredentialState`), independent of whether GitHub was reached.
+   *  The two facts are separate on purpose: "we hold a credential" and "GitHub just answered for it" fail for different
+   *  reasons, and collapsing them is what made a transient network blip read as "not connected". */
+  credential?: CredentialState;
+  /** Whether the live probe to GitHub got an ANSWER: "reachable" = it answered for this credential, "unavailable" = no
+   *  answer (network/timeout/5xx/rate limit, which says nothing about the credential), "rejected" = it answered and
+   *  refused it, "unknown" = the status handler's own deadline beat the probe. */
+  reachability?: "reachable" | "unavailable" | "rejected" | "unknown";
+  /** True when the answer is honest but incomplete: a credential is held and GitHub could not confirm it just now, so the
+   *  UI must say "connected (status check unavailable)" and never "not connected". */
+  degraded?: boolean;
+  /** Why a probe did not confirm the connection; human-readable and never a token. */
+  reachabilityError?: string;
+}
+
+/** A secondary GitHub read (orgs, installations) is decoration next to the credential verdict: it must never hold the
+ *  answer past the client's own abort, so it races a deadline and falls back to "not fetched". */
+const SECONDARY_READ_TIMEOUT_MS = 2500;
+
+async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([p, new Promise<T>((res) => (timer = setTimeout(() => res(fallback), ms)))]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** The last known good credential state, with NO network call: for a caller whose own deadline beat GitHub's answer, so an
+ *  unanswered probe is reported as "unknown" rather than as "not connected". */
+export async function githubLastKnownDetail(entity: string): Promise<GithubDetail> {
+  const { bundle, state } = await readTokenBundleResult();
+  const held = !!bundle;
+  return {
+    configured: githubConfigured(),
+    connected: held,
+    entity,
+    login: bundle?.login ?? null,
+    scopes: [],
+    hasPrivateAccess: held,
+    hasOrgScope: false,
+    live: false,
+    provider: held ? "github-app" : undefined,
+    via: held ? "user-token" : undefined,
+    credential: state === "ok" ? "valid" : state,
+    reachability: "unknown",
+    degraded: held,
+    ...(held
+      ? { reachabilityError: "GitHub did not answer in time — showing the last known connection state." }
+      : {}),
+  };
 }
 
 export async function githubConnectionDetail(entity: string): Promise<GithubDetail> {
-  const token = await getGithubAppToken();
-  if (token) {
-    const user = await rest.ghUser(token);
-    if (user?.login) {
-      const [orgs, installs] = await Promise.all([rest.ghOrgs(token), rest.ghInstallations(token)]);
+  const cred = await getGithubAppTokenResult();
+  const held = cred.state === "valid" || cred.state === "refresh-unavailable";
+
+  if (held) {
+    // GitHub could not be reached to rotate an expired token: we still HOLD the grant, so the connection is reported as
+    // connected-but-unconfirmed. Reporting false here is what made one network blip read as "you are not connected".
+    const probe = cred.token ? await probeGithubUser(cred.token) : ({ kind: "unreachable" } as const);
+
+    if (probe.kind === "ok") {
+      const token = cred.token as string;
+      const [orgs, installs] = await Promise.all([
+        withTimeout(rest.ghOrgs(token), SECONDARY_READ_TIMEOUT_MS, [] as { login: string; name?: string }[]),
+        withTimeout(rest.ghInstallations(token), SECONDARY_READ_TIMEOUT_MS, []),
+      ]);
       const hasOrg = orgs.length > 0 || installs.some((i) => i.account_type === "Organization");
       const slug = installs.find((i) => i.app_slug)?.app_slug;
       const installUrl = slug
         ? `https://github.com/apps/${slug}/installations/new`
         : "https://github.com/settings/installations";
-      const bundle = await readTokenBundle();
-      if (bundle && (bundle.login !== user.login || (slug && bundle.slug !== slug))) {
-        await updateBundleMeta({ login: user.login, slug }).catch(() => {});
+      if (cred.bundle && (cred.bundle.login !== probe.login || (slug && cred.bundle.slug !== slug))) {
+        await updateBundleMeta({ login: probe.login, slug }).catch(() => {});
       }
       return {
         configured: true,
         connected: true,
         entity,
-        login: user.login,
+        login: probe.login,
         scopes: [],
         hasPrivateAccess: true,
         hasOrgScope: hasOrg,
@@ -61,8 +129,49 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
         provider: "github-app",
         via: "user-token",
         installUrl,
+        credential: cred.state,
+        reachability: "reachable",
       };
     }
+
+    if (probe.kind === "rejected") {
+      // GitHub ANSWERED and refused the credential: the authorization is revoked or stale. The cookie is left for the user
+      // to reconnect explicitly — a read never destroys a credential — but this is the one class that is really "not connected".
+      return {
+        configured: true,
+        connected: false,
+        entity,
+        login: cred.bundle?.login ?? null,
+        scopes: [],
+        hasPrivateAccess: false,
+        hasOrgScope: false,
+        live: false,
+        provider: "github-app",
+        via: "user-token",
+        credential: "rejected",
+        reachability: "rejected",
+        reachabilityError:
+          "GitHub refused this connection's token — the authorization was revoked or replaced. Reconnect GitHub to continue.",
+      };
+    }
+
+    // Unreachable: keep the credential, keep the last known identity, and say the check did not run.
+    return {
+      configured: true,
+      connected: true,
+      entity,
+      login: cred.bundle?.login ?? null,
+      scopes: [],
+      hasPrivateAccess: true,
+      hasOrgScope: false,
+      live: false,
+      provider: "github-app",
+      via: "user-token",
+      credential: cred.state,
+      reachability: "unavailable",
+      degraded: true,
+      reachabilityError: "GitHub could not be reached just now — showing the last known connection state.",
+    };
   }
 
   let installationState: GithubDetail["installationState"];
@@ -81,6 +190,10 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
     provider: d.connected || d.scopes.length ? "composio" : undefined,
     via: d.connected || d.scopes.length ? "composio" : undefined,
     installationState,
+    // "foreign"/"unreadable" are reported, not collapsed into "no connection": an undecryptable cookie on a round-robin
+    // host whose client secret differs is a deployment fault, and the UI has to be able to say so.
+    credential: cred.state,
+    ...(d.connected ? { reachability: "reachable" as const } : {}),
     ...(installationError ? { installationError } : {}),
   };
 }

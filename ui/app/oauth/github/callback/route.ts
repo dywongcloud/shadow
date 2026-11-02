@@ -48,11 +48,18 @@ export async function GET(req: NextRequest) {
   }
 
   const returnTo = sameOriginPath(v.returnTo, "/");
-  const bundle = await exchangeCode(code);
-  if (!bundle) {
-    return back(returnTo, { github_error: "GitHub token exchange failed — please try again." });
+  const exchange = await exchangeCode(code);
+  if (exchange.kind !== "ok") {
+    // A transient failure ("GitHub did not answer") must not read like a refusal, and neither one touches a connection the
+    // browser already holds: the cookie is only ever written on success.
+    return back(returnTo, {
+      github_error:
+        exchange.kind === "transient"
+          ? "GitHub could not be reached to finish the connection — please try again in a moment."
+          : "GitHub refused this authorization — please connect GitHub again.",
+    });
   }
-
+  const bundle = exchange.bundle;
   if (v.uid) bundle.uid = v.uid;
   await setTokenCookie(bundle);
   const sep = returnTo.includes("?") ? "&" : "?";
