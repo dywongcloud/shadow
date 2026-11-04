@@ -321,6 +321,8 @@ struct EstablishWatch {
     /// When the current evidence streak began (0 = no evidence).
     since_ms: u64,
     last_warn_ms: u64,
+    last_blocker_warn_ms: u64,
+    last_clear_ms: u64,
 }
 
 impl EstablishWatch {
@@ -340,10 +342,14 @@ impl EstablishWatch {
         let boot_ms = now.saturating_sub(h.uptime_ms);
         let evidence = establishment_wedge_evidence(&es, now, boot_ms, window_ms, failing);
         let Some(WedgeEvidence::Restart(kind)) = evidence else {
-            if self.since_ms != 0 {
-                tracing::info!(
+            if self.since_ms != 0
+                && now.saturating_sub(self.last_clear_ms) >= 300_000
+            {
+                self.last_clear_ms = now;
+                tracing::warn!(
                     held_secs = now.saturating_sub(self.since_ms) / 1000,
-                    "mesh watchdog: establishment wedge evidence cleared"
+                    observed = ?evidence,
+                    "mesh watchdog: establishment wedge evidence cleared before the stagger elapsed"
                 );
             }
             self.since_ms = 0;
@@ -402,8 +408,8 @@ impl EstablishWatch {
             );
             return true;
         }
-        if now.saturating_sub(self.last_warn_ms) >= 300_000 {
-            self.last_warn_ms = now;
+        if now.saturating_sub(self.last_blocker_warn_ms) >= 300_000 {
+            self.last_blocker_warn_ms = now;
             tracing::warn!(
                 evidence = kind,
                 held_by = blocker.as_deref().unwrap_or("the shared restart gate"),

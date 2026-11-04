@@ -214,7 +214,7 @@ fi
 # ---------------------------------------------------------------------------
 # Fleet mode.
 INVENTORY="${INVENTORY:-$(dirname "$0")/../ansible/inventory/hosts.ini}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/billing.pem}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_OPTS=(-o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
 
 if [ ! -f "$INVENTORY" ]; then
@@ -264,7 +264,13 @@ probe() {
   # HIVE_DATA is read from the SAME live environ, falling back to $HOME/.hive-cloud (also from that
   # environ) like persist.rs's own default. The check script itself runs as `sh -c "<script>"`, so
   # nothing is written to the host. Bounded end to end: a wedged node cannot hang the whole audit.
-  ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "root@$1" 'timeout 60 sh -s' 2>/dev/null <<REMOTE
+  local ip="$1"
+  local user="${2:-root}"
+  local remote_cmd='timeout 60 sh -s'
+  if [ "$user" != root ]; then
+    remote_cmd='sudo -n timeout 60 sh -s'
+  fi
+  ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$user@$ip" "$remote_cmd" 2>/dev/null <<REMOTE
 pid=\$(systemctl show -p MainPID --value hive-node.service 2>/dev/null)
 if [ -z "\$pid" ] || [ "\$pid" = 0 ]; then
   echo "NO-PROCESS|FAIL|hive-node.service has no MainPID (not running, or this host is not a systemd host)"
@@ -289,13 +295,8 @@ bad=0; audited=0; skipped=0
 while IFS=$'\t' read -r name ip user; do
   [ -z "$name" ] && continue
   if [ -n "$ONLY" ] && [[ ",${ONLY}," != *",${name},"* ]]; then continue; fi
-  if [ "${user:-root}" != root ]; then
-    printf "%-18s %-16s %s\n" "$name" "$ip" "SKIPPED (ansible_user=$user is not root -- audit this host by hand)"
-    skipped=$((skipped + 1))
-    continue
-  fi
   audited=$((audited + 1))
-  out=$(probe "$ip")
+  out=$(probe "$ip" "${user:-root}")
   if [ -z "$out" ]; then
     printf "%-18s %-16s %s\n" "$name" "$ip" "UNREACHABLE (ssh failed -- try: ssh -i $SSH_KEY root@$ip true)"
     bad=1

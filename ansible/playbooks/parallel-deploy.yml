@@ -96,9 +96,22 @@
         tasks_from: push
 
 - name: Backend restart (serial -- mesh quorum safety)
-  hosts: platform
+  hosts: "platform:!sj"
   become: true
   serial: "{{ deploy_serial_backend | default(deploy_serial | default(1)) }}"
+  tags: [backend]
+  vars:
+    hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
+    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_platform_fanout
+        tasks_from: restart
+
+- name: Backend restart (control-plane chain head, deliberately last)
+  hosts: sj
+  become: true
+  serial: 1
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
