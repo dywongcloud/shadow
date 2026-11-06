@@ -1,0 +1,264 @@
+[platform:children]
+fc_kvm
+fc_pvm
+fc_gpu
+
+[fc_kvm]
+bkk ansible_host=43.152.247.70 ansible_user=root hive_name=fc-bangkok hive_region=bangkok hive_public_ip=43.152.247.70 hive_tencent_instance_id=ins-ldme28ac hive_tencent_region=ap-bangkok hive_retired=true
+# hk moved fc_pvm -> fc_kvm 2026-08-04 (pvm-fleet-target-inventory live probe:
+# real vmx + kvm_intel, /dev/kvm from HARDWARE, stock 6.6.117 kernel, KVM_CREATE_VM
+# ioctl ok, firecracker + 4GiB rootfs already present). It never needed PVM; its
+# fc_pvm membership was the wrong-group bug.
+hk  ansible_host=43.128.46.225   ansible_user=root hive_name=fc-hongkong    hive_region=hong-kong hive_public_ip=43.128.46.225 hive_tencent_instance_id=ins-aoa7qbkc hive_tencent_region=ap-hongkong hive_retired=true
+
+# fc-orlando: bare-metal Dell R640 at Atlantic.Net (Orlando FL), public IP
+# 209.23.0.183 IS on the interface -- no NAT, no CGNAT. Rocky Linux 10.2,
+# glibc 2.39 -> [glibc239]. REAL hardware virtualisation: /dev/kvm present,
+# Firecracker v1.16.1 at /usr/local/bin/firecracker, guest kernel
+# /var/lib/hive/vmlinux (vmlinux-6.1.128), and a real microVM was booted on
+# this host -- so it belongs in [fc_kvm], never [fc_pvm]. SELinux reads
+# Permissive here (getenforce), not Enforcing. SSH user is sysadmin (not
+# root) with our ed25519 key; sudo through wheel.
+# Added 2026-10-09 so scripts/gen-hive-lockdown.sh can derive a PEERS roster
+# that includes it. Without an inventory line this host can never appear in
+# the generated roster, which is exactly why its inbound rules ended up
+# hand-typed into the vendor `ip filter` PUBLIC chain instead.
+fc-orlando ansible_host=209.23.0.183 ansible_user=sysadmin ansible_ssh_private_key_file=/Users/dylanwong/.ssh/id_ed25519 hive_name=fc-orlando hive_region=orlando hive_public_ip=209.23.0.183 hive_geo="28.5383,-81.3792,Orlando,United States" hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0
+
+[fc_pvm]
+# hive_geo pins the UI's displayed city: ip-api.com's IP-block geolocation
+# guesses this Tencent Ashburn range as Santa Clara/Bay Area (a common
+# cloud-ASN geo-IP miss), which is wrong -- these are Ashburn, VA, matching
+# hive_region=virginia and cvmsj1/cvmsj2's own documented ping-triangulation
+# below. Format: lat,lon,city,country (see geolocate()'s HIVE_GEO parser).
+va  ansible_host=43.166.206.175  ansible_user=root hive_name=fc-virginia    hive_region=virginia  hive_public_ip=43.166.206.175 hive_geo="39.0438,-77.4874,Ashburn,United States" hive_tencent_instance_id=ins-7d6a22bf hive_tencent_region=na-ashburn hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_private_ip=10.0.0.8
+va2 ansible_host=170.106.40.67   ansible_user=root hive_name=fc-virginia-2  hive_region=virginia  hive_public_ip=170.106.40.67 hive_geo="39.0438,-77.4874,Ashburn,United States" hive_tencent_instance_id=ins-6hbrl6sd hive_tencent_region=na-ashburn
+va3 ansible_host=43.172.25.45    ansible_user=root hive_name=fc-virginia-3  hive_region=virginia  hive_public_ip=43.172.25.45 hive_geo="39.0438,-77.4874,Ashburn,United States" hive_tencent_instance_id=ins-q8qa1qi9 hive_tencent_region=na-ashburn hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_private_ip=10.0.0.10
+sj  ansible_host=170.106.158.151 ansible_user=root hive_name=fc-sanjose     hive_region=san-jose  hive_public_ip=170.106.158.151 litebox_verified=true hive_tencent_instance_id=ins-i4y58ayc hive_tencent_region=na-siliconvalley hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_private_ip=10.0.0.12
+# sj state note (live probe 2026-08-04): currently boots stock EL10
+# 6.12.0-211.32.1 - no kvm_pvm module, no /dev/kvm at all, no pti=off on
+# cmdline. It NEEDS the PVM kernel installed (not just patched); placement
+# must not count on its KVM until the rollout rows land.
+sj2 ansible_host=43.173.78.95    ansible_user=root hive_name=fc-sanjose-2   hive_region=san-jose  hive_public_ip=43.173.78.95 hive_tencent_instance_id=ins-01lhhsbg hive_tencent_region=na-siliconvalley hive_retired=true
+# sj3/sj4/sj5: 3 new Tencent CVMs added 2026-08-29. Live-probed: no vmx/svm,
+# no /dev/kvm, stock Rocky 10.2 kernel 6.12.0-211.16.1.el10_2.0.1 -> would
+# need the PVM path like sj/sj2 above, but per explicit operator choice these
+# run LITEBOX instead (see [litebox] group below) -- pvm_skip=true so the
+# fc_pvm play no-ops (stay IN the group per node-join.yml's membership
+# assertion, same pattern as fr/phx/tokyo/seoul: never leave the hardware
+# group, just skip its play). [litebox] is eligibility only: the role's default
+# preserves the active drop-in and does not build or authorize anything. Staging
+# and digest-bound enablement happen only on an explicitly drained canary.
+# ip-api.com geolocates AS132203 to Santa Clara/Bay Area -- the SAME
+# documented geo-IP miss as the Virginia/Ashburn and São Paulo entries in
+# this file; hive_region=san-jose matches the existing sj/sj2/gpusj*/cvmsj*
+# convention for this ASN block, not a guess.
+# Addressed bootstrap peers (not bare ids), same pattern as fc-saopaulo/fc-frankfurt.
+sj3 ansible_host=43.153.114.15  ansible_user=root hive_name=fc-sanjose-3   hive_region=san-jose  hive_public_ip=43.153.114.15  hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-kmyb43ki hive_tencent_region=na-siliconvalley hive_retired=true
+sj4 ansible_host=43.172.117.92  ansible_user=root hive_name=fc-sanjose-4   hive_region=san-jose  hive_public_ip=43.172.117.92  hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-qrv11zsi hive_tencent_region=na-siliconvalley hive_retired=true
+sj5 ansible_host=43.135.132.93  ansible_user=root hive_name=fc-sanjose-5   hive_region=san-jose  hive_public_ip=43.135.132.93  hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-m9u39q0g hive_tencent_region=na-siliconvalley hive_retired=true
+# sj6 (fc-sanjose-6): Tencent CVM, san-jose (na-siliconvalley), same /24 as
+# sj4 (43.172.117.92) -- same batch. Live-probed 2026-09-04: Rocky 10.2,
+# glibc 2.39, kernel 6.12.0-211.16.1.el10_2.0.1 byte-identical to sj3/sj4/sj5,
+# NO vmx/svm, NO /dev/kvm -- same PVM-eligible shape as its siblings.
+# pvm_skip=true by operator direction (2026-09-04): litebox only, no PVM
+# kernel install/reboot for this node. litebox_verified=true set 2026-09-04
+# after a real hive-cloud --litebox-probe PASS on this exact host (both the
+# syscall rewriter and the full per-cell-TUN + patched-litebox + bind-shim
+# HTTP round trip succeeded) -- see PATCHES.md's 2026-09-04 addendum for the
+# upstream repo-rewrite this pin bump required.
+sj6 ansible_host=43.172.117.25  ansible_user=root hive_name=fc-sanjose-6   hive_region=san-jose  hive_public_ip=43.172.117.25  litebox_verified=true hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-27odan10 hive_tencent_region=na-siliconvalley hive_retired=true
+# sj7 (fc-sanjose-7): Tencent CVM ins-0g349qgo, na-siliconvalley-1, SA5.2XLARGE32
+# (8 vCPU / 32 GB), 50 GB CLOUD_BSSD root + 1000 GB CLOUD_BSSD data disk at
+# /var/lib/hive, 50 Mbit/s, same VPC/subnet/SG/key as sj. Created 2026-09-30.
+# Rocky 10 (glibc 2.39), no /dev/kvm -> litebox only, pvm_skip=true.
+# litebox_verified=true set 2026-09-30 after `hive-cloud --litebox-probe` PASS on
+# this host (binary 983b3a41, runner b19b6e17 from pin c325d5d9 + both patches).
+sj7 ansible_host=170.106.177.140 ansible_user=root hive_name=fc-sanjose-7   hive_region=san-jose  hive_public_ip=170.106.177.140 litebox_verified=true hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-0g349qgo hive_tencent_region=na-siliconvalley hive_private_ip=10.0.0.14 hive_lockdown_strict=true
+# fc-saopaulo (Tencent CVM, sa-saopaulo-1, no vmx/svm -> PVM). 512 vCPU /
+# 2.2TB RAM / 250G disk -- wildly larger than the rest of this group, but
+# still belongs here on hardware-virt grounds. hive_bootstrap_peers is
+# addressed (id|relay-url), not bare ids, per AGENTS.md's mesh-join gotcha
+# (bare-id seeds left three prior nodes invisible fleet-wide despite
+# healthz=200) -- seeded from va/sj/bkk's own real ids + relay URLs.
+# RELAY URL FORM MATTERS (bn-relay-front-native-dial-timeout): the standalone
+# iroh-relay on bkk/va/sj runs TLS, which moves EVERY relay service
+# (/relay websocket, /ping net_report probe, QAD) to the https socket :3343;
+# the plaintext :3340 listener is captive-portal-only (verified live
+# 2026-08-04: ws://:3340/relay -> 404, :3340/ping -> 404, QAD cert is
+# *.relay.shadw.app so IP-literal URLs fail it too). http://<ip>:3340 entries
+# are therefore dead relays: never probed-preferred, never dialable. Name
+# the https :3343 hostnames (cert is the *.relay.shadw.app wildcard, so the
+# DNS name is mandatory -- an IP literal fails TLS verification).
+sp  ansible_host=43.166.76.159   ansible_user=root hive_name=fc-saopaulo    hive_region=sao-paulo hive_public_ip=43.166.76.159 hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 hive_tencent_instance_id=ins-3mirfph1 hive_tencent_region=sa-saopaulo hive_retired=true
+# fc-frankfurt: no vmx/svm -> PVM (kernel 7.1.5 + kvm-pvm.ko already present
+# on this host from a prior partial provisioning pass; podman/firecracker-next
+# also already installed -- only hive_platform/mesh/dns/fail2ban remained).
+# pvm_skip=true: EXCLUDED from the pvm_firecracker role entirely. Booting a real
+# microVM on this host's PVM kernel HARD-RESETS THE WHOLE HOST -- reproduced 3
+# times on 2026-07-31, root-caused to `switcher_return_from_guest`
+# (entry_64_switcher.S:80). See docs/blocked-work.md:76-80
+# ("pvm-switcher-real-guest-transition-crashes-host") and
+# docs/pvm-upstream-report.md §8. The role also reboots, which this host cannot
+# afford while it is the standing HIVE_FORCE_MOCK=1 mitigation case. Remove this
+# var only when that blocked-work row clears.
+# Addressed bootstrap peers (not bare ids), same pattern as fc-saopaulo.
+# hive_geo: ip-api.com geolocates this Tencent range to São José do Rio
+# Preto, Brazil -- WRONG (same class of miss as the Virginia/Santa-Clara
+# bug). RTT-triangulated instead (2026-07-31): 88ms from fc-virginia
+# (Ashburn), 161ms from fc-sanjose/gpusj3, 199ms from fc-bangkok, 208ms from
+# fc-hongkong -- all consistent with a real US/Asia-to-Central-Europe
+# route, confirming Frankfurt is correct and pinning it explicitly.
+fr  ansible_host=162.62.83.144  ansible_user=root hive_name=fc-frankfurt  hive_region=frankfurt hive_public_ip=162.62.83.144 hive_geo="50.1109,8.6821,Frankfurt,Germany" hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c|https://fc-virginia.relay.shadw.app:3343,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a|https://fc-phoenix.relay.shadw.app:3343 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-4307xlqe hive_tencent_region=eu-frankfurt hive_retired=true
+# cvmsj1/2 moved fc_gpu -> fc_pvm 2026-08-04 with pvm_skip=true KEPT: both are
+# UP (the old HARD-DOWN comment was false - both answer SSH instantly and ran
+# the full probe) but currently have NO /dev/kvm (stock TencentOS 6.6.117,
+# the PVM 7.1 kernels they once ran are gone), so they NEED PVM - and a blind
+# role run would reboot them into a kernel build before the canary program
+# clears it. Remove pvm_skip only per pvm-fleet-serial-rollout.
+cvmsj1 ansible_host=43.166.223.197  ansible_user=root hive_name=fc-sanjose-cvm-1 hive_region=virginia hive_public_ip=43.166.223.197 litebox_verified=true pvm_skip=true hive_tencent_instance_id=ins-815omxg7 hive_tencent_region=na-ashburn hive_retired=true
+cvmsj2 ansible_host=43.166.233.114  ansible_user=root hive_name=fc-sanjose-cvm-2 hive_region=virginia hive_public_ip=43.166.233.114 litebox_verified=true pvm_skip=true hive_tencent_instance_id=ins-hwheutvj hive_tencent_region=na-ashburn hive_retired=true
+# phx (fc-phoenix): Hostinger VPS, Phoenix AZ, Rocky 10.2 (glibc 2.39), NO
+# /dev/kvm and no vmx/svm (2026-08-21 recon) — pvm_skip forever unless the PVM
+# canary program clears a kernel for this provider; the Litebox backend is its
+# fallback candidate ([litebox] group), but group membership is not authorization;
+# activation requires the complete drained-host canary and exact artifact digest.
+# phx litebox_verified=true added 2026-09-09: the node HAS run verified Litebox for weeks (HIVE_LITEBOX_VERIFIED=1 live, backend=litebox in every registry) but this line lacked the flag, so any un-limited `--tags litebox` run would have removed its drop-in and restarted it into MockBackend (adversarial review, 2026-09-09).
+phx ansible_host=93.188.162.67    ansible_user=root hive_name=fc-phoenix    hive_region=phoenix   hive_public_ip=93.188.162.67 hive_geo="33.4939,-112.1696,Phoenix,United States" hive_bootstrap_peers=2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204|https://fc-sanjose.relay.shadw.app:3343,3e6cbd1b8a8d6c863896625dd6da86e929f068afb4b42e6cfb7321f505d66f0a@93.188.162.67:11204|https://fc-phoenix.relay.shadw.app:3343,4739d4eaaf7acd08670773cfd32cdf580b13cdda54cfd1fd38bae0dc20812f63@43.172.25.45:11204,9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204|https://fc-virginia.relay.shadw.app:3343 hive_relay_urls=https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343 hive_discovery_dns=http://170.106.158.151:3350,http://43.166.206.175:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true litebox_verified=true
+# tokyo (fc-tokyo): Tencent CVM, Tokyo JP, Rocky 10.2 (glibc 2.39), NO /dev/kvm
+# and no vmx/svm — Litebox is its eligible fallback ([litebox] group); activation still
+# requires the complete drained-host canary and an exact artifact digest.
+tokyo ansible_host=43.133.30.68    ansible_user=root hive_name=fc-tokyo     hive_region=tokyo     hive_public_ip=43.133.30.68 hive_geo="35.6893,139.6899,Tokyo,Japan" litebox_verified=true hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-7hvgpflu hive_tencent_region=ap-tokyo hive_retired=true
+# seoul (fc-seoul): Tencent CVM, Seoul KR, Rocky 10.2 (glibc 2.39), NO /dev/kvm
+# and no vmx/svm — Litebox is its eligible fallback ([litebox] group); activation still
+# requires the complete drained-host canary and an exact artifact digest.
+seoul ansible_host=150.109.247.150  ansible_user=root hive_name=fc-seoul     hive_region=seoul     hive_public_ip=150.109.247.150 hive_geo="37.5658,126.978,Seoul,South Korea" litebox_verified=true hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-lte5vdo1 hive_tencent_region=ap-seoul hive_retired=true
+# va4 (fc-virginia-4): Tencent CVM, Ashburn VA (metadata: na-ashburn-1), Rocky 10.2
+# (glibc 2.39), 64 vCPU / 278G RAM / 2T disk, NO /dev/kvm and no vmx/svm —
+# Litebox backend is its isolation tier ([litebox] group, litebox_verified set
+# after --litebox-probe PASS).
+va4 ansible_host=170.106.162.175 ansible_user=root hive_name=fc-virginia-4 hive_region=virginia hive_public_ip=170.106.162.175 hive_geo="39.0438,-77.4874,Ashburn,United States" litebox_verified=true hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-elcd0odx hive_tencent_region=na-ashburn hive_retired=true
+# va5 (fc-virginia-5): Tencent CVM, Ashburn VA (metadata: na-ashburn-2), Rocky 10.2
+# (glibc 2.39), 64 vCPU / 246G RAM / 2T disk, NO /dev/kvm and no vmx/svm —
+# Litebox backend is its isolation tier ([litebox] group, litebox_verified set
+# after --litebox-probe PASS).
+va5 ansible_host=43.130.153.237 ansible_user=root hive_name=fc-virginia-5 hive_region=virginia hive_public_ip=43.130.153.237 hive_geo="39.0438,-77.4874,Ashburn,United States" litebox_verified=true hive_bootstrap_peers=9e0f2249c5fcffa57856f798af322053044ddbd9bd8ab49e25c123340b75156c@43.166.206.175:11204,2c3e574c048be7660381385908aaca01a979834efdb0725228dc150caf65808a@170.106.158.151:11204 hive_relay_urls=https://fc-virginia.relay.shadw.app:3343,https://fc-sanjose.relay.shadw.app:3343,https://fc-phoenix.relay.shadw.app:3343 hive_discovery_dns=http://43.166.206.175:3350,http://170.106.158.151:3350 hive_owner_email=dylanwong007@gmail.com hive_acme_email=dylanwong007@gmail.com hive_acme_staging=0 pvm_skip=true hive_tencent_instance_id=ins-5thz80aj hive_tencent_region=na-ashburn hive_retired=true
+
+# GPU nodes. gpusj1-3 are bare metal (4x Tesla T4 each, stock TencentOS kernel —
+# they have real vmx so they need no PVM). cvmsj1-2 are CVMs with NO hardware
+# virt; live probe 2026-08-04: both currently run stock TencentOS 6.6.117 with
+# NO /dev/kvm at all (the PVM 7.1 kernels they once ran are gone), so they NEED
+# PVM to serve Firecracker - they now sit in [fc_pvm] with pvm_skip=true until
+# the canary program (pvm-canary-reboot-functional-gates) authorizes a roll.
+# NOTE: all five currently allow only inbound 22 in their Tencent security
+# groups, which blocks 8787/3340/3341/7842 and therefore deploy dispatch,
+# relay reachability and DNS inclusion.
+[fc_gpu]
+gpusj1 ansible_host=43.153.106.173 ansible_user=root hive_name=fc-sanjose-gpu-1 hive_region=san-jose hive_public_ip=43.153.106.173 hive_tencent_instance_id=ins-go3anw62 hive_tencent_region=na-siliconvalley hive_retired=true
+gpusj2 ansible_host=170.106.155.130 ansible_user=root hive_name=fc-sanjose-gpu-2 hive_region=san-jose hive_public_ip=170.106.155.130 hive_tencent_instance_id=ins-4hvo69ay hive_tencent_region=na-siliconvalley hive_retired=true
+gpusj3 ansible_host=162.62.83.91    ansible_user=root hive_name=fc-sanjose-gpu-3 hive_region=san-jose hive_public_ip=162.62.83.91 hive_tencent_instance_id=ins-3b6zqw9q hive_tencent_region=na-siliconvalley hive_retired=true
+# Region relabeled 2026-07-29: both "san-jose" CVM nodes are physically in
+# Ashburn VA (geolocated + ping-triangulated: 0.34ms to fc-virginia, 68ms to
+# fc-sanjose). Names kept — renaming changes mesh identity (affinity records,
+# rename semantics) for no routing gain; region is what placement/DNS/pooling
+# key on. cvmsj1/2 live in [fc_pvm] since 2026-08-04 (see above).
+
+[platform:vars]
+# Operator egress (LA residential NAT) -- never banned by fail2ban.
+hive_fail2ban_ignoreip_extra=142.129.51.22
+ansible_python_interpreter=/usr/bin/python3
+ansible_ssh_private_key_file=/Users/dylanwong/Documents/billing.pem
+hive_cp_owner_chain=fc-sanjose,fc-phoenix,fc-virginia-3,fc-virginia
+# Voters decide control-plane quorum (leadership::may_act): public servers only,
+# odd count, identical on every node. Laptops never vote.
+hive_cp_voters=fc-sanjose,fc-phoenix,fc-virginia-3
+
+# Two glibc groups needing separate native hive-cloud builds (AGENTS.md
+# "Fleet has two glibc groups"). Membership is by OS IMAGE, not region --
+# do NOT infer membership from [fc_kvm]/[fc_pvm]/[fc_gpu] or from
+# hive_region. Source of truth for a live check is
+# scripts/audit-runtime-versions.sh; this group split is how
+# ansible/playbooks/parallel-deploy.yml picks one build host per group.
+[glibc239]
+va
+va2
+va3
+sj
+sj2
+sp
+fr
+phx
+tokyo
+seoul
+va4
+va5
+sj3
+sj4
+sj5
+sj6
+sj7
+fc-orlando
+[glibc238]
+bkk
+hk
+gpusj1
+gpusj2
+gpusj3
+cvmsj1
+cvmsj2
+
+# Hosts running ONE headless browser node each
+# (ansible/playbooks/browser-nodes.yml, roles/hive_browser_node). Exactly five,
+# one per host, spread across five regions so donor capacity is not
+# single-region. Membership is deliberately NARROW and is asserted twice --
+# once by the playbook against this group, once by the role against
+# hive_browser_node_allowed -- because a browser node consumes real
+# memory/CPU on a machine whose actual job is running hive-node.
+#
+# NOT included, on purpose:
+#   va2/va3/sj2/hk  -- would double up a region already covered
+#   gpusj1..3       -- the GPU nodes' RAM/CPU belongs to inference, not a browser
+#   cvmsj1/cvmsj2   -- pending the PVM canary program (see [fc_pvm] notes)
+[browser_nodes]
+bkk
+sj
+va
+sp
+fr
+hk
+
+# Nodes eligible for the Litebox CellBackend (roles/litebox,
+# crates/hive-backend/src/litebox.rs) — an unprivileged syscall-sandbox
+# fallback for hosts where neither real Firecracker microVMs nor the PVM
+# software-virt path can safely run. fr (fc-frankfurt) is the concrete case:
+# pinned to HIVE_FORCE_MOCK=1 (zero isolation) since a real microVM boot on
+# its PVM kernel hard-resets the host (see [fc_pvm] notes above). The role
+# The group is eligibility only. Ordinary role convergence neither builds nor
+# changes active state. A disposable canary explicitly stages the pinned source;
+# enablement separately names the exact canary-approved runner digest. Firecracker
+# remains preferred wherever it is healthy, regardless of this membership.
+[litebox]
+fr
+phx
+tokyo
+seoul
+va4
+va5
+sj3
+sj4
+sj5
+# sj6 (fc-sanjose-6): new node, 2026-09-04. Litebox-only by operator
+# direction -- no PVM kernel work. See its [fc_pvm] entry above.
+sj6
+# sj7 (fc-sanjose-7): new node 2026-09-30, litebox-only (no /dev/kvm).
+sj7
+# Added 2026-09-01 (operator direction: every MockBackend node becomes a
+# Litebox node). Live leader registry that day showed exactly these three
+# Linux hosts still on backend=mock besides tokyo/seoul/va4/va5: sj (the
+# control-plane leader, stock EL10, no /dev/kvm -- roll it LAST and outside a
+# store-sync flap window) and the two TencentOS/glibc-2.38 CVMs (no /dev/kvm,
+# 7 and 29 live containers -- serial, after the idle canaries prove the pinned
+# AnEntrypoint runner). Membership is eligibility only, as above.
+sj
+cvmsj1
+cvmsj2
