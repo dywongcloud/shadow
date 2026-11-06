@@ -26,7 +26,6 @@
 //     this returns 500, it does not proxy to origin.
 //   * `request.cf` is absent (no Cloudflare edge metadata).
 //
-// TypeScript entries run under Node's type transform (enums, namespaces, parameter properties).
 const entryArg = process.argv[2];
 if (!entryArg) {
   console.error('[hive-worker-launcher] missing entry argument');

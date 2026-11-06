@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-11-05 — TypeScript launcher builds deploy and then refuse to launch under litebox, so the emitted flag and the admitted flag are one shared contract
+
+The exported-app and Worker emitters in `git.rs` switched from
+`--experimental-strip-types` to `--experimental-transform-types` on 2026-10-13
+(b9b117ca), because TypeScript entries use enums, namespaces and parameter
+properties. `litebox::resolve_direct_launch` still skipped only strip-types while
+looking for the entry module, so transform-types was taken as the entry and
+`validated_direct_entry` refused it as a leading-dash option; the sealed artifact
+failed with `NodeBackendUnavailable: ... the direct runtime entry must be one
+explicit module path`. Build-side `direct_launch_entry` skips any `--flag`, so
+preflight passed and the failure appeared only at launch. That switch also left
+`.cts` Worker entries without the flag and out of discovery.
+
+`hive_core::NODE_TS_LAUNCH_FLAGS` is now the one contract the emitters and the
+validator share. Strip-types stays admitted because a runtime artifact sealed
+before 2026-10-13 can still carry it and `project_redeploy` rebuilds from
+`last_build`. Worker entries ending in `.cts` now get the flag, and `.cts`/`.cjs`
+are discovered.
+
+The allowlist is a prefix skip, not an authority: the flags are not inert (Node
+can read stdin under them), but every accepted shape still requires one explicit
+module path after them (`entry_index < args.len()`), which must be a regular file
+in the sealed archive. A flag-only, stdin, eval or second-entry shape is refused.
+Verified with `cargo test --workspace --locked` (exit 0) and a live
+`node --experimental-transform-types .hive-express-launcher.mjs src/index.ts`
+serving `ok-from-ts` on fc-sanjose.
+
 ## 2026-11-04 — an expired relay TLS wildcard stranded the control-plane leader for 54 h, so renewal now distributes on every acme.sh renew
 
 The `*.relay.shadw.app` ZeroSSL wildcard served by the standalone `iroh-relay.service` on fc-phoenix, fc-virginia and fc-sanjose expired 2026-10-31T23:59:59Z. acme.sh renewed it on the laptop on 2026-10-19 (`notAfter=Jan 17 2027`), but `Le_RenewHook` was empty and `scripts/renew-relay-cert.sh` was unscheduled, so all three relays kept serving the expired file; `cert_mode="Reloading"` had not polled since the relays started on 2026-10-16. fc-sanjose's direct QUIC paths were already fragile under tenant interface churn (63 local IPs, 36 bridges, 73 veths; 250,405 `too many addresses` and 4,224 failed rebinds on 2026-11-02, zero on phoenix and virginia), so after its last handshake at 2026-11-02 11:51-11:54Z there was no working fallback: `inbound_established_window` and `outbound_established_window` stayed 0, `accept_stuck` reached 54,874, and the six warm trunks kept `isolated=false`, `audible_peers=5` and `may_act` true. Gossip-derived `peer_routes` expired on followers while the Ready deployment inventory survived, so `known_label_status` returned 503 `<project>:ready-unroutable:fc-sanjose` on five of six nodes while sanjose alone served 200; Vercel round-robin DNS publishes all six IPs, so ~5 of 6 tenant requests failed (`mesh-route-fail=0`, no dial was attempted). `meshwatch` Restart evidence fired twice with `held_secs=60`, but `node_stagger_ms("fc-sanjose")` is 577,442 ms and the blocker WARN shared `last_warn_ms` with the `InboundOnly` WARN, so the streak cleared silently.
