@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-06 — document the smart-contract / verifiable-database layer under docs/, and correct six stale AGENTS.md claims
+
+`docs/` had no coverage of `crates/hive-contract` or its one platform seam. Added `docs/smart-contracts.md`
+(contract-as-DATA, the declared op table, engine/executor, wiring), `docs/verifiable-database.md` (canonical bytes,
+BLAKE3 domains, ack binding, inclusion and append-only violation proofs, adjudication, checkpoints, replay-based
+replication, trust model), `docs/contract-platform-seam.md` (mutate-first/record-after, measurements, unattributed
+REFUSED writes, where authorization actually lives), `docs/contract-verification.md` (the eight binaries, `--state`,
+the on-disk format and env knobs), and a `docs/README.md` index.
+
+Adversarial reads refuted six `AGENTS.md` claims, now corrected: `OpenParticipation` + `StateWrite` is refused by
+`Contract::declare` at RUNTIME, not unrepresentable by construction (public fields + `Deserialize` bypass `declare`);
+the seam DOES maintain the canonical write counter via `record_write`; only the `db.write` lanes measure, `created`
+forwards its outcome and `purged`/`deleted` pass `Ok(())`; an unattributed REFUSED record is attempted but a store
+failure leaves NO entry; a checkpoint close normally defers to the engine drain with documented inline fallbacks, and
+`wrote` awaits `submit`, not the close; `entry_sig_preimage` (not `Ack::canonical`) folds the ack into the signed
+preimage. Confirmed: no consensus, no bond/incentive model (whitepaper 4.4), Inadmissible with no pinned identity.
+
+Findings filed as PRD rows `contract-declare-runtime-guard-bypass`, `contract-checkpoint-domain-unused`,
+`contract-cli-documented-flags-unimplemented`, `contract-comment-census-false-claims`,
+`agents-md-contract-section-stale`. A pre-existing tracked integration test (`crates/shadw-cli/tests/http_contract.rs`)
+was annotated on `remove-prohibited-test-artifacts`, not deleted during a docs task. No runtime gate was weakened.
+Witness: `contract-transparency` exited 0 with `RESULT: ALL PROBES PASSED` (0/20 probes) against a real `Engine::open`.
 ## 2026-11-05 — TypeScript launcher builds deploy and then refuse to launch under litebox, so the emitted flag and the admitted flag are one shared contract
 
 The exported-app and Worker emitters in `git.rs` switched from

@@ -178,24 +178,24 @@ stranded databases are reported, never re-hosted (re-provisioning the same slug 
 
 ## Contract and execution transparency (managed-db)
 
-- `crates/hive-contract`: a contract is DATA, not code. Per op kind it declares who may emit it (`AuthPolicy`) and whether it may
-change contract state (`Effect`); `OpenParticipation` + `StateWrite` is unrepresentable by construction (`hive.managed-db.v1`).
-- `crates/hive-cloud/src/db_contract.rs` is the ONLY seam into the platform. It does NOT authorize, does NOT mutate and does NOT fail
-the request: **the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD that a write was unattested, never a
-prevention -- never describe this layer as refusing an unauthorized write (authorization is `auth::require_auth` + the roles matrix +
-the ownership check).
-- A caller's outcome is a MEASUREMENT, never `Ok(())`: blob reads back at the submitted size, queue depth moved, the vector index
-retains the entry, pubsub uses the broker's PUBLISHED counter (0 delivered still lands). A write no managed database attests is
-recorded as an unattributed REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`, never dropped.
-- Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>`: a bare separator join is NOT injective, so a crafted payload travels under an
-entry hash the executor never signed. `Ack::canonical` folds the ack into the signed preimage (`entry_hash` is BLAKE3(prev||op) and
-cannot cover the ack, since `ack.log_head` IS that hash), so a seen signature cannot be copied onto a conflicting ack.
-- Adjudication with no PINNED identity returns Inadmissible, never Dishonest. A checkpoint window close never runs inline in `submit`
-(`db_contract::wrote` awaits it): defer to the bulkhead drain, and read EVERY segment a window's range touches, not only the segment
-its base falls in.
+- `crates/hive-contract`: a contract is DATA, not code (`AuthPolicy`/`Effect` per op kind). `Contract::declare` refuses
+`OpenParticipation` + `StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit`
+must recheck (`hive.managed-db.v1`). Docs: `docs/README.md`.
+- `crates/hive-cloud/src/db_contract.rs` is the ONLY seam. It does NOT authorize and does NOT fail the request: **the caller
+mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD that a write was unattested, never a prevention.
+Never describe this layer as refusing an unauthorized write (auth is `require_auth` + roles + ownership; see
+`docs/contract-platform-seam.md`). It DOES maintain the canonical write counter (`record_write`), even on refusal.
+- A `db.write` outcome is a MEASUREMENT, never `Ok(())`; `created` forwards its outcome; `purged`/`deleted` pass `Ok(())`. A write no database attests is
+an unattributed REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`; a store failure leaves NO entry.
+- Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>`: a bare join is NOT injective. `entry_sig_preimage` folds
+`Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical()); it cannot cover
+the ack, since `ack.log_head` IS that hash), so a seen signature cannot be copied onto a conflicting ack.
+- Adjudication with no PINNED identity returns Inadmissible, never Dishonest. A checkpoint close normally defers to the
+engine drain, NOT inline in `submit` (`wrote` awaits `submit`, not the close); an inline fallback fires when deferred
+closes exceed 1, and rebuild repair closes inline. Read EVERY segment a window's range touches.
 - **Vitra has no consensus**: oplogs are synced by peers and honesty is enforced by REPLAY, not agreement
-(`crates/hive-contract/src/replicate.rs`, `audit.rs`). Inclusion proofs and append-only violation proofs exist; **there is NO bond or
-incentive model** -- the whitepaper (§4.4) leaves it unspecified by design.
+(`replicate.rs`, `audit.rs`). Inclusion and append-only violation proofs exist; **there is NO bond or incentive model** --
+the whitepaper (§4.4) leaves it unspecified by design. Proofs show an entry WAS published, not freshness.
 
 ## Browser lane
 
