@@ -3080,11 +3080,6 @@ fn validated_next_arguments(
     Ok(result)
 }
 
-/// The one Node runtime flag the platform's own exported-server launcher emits (TypeScript
-/// entries): a loader toggle with no eval/exec/stdin semantics, so allowing exactly it ahead of the
-/// entry does not widen the launch grammar; every other option still refuses on the leading dash.
-const NODE_STRIP_TYPES_FLAG: &str = "--experimental-strip-types";
-
 async fn resolve_direct_launch(
     func: &FunctionLaunch,
     reference: &LiteboxImageReference,
@@ -3138,7 +3133,7 @@ async fn resolve_direct_launch(
     if runtime == DirectRuntime::Node {
         while args
             .get(entry_index)
-            .is_some_and(|arg| arg == NODE_STRIP_TYPES_FLAG)
+            .is_some_and(|arg| hive_core::NODE_TS_LAUNCH_FLAGS.contains(&arg.as_str()))
         {
             entry_index += 1;
         }

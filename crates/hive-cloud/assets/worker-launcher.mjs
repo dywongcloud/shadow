@@ -2,7 +2,7 @@
 // async fetch(request, env, ctx) { ... } }` shape). Staged into the build dir by
 // the platform; never part of the repository.
 //
-// Usage: node [--experimental-strip-types] .hive-worker-launcher.mjs <entry>
+// Usage: node [--experimental-transform-types] .hive-worker-launcher.mjs <entry>
 //
 // WHY THIS EXISTS. A Worker is not a Node server and cannot be started the way
 // its own template starts it: every Cloudflare template's `scripts.start` runs
@@ -26,7 +26,7 @@
 //     this returns 500, it does not proxy to origin.
 //   * `request.cf` is absent (no Cloudflare edge metadata).
 //
-// TypeScript entries run under Node's own type stripping (erasable syntax only).
+// TypeScript entries run under Node's type transform (enums, namespaces, parameter properties).
 const entryArg = process.argv[2];
 if (!entryArg) {
   console.error('[hive-worker-launcher] missing entry argument');

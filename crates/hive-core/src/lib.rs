@@ -22,3 +22,14 @@ pub use logcap::{CappedLine, LOG_CAP_STATS, MAX_LOG_LINE_BYTES};
 pub use proto::*;
 pub use state::{CellState, JobState};
 pub use time::now_ms;
+
+/// Node loader toggles the platform's own TypeScript launchers emit ahead of the entry module.
+/// Neither has eval/exec/stdin semantics. Build-side emitters and launch-side validation share
+/// this one contract so an allowlist can never drift away from the flag actually emitted.
+pub const NODE_TS_LAUNCH_FLAGS: &[&str] = &[
+    NODE_STRIP_TYPES_FLAG,
+    NODE_TRANSFORM_TYPES_FLAG,
+];
+
+pub const NODE_TRANSFORM_TYPES_FLAG: &str = "--experimental-transform-types";
+pub const NODE_STRIP_TYPES_FLAG: &str = "--experimental-strip-types";

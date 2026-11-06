@@ -7331,7 +7331,7 @@ done' hive-delink {} +
                             || entry.ends_with(".mts")
                             || entry.ends_with(".cts")
                         {
-                            cmd.push("--experimental-transform-types".to_string());
+                            cmd.push(hive_core::NODE_TRANSFORM_TYPES_FLAG.to_string());
                         }
                         cmd.push(EXPRESS_LAUNCHER_FILE.to_string());
                         cmd.push(entry.clone());
@@ -7358,8 +7358,11 @@ done' hive-delink {} +
             }
             if let Some(entry) = discover_worker_entry(dir) {
                 let mut cmd = vec!["node".to_string()];
-                if entry.ends_with(".ts") || entry.ends_with(".mts") {
-                    cmd.push("--experimental-transform-types".to_string());
+                if entry.ends_with(".ts")
+                    || entry.ends_with(".mts")
+                    || entry.ends_with(".cts")
+                {
+                    cmd.push(hive_core::NODE_TRANSFORM_TYPES_FLAG.to_string());
                 }
                 cmd.push(WORKER_LAUNCHER_FILE.to_string());
                 cmd.push(entry.clone());
@@ -7456,7 +7459,7 @@ fn discover_worker_entry(dir: &Path) -> Option<String> {
     }
     for prefix in ["src/", ""] {
         for stem in ["index", "worker", "main"] {
-            for ext in [".ts", ".mts", ".js", ".mjs"] {
+            for ext in [".ts", ".mts", ".cts", ".cjs", ".js", ".mjs"] {
                 candidates.push(format!("{prefix}{stem}{ext}"));
             }
         }
