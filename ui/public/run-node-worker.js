@@ -523,8 +523,20 @@ function remintSession(team) {
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ team }),
         });
-        return r.ok;
-      } catch {
+        if (r.ok) return true;
+        const d = await r.json().catch(() => null);
+        if (d && d.otp_required === true && typeof d.challenge_id === "string" && d.challenge_id.trim()) {
+          // A DedicatedWorkerGlobalScope has NO DOM: no form can be mounted here. Fail closed
+          // with an explicit, terminal refusal naming the dashboard settings page, never a
+          // silent success or a generic mint error. The challenge stays in this JSON body.
+          const e = new Error("otp_required: complete login in the dashboard settings page (/settings/two-factor), then reload");
+          e.code = "otp_required";
+          e.retryable = false;
+          throw e;
+        }
+        return false;
+      } catch (e) {
+        if (e && e.code === "otp_required") throw e;
         return false;
       }
     })().finally(() => {

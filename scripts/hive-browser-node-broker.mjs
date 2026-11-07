@@ -143,24 +143,53 @@ async function readBody(req) {
   return Buffer.concat(chunks);
 }
 
-async function drainUnusedBody(req) {
-  await readBody(req).catch(() => null);
+/** Reads ONLY the one-shot 2FA answer from a /api/token re-POST. Every other field is
+ *  ignored, so the upstream mint's claims stay this process's configuration. */
+async function readOtpChallenge(req) {
+  const raw = await readBody(req).catch(() => Buffer.alloc(0));
+  let incoming = null;
+  try {
+    incoming = JSON.parse(raw.toString("utf8") || "{}");
+  } catch {
+    /* malformed body: no challenge fields */
+  }
+  return {
+    challengeId: typeof incoming?.challenge_id === "string" ? incoming.challenge_id.trim() : "",
+    otp: typeof incoming?.otp === "string" ? incoming.otp.trim() : "",
+  };
+}
+
+/** The backend's typed TOTP challenge refusal: read the mint JSON ONCE, admit only a non-empty
+ *  string challenge id, and never log, persist or put it in a URL. */
+function otpChallengeId(body) {
+  if (!body || body.otp_required !== true || typeof body.challenge_id !== "string") return "";
+  return body.challenge_id.trim();
 }
 
 /** The ONE mint. Every claim is this process's configuration, never a caller's; the EMPTY email
  *  makes `mint_token`'s platform_admin derivation structurally impossible. `countFailures` is
  *  false for the geo lookup so a cosmetic failure never pollutes /healthz's mint counters. */
-async function mintRaw({ countFailures = true } = {}) {
+async function mintRaw({ countFailures = true, challengeId = "", otp = "" } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), MINT_TIMEOUT_MS);
   try {
+    const body = { sub: SUBJECT, tenant: TEAM, role: ROLE, email: "" };
+    // A caller may supply ONLY the one-shot challenge answer; every claim stays this
+    // process's configuration, never a caller's.
+    if (challengeId) {
+      body.challenge_id = challengeId;
+      body.otp = otp;
+    }
     const upstream = await fetch(`${ADMIN}/v1/token`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-hive-internal": INTERNAL_TOKEN },
-      body: JSON.stringify({ sub: SUBJECT, tenant: TEAM, role: ROLE, email: "" }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     if (!upstream.ok) {
+      const d = await upstream.json().catch(() => null);
+      const id = otpChallengeId(d);
+      if (id) return { ok: false, status: upstream.status, otpRequired: true, challengeId: id };
       if (countFailures) {
         state.mintFailures += 1;
         state.lastError = `mint ${upstream.status}`;
@@ -185,10 +214,21 @@ async function mintRaw({ countFailures = true } = {}) {
 }
 
 /** Mint a fresh platform JWT and hand it back as an httpOnly cookie.
- *  Deliberately ignores the request body: the tenant/role/subject are this
- *  process's configuration, never the caller's claim. */
-async function mintToken(res) {
-  const minted = await mintRaw();
+ *  Only the one-shot 2FA answer is read from the request body; the tenant/role/subject
+ *  stay this process's configuration, never a caller's claim. */
+async function mintToken(res, challenge = {}) {
+  const minted = await mintRaw({ challengeId: challenge.challengeId || "", otp: challenge.otp || "" });
+  if (minted.otpRequired) {
+    // This daemon has NO interactive UI: fail closed with an explicit typed refusal that
+    // names the dashboard settings page. The challenge id rides ONLY in this JSON body.
+    return json(res, minted.status === 428 ? 428 : 403, {
+      ok: false,
+      reason: "otp_required",
+      otp_required: true,
+      challenge_id: minted.challengeId,
+      hint: "otp_required: complete login in the dashboard settings page (/settings/two-factor)",
+    });
+  }
   if (!minted.ok) {
     return json(res, 502, {
       ok: false,
@@ -220,6 +260,10 @@ async function resolveGeoFromRegistry() {
   geoInFlight = (async () => {
     try {
       const minted = await mintRaw({ countFailures: false });
+      if (minted.otpRequired) {
+        geo.error = "otp_required";
+        return;
+      }
       if (!minted.ok) {
         geo.error = minted.status ? `nodes-mint-${minted.status}` : "nodes-mint-unreachable";
         return;
@@ -391,8 +435,7 @@ const server = createServer(async (req, res) => {
     });
   }
   if (p === "/api/token" && req.method === "POST") {
-    await drainUnusedBody(req);
-    return mintToken(res);
+    return mintToken(res, await readOtpChallenge(req));
   }
   if (p === "/heartbeat" && req.method === "POST") {
     try {

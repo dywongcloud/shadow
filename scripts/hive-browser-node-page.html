@@ -34,15 +34,87 @@ function presenceState(lifecycle) {
   return null;
 }
 
+/** The ONE 2FA prompt for this host page. A DOM input keeps the challenge id and the
+ *  code in this call chain only: never a URL, query, Location, attribute, storage or log line.
+ *  `otp` carries a 6-digit TOTP OR a one-use recovery code (both verified by the backend). */
+const OTP_PROMPT_TIMEOUT_MS = 5 * 60_000;
+let otpPromptInFlight = null;
+function askOtp(error) {
+  if (otpPromptInFlight) return otpPromptInFlight;
+  let box = document.getElementById("otp-box");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "otp-box";
+    const label = document.createElement("label");
+    label.textContent = "Two-factor code (6 digits or recovery code): ";
+    const input = document.createElement("input");
+    input.type = "password";
+    input.autocomplete = "one-time-code";
+    input.inputMode = "text";
+    input.maxLength = 64;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = "Verify";
+    const note = document.createElement("span");
+    box.append(label, input, button, note);
+    document.body.append(box);
+  }
+  const input = box.querySelector("input");
+  const button = box.querySelector("button");
+  const note = box.querySelector("span");
+  note.textContent = error || "";
+  input.value = "";
+  box.hidden = false;
+  input.focus();
+  otpPromptInFlight = new Promise((resolve) => {
+    let timer = null;
+    const done = (code) => {
+      if (timer !== null) clearTimeout(timer);
+      input.removeEventListener("keydown", onKey);
+      button.removeEventListener("click", onClick);
+      box.hidden = true;
+      otpPromptInFlight = null;
+      resolve(String(code || "").trim());
+    };
+    const onClick = () => done(input.value);
+    const onKey = (ev) => { if (ev.key === "Enter") done(input.value); };
+    timer = setTimeout(() => done(""), OTP_PROMPT_TIMEOUT_MS);
+    input.addEventListener("keydown", onKey);
+    button.addEventListener("click", onClick);
+  });
+  return otpPromptInFlight;
+}
+
+function otpChallengeId(d) {
+  if (!d || d.otp_required !== true || typeof d.challenge_id !== "string") return "";
+  return d.challenge_id.trim();
+}
+
 async function mint(team) {
+  const body = { team };
   try {
-    const r = await fetch("/api/token", {
+    let r = await fetch("/api/token", {
       method: "POST",
       credentials: "same-origin",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ team }),
+      body: JSON.stringify(body),
     });
-    return r.ok;
+    let error = "";
+    for (;;) {
+      if (r.ok) return true;
+      const d = await r.json().catch(() => null);
+      const challengeId = otpChallengeId(d);
+      if (!challengeId) return false;
+      const otp = await askOtp(error);
+      if (!otp) return false;
+      r = await fetch("/api/token", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...body, challenge_id: challengeId, otp }),
+      });
+      error = "That code was not accepted. Enter a new code or a recovery code.";
+    }
   } catch {
     return false;
   }

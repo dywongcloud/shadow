@@ -63,14 +63,32 @@ function patchRpcGuard(file, s) {
     `  let res = await __hiveFetch();\n` +
     `  const __hiveIsCbor = () => (res.headers.get("content-type") || "").includes("cbor");\n` +
     `  if ((!res.ok || !__hiveIsCbor()) && typeof window !== "undefined") {\n` +
-    `    try {\n` +
+    `    const __hiveMintBody = (() => {\n` +
     `      const m = __hiveName();\n` +
-    `      await fetch("/api/token", {\n` +
-    `        method: "POST",\n` +
-    `        headers: { "content-type": "application/json" },\n` +
-    `        body: JSON.stringify(m && m[1] ? { team: m[1] } : {})\n` +
-    `      });\n` +
-    `    } catch (_e) {}\n` +
+    `      return m && m[1] ? { team: m[1] } : {};\n` +
+    `    })();\n` +
+    `    let __hiveChallenge = "";\n` +
+    `    let __hiveOtp = "";\n` +
+    `    let __hiveMintError = "";\n` +
+    `    for (;;) {\n` +
+    `      let __hiveMint;\n` +
+    `      try {\n` +
+    `        __hiveMint = await fetch("/api/token", {\n` +
+    `          method: "POST",\n` +
+    `          headers: { "content-type": "application/json" },\n` +
+    `          body: JSON.stringify(__hiveChallenge ? { ...__hiveMintBody, challenge_id: __hiveChallenge, otp: __hiveOtp } : __hiveMintBody)\n` +
+    `        });\n` +
+    `      } catch (_e) { break; }\n` +
+    `      const __hiveMintJson = __hiveMint.ok ? null : await __hiveMint.json().catch(() => null);\n` +
+    `      if (!__hiveMintJson || __hiveMintJson.otp_required !== true || typeof __hiveMintJson.challenge_id !== "string" || !__hiveMintJson.challenge_id.trim()) break;\n` +
+    `      __hiveChallenge = __hiveMintJson.challenge_id.trim();\n` +
+    `      const __hiveCode = typeof window.prompt === "function" ? window.prompt(__hiveMintError || "Enter your 6-digit two-factor code or a recovery code:") : null;\n` +
+    `      if (!__hiveCode || !__hiveCode.trim()) {\n` +
+    `        throw new Error("otp_required: complete login in the dashboard settings page (/settings/two-factor), then reload");\n` +
+    `      }\n` +
+    `      __hiveOtp = __hiveCode.trim();\n` +
+    `      __hiveMintError = "That code was not accepted. Enter a new code or a recovery code.";\n` +
+    `    }\n` +
     `    res = await __hiveFetch();\n` +
     `  }\n` +
     `  if (res.ok && !__hiveIsCbor()) {\n` +
