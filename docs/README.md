@@ -38,6 +38,10 @@ oplog or execution-transparency contract.
 - `docs/lagon.md` - upstream Lagon runtime overview.
 - `docs/pvm-upstream-report.md` - PVM 6.12 to 7.1 port bug report.
 
+## Account security
+
+- `docs/account-2fa.md` - account two-factor authentication (2FA).
+
 ## Fleet operations and incidents
 
 - `docs/LIVE_INFRA_RUNBOOK.md` - live fleet infra hardening runbook.

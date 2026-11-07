@@ -351,6 +351,8 @@ pub struct CloudState {
     pub incidents: crate::incidents::IncidentStore,
     pub securelinks: crate::securelink::SecureLinkStore,
     pub apikeys: crate::apikeys::ApiKeyStore,
+    /// Optional per-account TOTP 2FA: replicated through store_sync::REGISTRY, never node-local.
+    pub totp: Arc<crate::totp::TotpStore>,
     pub integrations: crate::integrations::IntegrationStore,
     pub svcgraph: crate::svcgraph::ServiceGraphStore,
     pub identity: crate::identity::IdentityStore,
@@ -917,6 +919,7 @@ impl CloudState {
             incidents: crate::incidents::IncidentStore::new(),
             securelinks: crate::securelink::SecureLinkStore::new(),
             apikeys: crate::apikeys::ApiKeyStore::new(),
+            totp: Arc::new(crate::totp::TotpStore::new()),
             integrations: crate::integrations::IntegrationStore::new(),
             svcgraph: crate::svcgraph::ServiceGraphStore::new(),
             identity: crate::identity::IdentityStore::new(),

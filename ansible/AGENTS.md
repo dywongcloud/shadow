@@ -2,8 +2,7 @@
 
 Failure rules for `ansible/` and `scripts/` (rolls, host bring-up, role contracts): present-tense, what must
 be true now; history lives in `CHANGELOG.md`. Cap 12,000 bytes (`wc -c ansible/AGENTS.md`); past it,
-recompile from the code, the git log and the memory files. Loaded through `ansible/CLAUDE.md`; the root
-`AGENTS.md` rules still apply.
+recompile from code, git log and memory; loaded through `ansible/CLAUDE.md`; root rules apply.
 
 ## Building and rolling
 
@@ -85,8 +84,8 @@ recompile from the code, the git log and the memory files. Loaded through `ansib
   Relay URLs (`hive_relay_urls`, the browser node's relays) are the https `:3343` hostnames (wildcard cert
   `*.relay.shadw.app`: an IP-literal URL fails verification).
 - fail2ban installs from the upstream tarball (TencentOS 4 has no package), bans via
-  `nftables-multiport`/`-allports`, and `ignoreip` is every non-retired host plus
-  `hive_fail2ban_ignoreip_extra`.
+  `nftables-multiport`/`-allports`; `ignoreip` is every non-retired host plus
+  `hive_fail2ban_ignoreip_extra`. fc-orlando is not enrolled (live host check 2026-11-06).
 - A guardian-filled node (`GUARDIAN_GC_SECS=0` disables blob GC and the store grows without bound): stop
   hive-node, remove `iroh_store`, `iroh_docs` AND `keystore` together under the guardian `iroh/` dir (a kept
   keystore wedges init), keep `node_secret.key`.

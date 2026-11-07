@@ -9,6 +9,7 @@ mod apikeys;
 mod app_discovery;
 mod audit;
 mod auth;
+mod totp;
 mod billing;
 mod bounded_round;
 mod browser_admission;
@@ -503,6 +504,11 @@ struct Args {
 const WORKER_STACK_BYTES: usize = 16 * 1024 * 1024;
 
 fn main() -> anyhow::Result<()> {
+    // Operator diagnostic: prove the RFC 6238 primitive without booting a node.
+    if std::env::args().any(|a| a == "--totp-selftest") {
+        crate::totp::selftest_vectors();
+        return Ok(());
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_STACK_BYTES)
@@ -2181,13 +2187,24 @@ async fn admin_ingress(
         let is_mutation = is_mutation_request(&req);
         let has_own_credential = crate::auth::is_open_route(req.uri().path());
         if is_mutation && !has_own_credential {
-            let ok = crate::auth::extract_token(req.headers())
-                .map(|t| crate::auth::principal(&cloud, &t).is_some())
-                .unwrap_or(false);
-            if !ok {
+            // Both require_auth and this ingress authenticate through principal, so the 2FA
+            // step-up re-check MUST run here too or a forwarded mutation bypasses it.
+            let token = crate::auth::extract_token(req.headers());
+            let claims = token
+                .as_deref()
+                .and_then(|t| crate::auth::principal(&cloud, t));
+            let Some(c) = claims else {
                 return (
                     axum::http::StatusCode::UNAUTHORIZED,
                     "missing or invalid bearer token",
+                )
+                    .into_response();
+            };
+            let otp_at = crate::auth::step_up_claim(&c, token.as_deref());
+            if !crate::auth::step_up_ok(&cloud, &c, req.method(), req.uri().path(), otp_at) {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    "2fa_step_up_required",
                 )
                     .into_response();
             }

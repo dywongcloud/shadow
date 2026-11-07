@@ -157,6 +157,22 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/mesh/roster", get(mesh_roster_get))
         .route("/v1/mesh/admit", post(mesh_admit))
         .route("/v1/token", post(mint_token))
+        .route(
+            "/v1/account/2fa/status",
+            get(crate::totp::status_handler),
+        )
+        .route(
+            "/v1/account/2fa/enroll",
+            post(crate::totp::enroll_handler),
+        )
+        .route(
+            "/v1/account/2fa/confirm",
+            post(crate::totp::confirm_handler),
+        )
+        .route(
+            "/v1/account/2fa/disable",
+            post(crate::totp::disable_handler),
+        )
         .route("/v1/tls/bundle-mesh", get(tls_bundle_mesh))
         .route("/v1/whoami", get(whoami))
         .route("/v1/auth", get(auth_status))
@@ -406,6 +422,12 @@ struct TokenReq {
     /// `platform_admin`.
     #[serde(default)]
     email: String,
+    /// Server-issued one-shot login challenge; present only on the OTP re-POST.
+    #[serde(default)]
+    challenge_id: String,
+    /// 6-digit TOTP code or a one-use recovery code. NEVER logged, never in a URL.
+    #[serde(default)]
+    otp: String,
 }
 fn default_sub() -> String {
     "user".into()
@@ -574,30 +596,62 @@ async fn mint_token(
     axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     Json(req): Json<TokenReq>,
-) -> Result<Json<Value>, (StatusCode, String)> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     let peer_ip = peer.ip().to_string();
     let now = hive_core::now_ms();
     let request_is_a_guess_at_the_internal_token = !mint_allowed(&headers);
     if request_is_a_guess_at_the_internal_token {
         if !mint_rate_limiter().check(&peer_ip, now) {
-            return Err((
-                StatusCode::TOO_MANY_REQUESTS,
-                "too many token requests".into(),
-            ));
+            return (StatusCode::TOO_MANY_REQUESTS, "too many token requests").into_response();
         }
-        return Err((
+        return (
             StatusCode::FORBIDDEN,
-            "token minting is server-only (x-hive-internal required)".into(),
-        ));
+            "token minting is server-only (x-hive-internal required)",
+        )
+            .into_response();
     }
     if !mint_user_limiter().check(req.sub.trim(), now)
         || !mint_backstop_limiter().check(&peer_ip, now)
     {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            "too many token requests".into(),
-        ));
+        return (StatusCode::TOO_MANY_REQUESTS, "too many token requests").into_response();
     }
+
+    // ---- 2FA GATE: the ONE human JWT mint, enforced BEFORE auth::issue. ----
+    // roles::gate short-circuits for platform_admin and fleet tokens, and /v1/token is an open
+    // route exempt from leader forwarding, so this gate can live NOWHERE else. Dev (unenforced)
+    // mode bypasses 2FA entirely and NEVER reports otp_required as satisfied.
+    let mut otp_at: Option<u64> = None;
+    if crate::auth::enforced() && c.totp.requires_otp(req.sub.as_str()) {
+        if req.challenge_id.trim().is_empty() {
+            return match c.totp.create_challenge(req.sub.as_str(), now) {
+                Ok(id) => {
+                    let mut resp = Json(json!({
+                        "otp_required": true,
+                        "challenge_id": id,
+                        "status": "2fa_required",
+                    }))
+                    .into_response();
+                    *resp.status_mut() = StatusCode::FORBIDDEN;
+                    resp
+                }
+                Err(e) => (e.status(), e.message()).into_response(),
+            };
+        }
+        let code = req.otp.trim();
+        if code.is_empty() {
+            return (StatusCode::BAD_REQUEST, "otp required").into_response();
+        }
+        match c
+            .totp
+            .verify_login(req.sub.as_str(), req.challenge_id.trim(), code, now)
+        {
+            Ok(at) => otp_at = Some(at),
+            Err(e) => return (e.status(), e.message()).into_response(),
+        }
+    }
+    // -----------------------------------------------------------------------
+
     let email = req.email.trim();
     let platform_admin =
         !email.is_empty() && c.admin_emails.iter().any(|a| email.eq_ignore_ascii_case(a));
@@ -611,9 +665,20 @@ async fn mint_token(
         }
     }
     let ttl = minted_token_ttl(&req.role, platform_admin);
-    match crate::auth::issue(&req.sub, &req.tenant, &req.role, platform_admin, ttl) {
-        Ok(token) => Ok(Json(json!({ "token": token, "expires_in": ttl }))),
-        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    let issued = match otp_at {
+        Some(at) => crate::auth::issue_otp_satisfied(
+            &req.sub,
+            &req.tenant,
+            &req.role,
+            platform_admin,
+            ttl,
+            at,
+        ),
+        None => crate::auth::issue(&req.sub, &req.tenant, &req.role, platform_admin, ttl),
+    };
+    match issued {
+        Ok(token) => Json(json!({ "token": token, "expires_in": ttl })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     }
 }
 
@@ -5123,7 +5188,10 @@ async fn purge_project_source_dirs(
 /// `resolve_tenant`). `resolve_tenant`'s dev-mode "personal" default owns every project, so it must
 /// never authorize a destructive fleet-cascading operation; this is the pure core of that gate,
 /// unit-testable without a `HeaderMap`/`CloudState`.
-fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>) -> bool {
+pub(crate) fn has_explicit_caller_identity(
+    claims_present: bool,
+    team_header: Option<&str>,
+) -> bool {
     claims_present || team_header.map(|s| !s.trim().is_empty()).unwrap_or(false)
 }
 

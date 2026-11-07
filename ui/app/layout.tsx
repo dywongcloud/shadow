@@ -10,6 +10,7 @@ import { ChromeTop, ChromeBottom } from "@/components/app-chrome";
 import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
+import { LoginOtpChallenge } from "@/components/login-otp-challenge";
 import { VitalsBeacon } from "@/components/vitals-beacon";
 
 export const instant = false;
@@ -114,6 +115,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <PwaRegister />
         <VitalsBeacon />
         <Toaster />
+        <LoginOtpChallenge />
         <ThemeProvider>
           <Suspense fallback={null}>
             <ChromeTop />

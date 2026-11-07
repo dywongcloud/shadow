@@ -509,6 +509,19 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(n)
         },
     },
+    SyncedStore {
+        name: "totp",
+        // enc_sorted routes every row through serde_json::Value (BTreeMap-backed), so the nested
+        // challenges map is deterministic byte-for-byte on every node.
+        snapshot: |c| enc_sorted(c.totp.snapshot_rows()),
+        adopt: |c, b| {
+            let rows: Vec<crate::totp::TotpRow> = serde_json::from_slice(b).ok()?;
+            if rows.is_empty() {
+                return None;
+            }
+            Some(c.totp.merge_synced(rows))
+        },
+    },
 ];
 
 /// The stores [`adopt_on_promotion`] merges from any single peer: their adoption is a per-row merge
@@ -520,6 +533,7 @@ pub static MERGE_STORES: &[&str] = &[
     "projects",
     "teams",
     "production_deployments",
+    "totp",
 ];
 
 /// Rate-limit config wire shape, deliberately config-only: `tracked_ips` and `blocked_total` are

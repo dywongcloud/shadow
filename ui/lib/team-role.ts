@@ -7,6 +7,14 @@ export type TeamRole = (typeof TEAM_ROLES)[number];
  *  to change anything: a member's route is listed there deliberately, and `work` stands for those (day-to-day project work). */
 export const TEAM_ACTIONS = {
   work: { floor: "member", routes: ["POST /v1/apikeys", "POST /v1/git/deploy", "POST /v1/deploy/zip", "POST /v1/projects/:project/env", "POST /v1/databases", "POST /v1/teams"] },
+  /** Optional per-account 2FA: `roles.rs` RULES lists the three self-service POSTs at the LOWEST role.
+   *  The OTP gate lives in `admin::mint_token` BEFORE `auth::issue`, never in a rule. The GET status
+   *  read is the default viewer read (RULES names no row for it). `roleRefusalFor` /
+   *  `roleRefusalSentence` remain the ONLY refusal sentences; a handler never re-decides a role. */
+  "account.2fa.status": { floor: "viewer", routes: ["GET /v1/account/2fa/status"] },
+  "account.2fa.enroll": { floor: "viewer", routes: ["POST /v1/account/2fa/enroll"] },
+  "account.2fa.confirm": { floor: "viewer", routes: ["POST /v1/account/2fa/confirm"] },
+  "account.2fa.disable": { floor: "viewer", routes: ["POST /v1/account/2fa/disable"] },
   "enterprise.project": { floor: "member", routes: ["POST /v1/enterprise/microfrontends", "DELETE /v1/enterprise/microfrontends/:id", "POST /v1/enterprise/conformance/run"] },
   "webhooks.write": { floor: "admin", routes: ["POST /v1/webhooks", "DELETE /v1/webhooks/:id", "POST /v1/projects/:project/webhooks"] },
   "integrations.write": { floor: "admin", routes: ["POST /v1/integrations", "DELETE /v1/integrations/:id"] },
@@ -73,7 +81,7 @@ export function rolesUpTo(role: TeamRole | null): readonly TeamRole[] {
 /** The short tooltip for a control the role cannot use. */
 export function roleHint(action: TeamAction): string {
   const floor = TEAM_ACTIONS[action].floor;
-  return floor === "owner" ? "Needs the team owner" : floor === "admin" ? "Needs a team admin" : "Read-only: needs team member access";
+  return floor === "viewer" ? "Available to every team role" : floor === "owner" ? "Needs the team owner" : floor === "admin" ? "Needs a team admin" : "Read-only: needs team member access";
 }
 
 /** The line shown above a read-only group of controls. */
@@ -81,12 +89,19 @@ export function roleNote(action: TeamAction): string {
   const floor = TEAM_ACTIONS[action].floor;
   return floor === "owner"
     ? "Read-only for your role. Ask the team owner to change this."
-    : floor === "admin"
-      ? "Read-only for your role. Ask a team admin to change this."
-      : "Read-only for your role: changing this needs team member access.";
+    : floor === "viewer"
+      ? "Available to every team role."
+      : floor === "admin"
+        ? "Read-only for your role. Ask a team admin to change this."
+        : "Read-only for your role: changing this needs team member access.";
 }
 
-const refusalFor = (floor: TeamRole) => (floor === "owner" ? "Your role can't do this. Ask the team owner." : "Your role can't do this. Ask a team admin.");
+const refusalFor = (floor: TeamRole) =>
+  floor === "owner"
+    ? "Your role can't do this. Ask the team owner."
+    : floor === "viewer"
+      ? "Your role can't do this."
+      : "Your role can't do this. Ask a team admin.";
 
 /** The sentence for a role-matrix refusal (`roles.rs` and `admin::require_team` answer 403 "insufficient team role ..."), or `null` when `body` is anything else. */
 export function roleRefusalSentence(body: string): string | null {

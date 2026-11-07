@@ -14,11 +14,24 @@
   failed_when: false
   when: f2b_active.stdout != "active"
 
+- name: Require an operator-pinned SHA-256 before fetching fail2ban source
+  ansible.builtin.assert:
+    that:
+      - fail2ban_tarball_sha256 is defined
+      - (fail2ban_tarball_sha256 | default('')) is match('^[0-9a-f]{64}$')
+    fail_msg: >-
+      fail2ban_tarball_sha256 must be a 64-character lowercase hex SHA-256
+      supplied by the operator inventory/vault. Upstream publishes no SHA-256
+      for this GitHub-generated archive, so refusing to install unverified source.
+  when: f2b_active.stdout != "active"
+
 - name: Download fail2ban 1.1.0 release tarball
   ansible.builtin.get_url:
     url: https://github.com/fail2ban/fail2ban/archive/refs/tags/1.1.0.tar.gz
     dest: /tmp/fail2ban-1.1.0.tar.gz
     mode: "0644"
+    checksum: "sha256:{{ fail2ban_tarball_sha256 }}"
+    force: true
   when: f2b_active.stdout != "active"
 
 - name: Extract fail2ban source

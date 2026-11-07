@@ -322,8 +322,8 @@ see "Pending fleet rollout" below):
   unauthenticated hammering too). **Live-verified**: 650 requests against a
   local instance passed exactly 599 before 429s started.
 
-**All 7 remaining live-infra items are now DONE and verified end-to-end on
-all 5 fleet nodes** — the firewall + service changes, the SSH auth hardening,
+**Current posture (live host check 2026-11-06): the fail2ban role exists, fc-orlando is not yet enrolled, and SSH on fc-orlando is not key-only.** The rows below record the original hardening on the
+5-node fleet plus the current fc-orlando posture — the firewall + service changes, the SSH auth hardening,
 and (after the activation restart was run one node at a time) the
 `HIVE_PEER_TRUST` mesh-admission enforcement. Final post-activation sweep:
 every node `active`, `healthz` 200, sees all 5 peers, logged "peer-trust
@@ -332,12 +332,15 @@ warnings. Status per item:
 
 | Node(s) | Finding | Change | Status |
 |---|---|---|---|
-| All 5 | No brute-force SSH guard | Enabled — **fail2ban** on va/va2/va3/sj; **sshguard** on bkk (TencentOS 4.4 has no fail2ban/EPEL package, so used the native EPOL `sshguard` w/ iptables backend — it banned a live attacker within seconds of starting) | **DONE + verified** |
+| va/va2/va3/sj/bkk | No brute-force SSH guard | Enabled — **fail2ban** on va/va2/va3/sj; **sshguard** on bkk (TencentOS 4.4 has no fail2ban/EPEL package, so used the native EPOL `sshguard` w/ iptables backend — it banned a live attacker within seconds of starting) | **DONE + verified** |
+| fc-orlando | No brute-force SSH guard | The `ansible/roles/fail2ban` role exists but fc-orlando is not yet enrolled (live host check 2026-11-06): `fail2ban-client` is missing, the unit is inactive and no sshd jail is configured | **NOT ENROLLED** |
 | va, va2, sj | Cockpit reachable from fleet-peer IPs (lateral-movement path) | `cockpit.socket` disabled + stopped; port 9090 confirmed no longer listening (bkk/va3 were already clean) | **DONE + verified** |
 | bkk, va2, sj | Firewall trusted-peer allowlist missing va3 | va3 (43.172.25.45) added to `hive-lockdown.sh`'s peer set on all 5 nodes | **DONE + verified** |
 | va | `hive-rt-node` workers on `0.0.0.0:3000,7799-7804`, unfirewalled | Added those ports to `hive-lockdown.sh`'s drop-list (same script push as the row above); confirmed blocked from the public internet (curl → `000`) while the mesh stayed fully intact (5/5 peers each) | **DONE + verified** |
-| All 5 | SSH `PermitRootLogin yes` | Set to `prohibit-password` (key-only); `sshd -T` confirms `permitrootlogin without-password` on all 5, key-auth re-verified via fresh `BatchMode=yes` connection after each change (no lockout) | **DONE + verified** |
-| va2, sj | SSH `PasswordAuthentication yes` (root password login from the open internet) | Set to `no`; `sshd -T` confirms `passwordauthentication no` on all 5 (bkk/va/va3 already were) | **DONE + verified** |
+| va/va2/va3/sj/bkk | SSH `PermitRootLogin yes` | Set to `prohibit-password` (key-only); `sshd -T` confirms `permitrootlogin without-password` on all 5, key-auth re-verified via fresh `BatchMode=yes` connection after each change (no lockout) | **DONE + verified** |
+| fc-orlando | SSH `PermitRootLogin yes` | `sshd -T` reports `permitrootlogin without-password`, `passwordauthentication yes` and `maxauthtries 6`; SSH is not key-only (live host check 2026-11-06) | **NOT KEY-ONLY** |
+| va/va2/va3/sj/bkk | SSH `PasswordAuthentication yes` (root password login from the open internet) | Set to `no`; `sshd -T` confirms `passwordauthentication no` on all 5 (bkk/va/va3 already were) | **DONE + verified** |
+| fc-orlando | SSH `PasswordAuthentication yes` | `sshd -T` reports `passwordauthentication yes`, not `no`; password logins are accepted (live host check 2026-11-06) | **PASSWORD AUTH ON** |
 | All 7 | `HIVE_PEER_TRUST` off → mesh admission fails open | Drop-in written on all 5 cloud nodes, pre-seeded with `HIVE_TRUSTED_NODE_IDS` = **all 7 real endpoint IDs** (5 cloud + the 2 local los-angeles nodes node-a/node-b) + `HIVE_PEER_TRUST=1`, then activated via one-node-at-a-time `hive-node` restarts. Final mesh: every node (5 cloud + 2 LA) sees all 7; "peer-trust enforcement ENABLED (#20) trusted=7"; zero trust-rejection warnings. | **DONE + verified** |
 
 **On the `HIVE_PEER_TRUST` activation:** the pre-seed made this safe with

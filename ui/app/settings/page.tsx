@@ -19,6 +19,7 @@ export default function SettingsPage() {
         <NavCard href="/settings/webhooks" icon={<Webhook className="h-4 w-4" />} title="Webhooks" desc="Send signed events to your endpoints." />
         <NavCard href="/settings/notifications" icon={<Bell className="h-4 w-4" />} title="Notifications" desc="Web, email, push & SMS preferences." />
         <NavCard href="/settings/enterprise" icon={<ShieldCheck className="h-4 w-4" />} title="Enterprise" desc="SSO, SCIM, SIEM, IP blocking, conformance." />
+        <NavCard href="/settings/two-factor" icon={<KeyRound className="h-4 w-4" />} title="Two-Factor Auth" desc="Optional TOTP for your account: enrollment, recovery codes, disable." />
       </div>
 
       <General ov={ov} nodes={nodes} />

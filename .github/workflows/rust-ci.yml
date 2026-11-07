@@ -78,7 +78,7 @@ jobs:
         with:
           node-version: "20"
 
-      # npm audit for the dashboard (this is the ONLY place ui/ is checked in CI).
+      # npm audit runs in ui/ for the dashboard.
       - name: npm audit (dashboard)
         continue-on-error: true
         working-directory: ui

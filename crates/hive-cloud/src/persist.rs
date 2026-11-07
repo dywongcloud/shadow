@@ -96,6 +96,11 @@ pub struct PlatformSnapshot {
     pub push: crate::push::PushState,
     #[serde(default)]
     pub apikeys: Vec<crate::apikeys::ApiKey>,
+    /// Per-account TOTP 2FA rows (sealed secrets, one-shot challenges, replay steps, tombstones).
+    /// serde(default) is load-bearing: persist::load uses unwrap_or_default, so a required key
+    /// silently wipes ALL state when an older reader meets a newer snapshot.
+    #[serde(default)]
+    pub totp: Vec<crate::totp::TotpRow>,
     #[serde(default)]
     pub integrations: Vec<crate::integrations::IntegrationResource>,
     #[serde(default)]
@@ -516,6 +521,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         incidents: cloud.incidents.snapshot(),
         push: cloud.push.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
+        totp: cloud.totp.snapshot_rows(),
         integrations: cloud.integrations.snapshot(),
         svcgraphs: cloud.svcgraph.snapshot(),
         orgs: cloud.identity.orgs(),
@@ -953,6 +959,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.incidents.load(snap.incidents);
     cloud.push.load(snap.push);
     cloud.apikeys.load(snap.apikeys);
+    cloud.totp.restore(snap.totp);
     cloud.integrations.load(snap.integrations);
     cloud.svcgraph.load(snap.svcgraphs);
     cloud.identity.load(snap.orgs, snap.users);

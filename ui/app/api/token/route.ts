@@ -40,34 +40,66 @@ function cookieDomain(req: NextRequest): string | undefined {
   return `.${parts.slice(-2).join(".")}`;
 }
 
+/** The backend's typed TOTP challenge refusal (HTTP 403 or 428): `{"otp_required":true,"challenge_id":"..."}`.
+ *  A challenge id is one-shot material: it is returned to the browser ONLY in this JSON body, held in the
+ *  in-flight form state, and never written to a URL, a cookie, storage or a log line. */
+function otpChallengeId(body: unknown): string | null {
+  if (!body || typeof body !== "object") return null;
+  const d = body as { otp_required?: unknown; challenge_id?: unknown };
+  if (d.otp_required !== true || typeof d.challenge_id !== "string") return null;
+  const id = d.challenge_id.trim();
+  return id ? id : null;
+}
+
+/** A typed challenge is a STRUCTURED answer, never a generic mint failure. The dev `HIVE_AUTH_BYPASS` path
+ *  honors it too: the browser re-POSTs the same request plus `challenge_id` + `otp`. */
+function otpChallengeResponse(challengeId: string, backendStatus: number) {
+  return NextResponse.json(
+    { ok: false, reason: "otp_required", otp_required: true, challenge_id: challengeId },
+    { status: backendStatus === 428 ? 428 : 403 },
+  );
+}
+
 /** Mints a short-lived platform JWT for the signed-in user and sets it as the httpOnly `hive_jwt` cookie. The tenant claim is
  *  derived SERVER-SIDE from the verified Clerk session, never from client input, and the mint call to the backend carries
  *  `x-hive-internal`. Clerk disabled: `{ ok:false }` and no cookie (the backend is unenforced). */
 export async function POST(req: NextRequest) {
+  const incoming = (await req.json().catch(() => null)) as
+    | { team?: unknown; clerk_token?: unknown; challenge_id?: unknown; otp?: unknown }
+    | null;
+  const challengeId = typeof incoming?.challenge_id === "string" ? incoming.challenge_id.trim() : "";
+  const otp = typeof incoming?.otp === "string" ? incoming.otp.trim() : "";
+  /** The re-POST keeps the SAME server-derived TokenReq and adds only the one-shot challenge answer. */
+  const challengeFields = {
+    ...(challengeId ? { challenge_id: challengeId } : {}),
+    ...(otp ? { otp } : {}),
+  };
   if (!clerkEnabled) {
     const devMint = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== "production";
     if (!devMint) {
       return NextResponse.json({ ok: false, reason: "clerk-disabled" });
     }
     let team = "personal";
-    try {
-      const t = String(((await req.json()) as { team?: unknown })?.team ?? "").trim();
+    {
+      const t = String(incoming?.team ?? "").trim();
       if (t && t !== "__pending__") team = t;
-    } catch {}
+    }
     const devRole = process.env.HIVE_DEV_ROLE?.trim() || "owner";
     try {
       const r = await fetch(`${ADMIN}/v1/token`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: devRole, email: primaryOwnerEmail() }),
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: devRole, email: primaryOwnerEmail(), ...challengeFields }),
         cache: "no-store",
       });
+      const d = await r.json().catch(() => null);
+      const challenge = otpChallengeId(d);
+      if (challenge) return otpChallengeResponse(challenge, r.status);
       if (!r.ok) {
         return NextResponse.json({ ok: false, reason: `mint-failed-${r.status}` }, { status: 502 });
       }
-      const d = await r.json();
-      const token = d.token || "";
-      const expiresIn = d.expires_in || 3600;
+      const token = d?.token || "";
+      const expiresIn = d?.expires_in || 3600;
       if (!token) {
         return NextResponse.json({ ok: true, tenant: team, enforced: false });
       }
@@ -116,13 +148,8 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
   }
 }
 
-  let clerkTokenFromBody = "";
-  let requested = "";
-  try {
-    const body = (await req.json()) as { team?: unknown; clerk_token?: unknown } | null;
-    requested = String(body?.team ?? "").trim();
-    if (typeof body?.clerk_token === "string") clerkTokenFromBody = body.clerk_token.trim();
-  } catch {}
+  const clerkTokenFromBody = typeof incoming?.clerk_token === "string" ? incoming.clerk_token.trim() : "";
+  const requested = String(incoming?.team ?? "").trim();
 
   let userId: string | null = null;
   let usedSessionToken = false;
@@ -190,15 +217,17 @@ async function userIdFromSessionToken(tok: string): Promise<string | null> {
     const r = await fetch(`${ADMIN}/v1/token`, {
       method: "POST",
       headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-      body: JSON.stringify({ sub: userId, tenant, role, email }),
+      body: JSON.stringify({ sub: userId, tenant, role, email, ...challengeFields }),
       cache: "no-store",
     });
+    const d = await r.json().catch(() => null);
+    const challenge = otpChallengeId(d);
+    if (challenge) return otpChallengeResponse(challenge, r.status);
     if (!r.ok) {
       return NextResponse.json({ ok: false, reason: `mint-failed-${r.status}` }, { status: 502 });
     }
-    const d = await r.json();
-    token = d.token || "";
-    expiresIn = d.expires_in || 3600;
+    token = d?.token || "";
+    expiresIn = d?.expires_in || 3600;
   } catch {
     return NextResponse.json({ ok: false, reason: "mint-unreachable" }, { status: 502 });
   }

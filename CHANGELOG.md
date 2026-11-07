@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-11-06 — optional per-account TOTP 2FA, and a read-only fc-orlando compromise audit
+
+Optional 2FA is TOTP (RFC 6238 authenticator app), per ACCOUNT keyed on the verified Claims.sub,
+never on tenant/email/NameID/x-hive-team. Zero new dependencies: the primitive uses the already
+locked ring/hmac/sha1/argon2/base32 crates. The OTP gate sits inside admin::mint_token before
+auth::issue and is re-checked per request from both require_auth and admin_ingress; 2FA state rides
+store_sync::REGISTRY + MERGE_STORES behind serde(default). The TOTP secret is sealed with
+secrets::encrypt (assert is_encrypted, since encrypt fails open) and read only with try_decrypt;
+comparisons are ct_eq; a signed otp_at claim is read only from an already-verified token and fails
+closed when absent. Machine identities are carved out explicitly. Docs: docs/account-2fa.md.
+
+fc-orlando (209.23.0.183) was audited READ-ONLY over SSH as sysadmin@ + sudo -n. Verdict
+INDETERMINATE: unattributed privileged SSH access IS supported (116 root pubkey logins 2026-10-21
+from 107.181.252.214 using two keys now absent; ~2,200 sysadmin password logins Oct 21-Nov 1 from
+107.181.252.214 and 107.182.163.82; a second sysadmin key; an atltech wheel account), while a
+persistent/current compromise is refuted (no new accounts since Oct 9, no cron/unit persistence
+after Oct 15, rpm -Va shows 7 diffs all in /etc configs and zero binaries/libs/kernel, no
+deleted-binary processes, no unexpected setuid, every Nov 2+ login is the operator laptop key).
+The repo holds no attribution for those IPs. No host was changed, nothing was rotated, no service
+was restarted. Rotation and a fail2ban/sshd production apply are one-way doors held for the
+operator's word; the single decisive question is whether those two IPs are operator-owned control
+hosts.
+
+Repo-side: the fail2ban ansible role already exists and is wired at site.yml:18-19, but fc-orlando
+is not enrolled (fail2ban-client missing, unit inactive, no sshd jail, sshguard inactive), and sshd
+-T reports passwordauthentication yes / permitrootlogin without-password. Corrected the docs that
+claimed fleet-wide fail2ban coverage and key-only SSH. Added a fail-closed
+fail2ban_tarball_sha256 assert to the role (upstream publishes no SHA-256 for the GitHub-generated
+archive; a Debian .dsc digest is for a DIFFERENT tarball and was not used). Added .gitignore rules
+for inventory backup name forms and backups/ after discovering that commit 926be87d added and
+pushed the operator's inventory backups to the public repo; a shape-only scan of all 41,351
+inserted lines found no PEM key and no secret value, so the exposure is fleet topology, operator
+email and an SSH key PATH, not a proven credential disclosure. Removing the already-pushed files
+requires a force-push history rewrite, held for the operator. AGENTS.md recompiled under its 30 KB
+budget. No runtime gate was weakened.
+
+Witnesses: cargo test --workspace --locked TEST_EXIT 0; scripts/cli-acceptance.sh 31 passed / 4
+failed (all four the known macOS Podman BUILD_ISOLATION_UNAVAILABLE environment limitation);
+ansible-playbook --syntax-check site.yml exit 0; RFC 6238 Appendix B vectors all MATCH;
+contract-transparency not part of this change.
+
 ## 2026-11-06 — document the smart-contract / verifiable-database layer under docs/, and correct six stale AGENTS.md claims
 
 `docs/` had no coverage of `crates/hive-contract` or its one platform seam. Added `docs/smart-contracts.md`

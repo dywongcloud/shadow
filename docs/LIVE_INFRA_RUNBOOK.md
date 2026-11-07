@@ -2,23 +2,25 @@
 
 ## STATUS (updated after live execution)
 
-- **Stage 1 (brute-force SSH guard) — DONE + verified.** fail2ban active on
+- **Stage 1 (brute-force SSH guard) — DONE + verified on the 5 original nodes.** fail2ban active on
   va/va2/va3/sj; **sshguard** on bkk instead (TencentOS Server 4.4 carries
   neither fail2ban nor a compatible EPEL — used the native EPOL `sshguard`
   package with the iptables backend; it banned a live attacker seconds after
   starting). The Stage 1 block below is left for reference / re-runs, but
   note bkk needs the sshguard variant (documented inline).
+- **fc-orlando (live host check 2026-11-06): the `ansible/roles/fail2ban` role exists but fc-orlando is not yet enrolled.** `fail2ban-client` is missing, the unit is inactive and no sshd jail is configured.
 - **Stage 2 (Cockpit disable) — DONE + verified.** `cockpit.socket` disabled
   + stopped on va/va2/sj; port 9090 no longer listening.
 - **Stage 3 (firewall lockdown) — DONE + verified.** va3 added to every
   node's peer allowlist; hive-rt-node ports (3000, 7799-7804) now dropped
   from the public internet on va (confirmed blocked) while the mesh stayed
   intact (5/5 peers on every node).
-- **Stages 5-6 (SSH auth hardening) — DONE + verified.** All 5 nodes now show
+- **Stages 5-6 (SSH auth hardening) — DONE + verified on the 5 original nodes.** All 5 of those nodes show
   (via `sshd -T`) `permitrootlogin without-password` (key-only) and
   `passwordauthentication no`. Key-based root login was re-verified with a
   fresh `BatchMode=yes` connection after every change — no lockout. A backup
   of each edited file was left as `<file>.bak.pretrust`.
+- **fc-orlando (live host check 2026-11-06): SSH is not key-only.** `sshd -T` reports `passwordauthentication yes`, `permitrootlogin without-password` and `maxauthtries 6`; a second privileged account `atltech` exists.
 - **Stage 4 (`HIVE_PEER_TRUST`) — DONE + verified.** Config pre-seeded with
   all 5 real endpoint IDs, then activated via a one-node-at-a-time
   `hive-node` restart (va3→va2→bkk→sj→va, DNS leader last). All 5 nodes came
@@ -27,7 +29,7 @@
   warnings. The Stage 4 section below is retained for reference (rollback +
   abandon-entirely commands).
 
-**Everything in this runbook is now DONE. Nothing here requires action.** It
+**Everything in this runbook is DONE for the 5 original nodes; fc-orlando is not covered by the stages below (live host check 2026-11-06).** It
 is retained as the record of what was executed and for rollback commands.
 
 ---

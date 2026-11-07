@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 /// token) without widening the replay window of a single-purpose token.
 pub const MESH_DELEGATION_TOKEN_TTL_SECS: i64 = 90;
 
+/// Unknown JWT claims are IGNORED on decode: this derive does not use deny_unknown_fields, so a
+/// pre-roll token verifies unchanged and an OTP-satisfied token carrying the extra signed otp_at
+/// claim still decodes into this exact struct. Deliberately NO otp_at field: see
+/// issue_otp_satisfied. Every explicit Claims literal in gossip.rs therefore still compiles.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     /// Subject: the user id, or `key:<id>` for a dashboard API key.
@@ -148,6 +152,178 @@ pub fn issue_with_secret(
     Ok(token)
 }
 
+/// The ONLY writer of the otp_at claim: admin::mint_token calls this after a verified OTP or
+/// one-use recovery code. The otp_at value is the unix-seconds verification timestamp returned by
+/// TotpStore::verify_login; it is NEVER taken from TokenReq, a header, a cookie or any other
+/// client-supplied string, and it is emitted INSIDE the signed payload (HS256 covers it). Claims
+/// deliberately has no such field: three explicit Claims literals in gossip.rs have no struct
+/// update, and serde ignores the extra claim on decode, so every pre-roll token still verifies.
+pub fn issue_otp_satisfied(
+    sub: &str,
+    tenant: &str,
+    role: &str,
+    platform_admin: bool,
+    ttl_secs: i64,
+    otp_at: u64,
+) -> anyhow::Result<String> {
+    let key = secret().ok_or_else(|| anyhow::anyhow!("HIVE_JWT_SECRET not set"))?;
+    issue_otp_satisfied_with_secret(sub, tenant, role, platform_admin, ttl_secs, otp_at, &key)
+}
+
+/// Deterministic core with an explicit signing key (no env read), used by issue_otp_satisfied
+/// and by selftest_claim_roundtrip.
+fn issue_otp_satisfied_with_secret(
+    sub: &str,
+    tenant: &str,
+    role: &str,
+    platform_admin: bool,
+    ttl_secs: i64,
+    otp_at: u64,
+    key: &str,
+) -> anyhow::Result<String> {
+    #[derive(Serialize)]
+    struct OtpPayload<'a> {
+        sub: &'a str,
+        tenant: &'a str,
+        role: &'a str,
+        exp: usize,
+        iat: usize,
+        platform_admin: bool,
+        otp_at: u64,
+    }
+    let now = chrono::Utc::now().timestamp() as usize;
+    let payload = OtpPayload {
+        sub,
+        tenant,
+        role,
+        iat: now,
+        exp: now + ttl_secs.max(1) as usize,
+        platform_admin,
+        otp_at,
+    };
+    Ok(encode(
+        &Header::default(),
+        &payload,
+        &EncodingKey::from_secret(key.as_bytes()),
+    )?)
+}
+
+/// PRIVATE raw JWT payload parse. This is NOT signature verification. The ONLY sanctioned
+/// request-path caller is step_up_claim, which demands a Claims value that principal already
+/// produced from verify_with_secret. Never make this pub; never call it on an unauthenticated
+/// raw token. A hive_ API key and the queue token have no JWT payload and yield None.
+fn otp_payload_claims(token: &str) -> Option<(String, u64)> {
+    let payload = token.split('.').nth(1)?;
+    let payload = payload.trim_end_matches('=');
+    let raw = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        payload,
+    )
+    .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let sub = v.get("sub")?.as_str()?.to_string();
+    let at = v.get("otp_at")?.as_u64()?;
+    Some((sub, at))
+}
+
+/// The step-up claim of an ALREADY-AUTHENTICATED request. verified is a Claims value returned by
+/// principal (verify_with_secret / api_key_claims / verify_queue_client); requiring it is the
+/// type-level proof that the token signature was checked BEFORE the payload is parsed. The parsed
+/// payload sub MUST equal the verified principal sub, so a caller cannot hand a different token's
+/// payload than the one principal authenticated. A missing otp_at yields None (fail closed).
+pub fn step_up_claim(verified: &Claims, token: Option<&str>) -> Option<u64> {
+    let (sub, at) = otp_payload_claims(token?)?;
+    (sub == verified.sub).then_some(at)
+}
+
+/// Whether the presented bearer of an already-verified principal carries a fresh otp_at. Used by
+/// the destructive 2FA handlers as defense in depth behind require_auth / admin_ingress.
+pub fn fresh_step_up(verified: &Claims, headers: &axum::http::HeaderMap) -> bool {
+    let token = extract_token(headers);
+    let Some(at) = step_up_claim(verified, token.as_deref()) else {
+        return false;
+    };
+    let now = hive_core::now_ms() / 1000;
+    at <= now.saturating_add(60) && now.saturating_sub(at) <= crate::totp::STEP_UP_WINDOW_SECS
+}
+
+/// Live witness for the extra-claim contract, run by hive-cloud --totp-selftest. Uses a FIXED,
+/// non-secret test key and explicit-key encode/decode, so no credential is read from the process
+/// env, printed, or placed in argv. Proves: a pre-roll token has otp_at=None (fail closed); a
+/// token carrying the extra signed claim STILL decodes into Claims (serde ignores unknown
+/// fields); and step_up_claim reads Some(at) only from the latter.
+pub(crate) fn selftest_claim_roundtrip() {
+    const TEST_KEY: &str = "hive-totp-selftest-not-a-secret";
+    let now = chrono::Utc::now().timestamp() as u64;
+    let plain = issue_with_secret("u1", "t1", "viewer", false, 60, TEST_KEY).unwrap_or_default();
+    let sat = issue_otp_satisfied_with_secret("u1", "t1", "viewer", false, 60, now, TEST_KEY)
+        .unwrap_or_default();
+    println!("decode_preroll_ok={}", verify_with_secret(&plain, TEST_KEY).is_ok());
+    println!("decode_satisfied_ok={}", verify_with_secret(&sat, TEST_KEY).is_ok());
+    println!("preroll_otp_payload={:?}", otp_payload_claims(&plain));
+    println!("satisfied_otp_payload={:?}", otp_payload_claims(&sat));
+    let verified = verify_with_secret(&sat, TEST_KEY).ok();
+    println!(
+        "step_up_claim_satisfied={:?}",
+        verified.as_ref().and_then(|c| step_up_claim(c, Some(&sat)))
+    );
+}
+
+/// The SINGLE carve-out, evaluated BEFORE any OTP is demanded. A verified, explicitly-asserted
+/// HUMAN account is the only subject 2FA applies to. A fleet mesh-internal delegation (all 20
+/// sites), the World queue client, a hive_ API key, an empty subject and the untagged sentinel are
+/// NOT human and are NEVER asked for an OTP here: their own gates decide them, and demanding one at
+/// the principal chokepoint would reject them fleet-wide. claims.role == "service" ALONE is not a
+/// carve-out: is_fleet_service / is_queue_client both require subject AND role.
+fn step_up_subject(claims: &Claims) -> Option<&str> {
+    if is_fleet_service(claims)
+        || is_queue_client(claims)
+        || claims.sub.starts_with("key:")
+        || claims.sub.is_empty()
+        || claims.sub == "__untagged__"
+    {
+        return None;
+    }
+    Some(&claims.sub)
+}
+
+/// Per-request 2FA step-up re-check. Called from BOTH require_auth and main::admin_ingress (both
+/// authenticate through principal), so a leader-forwarded mutation cannot bypass it. An OTP is
+/// demanded ONLY when step_up_subject yields a human sub AND a stored otp_required row exists;
+/// an unreadable store row FAILS CLOSED. Reads and own-credential routes are never gated here.
+pub fn step_up_ok(
+    c: &crate::state::CloudState,
+    claims: &Claims,
+    method: &axum::http::Method,
+    path: &str,
+    otp_at: Option<u64>,
+) -> bool {
+    if !enforced() {
+        return true;
+    }
+    if is_open_route(path) {
+        return true;
+    }
+    if matches!(method.as_str(), "GET" | "HEAD" | "OPTIONS") {
+        return true;
+    }
+    let Some(sub) = step_up_subject(claims) else {
+        return true; // not a human account: no OTP demand here
+    };
+    let Some(required) = c.totp.otp_required_checked(sub) else {
+        return false; // missing/unreadable store row: FAIL CLOSED
+    };
+    if !required {
+        return true;
+    }
+    // A pre-roll token with no otp_at FAILS CLOSED on a 2FA account.
+    let Some(at) = otp_at else {
+        return false;
+    };
+    let now = hive_core::now_ms() / 1000;
+    at <= now.saturating_add(60) && now.saturating_sub(at) <= crate::totp::STEP_UP_WINDOW_SECS
+}
+
 /// Verify a token and return its claims.
 pub fn verify(token: &str) -> anyhow::Result<Claims> {
     let key = secret().ok_or_else(|| anyhow::anyhow!("HIVE_JWT_SECRET not set"))?;
@@ -273,6 +449,10 @@ pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claim
         return None;
     }
     let k = c.apikeys.verify(token)?;
+    // A dashboard API key is never a 2FA-satisfied principal.
+    if c.totp.api_key_blocked(&k.id, &k.team, k.created_ms) {
+        return None;
+    }
     let now = chrono::Utc::now().timestamp() as usize;
     Some(Claims {
         sub: format!("key:{}", k.id),
@@ -340,7 +520,8 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    let claims = extract_token(req.headers()).and_then(|t| principal(&state, &t));
+    let token = extract_token(req.headers());
+    let claims = token.as_deref().and_then(|t| principal(&state, t));
     let authed = claims.is_some();
     if let Some(c) = &claims {
         req.extensions_mut().insert(c.clone());
@@ -365,6 +546,12 @@ pub async fn require_auth(
         return resp;
     }
     if authed {
+        if let Some(c) = claims.as_ref() {
+            let otp_at = step_up_claim(c, token.as_deref());
+            if !step_up_ok(&state, c, &method, req.uri().path(), otp_at) {
+                return (StatusCode::FORBIDDEN, "2fa_step_up_required").into_response();
+            }
+        }
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()

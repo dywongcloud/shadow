@@ -150,6 +150,82 @@ async function clerkSessionToken(): Promise<string | null> {
 /** A mint that does not answer in this long fails (counted like any other failure): mints run one at a time per tab, so a hung one would otherwise hold up the queue and every request waiting on it. */
 const MINT_TIMEOUT_MS = 20_000;
 
+/** A typed 2FA challenge from `/api/token` (HTTP 403/428): `{"otp_required":true,"challenge_id":"..."}`.
+ *  The challenge id never leaves this in-flight call chain: no URL, storage, log line or attribute. */
+type OtpChallengeBody = {
+  ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean; role?: string;
+  expires_in?: number; otp_required?: unknown; challenge_id?: unknown; reason?: string;
+};
+function challengeIdOf(d: unknown): string | null {
+  if (!d || typeof d !== "object") return null;
+  const b = d as OtpChallengeBody;
+  if (b.otp_required !== true || typeof b.challenge_id !== "string") return null;
+  const id = b.challenge_id.trim();
+  return id ? id : null;
+}
+
+/** The ONE 6-digit form (mounted in the root layout) registers here. `null` = no form mounted, so a
+ *  challenge fails closed instead of silently minting. */
+type OtpPrompt = (error: string) => Promise<string | null>;
+let otpPrompt: OtpPrompt | null = null;
+export function registerOtpPrompt(fn: OtpPrompt | null): void { otpPrompt = fn; }
+const OTP_PROMPT_TIMEOUT_MS = 5 * 60_000;
+
+/** Answers a typed challenge: prompt, re-POST the SAME body plus `challenge_id` + `otp`, and on a new
+ *  challenge (wrong code) prompt again. `otp` carries a 6-digit TOTP OR a one-use recovery code: the
+ *  backend verifies both through that one field (`admin::mint_token` -> `totp::verify_login`). */
+async function resolveOtpChallenge(
+  team: string,
+  clerkTok: string | null,
+  firstChallengeId: string,
+): Promise<{ tenant: string; sentAt: number; lifeMs: number } | null> {
+  let challengeId = firstChallengeId;
+  let error = "";
+  for (;;) {
+    if (!otpPrompt) return null;
+    const code = await Promise.race([
+      otpPrompt(error),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), OTP_PROMPT_TIMEOUT_MS)),
+    ]);
+    if (!code) return null;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), MINT_TIMEOUT_MS);
+    let r: Response;
+    try {
+      r = await fetch("/api/token", {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(clerkTok ? { authorization: `Bearer ${clerkTok}` } : {}) },
+        body: JSON.stringify({ team, ...(clerkTok ? { clerk_token: clerkTok } : {}), challenge_id: challengeId, otp: code }),
+        signal: ctrl.signal,
+      });
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+    const d = (await r.json().catch(() => null)) as OtpChallengeBody | null;
+    if (r.ok && d?.ok) {
+      mirrorSession(d as { enforced?: boolean; platform_admin?: boolean; role?: string });
+      const backendUnenforced = d.enforced === false;
+      return {
+        tenant: backendUnenforced ? team : (d.tenant ?? team),
+        sentAt: Date.now(),
+        lifeMs: typeof d.expires_in === "number" && d.expires_in > 0 ? d.expires_in * 1000 : 0,
+      };
+    }
+    const next = challengeIdOf(d);
+    if (!next) return null;
+    challengeId = next;
+    error = "That code was not accepted. Enter a new code or a recovery code.";
+  }
+}
+
+/** Re-run the 2FA login challenge to put a FRESH `otp_at` claim in the httpOnly cookie: the backend's
+ *  destructive 2FA routes require a step-up no older than five minutes. Same single-flight mint. */
+export function refreshTwoFactorStepUp(): Promise<string | null> {
+  return mintSessionToken();
+}
+
 /** One mint round trip: the tenant it granted, when it was sent and the lifetime it reported (0 when it did not say), or null when it failed. */
 async function mintOnce(team?: string): Promise<{ tenant: string; sentAt: number; lifeMs: number } | null> {
   const t = team ?? currentTeam();
@@ -167,12 +243,14 @@ async function mintOnce(team?: string): Promise<{ tenant: string; sentAt: number
       body: JSON.stringify({ team: t, ...(clerkTok ? { clerk_token: clerkTok } : {}) }),
       signal: ctrl.signal,
     });
+    const raw = (await r.json().catch(() => null)) as OtpChallengeBody | null;
+    const challenge = challengeIdOf(raw);
+    if (challenge) return resolveOtpChallenge(t, clerkTok, challenge);
     if (!r.ok) {
-      const reason = await r.json().then((d) => d?.reason).catch(() => undefined);
-      console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
+      console.warn(`hive: session mint failed (${raw?.reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
       return null;
     }
-    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean; platform_admin?: boolean; role?: string; expires_in?: number } | null;
+    const d = raw;
     if (!d?.ok) return null;
     mirrorSession(d);
     const backendUnenforced = d.enforced === false;

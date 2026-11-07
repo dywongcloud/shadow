@@ -77,6 +77,13 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/push/test", Role::Viewer),
     rule(POST, "/v1/identity/sync", Role::Viewer),
     rule(POST_DELETE, "/v1/browser/*", Role::Viewer),
+    // Optional per-account 2FA: self-service at the lowest role. The OTP gate itself lives in
+    // admin::mint_token BEFORE auth::issue, never in a rule: roles::gate short-circuits for a
+    // platform_admin or a fleet token, so a rule there would be a complete bypass.
+    rule(GET, "/v1/account/2fa/status", Role::Viewer),
+    rule(POST, "/v1/account/2fa/enroll", Role::Viewer),
+    rule(POST, "/v1/account/2fa/confirm", Role::Viewer),
+    rule(POST, "/v1/account/2fa/disable", Role::Viewer),
     rule(POST, "/v1/storage/vector/:index/query", Role::Viewer),
     rule(GET, "/v1/databases/:id/credentials", Role::Member),
     rule(
