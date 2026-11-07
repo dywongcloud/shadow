@@ -342,7 +342,7 @@ impl TotpStore {
         let mut s = self.rows.lock();
         // CAS: the pending secret must be exactly the one we verified.
         let cur = s.get_mut(sub).ok_or(TotpError::NoPending)?;
-        if cur.otp_required || cur.pending_secret_enc != pending {
+        if cur.otp_required || !crate::admin::ct_eq(&cur.pending_secret_enc, &pending) {
             return Err(TotpError::NoPending);
         }
         cur.deleted = false;
