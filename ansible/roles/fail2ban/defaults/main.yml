@@ -1,0 +1,19 @@
+---
+# Operator-only preconditions for a fail2ban apply. Every default FAILS CLOSED:
+# a fresh run refuses to enable the sshd jail until a human has verified the
+# on-host facts. Never set these in group_vars/all or on an unverified host.
+#
+# prerequisites disables PasswordAuthentication before this role runs, so an
+# sshd jail without a verified authorized_keys path is a self-ban with no
+# in-band recovery. The role never guesses the path.
+hive_fail2ban_sshd_authorized_keys_confirmed: false
+#
+# The operator's recovery addresses (laptop, jump host) are the only in-band
+# way back in once the sshd jail is live. Empty is refused by the lockout assert
+# in tasks/main.yml. No IP is hardcoded anywhere in this role.
+hive_fail2ban_ignoreip_extra: ""
+#
+# This role ships no SELinux policy module (.te/.pp). On an Enforcing host the
+# operator must install one, add the two fcontext rules and restorecon before
+# the jails may be enabled.
+hive_fail2ban_selinux_policy_installed: false

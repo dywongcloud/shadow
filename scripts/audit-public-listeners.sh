@@ -40,6 +40,11 @@
 # Both layers present at once is flagged: after a roll the stale legacy chain
 # keeps enforcing its OLD roster beside the new table.
 #
+# Fail2ban bans land in table inet f2b-table. The F2B_TABLE column reports
+# whether that table exists and how many ban/set rules it carries, so a jail
+# that is registered but never bans is visible after an apply. Only the COUNT
+# is printed -- never the banned addresses or any inventory content.
+#
 # Usage:
 #   scripts/audit-public-listeners.sh            # table for the whole fleet
 #   SSH_KEY=~/.ssh/other.pem scripts/audit-public-listeners.sh
@@ -51,15 +56,18 @@
 #                                    # hive_retired=true hosts (normally skipped:
 #                                    # the instance is gone); they never join the
 #                                    # expected roster, matching the generator
+#   SSH_KEY=~/.ssh/id_ed25519 scripts/audit-public-listeners.sh  # fc-orlando
 #   ALLOW_SKIPPED=1 ...              # accept hosts this script cannot audit
 # Exit status: 0 clean, 1 on a finding (foreign listener, missing/extra peer,
 # two layers, no lockdown, unreachable or unaudited host), 2 when nothing was
 # audited (bad ONLY, empty selection). A host whose ansible_user is not root is
-# reported SKIPPED and counts as a finding unless ALLOW_SKIPPED=1.
+# probed with sudo -n timeout 60 sh -s (fc-orlando: sysadmin), NEVER skipped
+# up front; it is reported SKIPPED only if that probe fails, and still counts
+# as a finding unless ALLOW_SKIPPED=1.
 set -uo pipefail
 
 INVENTORY="${INVENTORY:-$(dirname "$0")/../ansible/inventory/hosts.ini}"
-SSH_KEY="${SSH_KEY:-$HOME/.ssh/billing.pem}"
+SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 SSH_OPTS=(-o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=accept-new -o BatchMode=yes)
 
 if [ ! -f "$INVENTORY" ]; then
@@ -111,8 +119,17 @@ fi
 
 probe() {
   # The remote script travels on stdin (`sh -s`), so it needs no quoting of its
-  # own. Do NOT add `-n`: it would swallow that stdin.
-  ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "root@$1" 'timeout 60 sh -s' 2>/dev/null <<'REMOTE'
+  # own. Do NOT add `-n`: it would swallow that stdin. A host with a non-root
+  # ansible_user (fc-orlando: sysadmin) is reached as THAT user through
+  # passwordless sudo -n -- the same pattern as scripts/audit-secret-keys.sh --
+  # so a provisioned-but-non-root node is audited, never skipped up front.
+  local ip="$1"
+  local user="${2:-root}"
+  local remote_cmd='timeout 60 sh -s'
+  if [ "$user" != root ]; then
+    remote_cmd='sudo -n timeout 60 sh -s'
+  fi
+  ssh -i "$SSH_KEY" "${SSH_OPTS[@]}" "$user@$ip" "$remote_cmd" 2>/dev/null <<'REMOTE'
 # Wildcard listeners (0.0.0.0 / [::] / *), minus the platform daemons.
 foreign=$(ss -tlnpH 2>/dev/null \
   | awk '$4 ~ /^(0\.0\.0\.0|\[::\]|\*):/' \
@@ -136,7 +153,14 @@ if nft list table inet hive_lockdown >/dev/null 2>&1; then
   ips=$(nft list table inet hive_lockdown | tr '\n' ' ' | grep -o 'ip saddr {[^}]*} accept' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | peers_of)
   layers="$layers inet=$ips"
 fi
-echo "${layers# }|${foreign}"
+# Fail2ban's own ban table. Report presence + a rule count only: never echo
+# the banned addresses (and never the inventory) back to the audit output.
+f2b="absent"
+if nft list table inet f2b-table >/dev/null 2>&1; then
+  f2b_rules=$(nft list table inet f2b-table 2>/dev/null | grep -cE '(^|[[:space:]])(drop|reject|elements)([[:space:]]|$|=)' || true)
+  f2b="present:${f2b_rules:-0}"
+fi
+echo "${layers# }|${foreign}|${f2b}"
 REMOTE
 }
 
@@ -149,30 +173,29 @@ roster_diff() {
   printf '%s|%s' "$missing" "$extra"
 }
 
-printf "%-20s %-16s %-32s %s\n" NODE HOST_IP LOCKDOWN FOREIGN_WILDCARD_LISTENERS
-printf "%.0s-" {1..110} && echo
+printf "%-20s %-16s %-32s %-14s %s\n" NODE HOST_IP LOCKDOWN F2B_TABLE FOREIGN_WILDCARD_LISTENERS
+printf "%.0s-" {1..124} && echo
 
 bad=0; audited=0; skipped=0
 while IFS=$'\t' read -r name ip user retired; do
   [ -z "$name" ] && continue
   if [ -n "$ONLY" ] && [[ ",${ONLY}," != *",${name},"* ]]; then continue; fi
-  # The probe needs root (`ss -p`, nft). A host provisioned with another ssh
-  # user (fc-orlando: sysadmin) cannot be audited by this script -- say so
-  # rather than report a reachable node as UNREACHABLE. It is NOT audited, so
-  # it can never count toward a clean verdict (see the summary below).
-  if [ "${user:-root}" != root ]; then
-    printf "%-20s %-16s %-32s %s\n" "$name" "$ip" SKIPPED "ansible_user=$user is not root -- audit this host by hand"
-    skipped=$((skipped + 1))
-    continue
-  fi
-  audited=$((audited + 1))
-  out=$(probe "$ip")
+  # Every live node is probed, including a host with a non-root ansible_user
+  # (fc-orlando: sysadmin + passwordless sudo -n). A node that is never probed
+  # can never count toward a clean verdict, so there is no pre-emptive skip.
+  out=$(probe "$ip" "${user:-root}")
   if [ -z "$out" ]; then
-    printf "%-20s %-16s %-32s %s\n" "$name" "$ip" UNREACHABLE "ssh failed -- try: ssh -i $SSH_KEY root@$ip true"
+    if [ "${user:-root}" != root ]; then
+      printf "%-20s %-16s %-32s %-14s %s\n" "$name" "$ip" SKIPPED "-" "ansible_user=$user needs passwordless sudo -n -- audit this host by hand"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    printf "%-20s %-16s %-32s %-14s %s\n" "$name" "$ip" UNREACHABLE "-" "ssh failed -- try: ssh -i $SSH_KEY root@$ip true"
     bad=1
     continue
   fi
-  layers="${out%%|*}"; foreign="${out#*|}"
+  audited=$((audited + 1))
+  layers="${out%%|*}"; rest="${out#*|}"; foreign="${rest%%|*}"; f2b="${rest#*|}"
   tag=""; detail=""
   if [ -z "$layers" ]; then
     tag="NONE!"; bad=1
@@ -197,9 +220,9 @@ while IFS=$'\t' read -r name ip user retired; do
   fi
   if [ -n "$foreign" ]; then
     bad=1
-    printf "%-20s %-16s %-32s %s\n" "$name" "$ip" "$tag" "$foreign"
+    printf "%-20s %-16s %-32s %-14s %s\n" "$name" "$ip" "$tag" "$f2b" "$foreign"
   else
-    printf "%-20s %-16s %-32s %s\n" "$name" "$ip" "$tag" "-"
+    printf "%-20s %-16s %-32s %-14s %s\n" "$name" "$ip" "$tag" "$f2b" "-"
   fi
   [ -n "$detail" ] && printf "    %s\n" "${detail# }"
 done <<< "$NODES"

@@ -25,6 +25,19 @@
       for this GitHub-generated archive, so refusing to install unverified source.
   when: f2b_active.stdout != "active"
 
+- name: Refuse to apply fail2ban until the operator confirms the sshd key path
+  ansible.builtin.assert:
+    that:
+      - hive_fail2ban_sshd_authorized_keys_confirmed | default(false) | bool
+    fail_msg: >-
+      FAIL CLOSED: roles/prerequisites sets PasswordAuthentication no and
+      reloads sshd BEFORE this role runs, with no authorized_keys check in
+      between. Enabling the sshd jail without a verified key path locks the
+      operator out with NO in-band recovery (self-ban / fleet lockout).
+      Confirm the on-host authorized_keys path first, then set
+      hive_fail2ban_sshd_authorized_keys_confirmed=true for this host. This
+      role never guesses the path and never treats an unverified host as safe.
+
 - name: Download fail2ban 1.1.0 release tarball
   ansible.builtin.get_url:
     url: https://github.com/fail2ban/fail2ban/archive/refs/tags/1.1.0.tar.gz
@@ -64,7 +77,12 @@
       [Unit]
       Description=Fail2Ban Service
       Documentation=man:fail2ban(1)
-      After=network.target
+      # hive-lockdown.service rebuilds the only host firewall and nftables.service
+      # restores the base ruleset; both can flush inet f2b-table at boot. The
+      # jails must come up AFTER them. Wants= is a weak dependency: a host
+      # without either unit still starts fail2ban.
+      After=network.target nftables.service hive-lockdown.service
+      Wants=nftables.service hive-lockdown.service
 
       [Service]
       Type=simple
@@ -97,6 +115,102 @@
              | map(attribute='hive_private_ip') | list)
           + (hive_fail2ban_ignoreip_extra | default('')).split(','))
          | map('trim') | reject('equalto', '') | unique | join(' ') }}
+
+- name: Refuse to apply fail2ban unless ignoreip covers every live peer and the operator recovery addresses
+  ansible.builtin.assert:
+    that:
+      - (hive_fail2ban_ignoreip_extra | default('') | trim | length) > 0
+      - >-
+        (((groups['all'] | map('extract', hostvars)
+            | rejectattr('hive_retired', 'defined')
+            | selectattr('ansible_host', 'defined')
+            | map(attribute='ansible_host') | list)
+           + (groups['all'] | map('extract', hostvars)
+              | rejectattr('hive_retired', 'defined')
+              | selectattr('hive_private_ip', 'defined')
+              | map(attribute='hive_private_ip') | list))
+          | map('trim') | reject('equalto', '')
+          | difference(hive_fail2ban_ignoreip.split()) | list | length) == 0
+      - >-
+        ((hive_fail2ban_ignoreip_extra | default('')).split(',')
+          | map('trim') | reject('equalto', '')
+          | difference(hive_fail2ban_ignoreip.split()) | list | length) == 0
+    fail_msg: >-
+      FAIL CLOSED: the rendered ignoreip does not cover every non-retired host,
+      or hive_fail2ban_ignoreip_extra is empty. fail2ban would ban a fleet peer
+      or the operator laptop, and with PasswordAuthentication no there is NO
+      in-band recovery (self-ban / fleet lockout). Populate
+      hive_fail2ban_ignoreip_extra with the operator's recovery addresses and
+      re-check the live inventory before applying. No address is hardcoded here.
+
+- name: Read the host's SELinux mode
+  ansible.builtin.command: getenforce
+  register: f2b_getenforce
+  changed_when: false
+  failed_when: false
+
+- name: Record whether SELinux is Enforcing on this host
+  ansible.builtin.set_fact:
+    f2b_selinux_enforcing: >-
+      {{ (f2b_getenforce.stdout | default('') | trim | lower) == 'enforcing' }}
+
+- name: Create the fail2ban runtime directory before the jails are enabled
+  ansible.builtin.file:
+    path: /run/fail2ban
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Pre-create the recidive log (0600, root-owned) before the jail is enabled
+  ansible.builtin.file:
+    path: /var/log/fail2ban.log
+    state: touch
+    owner: root
+    group: root
+    mode: "0600"
+    modification_time: preserve
+    access_time: preserve
+  register: f2b_recidive_log
+
+- name: Apply the operator's SELinux file-context mapping to the fail2ban paths
+  ansible.builtin.command: "restorecon -v {{ item }}"
+  loop:
+    - /run/fail2ban
+    - /var/log/fail2ban.log
+  register: f2b_restorecon
+  changed_when: false
+  failed_when: false
+  when: f2b_selinux_enforcing | bool
+
+- name: Read the SELinux labels on the fail2ban runtime and log paths
+  ansible.builtin.command: "stat -c %C {{ item }}"
+  loop:
+    - /run/fail2ban
+    - /var/log/fail2ban.log
+  register: f2b_selinux_ctx
+  changed_when: false
+  failed_when: false
+  when: f2b_selinux_enforcing | bool
+
+- name: Refuse to enable the jails on an SELinux Enforcing host with unlabelled paths
+  ansible.builtin.assert:
+    that:
+      - hive_fail2ban_selinux_policy_installed | default(false) | bool
+      - >-
+        (f2b_selinux_ctx.results | map(attribute='stdout')
+          | select('match', '^[^:]+:[^:]+:[^:]+:') | list | length) == 2
+      - >-
+        (f2b_selinux_ctx.results | map(attribute='stdout')
+          | select('match', '^.*:(unlabeled_t|default_t|file_t):') | list | length) == 0
+    fail_msg: >-
+      FAIL CLOSED: SELinux is Enforcing but this role ships NO SELinux policy
+      module (.te/.pp) for the setup.py-installed binaries, /etc/fail2ban,
+      /run/fail2ban and /var/log/fail2ban.log. Unlabelled paths make fail2ban
+      fail with 203/EXEC or run as a SILENT SECURITY NO-OP. Install the
+      operator's policy module, add the two fcontext rules, restorecon the
+      paths, then set hive_fail2ban_selinux_policy_installed=true for this host.
+  when: f2b_selinux_enforcing | bool
 
 - name: Install jail.local (defaults + sshd + recidive)
   ansible.builtin.copy:
@@ -183,4 +297,33 @@
     fail2ban-client status | grep -q 'sshd'
     fail2ban-client status | grep -q 'recidive'
     fail2ban-client get sshd actions | grep -q 'nftables'
+  changed_when: false
+
+- name: Verify the recidive jail is actually banning (an inert jail is a failure)
+  ansible.builtin.shell: |
+    set -eu
+    status=$(fail2ban-client status recidive 2>&1)
+    printf '%s\n' "$status" | grep -q 'File list:.*fail2ban.log' || {
+      echo "INERT recidive jail: no monitored log file attached -- registered but cannot ban" >&2
+      printf '%s\n' "$status" >&2
+      exit 1
+    }
+    printf '%s\n' "$status" | grep -q 'Currently banned:' || {
+      echo "INERT recidive jail: no Actions section -- registered but cannot ban" >&2
+      printf '%s\n' "$status" >&2
+      exit 1
+    }
+    printf '%s\n' "$status" | grep -q 'Banned IP list' || {
+      echo "INERT recidive jail: no ban list -- registered but cannot record bans" >&2
+      printf '%s\n' "$status" >&2
+      exit 1
+    }
+    fail2ban-client get recidive actions | grep -q 'nftables' || {
+      echo "INERT recidive jail: banaction is not nftables -- bans would not land" >&2
+      exit 1
+    }
+    [ -s /var/log/fail2ban.log ] || {
+      echo "INERT recidive jail: /var/log/fail2ban.log is empty -- fail2ban is not writing ban events, so recidive can never ban" >&2
+      exit 1
+    }
   changed_when: false
