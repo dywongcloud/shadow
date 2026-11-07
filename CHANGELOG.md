@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-07 - correction: 2FA dependency parenthetical and commit-body attribution
+
+Two commit bodies are wrong; the commits stay untouched. `1d1b454c78` and the 2026-11-06 entry
+below say the primitive uses already-locked `ring/hmac/sha1/argon2/base32` crates. `hive-cloud`
+has NO `sha1` or `base32` dependency: its direct crypto deps are `ring` (HMAC-SHA1 comes from
+`ring`), `argon2`, `hex`, `base64`, `hmac` and `sha2`, and base32 is hand-written in `totp.rs`.
+Zero new dependencies is correct. `b874acc4c5` says it removed an unchecked `expect()` and
+registered `GET /v1/account/2fa/status`; that commit changes ONE line in `totp.rs` (`!=` to
+`admin::ct_eq` in the secret CAS) and touches no route or `expect()`. The status route, its viewer
+`RULES` row and the rest of the 2FA source landed in `1d1b454c78`. This entry corrects those two
+commit bodies and the entry below without rewriting history.
+
 ## 2026-11-06 — optional per-account TOTP 2FA, and a read-only fc-orlando compromise audit
 
 Optional 2FA is TOTP (RFC 6238 authenticator app), per ACCOUNT keyed on the verified Claims.sub,
@@ -23,7 +35,7 @@ was restarted. Rotation and a fail2ban/sshd production apply are one-way doors h
 operator's word; the single decisive question is whether those two IPs are operator-owned control
 hosts.
 
-Repo-side: the fail2ban ansible role already exists and is wired at site.yml:18-19, but fc-orlando
+Repo-side: the fail2ban ansible role already exists and is wired at ansible/playbooks/site.yml:18-19, but fc-orlando
 is not enrolled (fail2ban-client missing, unit inactive, no sshd jail, sshguard inactive), and sshd
 -T reports passwordauthentication yes / permitrootlogin without-password. Corrected the docs that
 claimed fleet-wide fail2ban coverage and key-only SSH. Added a fail-closed
@@ -31,7 +43,9 @@ fail2ban_tarball_sha256 assert to the role (upstream publishes no SHA-256 for th
 archive; a Debian .dsc digest is for a DIFFERENT tarball and was not used). Added .gitignore rules
 for inventory backup name forms and backups/ after discovering that commit 926be87d added and
 pushed the operator's inventory backups to the public repo; a shape-only scan of all 41,351
-inserted lines found no PEM key and no secret value, so the exposure is fleet topology, operator
+inserted lines found no PEM private key, no HIVE_SECRET_KEY-shaped value and no password-shaped
+value; a shape-only scan cannot establish the absence of an arbitrary secret, so the exposure is
+fleet topology, operator
 email and an SSH key PATH, not a proven credential disclosure. Removing the already-pushed files
 requires a force-push history rewrite, held for the operator. AGENTS.md recompiled under its 30 KB
 budget. No runtime gate was weakened.

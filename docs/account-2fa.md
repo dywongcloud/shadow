@@ -5,15 +5,28 @@ result or deployment is claimed here. Present tense; every claim cites `path:lin
 are hints that drift as the tree moves. History lives in `CHANGELOG.md`; this page states only what
 must be true of the code now.
 
+## Citation drift
+
+`path:line` numbers are observed at a point in time and drift as the tree moves; SYMBOLS are
+authoritative. These six symbol-to-location mappings are re-verified against the current tree:
+
+- `RULES` -> `crates/hive-cloud/src/roles.rs:72`
+- `mint_token` -> `crates/hive-cloud/src/admin.rs:594`
+- `step_up_ok` -> `crates/hive-cloud/src/auth.rs:294`
+- `TotpRow` -> `crates/hive-cloud/src/totp.rs:75`
+- `REGISTRY` -> `crates/hive-cloud/src/store_sync.rs:131`
+- `ct_eq` -> `crates/hive-cloud/src/admin.rs:440`
+
 ## Current state
 
 The feature source is present in the working tree at the moment of writing. A filename scan of the
 source tree returns exactly one TOTP file, `crates/hive-cloud/src/totp.rs`, and no 2FA-named
 source file; the only 2FA-named artifact is this document. An exhaustive literal scan of
-`crates/hive-cloud/src` locates three registered 2FA routes
-(`crates/hive-cloud/src/admin.rs:160-171`): `POST /v1/account/2fa/enroll`,
-`POST /v1/account/2fa/confirm` and `POST /v1/account/2fa/disable`, each with a viewer-floor
-`RULES` row (`crates/hive-cloud/src/roles.rs:83-85`). The `totp` store is registered in
+`crates/hive-cloud/src` locates four registered 2FA routes
+(`crates/hive-cloud/src/admin.rs:161`, `:165`, `:169`, `:173`): `GET /v1/account/2fa/status`,
+`POST /v1/account/2fa/enroll`, `POST /v1/account/2fa/confirm` and
+`POST /v1/account/2fa/disable`, each with a viewer-floor `RULES` row
+(`crates/hive-cloud/src/roles.rs:83-86`). The `totp` store is registered in
 `REGISTRY` (`crates/hive-cloud/src/store_sync.rs:512-524`) and named in `MERGE_STORES`
 (`crates/hive-cloud/src/store_sync.rs:530-537`); its snapshot field is
 `crates/hive-cloud/src/persist.rs:99-103` and its in-process handle is
@@ -62,7 +75,7 @@ properties of the surrounding code make any other placement a complete bypass:
 - `roles::gate` returns `Ok(())` immediately for `platform_admin` and fleet identities
   (`crates/hive-cloud/src/roles.rs:316`), and a new `RULES` row cannot change that
   short-circuit. The self-service 2FA `RULES` rows are viewer-floor and the source says outright
-  that the OTP gate is never a rule (`crates/hive-cloud/src/roles.rs:80-85`). The dashboard mirror
+  that the OTP gate is never a rule (`crates/hive-cloud/src/roles.rs:80-86`). The dashboard mirror
   of the matrix only decides whether to offer a control; the backend is the authority
   (`ui/lib/team-role.ts:5-8`).
 
@@ -142,6 +155,10 @@ in an authenticated JSON body (`crates/hive-cloud/src/totp.rs:20-21`, `:686-687`
 
 ## Flows
 
+- **Status.** `GET /v1/account/2fa/status` reports only the caller's own enrollment flag over the
+  authenticated JSON body, scoped to the verified sub; a read never reveals the secret, recovery
+  codes or challenge ids (`crates/hive-cloud/src/admin.rs:161`,
+  `crates/hive-cloud/src/roles.rs:83`, `crates/hive-cloud/src/totp.rs:687-697`).
 - **Enrollment.** `POST /v1/account/2fa/enroll` requires an asserted human identity and returns the
   base32 secret ONCE over the authenticated JSON body with digits, period, and algorithm, while
   `otp_required` stays false (`crates/hive-cloud/src/admin.rs:160-163`,

@@ -7,10 +7,10 @@ export type TeamRole = (typeof TEAM_ROLES)[number];
  *  to change anything: a member's route is listed there deliberately, and `work` stands for those (day-to-day project work). */
 export const TEAM_ACTIONS = {
   work: { floor: "member", routes: ["POST /v1/apikeys", "POST /v1/git/deploy", "POST /v1/deploy/zip", "POST /v1/projects/:project/env", "POST /v1/databases", "POST /v1/teams"] },
-  /** Optional per-account 2FA: `roles.rs` RULES lists the three self-service POSTs at the LOWEST role.
-   *  The OTP gate lives in `admin::mint_token` BEFORE `auth::issue`, never in a rule. The GET status
-   *  read is the default viewer read (RULES names no row for it). `roleRefusalFor` /
-   *  `roleRefusalSentence` remain the ONLY refusal sentences; a handler never re-decides a role. */
+  /** Optional per-account 2FA: `roles.rs` RULES lists all four self-service actions (the status GET
+   *  and the three POSTs) at the LOWEST role, viewer. The OTP gate lives in `admin::mint_token`
+   *  BEFORE `auth::issue`, never in a rule. `roleRefusalFor` / `roleRefusalSentence` remain the
+   *  ONLY refusal sentences; a handler never re-decides a role. */
   "account.2fa.status": { floor: "viewer", routes: ["GET /v1/account/2fa/status"] },
   "account.2fa.enroll": { floor: "viewer", routes: ["POST /v1/account/2fa/enroll"] },
   "account.2fa.confirm": { floor: "viewer", routes: ["POST /v1/account/2fa/confirm"] },
