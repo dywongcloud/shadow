@@ -1620,11 +1620,94 @@ export interface PlanSpec {
   max_members: number;
   features: string[];
 }
+/** The ONE public price list (`billing::RATE_CARD`), cents per billed unit. A new server-derived wire
+ *  field is OPTIONAL with an exact fallback: the dashboard rolls independently of the nodes, so the
+ *  seven fields added here stay optional and a node that predates them never makes the UI invent a
+ *  number. NEVER COGS: that is operator-only (`CostCard`). */
 export interface RateCard {
   active_cpu_hr_cents: number;
   mem_gb_hr_cents: number;
   requests_per_million_cents: number;
   waf_per_million_cents: number;
+  gpu_hr_cents?: number;
+  browser_per_million_cents?: number;
+  db_row_ops_per_million_cents?: number;
+  db_storage_gb_month_cents?: number;
+  object_storage_gb_month_cents?: number;
+  ingress_gb_cents?: number;
+  egress_gb_cents?: number;
+}
+
+/** One SKU's profitability (`billing::SkuMargin`), operator-only. */
+export interface SkuMargin {
+  sku: string;
+  price_cents: number;
+  cogs_cents: number;
+  gross_margin_bps: number;
+}
+
+/** `billing::COST_CARD`: COGS in cents per billed unit; the 11 field names mirror `RateCard` so
+ *  `margin_report()` pairs price with cost mechanically. Only `GET /v1/admin/usage/economics`
+ *  serves it; `/v1/usage/summary` NEVER carries COGS. */
+export interface CostCard {
+  active_cpu_hr_cents: number;
+  mem_gb_hr_cents: number;
+  requests_per_million_cents: number;
+  waf_per_million_cents: number;
+  gpu_hr_cents: number;
+  browser_per_million_cents: number;
+  db_row_ops_per_million_cents: number;
+  db_storage_gb_month_cents: number;
+  object_storage_gb_month_cents: number;
+  ingress_gb_cents: number;
+  egress_gb_cents: number;
+}
+
+/** Cumulative counters from `billing::UsageTotals`. The five new fields are `serde(default)` on the
+ *  backend, so a pre-extension snapshot loads them as ZERO, not a deserialize error; they stay
+ *  optional here so the view renders absent values as absent, never as a fabricated 0. */
+export interface UsageTotals {
+  active_cpu_ms: number;
+  mem_gb_hr_milli: number;
+  requests: number;
+  blocked: number;
+  gpu_ms: number;
+  browser_requests: number;
+  db_row_ops?: number;
+  db_storage_byte_ms?: number;
+  object_storage_byte_ms?: number;
+  ingress_bytes?: number;
+  egress_bytes?: number;
+}
+
+/** `GET /v1/usage/summary`: the caller's OWN usage plus the PUBLIC rate card, owner-proxied. The
+ *  keys are `usage`, `rate_card`, `included_cents` and `overage_ceiling_cents` (`admin.rs`
+ *  `usage_summary_for`); NO COGS, no other tenant, no tenant key. A rejected session (401, or
+ *  `x-hive-anon: 1` with an empty body when a node answers before the handler) never yields a
+ *  payload, so `usePoll` keeps `data === null` and the view seeds NO zeros. */
+export interface UsageSummary {
+  usage: UsageTotals;
+  rate_card: RateCard;
+  included_cents: number;
+  overage_ceiling_cents: number;
+}
+
+/** Operator-only `GET /v1/admin/usage/economics`: COGS, margins and the enable gate. */
+export interface UsageEconomics {
+  cost_card: CostCard;
+  margin_report: SkuMargin[];
+  min_gross_margin_bps: number;
+  profitable: boolean;
+  unprofitable_skus: string[];
+  resource_charging_enabled: boolean;
+}
+
+/** One-shot reader for the tenant's usage summary. A misshapen or anonymous payload is a 401, never
+ *  an empty data set: `x-hive-anon: 1` is a session answer, not usage. */
+export async function getUsageSummary(opts?: { fresh?: boolean }): Promise<UsageSummary> {
+  const d = await apiGet<UsageSummary>("/v1/usage/summary", opts);
+  if (!d || !d.usage || !d.rate_card) throw new ApiError(401, "Usage summary needs a signed-in session");
+  return d;
 }
 export interface PlanLimits {
   max_projects: number;

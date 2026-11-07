@@ -125,6 +125,7 @@ mod teams;
 mod tenancy_reconcile;
 mod tencent_eip;
 mod udp_relay;
+mod usage_metering;
 mod vercel_dns;
 mod webhooks;
 mod workspace;
@@ -1609,6 +1610,13 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_disk_refresh(cloud.registry.clone(), runtime_capability_source.clone());
     spawn_memory_pressure_alarm();
 
+    usage_metering::spawn_saver(cloud.clone());
+    if let Err(unprofitable) = billing::RATE_CARD.assert_profitable() {
+        tracing::error!(
+            ?unprofitable,
+            "billing: rate card is not profitable; resource charging stays OFF"
+        );
+    }
     spawn_billing_meter_loop(cloud.clone());
 
     spawn_promotion_reconcile_loop(cloud.clone());
@@ -1706,6 +1714,7 @@ async fn async_main() -> anyhow::Result<()> {
     );
     let admin_router = admin::router(cloud.clone())
         .merge(crate::guardian::routes().with_state(cloud.clone()))
+        .merge(crate::usage_metering::routes().with_state(cloud.clone()))
         .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn_with_state(
             cloud.clone(),
@@ -4930,6 +4939,27 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                 t.browser_requests = t.browser_requests.saturating_add(s.browser_requests);
                 if s.gpu {
                     t.gpu_ms = t.gpu_ms.saturating_add(s.fluid_ms);
+                }
+            }
+            // The SAME owner-elected tick folds the five resource SKUs into the SAME totals map.
+            // Measurement is always running; charging is gated by resource_charging_enabled().
+            // The fold is skipped entirely when charging is off, so shadow mode has zero effect
+            // on the ledger. One charge per tenant per tick, never a second loop.
+            if billing::resource_charging_enabled() {
+                for (tenant, u) in usage_metering::fleet_totals(&cloud).await {
+                    if tenant == usage_metering::UNATTRIBUTED {
+                        continue;
+                    }
+                    let t = totals.entry(tenant).or_default();
+                    t.db_row_ops = t.db_row_ops.saturating_add(u.db_row_ops);
+                    t.db_storage_byte_ms = t
+                        .db_storage_byte_ms
+                        .saturating_add(u.db_storage_byte_ms);
+                    t.object_storage_byte_ms = t
+                        .object_storage_byte_ms
+                        .saturating_add(u.object_storage_byte_ms);
+                    t.ingress_bytes = t.ingress_bytes.saturating_add(u.ingress_bytes);
+                    t.egress_bytes = t.egress_bytes.saturating_add(u.egress_bytes);
                 }
             }
             let mut charged_any = 0u64;

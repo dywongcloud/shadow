@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-11-07 - feature: profitable 11-SKU usage metering, storage/network view and shadow-mode gate
+
+`billing::RATE_CARD` is the ONE public price list with 11 SKUs; the five new ones are managed
+database row ops (20 c/M), database storage (15 c/GB-mo), object storage (1.5 c/GB-mo), ingress
+(0.2 c/GB) and egress (1.0 c/GB). `billing::COST_CARD` holds the measured COGS in the same units,
+`RATE_CARD::margin_report()` emits one `SkuMargin` per priced SKU and
+`RATE_CARD::assert_profitable()` fails the card when any margin falls below
+`MIN_GROSS_MARGIN_BPS=6000` (60%). The floor is load-bearing because a paid plan's
+`included_cents == price_cents`: the subscription's gross margin IS the metered margin, with no
+base fee to absorb a loss-making SKU. The 0/0 browser-node SKU is a counter, not a sale, and is
+skipped by the margin check. Public COGS references and the derivation live in
+`docs/usage-metering.md`.
+
+`billing::UsageTotals` grows by five `serde(default)` counters (`db_row_ops`,
+`db_storage_byte_ms`, `object_storage_byte_ms`, `ingress_bytes`, `egress_bytes`): a snapshot
+written before the extension loads them as zeros, never as a deserialize error in `persist::load`.
+Metering has ONE writer: `may_act(cloud, BillingMeter)` gates `meter_usage` on the elected owner,
+which reads node-local cumulative counters and charges ONE delta per tenant per tick from the last
+durably recorded watermark. `may_consume(tenant, projected_cents)` refuses a projected charge past
+`PlanSpec::overage_ceiling_cents` (Hobby 0, Pro 10000, Enterprise 1000000) BEFORE bytes land, with
+a typed 402/429 and whole-batch rollback; no byte path is both unmetered and unbounded.
+`resource_charging_enabled()` is OFF by default and true only with
+`HIVE_BILLING_METER_RESOURCES=1` AND a profitable card, so the first period runs in shadow mode.
+
+`GET /v1/usage/summary` is tenant-scoped and owner-proxied (own usage + public rate card, NEVER
+COGS); `GET /v1/admin/usage/economics` is operator-only (`COST_CARD`, `margin_report`,
+`MIN_GROSS_MARGIN_BPS`, profitable, `resource_charging_enabled`). Default
+`GET /v1/gitops/projects?view=summary` stays byte-identical. Dashboard: `ui/lib/api.ts` expands
+`RateCard` to all 11 SKUs (new wire fields optional), adds `UsageTotals`, `SkuMargin`, `CostCard`,
+`UsageSummary`, `UsageEconomics` and `getUsageSummary()`; `ui/app/usage/usage-view.tsx` renders a
+compact "Storage & network" section over those five SKUs, with an explicit empty state that treats
+an `x-hive-anon: 1` GET as a session answer and seeds no zeros. The existing compute section's
+numbers are unchanged. Docs: `docs/usage-metering.md`, indexed in `docs/README.md`.
+
 ## 2026-11-07 - correction: 2FA dependency parenthetical and commit-body attribution
 
 Two commit bodies are wrong; the commits stay untouched. `1d1b454c78` and the 2026-11-06 entry

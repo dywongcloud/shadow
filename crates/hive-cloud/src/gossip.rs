@@ -1740,6 +1740,20 @@ async fn dispatch_verified(
             crate::admin::billing_ledger(State(cloud.clone()), team_headers(p), team_claims(p))
                 .await,
         ),
+        // Tenant usage summary, the other end of `admin::proxy_billing_read`: usage rows are
+        // NODE-LOCAL, so only the metering authority serves its own (tenant-re-scoped) view.
+        // `mesh_tenant` re-derives the tenant from the VERIFIED delegation token (`team_claims`),
+        // never a raw `?team=` under enforcement; an empty tenant is an EMPTY body, never a
+        // fallback that could answer for the wrong tenant. Distinct prefix, placed before the bare
+        // `/v1/billing` arm; the terminal catch-all keeps every unknown path an EMPTY body.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/usage/summary") => {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                jb(axum::Json(crate::admin::usage_summary_for(cloud, &tenant)))
+            }
+        }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => jb(
             crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await,
         ),

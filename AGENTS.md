@@ -1,25 +1,25 @@
 # AGENTS.md
 
-Present tense: what must be true now; history lives in `CHANGELOG.md`. Past ~30 KB (`wc -c`), recompile from the code,
-git log and memory files: keep what is load-bearing, drop what it absorbs. Nested files load where you work:
+Present tense: what is true now; history in `CHANGELOG.md`. Past ~30 KB (`wc -c`), recompile from code,
+git log and memory: keep load-bearing, drop absorbed. Nested files load where you work:
 `ui/AGENTS.md`, `ui/components/landing/AGENTS.md`, `ansible/AGENTS.md` (ansible, `scripts/`).
 
 ## Process & verification
 
-- Every task runs through the `gm` skill (MCP `mcp__gm__gm`), subagents too: `codeinsight`/`codesearch`/`grep` verbs, never shell
-grep/find; git only via the `git_*` verbs (`git_commit paths:[...]` stages EVERY dirty hunk of a named file: `git_status` first).
+- Every task runs through the `gm` skill (`mcp__gm__gm`), subagents too: `codeinsight`/`codesearch`/`grep` verbs, never shell
+grep/find; git only via `git_*` verbs (`git_commit paths:[...]` stages EVERY dirty hunk of a named file: `git_status` first).
 Attribution is dywongcloud ONLY: no `Co-Authored-By`, no Claude/Anthropic trailer.
 - **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries). Verify with `cargo test
 --workspace --locked` (CI's hard gate, with `scripts/cli-acceptance.sh`: on macOS use temp dirs under `/private/tmp`) plus live
-execution; fix a failure CLASS once at the shared primitive. `cargo check` skips `cfg(target_os = "linux")` code AND test targets,
-so a behaviour change needs the run itself, not just `--no-run`. A dependency change ships its `Cargo.lock` diff in the same pass
+execution; fix a failure CLASS at the shared primitive. `cargo check` skips `cfg(target_os = "linux")` code AND test targets,
+so a behaviour change needs the run, not `--no-run`. A dependency change ships its `Cargo.lock` diff in the same pass
 (`--locked`).
 - Cargo/disk traps: keep the user's PATH (Homebrew cargo has no cross std); `hive-cloud` is bin-only; `df` before a build; never
 build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work with
 `refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup name form (removing a pushed
 copy needs a force-push rewrite). `hive_health_interval` > `hive_health_timeout`; an empty reviewed public resolver set
 fails build-executor preflight; raise `deploy_serial_backend` only with quorum-safety evidence.
-- A roll or deploy is a production change: the operator's word first, then `ansible/AGENTS.md` (the dashboard: `ui/AGENTS.md`);
+- A roll/deploy is a production change: operator's word first, then `ansible/AGENTS.md` (dashboard: `ui/AGENTS.md`);
 prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never by grepping a Rust format literal;
 never `git_reword` during a roll (it rewrites every later SHA).
 
@@ -53,6 +53,8 @@ owner only) fresh DIRECT contact with a strict majority of `HIVE_CP_VOTERS`, hel
 NodeDeathRelocate); take-over keys on the ownership TERM (`TERM_LAPSE`, 30 s). An owner present but unable to act is still owner
 everywhere, so every job HOLDS fleet-wide: restore transport/voters, never weaken the gate. Node-death self-heal is OFF unless
 `HIVE_NODE_DEATH_SELF_HEAL=1`.
+- `RATE_CARD` > `COST_CARD` (>=6000 bps, `assert_profitable()`); ONE `may_act(BillingMeter)` writer;
+charging OFF until `HIVE_BILLING_METER_RESOURCES=1`.
 
 ## State: replication, routing, relational mirror
 
@@ -79,7 +81,7 @@ it completes once** (`spawn_index_refresher`, `HIVE_RELATIONAL_INDEX_BUILD_SECS`
 and `ensure_table_exists` (`information_schema.tables`, never `SELECT 1 FROM t`). A non-CAS catalog write LOSES tables
 and no restart repairs it: CAS the doc, repair 42P01, drop orphan indexes. Cron is NODE-LOCAL: `CronScheduler::replace_all`,
 never `add()`. fc-orlando is NOT enrolled in the fail2ban role; `site.yml --tags fail2ban` is the sanctioned apply and
-needs the operator word. A negative-priority nft ACCEPT does not stop a later policy-drop base chain.
+needs the operator word.
 
 ## Mesh transport, discovery, watchdogs
 

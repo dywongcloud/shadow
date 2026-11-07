@@ -369,6 +369,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/billing/webhook", post(billing_webhook))
+        .route("/v1/usage/summary", get(usage_summary))
+        .route("/v1/admin/usage/economics", get(usage_economics))
         .route("/v1/admin/billing/grant", post(billing_grant))
         .route("/v1/admin/billing/backfill", post(billing_backfill_run))
         .route(
@@ -16489,6 +16491,103 @@ pub(crate) async fn billing_get(
     }))
 }
 
+/// Owner-local usage view for ONE tenant. Usage rows are NODE-LOCAL (an in-process meter), so a
+/// follower answering from its own copy is empty/404 under round-robin DNS: the HTTP handler
+/// proxies to the metering authority via [`proxy_billing_read`], and the gossip
+/// `/v1/usage/summary` arm re-derives the tenant from the signed delegation before calling this.
+/// Public PRICES only (`RATE_CARD`); COGS and gross margin are INTERNAL and never returned here.
+/// The mesh-local snapshot is re-scoped to `t` so another tenant's rows can never be served.
+pub(crate) fn usage_summary_for(c: &Arc<CloudState>, t: &str) -> Value {
+    let local: Value = serde_json::from_slice(&crate::usage_metering::mesh_local())
+        .unwrap_or(json!({}));
+    // The local slice is a flat tenants[] ARRAY, not an object keyed by tenant. Re-derive
+    // exactly the caller's row; another tenant's row can never be served.
+    let row = local["tenants"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["tenant"].as_str() == Some(t)));
+    let usage = crate::billing::UsageTotals {
+        db_row_ops: row
+            .and_then(|r| r["db_row_ops"].as_u64())
+            .unwrap_or_default(),
+        db_storage_byte_ms: row
+            .and_then(|r| r["db_storage_byte_ms"].as_u64())
+            .unwrap_or_default(),
+        object_storage_byte_ms: row
+            .and_then(|r| r["object_storage_byte_ms"].as_u64())
+            .unwrap_or_default(),
+        ingress_bytes: row
+            .and_then(|r| r["ingress_bytes"].as_u64())
+            .unwrap_or_default(),
+        egress_bytes: row
+            .and_then(|r| r["egress_bytes"].as_u64())
+            .unwrap_or_default(),
+        ..Default::default()
+    };
+    let plan = crate::billing::plan_spec(&c.billing.account(t).plan);
+    json!({
+        "usage": usage,
+        "rate_card": crate::billing::RATE_CARD,
+        "included_cents": plan.included_cents,
+        "overage_ceiling_cents": plan.overage_ceiling_cents,
+    })
+}
+
+/// GET /v1/usage/summary — the caller's OWN usage and the public price card. `auth::require_auth`
+/// installed any verified claims; an ASSERTED identity is mandatory, and the tenant is read ONLY
+/// from that cryptographically-bound JWT claim (`cl.tenant`) — never `x-hive-team`, never a raw
+/// `?team=`, never the ANON fallback (which would otherwise answer for a namespace that is not the
+/// caller's). The read is proxied to the metering authority because the rows are node-local.
+async fn usage_summary(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    let t = cl
+        .map(|cl| norm(&cl.tenant).to_string())
+        .filter(|t| t.as_str() != ANON_TENANT)
+        .ok_or((StatusCode::UNAUTHORIZED, "sign-in required".to_string()))?;
+    if let Some(v) = proxy_billing_read(&c, "/v1/usage/summary", &t).await {
+        return Ok(Json(v));
+    }
+    Ok(Json(usage_summary_for(&c, &t)))
+}
+
+/// GET /v1/admin/usage/economics — operator-only economics: COGS, per-SKU margin, the margin
+/// floor, the profitability verdict and whether resource charging is enabled. INTERNAL data that
+/// must never reach a tenant. `require_operator` (platform_admin) is the existing operator guard;
+/// the RULES row adds an admin floor, and `roles::gate` short-circuits for platform_admin, so a
+/// tenant `admin` role is still refused here.
+async fn usage_economics(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let profitable = crate::billing::RATE_CARD.assert_profitable();
+    Ok(Json(json!({
+        "cost_card": crate::billing::COST_CARD,
+        "margin_report": crate::billing::RATE_CARD.margin_report(),
+        "min_gross_margin_bps": crate::billing::MIN_GROSS_MARGIN_BPS,
+        "profitable": profitable.is_ok(),
+        "unprofitable_skus": profitable.err().unwrap_or_default(),
+        "resource_charging_enabled": crate::billing::resource_charging_enabled(),
+    })))
+}
+
+/// Typed pre-write gate for a projected resource charge. `BillingStore::may_consume` returns a
+/// reason; map a refusal to an explicit 402 (Payment Required) so the caller learns the projection
+/// was refused instead of receiving a silently clamped amount. Nothing is truncated or evicted —
+/// the whole write is refused. `pub(crate)` so any lane's pre-write gate (drive_api `check_quota`,
+/// db row writes) can reuse the same refusal shape. Called BEFORE bytes/ledger rows are written.
+pub(crate) fn refuse_projected_charge(
+    c: &Arc<CloudState>,
+    tenant: &str,
+    projected_cents: u64,
+) -> Result<(), (StatusCode, String)> {
+    c.billing
+        .may_consume(tenant, projected_cents)
+        .map_err(|reason| (StatusCode::PAYMENT_REQUIRED, reason))
+}
+
 /// Invoices for the tenant (finalized periods plus the current draft, newest first). The read order
 /// is deliberate: (1) the LOCAL fleet-replicated relational mirror, bounded by
 /// `relational::billing_read_budget()`: no network hop, and the only source of finalized invoice
@@ -17160,6 +17259,13 @@ async fn billing_charge(
     Json(req): Json<ChargeReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Resource charging is opt-in (shadow mode by default). When it is on, a projected charge
+    // must clear the plan's overage ceiling BEFORE `charge()` writes the ledger and `persist()`
+    // writes state bytes: a typed 402 refusal, never a clamp/truncate/evict. The legacy
+    // self-service charge path stays byte-identical while charging is off.
+    if crate::billing::resource_charging_enabled() {
+        refuse_projected_charge(&c, &t, req.cents as u64)?;
+    }
     let note = if req.note.is_empty() {
         "Compute usage".to_string()
     } else {

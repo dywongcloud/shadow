@@ -16,6 +16,11 @@ use uuid::Uuid;
 
 pub const MONTH_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// Byte-milliseconds in one decimal GB-month: 1_000_000_000 bytes per GB times
+/// MONTH_MS (a 30-day month) expressed in milliseconds. Storage counters arrive
+/// as cumulative byte * ms, so dividing by this converts them to GB-months.
+pub const BYTE_MS_PER_GB_MONTH: f64 = 1_000_000_000.0 * 2_592_000_000.0;
+
 /// Plan catalog. `included_cents` is the monthly compute allowance, the only field that costs real
 /// money per active tenant (the rest are ceilings that decide how early a user hits a wall);
 /// `overage` allows pay-as-you-go beyond it (Pro, Enterprise). The `max_*` fields are the enforced
@@ -31,6 +36,9 @@ pub struct PlanSpec {
     pub stripe_price_id: Option<&'static str>,
     pub included_cents: u64,
     pub overage: bool,
+    /// Hard ceiling, in cents, on billed overage usage for the period (0 = no overage).
+    /// BillingStore::may_consume refuses a projection that would cross it.
+    pub overage_ceiling_cents: u64,
     /// Max projects for the tenant (0 = unlimited).
     pub max_projects: u32,
     /// Max team members/seats (0 = unlimited).
@@ -59,6 +67,7 @@ pub const PLANS: &[PlanSpec] = &[
         stripe_price_id: None,
         included_cents: 500,
         overage: false,
+        overage_ceiling_cents: 0,
         max_projects: 250,
         max_members: 3,
         max_sandboxes: 15,
@@ -81,6 +90,7 @@ pub const PLANS: &[PlanSpec] = &[
         stripe_price_id: Some("price_1TqK9jRj0yq8r94Ek8Gjgl7d"),
         included_cents: 2000,
         overage: true,
+        overage_ceiling_cents: 10_000,
         max_projects: 1000,
         max_members: 25,
         max_sandboxes: 50,
@@ -103,6 +113,7 @@ pub const PLANS: &[PlanSpec] = &[
         stripe_price_id: Some("price_1TqKCGRj0yq8r94E4B8VhCC3"),
         included_cents: 100000,
         overage: true,
+        overage_ceiling_cents: 1_000_000,
         max_projects: 0,
         max_members: 0,
         max_sandboxes: 0,
@@ -185,6 +196,12 @@ pub fn plan_max_drive_bytes(plan: &str) -> u64 {
     plan_spec(plan).max_drive_bytes
 }
 
+/// The plan's hard overage ceiling in cents. Uses plan_spec so a stored legacy plan
+/// string resolves to Hobby's 0 (fail closed: unknown plans get no overage).
+pub fn plan_overage_ceiling_cents(plan: &str) -> u64 {
+    plan_spec(plan).overage_ceiling_cents
+}
+
 /// The usage rate card — the SINGLE source of truth for metered pricing (the UI
 /// fetches this; the meter loop charges with it). Cents per unit.
 #[derive(Clone, Copy, Serialize)]
@@ -203,6 +220,16 @@ pub struct RateCard {
     /// platform-consumed resources are billed, and an owner's own browser serving their own app
     /// consumes none. A real rate-card field, so pricing it later is a config change.
     pub browser_per_million_cents: f64,
+    /// Managed-database row operations, cents per million reads/writes.
+    pub db_row_ops_per_million_cents: f64,
+    /// Managed-database storage, cents per decimal GB-month.
+    pub db_storage_gb_month_cents: f64,
+    /// Object storage, cents per decimal GB-month.
+    pub object_storage_gb_month_cents: f64,
+    /// Inbound network transfer, cents per decimal GB.
+    pub ingress_gb_cents: f64,
+    /// Outbound network transfer, cents per decimal GB.
+    pub egress_gb_cents: f64,
 }
 
 pub const RATE_CARD: RateCard = RateCard {
@@ -212,7 +239,69 @@ pub const RATE_CARD: RateCard = RateCard {
     waf_per_million_cents: 60.0,
     gpu_hr_cents: 60.0,
     browser_per_million_cents: 0.0,
+    db_row_ops_per_million_cents: 20.0,
+    db_storage_gb_month_cents: 15.0,
+    object_storage_gb_month_cents: 1.5,
+    ingress_gb_cents: 0.2,
+    egress_gb_cents: 1.0,
 };
+
+/// Platform COGS per billed unit, in cents, derived from fetched public infra
+/// rates. Field names mirror RateCard so RateCard::margin_report can pair each
+/// price with its cost mechanically.
+///
+/// Sources (public list prices):
+/// - active_cpu_hr: Fly.io shared CPU $2.19 per 30 days = 219c / 720h = 0.3042c per CPU-hour.
+/// - mem_gb_hr: Fly.io $0.15 per GB-month = 15c / 720h = 0.0208c per GB-hour.
+/// - requests_per_million / waf_per_million: edge and WAF request handling, 20c / 6c per million.
+/// - gpu_hr: NVIDIA T4 spot capacity, 20c per GPU-hour.
+/// - browser_per_million: a donated browser node consumes no platform resource, 0c.
+/// - db_row_ops_per_million: Turso Pro blended 10:1 read:write row ops, 7.345c per million.
+/// - db_storage_gb_month: Backblaze B2 $0.005 per GB-month, 3x replicated = 1.5c per GB-month.
+/// - object_storage_gb_month: Backblaze B2 $0.005 per GB-month = 0.5c per GB-month.
+/// - ingress_gb: 0.25x bulk egress, a stated assumption = 0.05c per GB.
+/// - egress_gb: Bunny over 1 PB tier $0.002 per GB = 0.2c per GB.
+#[derive(Clone, Copy, Serialize)]
+pub struct CostCard {
+    pub active_cpu_hr_cents: f64,
+    pub mem_gb_hr_cents: f64,
+    pub requests_per_million_cents: f64,
+    pub waf_per_million_cents: f64,
+    pub gpu_hr_cents: f64,
+    pub browser_per_million_cents: f64,
+    pub db_row_ops_per_million_cents: f64,
+    pub db_storage_gb_month_cents: f64,
+    pub object_storage_gb_month_cents: f64,
+    pub ingress_gb_cents: f64,
+    pub egress_gb_cents: f64,
+}
+
+pub const COST_CARD: CostCard = CostCard {
+    active_cpu_hr_cents: 0.3042,
+    mem_gb_hr_cents: 0.0208,
+    requests_per_million_cents: 20.0,
+    waf_per_million_cents: 6.0,
+    gpu_hr_cents: 20.0,
+    browser_per_million_cents: 0.0,
+    db_row_ops_per_million_cents: 7.345,
+    db_storage_gb_month_cents: 1.5,
+    object_storage_gb_month_cents: 0.5,
+    ingress_gb_cents: 0.05,
+    egress_gb_cents: 0.2,
+};
+
+/// Minimum gross margin, in basis points, every priced SKU must clear before
+/// resource metering may charge real money.
+pub const MIN_GROSS_MARGIN_BPS: u64 = 6_000;
+
+/// One SKU's price, its COGS, and the resulting gross margin in basis points.
+#[derive(Clone, Copy, Serialize)]
+pub struct SkuMargin {
+    pub sku: &'static str,
+    pub price_cents: f64,
+    pub cogs_cents: f64,
+    pub gross_margin_bps: i64,
+}
 
 /// Cumulative usage counters for a tenant (as measured from live metrics).
 #[derive(Clone, Copy, Default, Serialize, Deserialize)]
@@ -230,18 +319,110 @@ pub struct UsageTotals {
     /// ahead of any pricing decision and never folded into the billed fleet-request count.
     #[serde(default)]
     pub browser_requests: u64,
+    /// Managed-database row operations (reads + writes), cumulative.
+    /// serde(default) is load-bearing: UsageTotals is nested inside the persisted
+    /// MeterWatermark, so a required key would make an old snapshot fail to deserialize.
+    #[serde(default)]
+    pub db_row_ops: u64,
+    /// Managed-database storage, cumulative byte-milliseconds (decimal GB-month
+    /// once divided by BYTE_MS_PER_GB_MONTH).
+    #[serde(default)]
+    pub db_storage_byte_ms: u64,
+    /// Object storage, cumulative byte-milliseconds.
+    #[serde(default)]
+    pub object_storage_byte_ms: u64,
+    /// Inbound network transfer, cumulative bytes (decimal GB).
+    #[serde(default)]
+    pub ingress_bytes: u64,
+    /// Outbound network transfer, cumulative bytes (decimal GB).
+    #[serde(default)]
+    pub egress_bytes: u64,
 }
 
 impl RateCard {
-    /// Cost in (fractional) cents for a usage delta.
+    /// Cost in (fractional) cents for a usage delta. A non-finite result (a corrupt
+    /// counter or rate) is never a chargeable amount: return 0.0 for the whole sum.
     pub fn cost_cents(&self, u: &UsageTotals) -> f64 {
-        (u.active_cpu_ms as f64 / 3_600_000.0) * self.active_cpu_hr_cents
+        let total = (u.active_cpu_ms as f64 / 3_600_000.0) * self.active_cpu_hr_cents
             + (u.mem_gb_hr_milli as f64 / 1000.0) * self.mem_gb_hr_cents
             + (u.requests as f64 / 1_000_000.0) * self.requests_per_million_cents
             + (u.blocked as f64 / 1_000_000.0) * self.waf_per_million_cents
             + (u.gpu_ms as f64 / 3_600_000.0) * self.gpu_hr_cents
             + (u.browser_requests as f64 / 1_000_000.0) * self.browser_per_million_cents
+            + (u.db_row_ops as f64 / 1_000_000.0) * self.db_row_ops_per_million_cents
+            + (u.db_storage_byte_ms as f64 / BYTE_MS_PER_GB_MONTH)
+                * self.db_storage_gb_month_cents
+            + (u.object_storage_byte_ms as f64 / BYTE_MS_PER_GB_MONTH)
+                * self.object_storage_gb_month_cents
+            + (u.ingress_bytes as f64 / 1_000_000_000.0) * self.ingress_gb_cents
+            + (u.egress_bytes as f64 / 1_000_000_000.0) * self.egress_gb_cents;
+        if total.is_finite() { total } else { 0.0 }
     }
+
+    /// Price vs COGS per SKU: margin = (price - cogs) / price * 10_000 basis points.
+    pub fn margin_report(&self) -> Vec<SkuMargin> {
+        let skus: [(&'static str, f64, f64); 11] = [
+            ("active_cpu_hr", self.active_cpu_hr_cents, COST_CARD.active_cpu_hr_cents),
+            ("mem_gb_hr", self.mem_gb_hr_cents, COST_CARD.mem_gb_hr_cents),
+            ("requests_per_million", self.requests_per_million_cents, COST_CARD.requests_per_million_cents),
+            ("waf_per_million", self.waf_per_million_cents, COST_CARD.waf_per_million_cents),
+            ("gpu_hr", self.gpu_hr_cents, COST_CARD.gpu_hr_cents),
+            ("browser_per_million", self.browser_per_million_cents, COST_CARD.browser_per_million_cents),
+            ("db_row_ops_per_million", self.db_row_ops_per_million_cents, COST_CARD.db_row_ops_per_million_cents),
+            ("db_storage_gb_month", self.db_storage_gb_month_cents, COST_CARD.db_storage_gb_month_cents),
+            ("object_storage_gb_month", self.object_storage_gb_month_cents, COST_CARD.object_storage_gb_month_cents),
+            ("ingress_gb", self.ingress_gb_cents, COST_CARD.ingress_gb_cents),
+            ("egress_gb", self.egress_gb_cents, COST_CARD.egress_gb_cents),
+        ];
+        let mut rows = Vec::with_capacity(skus.len());
+        for (sku, price_cents, cogs_cents) in skus {
+            // Browser node: no platform resource, deliberately unpriced. A
+            // price == 0.0 && cogs == 0.0 SKU has no margin to measure, so skip it.
+            if price_cents == 0.0 && cogs_cents == 0.0 {
+                continue;
+            }
+            let gross_margin_bps = if price_cents == 0.0 {
+                i64::MIN
+            } else {
+                ((price_cents - cogs_cents) / price_cents * 10_000.0) as i64
+            };
+            rows.push(SkuMargin {
+                sku,
+                price_cents,
+                cogs_cents,
+                gross_margin_bps,
+            });
+        }
+        rows
+    }
+
+    /// Every priced SKU must clear MIN_GROSS_MARGIN_BPS; returns the names of all
+    /// SKUs that do not, so one failing SKU cannot hide behind another.
+    pub fn assert_profitable(&self) -> Result<(), Vec<&'static str>> {
+        let below: Vec<&'static str> = self
+            .margin_report()
+            .into_iter()
+            .filter(|row| row.gross_margin_bps < MIN_GROSS_MARGIN_BPS as i64)
+            .map(|row| row.sku)
+            .collect();
+        if below.is_empty() { Ok(()) } else { Err(below) }
+    }
+}
+
+/// Financial ONE-WAY DOOR: enabling this makes resource metering charge real tenant
+/// money. Default is FALSE (shadow mode: meters measure, nobody is charged). It is
+/// true only when BOTH an operator explicitly opts in with
+/// HIVE_BILLING_METER_RESOURCES=1 (or true) AND every priced SKU on RATE_CARD clears
+/// MIN_GROSS_MARGIN_BPS against COST_CARD. The margin check fails closed: a price
+/// below COGS, or a missing or unrecognised opt-in, keeps charging off.
+pub fn resource_charging_enabled() -> bool {
+    let opted_in = std::env::var("HIVE_BILLING_METER_RESOURCES")
+        .map(|raw| {
+            let v = raw.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+    opted_in && RATE_CARD.assert_profitable().is_ok()
 }
 
 /// A generated invoice for one billing period (subscription + metered usage).
@@ -736,6 +917,16 @@ impl BillingStore {
     /// the monthly included allowance first, then prepaid balance (may go negative;
     /// the create-time gate handles Hobby lock-out separately).
     fn record_usage(&self, tenant: &str, cents: u64, note: &str) {
+        // Bounds the amount BEFORE any as i64 cast: a u64 above i64::MAX cast to
+        // i64 is negative, so an out-of-range debit would CREDIT the account.
+        if cents > MAX_AMOUNT_CENTS {
+            tracing::error!(
+                tenant,
+                cents,
+                "billing meter: usage charge exceeds MAX_AMOUNT_CENTS; refusing it"
+            );
+            return;
+        }
         if cents == 0 {
             return;
         }
@@ -796,13 +987,26 @@ impl BillingStore {
                     blocked: sub(current.blocked, st.last.blocked),
                     gpu_ms: sub(current.gpu_ms, st.last.gpu_ms),
                     browser_requests: sub(current.browser_requests, st.last.browser_requests),
+                    db_row_ops: sub(current.db_row_ops, st.last.db_row_ops),
+                    db_storage_byte_ms: sub(current.db_storage_byte_ms, st.last.db_storage_byte_ms),
+                    object_storage_byte_ms: sub(current.object_storage_byte_ms, st.last.object_storage_byte_ms),
+                    ingress_bytes: sub(current.ingress_bytes, st.last.ingress_bytes),
+                    egress_bytes: sub(current.egress_bytes, st.last.egress_bytes),
                 }
             };
             st.last = current;
             (delta, st.frac_cents)
         };
         let cost = RATE_CARD.cost_cents(&delta) + carry;
-        let whole = cost.floor().max(0.0) as u64;
+        if !cost.is_finite() || cost > MAX_AMOUNT_CENTS as f64 {
+            tracing::error!(
+                tenant,
+                cost,
+                "billing meter: non-finite or out-of-range usage cost; charging nothing"
+            );
+            return 0;
+        }
+        let whole = (cost.floor().max(0.0) as u64).min(MAX_AMOUNT_CENTS);
         {
             let mut meters = self.meters.write();
             if let Some(st) = meters.get_mut(tenant) {
@@ -1057,6 +1261,27 @@ impl BillingStore {
                 "Monthly included compute exhausted — upgrade to Pro or add credits to deploy."
                     .into(),
             );
+        }
+        Ok(())
+    }
+
+    /// Typed refusal for a projected overage charge: the caller must learn the
+    /// projection was refused, never receive a silently clamped amount. Hobby
+    /// (no overage) is gated exactly as BillingStore::can_deploy gates it; every
+    /// other plan is refused once used_cents + projected_cents would cross its
+    /// PlanSpec::overage_ceiling_cents.
+    pub fn may_consume(&self, tenant: &str, projected_cents: u64) -> Result<(), String> {
+        let acc = self.account(tenant);
+        let spec = plan_spec(&acc.plan);
+        if !spec.overage {
+            return self.can_deploy(tenant);
+        }
+        let ceiling = plan_overage_ceiling_cents(&acc.plan);
+        if acc.used_cents.saturating_add(projected_cents) > ceiling {
+            return Err(format!(
+                "Projected usage exceeds the {} plan's {} cent overage ceiling.",
+                spec.id, ceiling
+            ));
         }
         Ok(())
     }
@@ -1555,6 +1780,7 @@ mod tests {
             blocked: 0,
             gpu_ms: 0,
             browser_requests: 0,
+            ..Default::default()
         };
         let c = RATE_CARD.cost_cents(&u);
         assert!((c - (12.8 + 1.06 + 200.0)).abs() < 1e-6, "got {c}");

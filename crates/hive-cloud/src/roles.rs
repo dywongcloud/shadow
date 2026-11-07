@@ -104,6 +104,14 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/billing/checkout", Role::Admin),
     rule(POST, "/v1/billing/confirm", Role::Admin),
     rule(POST, "/v1/billing/charge", Role::Admin),
+    // Tenant usage summary: a READ, so viewer. The tenant is taken from the caller's own verified
+    // JWT inside the handler, never a header, so the low floor cannot cross tenants.
+    rule(GET, "/v1/usage/summary", Role::Viewer),
+    // Operator economics exposes COGS/margins: INTERNAL. An unlisted read would be viewer, so
+    // list it at an ADMIN floor; `admin::usage_economics` then hard-gates on `require_operator`
+    // (platform_admin), which makes the effective access operator-only. `roles::gate`
+    // short-circuits for platform_admin, so the floor never blocks the operator.
+    rule(GET, "/v1/admin/usage/economics", Role::Admin),
     rule(POST, "/v1/domains/:domain/import", Role::Admin),
     rule(PUT, "/v1/domains/:domain/nameservers", Role::Admin),
     rule(POST, "/v1/domains/:domain/records", Role::Admin),

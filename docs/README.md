@@ -37,6 +37,9 @@ oplog or execution-transparency contract.
 - `docs/BUN_RUNTIME.md` - Bun as a deployment/runtime target.
 - `docs/lagon.md` - upstream Lagon runtime overview.
 - `docs/pvm-upstream-report.md` - PVM 6.12 to 7.1 port bug report.
+- `docs/usage-metering.md` - profitable 11-SKU rate card (price above COGS, 60% gross-margin
+  floor), the ONE metering writer, serde(default) snapshots, anti-abuse bounds, shadow mode and
+  the operator enable procedure; public COGS references and the honest residual list.
 
 ## Account security
 

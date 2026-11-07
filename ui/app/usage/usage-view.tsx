@@ -13,7 +13,7 @@ const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.Spark
   loading: () => <div className="h-7 w-28 animate-pulse rounded bg-subtle" />,
 });
 import { Card } from "@/components/ui";
-import { usePoll, type FunctionStats, type BillingInfo, type Metrics } from "@/lib/api";
+import { usePoll, type FunctionStats, type BillingInfo, type Metrics, type UsageSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /** A flat sparkline at the real current level, for metrics tracked as a running total rather than a time series (CPU/memory/instances): it shows
@@ -95,6 +95,66 @@ export default function UsageView() {
   }));
 
   const pct = Math.min(100, includedTotal ? (includedUsed / includedTotal) * 100 : 0);
+
+  /** The five storage/network SKUs come ONLY from `/v1/usage/summary`, whose usage key is `usage`.
+   *  A rejected session (401, or `x-hive-anon: 1` with an empty body) yields no payload, so `data`
+   *  stays null, the section renders an empty state and NEVER seeds zeros. A node that predates a
+   *  counter omits it, and an absent value renders as "-", never as a measured 0. */
+  const { data: summary, error: summaryError } = usePoll<UsageSummary>("/v1/usage/summary", 30000);
+  const ut = summary?.usage;
+  const ur = summary?.rate_card;
+  const summaryReady = !!summary && !!summary.usage && !!summary.rate_card;
+  const GB = 1_000_000_000;
+  const MS_MONTH = 30 * 24 * 3600 * 1000;
+  const perM = (v?: number) => (v === undefined ? null : v / 1_000_000);
+  const gb = (v?: number) => (v === undefined ? null : v / GB);
+  const gbMonth = (v?: number) => (v === undefined ? null : v / (GB * MS_MONTH));
+  const count = (v?: number) => (v === undefined ? "-" : fmt(v));
+  const shown = (v: number | null, digits: number) => (v === null ? "-" : v.toFixed(digits));
+  const price = (c: number | undefined, suffix: string) => (c === undefined ? "-" : `$${(c / 100).toFixed(3)}${suffix}`);
+  const charge = (units: number | null, c?: number) => (units === null || c === undefined ? null : (units * c) / 100);
+  const storageRows = [
+    {
+      key: "db-rows",
+      name: "Database row ops",
+      unit: "per million row ops",
+      usage: count(ut?.db_row_ops),
+      rate: price(ur?.db_row_ops_per_million_cents, "/M ops"),
+      amount: charge(perM(ut?.db_row_ops), ur?.db_row_ops_per_million_cents),
+    },
+    {
+      key: "db-storage",
+      name: "Database storage",
+      unit: "GB-month, from byte-ms",
+      usage: shown(gbMonth(ut?.db_storage_byte_ms), 3),
+      rate: price(ur?.db_storage_gb_month_cents, "/GB-mo"),
+      amount: charge(gbMonth(ut?.db_storage_byte_ms), ur?.db_storage_gb_month_cents),
+    },
+    {
+      key: "object-storage",
+      name: "Object storage",
+      unit: "GB-month, from byte-ms",
+      usage: shown(gbMonth(ut?.object_storage_byte_ms), 3),
+      rate: price(ur?.object_storage_gb_month_cents, "/GB-mo"),
+      amount: charge(gbMonth(ut?.object_storage_byte_ms), ur?.object_storage_gb_month_cents),
+    },
+    {
+      key: "ingress",
+      name: "Ingress",
+      unit: "GB transferred in",
+      usage: shown(gb(ut?.ingress_bytes), 3),
+      rate: price(ur?.ingress_gb_cents, "/GB"),
+      amount: charge(gb(ut?.ingress_bytes), ur?.ingress_gb_cents),
+    },
+    {
+      key: "egress",
+      name: "Egress",
+      unit: "GB transferred out",
+      usage: shown(gb(ut?.egress_bytes), 3),
+      rate: price(ur?.egress_gb_cents, "/GB"),
+      amount: charge(gb(ut?.egress_bytes), ur?.egress_gb_cents),
+    },
+  ];
 
   return (
     <div>
@@ -186,6 +246,37 @@ export default function UsageView() {
           <Row color="bg-teal-500" name="Provisioned Memory" spark={flat(Math.round(memGbHrs * 1000), N)} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
           <Row color="bg-cyan-500" name="Provisioned Instances" spark={flat(instances * 100, N)} usage={`${instances}`} charge={0} />
         </div>
+      </Card>
+
+      <Card className="mt-4">
+        <h2 className="text-lg font-semibold">Storage &amp; network</h2>
+        <p className="mb-4 mt-1 text-sm text-secondary">
+          Five metered SKUs from your usage summary. Rates are the public rate card; these sit apart from the compute totals above.
+        </p>
+        {!summaryReady || summaryError ? (
+          <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-secondary">
+            {summaryError
+              ? "Usage summary is unavailable for this session. Sign in to see storage and network usage."
+              : "No storage or network usage reported for this billing cycle."}
+          </div>
+        ) : (
+          <div>
+            <div className="grid grid-cols-[1fr_auto_auto_auto] gap-2 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted sm:gap-4">
+              <span>SKU</span><span className="text-right">Usage</span><span className="text-right">Rate</span><span className="text-right">Charge</span>
+            </div>
+            {storageRows.map((r) => (
+              <div key={r.key} className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2 border-b border-border py-3 text-sm sm:gap-4">
+                <span className="min-w-0">
+                  <span className="block truncate text-fg">{r.name}</span>
+                  <span className="block text-xs text-secondary">{r.unit}</span>
+                </span>
+                <span className="w-20 text-right tabular-nums text-secondary sm:w-24">{r.usage}</span>
+                <span className="w-24 text-right tabular-nums text-secondary sm:w-28">{r.rate}</span>
+                <span className="w-16 text-right tabular-nums">{r.amount === null ? "-" : `$${r.amount.toFixed(2)}`}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
     </div>
   );
