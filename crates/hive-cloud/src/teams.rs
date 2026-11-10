@@ -142,7 +142,7 @@ pub struct Team {
     /// URL-safe slug, e.g. "dylans-projects" — also the tenant identifier.
     pub slug: String,
     pub name: String,
-    /// hobby | pro | enterprise
+    /// hobby | pro | business | enterprise | enterprise_plus
     #[serde(default = "default_plan")]
     pub plan: String,
     #[serde(default)]

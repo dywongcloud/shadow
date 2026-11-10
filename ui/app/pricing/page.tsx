@@ -8,9 +8,9 @@ export const metadata: Metadata = pageMeta({
   title: "Pricing",
   socialTitle: "Pricing — shadw",
   description:
-    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read answers to common pricing questions.",
+    "shadw pricing plans: Hobby is free ($0), Pro is $20/month, Business is $200/month, Enterprise is $1,000/month and Enterprise Plus is $5,000/month. Compare tiers and read answers to common pricing questions.",
   twitterDescription:
-    "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or choose Enterprise at $1,000/month. Compare tiers and read pricing FAQs.",
+    "shadw pricing: Hobby $0, Pro $20/month, Business $200/month, Enterprise $1,000/month, Enterprise Plus $5,000/month. Compare tiers and read pricing FAQs.",
   path: "/pricing",
 });
 export const viewport = darkViewport;
@@ -28,7 +28,8 @@ type Tier = {
 };
 
 /** Every bullet is a line the plan catalog or a plan gate backs (`crates/hive-cloud/src/billing.rs`: `PLANS`, `plan_allows_*`, `plan_max_*`; the
- *  Enterprise suite is gated in `enterprise_api.rs`): a feature every plan has (preview deployments, HTTPS, domains) is listed once, under Hobby. */
+ *  Enterprise suite is gated in `enterprise_api.rs`): a feature every plan has (preview deployments, HTTPS, domains) is listed once, under Hobby, and
+ *  "Everything in ..." is cumulative, so a higher tier never shows fewer capabilities than the tier below it. */
 const TIERS: Tier[] = [
   {
     name: "Hobby",
@@ -36,6 +37,7 @@ const TIERS: Tier[] = [
     period: "/ forever",
     tagline: "For personal projects and experiments.",
     features: [
+      "20 projects",
       "1 concurrent build",
       "Community support",
       "$5 of included compute / month",
@@ -55,6 +57,7 @@ const TIERS: Tier[] = [
     tagline: "For growing teams shipping to production.",
     features: [
       "Everything in Hobby",
+      "200 projects",
       "Unlimited concurrent builds",
       "$20 of included compute / month",
       "Pay-as-you-go beyond included compute",
@@ -68,20 +71,63 @@ const TIERS: Tier[] = [
     featured: true,
   },
   {
+    name: "Business",
+    price: "$200",
+    period: "/month",
+    tagline: "For scaling teams.",
+    features: [
+      "Everything in Pro",
+      "800 projects",
+      "Unlimited concurrent builds",
+      "$200 of included compute / month",
+      "Pay-as-you-go beyond included compute",
+      "Up to 100 team members",
+      "Deployment protection and microfrontends",
+      "30 days of log history",
+      "800s function runtime",
+    ],
+    cta: { label: "Start Business", href: "/sign-up" },
+    variant: "outline",
+  },
+  {
     name: "Enterprise",
     price: "$1,000",
     period: "/month",
     tagline: "For organizations with large compute needs.",
     features: [
-      "Everything in Pro",
+      "Everything in Business",
+      "10,000 projects",
       "$1,000 of included compute / month",
       "Multi-region fail-over",
       "SAML SSO, SCIM and SIEM audit-log streaming",
       "IP blocking",
+      "Org-wide conformance controls",
       "Functions that run up to an hour",
+      "Unlimited team members",
       "Priority support",
     ],
     cta: { label: "Start Enterprise", href: "/sign-up" },
+    variant: "outline",
+  },
+  {
+    name: "Enterprise Plus",
+    price: "$5,000",
+    period: "/month",
+    tagline: "For the largest deployments.",
+    features: [
+      "Everything in Enterprise",
+      "Unlimited projects",
+      "Unlimited team members",
+      "Unlimited sandboxes",
+      "$5,000 of included compute / month",
+      "Multi-region fail-over",
+      "SAML SSO, SCIM and SIEM audit-log streaming",
+      "IP blocking",
+      "Org-wide conformance controls",
+      "Functions that run up to an hour",
+      "Priority support",
+    ],
+    cta: { label: "Start Enterprise Plus", href: "/sign-up" },
     variant: "outline",
   },
 ];
@@ -89,7 +135,7 @@ const TIERS: Tier[] = [
 const FAQS: { q: string; a: string }[] = [
   {
     q: "Can I self-host?",
-    a: "Yes. shadw can run on nodes you operate. Self-hosting is not a plan feature: Hobby, Pro and Enterprise differ in included compute, limits and support.",
+    a: "Yes. shadw can run on nodes you operate. Self-hosting is not a plan feature: Hobby, Pro, Business, Enterprise and Enterprise Plus differ in included compute, limits and support.",
   },
   {
     q: "What counts as a build?",
@@ -128,11 +174,11 @@ export default function PricingPage() {
       />
 
       <MarketingSection className="pb-20">
-        <div className="grid gap-6 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5">
           {TIERS.map((tier) => (
             <div
               key={tier.name}
-              className={`relative flex flex-col rounded-2xl border border-white/10 bg-white/[0.03] p-7 ${
+              className={`relative flex min-w-0 break-words flex-col rounded-2xl border border-white/10 bg-white/[0.03] p-7 ${
                 tier.featured ? "ring-2 ring-emerald-400/60" : ""
               }`}
             >
@@ -144,20 +190,20 @@ export default function PricingPage() {
                 </div>
               )}
 
-              <div className="text-lg font-semibold text-white">{tier.name}</div>
+              <div className="min-w-0 break-words text-lg font-semibold text-white">{tier.name}</div>
 
-              <div className="mt-4 flex items-baseline gap-1">
-                <span className="text-4xl font-bold text-white">{tier.price}</span>
+              <div className="mt-4 flex min-w-0 items-baseline gap-1">
+                <span className="min-w-0 break-words text-4xl font-bold text-white">{tier.price}</span>
                 {tier.period && <span className="text-sm text-zinc-500">{tier.period}</span>}
               </div>
 
-              <p className="mt-3 text-sm text-zinc-400">{tier.tagline}</p>
+              <p className="mt-3 min-w-0 break-words text-sm text-zinc-400">{tier.tagline}</p>
 
-              <ul className="mt-6 space-y-3">
+              <ul className="mt-6 min-w-0 space-y-3">
                 {tier.features.map((feature) => (
-                  <li key={feature} className="flex items-start gap-3">
+                  <li key={feature} className="flex min-w-0 items-start gap-3">
                     <Check className="h-4 w-4 text-emerald-400 shrink-0" />
-                    <span className="text-sm text-zinc-300">{feature}</span>
+                    <span className="min-w-0 break-words text-sm text-zinc-300">{feature}</span>
                   </li>
                 ))}
               </ul>

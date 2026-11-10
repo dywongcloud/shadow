@@ -94,7 +94,7 @@ fn plan_of(c: &Arc<CloudState>, team: &str) -> String {
 fn forbid(feature: &str) -> (StatusCode, String) {
     (
         StatusCode::FORBIDDEN,
-        format!("{feature} requires the Enterprise plan"),
+        format!("{feature} requires Enterprise or Enterprise Plus"),
     )
 }
 
@@ -284,7 +284,7 @@ fn yes() -> bool {
     true
 }
 
-/// Stores the team's SAML config (Enterprise plan) and reflects `enabled` into the team's SSO flag
+/// Stores the team's SAML config (Enterprise / Enterprise Plus) and reflects `enabled` into the SSO flag
 /// (`teams.set_sso`), so the rest of the platform sees SSO on.
 async fn saml_put(
     State(c): State<Arc<CloudState>>,
@@ -760,7 +760,7 @@ async fn protection_put(
     if !crate::billing::plan_allows_deploy_protection(&plan_of(&c, &t)) {
         return Err((
             StatusCode::FORBIDDEN,
-            "Deployment protection requires the Pro or Enterprise plan".into(),
+            "Deployment protection requires the Pro plan or higher".into(),
         ));
     }
     if !matches!(b.mode.as_str(), "off" | "standard" | "password") {
@@ -823,7 +823,7 @@ struct MfeChildReq {
     path_prefix: String,
 }
 
-/// Creates or updates a microfrontend group (Pro or Enterprise plan). Every referenced project,
+/// Creates or updates a microfrontend group (Pro or higher). Every referenced project,
 /// host and children, must belong to THIS team so a group never composes another tenant's
 /// deployments; the check is fleet-aware (`project_owned_by`) because settings rows are node-local,
 /// so a remotely placed project's ownership is judged from its deployment tenant tags. The request
@@ -839,7 +839,7 @@ async fn mfe_upsert(
     if !crate::billing::plan_allows_microfrontends(&plan_of(&c, &t)) {
         return Err((
             StatusCode::FORBIDDEN,
-            "Microfrontends require the Pro or Enterprise plan".into(),
+            "Microfrontends require the Pro plan or higher".into(),
         ));
     }
     if b.name.trim().is_empty() || b.host_project.trim().is_empty() {

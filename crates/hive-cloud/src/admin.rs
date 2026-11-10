@@ -660,8 +660,17 @@ async fn mint_token(
     let admin_tenant = req.tenant.trim();
     let is_billing_writer = || crate::leadership::may_act(&c, crate::leadership::Job::BillingMeter);
     if platform_admin && !admin_tenant.is_empty() && is_billing_writer() {
-        let floor_already_enterprise =
-            c.billing.account(admin_tenant).tier_locked_plan.as_deref() == Some("enterprise");
+        // Rank-based, never a string equality: an operator floor at enterprise_plus (or any
+        // later tier) already satisfies the enterprise floor. Comparing to Some("enterprise")
+        // would re-lock that tenant DOWN to rank 4 on the next admin token mint.
+        let floor_already_enterprise = c
+            .billing
+            .account(admin_tenant)
+            .tier_locked_plan
+            .as_deref()
+            .is_some_and(|p| {
+                crate::billing::plan_rank(p) >= crate::billing::plan_rank("enterprise")
+            });
         if !floor_already_enterprise {
             apply_admin_enterprise(&c, admin_tenant);
         }
@@ -9040,7 +9049,7 @@ fn logs_hdr(h: &mut HeaderMap, k: &'static str, v: impl std::fmt::Display) {
 /// Event log read (`/v1/logs`): every input is bounded first and a malformed filter is a 400, never
 /// ignored. The window resolves to absolute bounds (`range` or `since_ms`/`until_ms`) and is gated
 /// on the OWNING TENANT's plan SERVER-SIDE (history older than the hobby window of 7 days is
-/// Pro/Enterprise, up to the 30-day retention ceiling): a request past it is REFUSED with a typed
+/// Pro and higher, up to the 30-day retention ceiling): a request past it is REFUSED with a typed
 /// error, never silently truncated, with no operator carve-out because platform admins read as
 /// `enterprise` through the billing floor (the team row wins over billing, as in `team_plan`).
 /// Scoping runs INSIDE the scan: only events of projects this team owns, UNATTRIBUTED events (empty
@@ -9153,7 +9162,7 @@ pub(crate) async fn logs(
                         "code": "PLAN_UPGRADE_REQUIRED",
                         "feature": "extended_log_history",
                         "message": format!(
-                            "Log history older than {} days requires the Pro or Enterprise plan (current plan: {plan}).",
+                            "Log history older than {} days requires the Pro plan or higher (current plan: {plan}).",
                             crate::billing::plan_max_log_age_ms("hobby") / crate::event_log::DAY_MS
                         ),
                         "plan": plan,
@@ -11453,8 +11462,14 @@ async fn team_create(
         require_operator(claims.as_ref().map(|e| &e.0))?;
     }
     let plan = b.plan.trim().to_ascii_lowercase();
-    if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
-        return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
+    if crate::billing::known_plan(&plan).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown plan '{plan}': the plans are {}",
+                crate::billing::plan_ids()
+            ),
+        ));
     }
     if plan != "hobby"
         && !claims
@@ -11716,12 +11731,23 @@ impl PlanChange<'_> {
 /// `customer.subscription.deleted`) can drop. Called from `mint_token` on the billing writer only,
 /// and idempotent.
 pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
-    if let Err((_, why)) = apply_plan_everywhere(c, tenant, "enterprise", PlanChange::AdminTenant) {
-        tracing::error!(tenant, %why, "platform admin tenant could not be set to enterprise");
+    // NEVER pin a literal "enterprise": a tenant already on a higher tier would be
+    // DOWNGRADED on every mint_token. The floor is the higher of its current plan
+    // and enterprise, compared by rank.
+    let current = c.billing.account(tenant).plan;
+    let floor = if crate::billing::plan_rank(&current)
+        > crate::billing::plan_rank("enterprise")
+    {
+        current
+    } else {
+        "enterprise".to_string()
+    };
+    if let Err((_, why)) = apply_plan_everywhere(c, tenant, &floor, PlanChange::AdminTenant) {
+        tracing::error!(tenant, %why, "platform admin tenant could not be set to its floor");
     }
-    c.billing.set_tier_lock(tenant, Some("enterprise"));
+    c.billing.set_tier_lock(tenant, Some(&floor));
     crate::persist::persist(c);
-    tracing::info!(tenant, "platform admin tenant locked to enterprise");
+    tracing::info!(tenant, %floor, "platform admin tenant locked to its tier floor");
 }
 
 #[derive(Deserialize)]
@@ -11748,8 +11774,14 @@ async fn team_set_plan(
         &["owner", "admin"],
     )?;
     let plan = b.plan.to_lowercase();
-    if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
-        return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
+    if crate::billing::known_plan(&plan).is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown plan '{plan}': the plans are {}",
+                crate::billing::plan_ids()
+            ),
+        ));
     }
     c.teams
         .get(&slug)
@@ -11837,7 +11869,7 @@ async fn team_set_sso(
     if !crate::billing::plan_allows_sso(&team.plan) {
         return Err((
             StatusCode::FORBIDDEN,
-            "SSO requires the Enterprise plan".into(),
+            "SSO requires Enterprise or Enterprise Plus".into(),
         ));
     }
     let t = c
@@ -16847,11 +16879,12 @@ async fn billing_checkout(
                         ),
                     ));
                 };
+                let plan_price_id = crate::billing::plan_stripe_price_id(&plan);
                 (
                     plan,
                     spec.price_cents,
                     format!("OpenEdge {} plan", spec.name),
-                    spec.stripe_price_id.map(|s| s.to_string()),
+                    plan_price_id,
                 )
             }
         };
@@ -16930,6 +16963,27 @@ async fn billing_checkout(
             "billing is not set up on this platform (no payment provider is configured): \
              nothing was purchased or charged"
                 .into(),
+        ));
+    }
+    // A paid PLAN checkout whose recurring Stripe Price is not wired would otherwise reach
+    // `billing::stripe_checkout` with `price_id = None`: that path switches to `mode=payment`
+    // plus ad-hoc `price_data`, a ONE-TIME charge for a MONTHLY plan. Refuse before any
+    // checkout record is opened. Credits and addons are one-time purchases by design, so
+    // only plan checkouts are gated: req.kind == "plan", plus the match's `_` arm which
+    // also treats an unknown kind as a plan (exclude the two non-plan kinds).
+    if stripe
+        && req.kind != "credits"
+        && req.kind != "addon"
+        && price_id.is_none()
+        && amount > 0
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "no recurring Stripe Price is configured for the '{plan}' plan: nothing was \
+                 purchased or charged; set HIVE_STRIPE_PRICE_{} to a real recurring price id",
+                plan.to_ascii_uppercase()
+            ),
         ));
     }
     let co = c

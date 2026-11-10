@@ -7,6 +7,7 @@ import { Card, Button, PageHeader, Badge } from "@/components/ui";
 import { RoleGate } from "@/components/role-gate";
 import { apiSend, usePoll, type BillingInfo, type LedgerEntry, type Invoice } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { planLabel, planRank } from "@/lib/plan-change";
 
 const BILLING_POLL_MS = 30_000;
 const LEDGER_POLL_MS = 120_000;
@@ -87,8 +88,8 @@ function BillingInner() {
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div>
               <div className="flex items-center gap-2">
-                <span className="text-lg font-semibold capitalize">{acc.plan} plan</span>
-                <Badge tone={acc.plan === "pro" ? "blue" : "default"}>{acc.status}</Badge>
+                <span className="text-lg font-semibold capitalize">{planLabel(acc.plan)} plan</span>
+                <Badge tone={planRank(acc.plan) >= planRank("pro") ? "blue" : "default"}>{acc.status}</Badge>
                 {data?.stripe ? <Badge tone="green">Stripe</Badge> : <Badge tone="amber">Mock checkout</Badge>}
               </div>
               <div className="mt-1 text-sm text-secondary">
@@ -143,17 +144,20 @@ function BillingInner() {
 
       <RoleGate action="billing.pay" note>
       <div className="mb-3 text-base font-semibold">Plans</div>
-      <div className="mb-8 grid grid-cols-1 gap-4 md:grid-cols-2">
+      <div className="mb-8 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
         {plans.map((p) => {
           const current = acc?.plan === p.id;
           return (
-            <Card key={p.id} className={`flex flex-col p-5 ${current ? "ring-2 ring-fg" : ""}`}>
+            <Card key={p.id} className={`flex min-w-0 break-words flex-col p-5 ${current ? "ring-2 ring-fg" : ""}`}>
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-lg font-semibold">{p.name}</span>
                 {current && <Badge tone="blue">Current</Badge>}
               </div>
-              <div className="mb-4 text-2xl font-semibold tabular-nums">
+              <div className="mb-1 text-2xl font-semibold tabular-nums">
                 {p.price_cents === 0 ? "Free" : usd(p.price_cents)}<span className="text-sm font-normal text-muted">{p.price_cents ? " / mo" : ""}</span>
+              </div>
+              <div className="mb-4 min-w-0 break-words text-sm text-secondary">
+                {p.max_projects === 0 ? "Unlimited projects" : `${p.max_projects.toLocaleString("en-US")} projects`}
               </div>
               <ul className="mb-5 flex flex-1 flex-col gap-2 text-sm">
                 {p.features.map((f) => (

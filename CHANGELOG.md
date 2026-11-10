@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-10 - feat(billing): Business and Enterprise Plus tiers
+
+`billing::PLANS` now carries five tiers. Business is $200/mo and Enterprise Plus is
+$5,000/mo, with project limits hobby 20 / pro 200 / business 800 / enterprise
+10,000 / enterprise_plus unlimited. `included_cents == price_cents` is preserved on
+every paid plan, so the subscription gross margin stays the metered margin.
+`plan_rank` is extended to 1..5 and the entitlement gates (`plan_allows_*`,
+`plan_max_duration_secs`) are rank-monotone. `plan_resource_ceiling` is a capacity
+guard, not an entitlement: it stays byte-identical to the enterprise-only clamp at
+HEAD, so neither new tier is given a new per-function resource cap (the fleet-wide
+`HIVE_CONTAINER_*_MAX` clamp still applies). An operator tier floor is now compared
+by rank, so an `enterprise_plus` floor is never re-locked down to `enterprise`. The
+`plan_quotas_are_wired` assertion is updated, not added, with the `enterprise_plus`
+project-limit check.
+
+Stripe recurring Price ids are NOT invented for the new tiers: a catalog id wins,
+otherwise the operator wires the real Price on the node with `HIVE_STRIPE_PRICE_BUSINESS`
+or `HIVE_STRIPE_PRICE_ENTERPRISE_PLUS` (uppercased plan id). Checkout fails closed when a paid
+plan has no recurring Price id, because `stripe_checkout` with `None` uses `mode=payment` with
+one-time ad-hoc `price_data`, which would charge ONCE for a monthly plan. Metered
+charging stays OFF until `HIVE_BILLING_METER_RESOURCES=1`.
+
 ## 2026-11-09 - feat(ui): Team Domains layout matching the reference console
 
 `/domains` now uses the Team Domains console structure: a three-part header bar

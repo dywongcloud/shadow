@@ -404,7 +404,7 @@ struct Args {
     /// Image/rootfs for function & build cells.
     #[arg(long, default_value = "default")]
     image: String,
-    /// Plan (sets max concurrency: hobby/pro=30k, enterprise=100k).
+    /// Plan (max concurrency: hobby/pro/business=30k, enterprise/enterprise_plus=100k).
     #[arg(long, default_value = "pro")]
     plan: String,
     /// Per-region burst concurrency limit (executions per 10s).
@@ -838,7 +838,10 @@ async fn async_main() -> anyhow::Result<()> {
     let cdn = Arc::new(CdnCache::new());
     let plan = match args.plan.to_lowercase().as_str() {
         "hobby" => Plan::Hobby,
-        "enterprise" => Plan::Enterprise,
+        // Rank, not an id list: a tier added above enterprise must inherit its ceiling.
+        p if crate::billing::plan_rank(p) >= crate::billing::plan_rank("enterprise") => {
+            Plan::Enterprise
+        }
         _ => Plan::Pro,
     };
     let limiter = Arc::new(

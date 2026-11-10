@@ -74,7 +74,7 @@ function LocalTeams() {
 
   async function createTeam() {
     if (!newName.trim()) return;
-    await apiSend("POST", "/v1/teams", { name: newName, plan: "pro" });
+    await apiSend("POST", "/v1/teams", { name: newName });
     setNewName("");
     setCreating(false);
     refresh();

@@ -23,14 +23,14 @@ pub const BYTE_MS_PER_GB_MONTH: f64 = 1_000_000_000.0 * 2_592_000_000.0;
 
 /// Plan catalog. `included_cents` is the monthly compute allowance, the only field that costs real
 /// money per active tenant (the rest are ceilings that decide how early a user hits a wall);
-/// `overage` allows pay-as-you-go beyond it (Pro, Enterprise). The `max_*` fields are the enforced
+/// `overage` allows pay-as-you-go beyond it (every paid tier). The `max_*` fields are the enforced
 /// quotas (0 = unlimited).
 #[derive(Clone, Serialize)]
 pub struct PlanSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub price_cents: u64,
-    /// The Stripe recurring Price id of this plan's subscription (`price_...`), `None` for Hobby.
+    /// The Stripe recurring Price id of this plan's subscription (`price_...`), `None` until wired.
     /// Checkout uses it directly (`mode=subscription`): ad-hoc `price_data` only supports one-time
     /// payments.
     pub stripe_price_id: Option<&'static str>,
@@ -68,7 +68,7 @@ pub const PLANS: &[PlanSpec] = &[
         included_cents: 500,
         overage: false,
         overage_ceiling_cents: 0,
-        max_projects: 250,
+        max_projects: 20,
         max_members: 3,
         max_sandboxes: 15,
         max_running_sandboxes: 3,
@@ -91,7 +91,7 @@ pub const PLANS: &[PlanSpec] = &[
         included_cents: 2000,
         overage: true,
         overage_ceiling_cents: 10_000,
-        max_projects: 1000,
+        max_projects: 200,
         max_members: 25,
         max_sandboxes: 50,
         max_running_sandboxes: 10,
@@ -107,6 +107,30 @@ pub const PLANS: &[PlanSpec] = &[
         ],
     },
     PlanSpec {
+        id: "business",
+        name: "Business",
+        price_cents: 20_000,
+        stripe_price_id: None,
+        included_cents: 20_000,
+        overage: true,
+        overage_ceiling_cents: 100_000,
+        max_projects: 800,
+        max_members: 100,
+        max_sandboxes: 200,
+        max_running_sandboxes: 40,
+        max_sandbox_mounts: 8,
+        max_sandbox_env_vars: 200,
+        max_sandbox_ports: 16,
+        max_drive_bytes: 100 * 1024 * 1024 * 1024,
+        features: &[
+            "$200 of included compute / month",
+            "Pay-as-you-go beyond included compute",
+            "Unlimited concurrent builds",
+            "Deployment protection and microfrontends",
+            "30 days of log history",
+        ],
+    },
+    PlanSpec {
         id: "enterprise",
         name: "Enterprise",
         price_cents: 100000,
@@ -114,7 +138,7 @@ pub const PLANS: &[PlanSpec] = &[
         included_cents: 100000,
         overage: true,
         overage_ceiling_cents: 1_000_000,
-        max_projects: 0,
+        max_projects: 10_000,
         max_members: 0,
         max_sandboxes: 0,
         max_running_sandboxes: 0,
@@ -130,13 +154,39 @@ pub const PLANS: &[PlanSpec] = &[
             "100k concurrency · priority support",
         ],
     },
+    PlanSpec {
+        id: "enterprise_plus",
+        name: "Enterprise Plus",
+        price_cents: 500_000,
+        stripe_price_id: None,
+        included_cents: 500_000,
+        overage: true,
+        overage_ceiling_cents: 5_000_000,
+        max_projects: 0,
+        max_members: 0,
+        max_sandboxes: 0,
+        max_running_sandboxes: 0,
+        max_sandbox_mounts: 0,
+        max_sandbox_env_vars: 0,
+        max_sandbox_ports: 0,
+        max_drive_bytes: 0,
+        features: &[
+            "$5,000 of included compute / month",
+            "Automatic multi-region fail-over",
+            "1-hour function runtime (3600s)",
+            "Team / Org SSO (SAML & OIDC)",
+            "100k concurrency · priority support",
+            "Unlimited projects, seats and sandboxes",
+        ],
+    },
 ];
 
 /// Per-plan CEILING on one function's resources, `(max_vcpus, max_memory_mib)`, or `None` for no
-/// plan-specific cap (the fleet-wide `HIVE_CONTAINER_*_MAX` clamp still applies). Capacity policy:
-/// an enterprise function may request at most 2 vCPU / 4 GiB (default sizing is unchanged) since
-/// enterprise deployments are the fleet's biggest consumers; every other plan, legacy tenants
-/// included, keeps its sizing.
+/// plan-specific cap (the fleet-wide `HIVE_CONTAINER_*_MAX` clamp still applies). This is a
+/// capacity guard, NOT a rank entitlement: it stays keyed to the enterprise plan exactly as it
+/// was before the five-tier catalog, so adding a tier never silently clamps a higher-paying
+/// tenant's functions. Every other plan, the two new tiers and legacy tenants included, keeps
+/// its sizing.
 pub fn plan_resource_ceiling(plan: &str) -> Option<(u32, u32)> {
     match plan.trim().to_ascii_lowercase().as_str() {
         "enterprise" => Some((2, 4096)),
@@ -155,6 +205,26 @@ pub fn known_plan(id: &str) -> Option<&'static PlanSpec> {
 /// The accepted plan ids, for a refusal that names them.
 pub fn plan_ids() -> String {
     PLANS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
+}
+
+/// The recurring Stripe Price id for `plan`, if one is wired. NEVER invent a `price_...` id: an
+/// unwired paid plan has no recurring Price, and `stripe_checkout` with `None` uses `mode=payment`
+/// (one-time ad-hoc `price_data`), which is WRONG for a monthly plan; `admin::billing_checkout`
+/// refuses those. A catalog id wins; otherwise the operator wires the real Price on the node with
+/// `HIVE_STRIPE_PRICE_<PLAN_ID_UPPERCASE>` (uppercase the plan id, trim, empty = unwired).
+pub fn plan_stripe_price_id(plan: &str) -> Option<String> {
+    let spec = known_plan(plan)?;
+    if let Some(id) = spec.stripe_price_id.map(str::to_string) {
+        return Some(id);
+    }
+    let key = format!("HIVE_STRIPE_PRICE_{}", spec.id.to_ascii_uppercase());
+    let wired = std::env::var(key).ok()?;
+    let wired = wired.trim();
+    if wired.is_empty() {
+        None
+    } else {
+        Some(wired.to_string())
+    }
 }
 
 /// The plan priced for `id`: Hobby for an id no plan carries (a stored legacy value). For a
@@ -474,56 +544,56 @@ pub struct LedgerCheckpoint {
     pub created_ms: u64,
 }
 
-/// Max function runtime (seconds) allowed on a plan. Enterprise unlocks 1 hour.
+/// Max function runtime (seconds) allowed on a plan. Enterprise and Enterprise Plus unlock 1 hour.
 pub fn plan_max_duration_secs(plan: &str) -> u64 {
     match plan {
-        "enterprise" => 3600,
-        "pro" => 800,
+        "enterprise" | "enterprise_plus" => 3600,
+        "pro" | "business" => 800,
         _ => 300,
     }
 }
 
-/// Automatic multi-region fail-over is an Enterprise capability.
+/// Automatic multi-region fail-over is an Enterprise / Enterprise Plus capability.
 pub fn plan_allows_failover(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
 
-/// Optional team/org SSO is an Enterprise capability.
+/// Optional team/org SSO is an Enterprise / Enterprise Plus capability.
 pub fn plan_allows_sso(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
 
-/// SAML SSO configuration is Enterprise-only (org identity federation).
+/// SAML SSO configuration is Enterprise / Enterprise Plus (org identity federation).
 pub fn plan_allows_saml(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
-/// SCIM 2.0 directory sync is Enterprise-only.
+/// SCIM 2.0 directory sync is Enterprise / Enterprise Plus.
 pub fn plan_allows_scim(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
-/// Custom SIEM log streaming (audit → Datadog/Splunk/HTTP) is Enterprise-only.
+/// Custom SIEM log streaming (audit → Datadog/Splunk/HTTP) is Enterprise / Enterprise Plus.
 pub fn plan_allows_siem(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
-/// Account-level IP blocking is Enterprise-only.
+/// Account-level IP blocking is Enterprise / Enterprise Plus.
 pub fn plan_allows_ip_blocking(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
-/// Org-wide Conformance is Enterprise-only.
+/// Org-wide Conformance is Enterprise / Enterprise Plus.
 pub fn plan_allows_conformance(plan: &str) -> bool {
-    plan == "enterprise"
+    matches!(plan, "enterprise" | "enterprise_plus")
 }
 /// Deployment password / access protection is available from Pro up.
 pub fn plan_allows_deploy_protection(plan: &str) -> bool {
-    matches!(plan, "pro" | "enterprise")
+    matches!(plan, "pro" | "business" | "enterprise" | "enterprise_plus")
 }
 /// Microfrontends composition is available from Pro up.
 pub fn plan_allows_microfrontends(plan: &str) -> bool {
-    matches!(plan, "pro" | "enterprise")
+    matches!(plan, "pro" | "business" | "enterprise" | "enterprise_plus")
 }
 /// Request-log history older than 7 days is available from Pro up.
 pub fn plan_allows_extended_logs(plan: &str) -> bool {
-    matches!(plan, "pro" | "enterprise")
+    matches!(plan, "pro" | "business" | "enterprise" | "enterprise_plus")
 }
 /// How far back `/v1/logs` may read, per plan. This is the SERVER-SIDE gate —
 /// the UI offering a 30-day option is presentation, the refusal lives here.
@@ -597,9 +667,11 @@ impl BillingAccount {
 /// matching `plan_spec`'s fail-toward-hobby behaviour.
 pub fn plan_rank(plan: &str) -> u8 {
     match plan {
-        "enterprise" => 3,
-        "pro" => 2,
         "hobby" => 1,
+        "pro" => 2,
+        "business" => 3,
+        "enterprise" => 4,
+        "enterprise_plus" => 5,
         _ => 0,
     }
 }
@@ -1247,8 +1319,8 @@ impl BillingStore {
         Ok(self.account(tenant))
     }
 
-    /// Business lock: can this tenant start a new deployment? Pro/Enterprise always
-    /// can (pay-as-you-go). Hobby is blocked once the monthly included compute is
+    /// Business lock: can this tenant start a new deployment? Every paid tier can
+    /// (pay-as-you-go). Hobby is blocked once the monthly included compute is
     /// exhausted AND there's no prepaid balance — the usage→limit→lock tie-in.
     pub fn can_deploy(&self, tenant: &str) -> Result<(), String> {
         let acc = self.account(tenant);
@@ -1876,16 +1948,16 @@ mod tests {
 
     #[test]
     fn plan_quotas_are_wired() {
-        // Assert the SHAPE (bounded, and strictly below Pro), not the exact
-        // numbers: pinning literals here made every deliberate limit change look
-        // like a regression, which is the opposite of what this test is for.
-        // 0 means unlimited, so an enterprise check is an equality on 0.
+        // Assert the SHAPE (bounded, and strictly below Pro) plus the two
+        // tier boundaries this change set: Enterprise has a finite 10,000
+        // project cap, Enterprise Plus is unlimited (0), like its other quotas.
         assert!(plan_max_members("hobby") > 0);
         assert!(plan_max_members("hobby") < plan_max_members("pro"));
         assert_eq!(plan_max_members("enterprise"), 0); // unlimited
         assert!(plan_max_projects("hobby") > 0);
         assert!(plan_max_projects("hobby") < plan_max_projects("pro"));
-        assert_eq!(plan_max_projects("enterprise"), 0);
+        assert_eq!(plan_max_projects("enterprise"), 10_000);
+        assert_eq!(plan_max_projects("enterprise_plus"), 0); // unlimited
         // Hobby must never gain overage billing — it is the no-payment tier.
         assert!(!plan_spec("hobby").overage);
         assert!(plan_spec("pro").overage);

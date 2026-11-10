@@ -1,7 +1,17 @@
 import { ApiError, ROLE_REFUSED, apiSend } from "@/lib/api";
 
 /** The tiers in rising order, as `billing::plan_rank` ranks them. */
-export const PLAN_TIERS = ["hobby", "pro", "enterprise"] as const;
+export const PLAN_TIERS = ["hobby", "pro", "business", "enterprise", "enterprise_plus"] as const;
+
+const tierIndex = (plan: string) => PLAN_TIERS.indexOf(plan.toLowerCase() as (typeof PLAN_TIERS)[number]);
+
+/** Ranks a plan exactly as `billing::plan_rank` does (1..5 for the five tiers, 0 for an unknown
+ *  id). Feature gates compare a plan's rank to a floor, so every tier at or above that floor
+ *  inherits the capability (`plan_allows_*`, `plan_max_duration_secs`, `plan_max_projects`). */
+export const planRank = (plan: string): number => Math.max(0, tierIndex(plan) + 1);
+
+/** A plan id is a backend slug (`enterprise_plus`), never a sentence: render it with spaces. */
+export const planLabel = (plan: string): string => plan.replace(/_/g, " ");
 
 const GENERIC_REFUSAL = "The plan could not be changed. Try again, or use the Billing page.";
 const PERMISSION_REFUSAL =
@@ -9,7 +19,7 @@ const PERMISSION_REFUSAL =
 const NO_TEAM_REFUSAL = "This team has no plan record to change here. The Billing page manages the plan of the team you are working in.";
 const RAW_REQUEST_LINE = /^[A-Z]+ \/\S* -> \d+$/;
 
-const tierRank = (plan: string) => Math.max(0, PLAN_TIERS.indexOf(plan.toLowerCase() as (typeof PLAN_TIERS)[number]));
+const tierRank = (plan: string) => Math.max(0, tierIndex(plan));
 
 export type PlanAction = "none" | "switch" | "checkout";
 

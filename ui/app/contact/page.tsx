@@ -30,7 +30,7 @@ export default function ContactPage() {
       <MarketingSection className="grid gap-6 py-16 md:grid-cols-3">
         {[
           { icon: MessageSquare, title: "Sales", desc: "Talk through your use case and self-hosting plan.", cta: "sales@shadw.cloud" },
-          { icon: Mail, title: "Support", desc: "Email support for Pro and Enterprise; Hobby has community support.", cta: "support@shadw.cloud" },
+          { icon: Mail, title: "Support", desc: "Email support from Pro; priority support on Enterprise tiers. Hobby has community support.", cta: "support@shadw.cloud" },
           { icon: Building2, title: "Enterprise", desc: "Multi-region fail-over, SAML SSO and priority support.", cta: "enterprise@shadw.cloud" },
         ].map((c) => (
           <GlowCard key={c.title}>

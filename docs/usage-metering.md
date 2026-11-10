@@ -32,7 +32,7 @@ and carries no usage data.
 
 ### Why 60%
 
-`PlanSpec.included_cents == price_cents` on both paid plans. The subscription's gross margin IS the
+`PlanSpec.included_cents == price_cents` on all four paid plans. The subscription's gross margin IS the
 metered margin: there is no separate base fee to absorb a loss-making SKU, so one SKU below cost
 makes the whole plan below cost. 60% leaves 40% for the costs a per-SKU COGS figure does not
 contain: idle host capacity, power, transit contracts, storage replication, support and payment
@@ -40,8 +40,9 @@ fees. A price that merely beats COGS is still a loss once those are counted. The
 not a target: `assert_profitable()` fails the card, it never raises a price by itself.
 
 `PlanSpec.overage_ceiling_cents` bounds exposure above the included credit (Hobby 0, Pro 10000,
-Enterprise 1000000). `BillingStore::may_consume(tenant, projected_cents)` is the typed refusal
-that enforces it; a plan is bought or granted, never self-assigned.
+Business 100000, Enterprise 1000000, Enterprise Plus 5000000). `BillingStore::may_consume(tenant,
+projected_cents)` is the typed refusal that enforces it; a plan is bought or granted, never
+self-assigned.
 
 ## SKU table
 

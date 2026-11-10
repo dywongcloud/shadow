@@ -11109,8 +11109,9 @@ enum GitPollOutcome {
 }
 
 /// Concurrent `git_poll_one` fan-out width per cycle (`HIVE_GIT_POLL_CONCURRENCY`, default 16). The
-/// input is `cloud.projects`: platform-wide and, on the enterprise tier, unbounded per tenant
-/// (`plan_max_projects`), so an unbounded `join_all` would fork one `git ls-remote` per project at
+/// input is `cloud.projects`: platform-wide and bounded only by each tier's project quota
+/// (`plan_max_projects`, 0 = unlimited on Enterprise Plus), so an unbounded `join_all` would
+/// fork one `git ls-remote` per project at
 /// once on the single control-plane leader every tick (FD, process-table and socket pressure that
 /// scales with tenant-controlled project count). `buffer_unordered` keeps one slow remote from
 /// blocking another while capping the number of `git` subprocesses.

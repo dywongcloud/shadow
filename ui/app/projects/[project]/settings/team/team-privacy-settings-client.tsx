@@ -6,7 +6,7 @@ import { Lock } from "lucide-react";
 import { Button, Switch, SettingCard } from "@/components/ui";
 import { RoleGate } from "@/components/role-gate";
 import { apiGet, apiSend, useCan, usePlatformAdmin, usePoll, type ProjectSettings, type Team } from "@/lib/api";
-import { PLAN_TIERS, followCheckout, planAction, planRefusal, startPlanCheckout } from "@/lib/plan-change";
+import { PLAN_TIERS, followCheckout, planAction, planLabel, planRank, planRefusal, startPlanCheckout } from "@/lib/plan-change";
 import { roleHint } from "@/lib/team-role";
 import { cn } from "@/lib/utils";
 
@@ -26,6 +26,8 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
 
   const owning = (teams ?? []).find((t) => t.slug === team);
   const plan = owning?.plan ?? "hobby";
+  /** `billing::plan_allows_sso` admits Enterprise and Enterprise Plus; rank, never a name list. */
+  const ssoUnlocked = planRank(plan) >= planRank("enterprise");
   const ssoOn = !!owning?.sso_enabled;
   const planScope = !teams || settings === null ? "loading" : owning ? "team" : "none";
   const planFooter =
@@ -222,7 +224,7 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
 
       <SettingCard
         title="Plan & Enterprise"
-        desc="Your team's tier. Enterprise unlocks automatic region fail-over, 1-hour function runtimes (3600s), and optional Org SSO."
+        desc="Your team's tier. Enterprise and Enterprise Plus unlock automatic region fail-over, 1-hour function runtimes (3600s), and optional Org SSO."
         footer={planFooter}
       >
         <div className="flex flex-wrap gap-2">
@@ -249,7 +251,7 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
                 ) : (
                   <>
                     {action === "checkout" ? "Upgrade to " : ""}
-                    <span className="capitalize">{p}</span>
+                    <span className="capitalize">{planLabel(p)}</span>
                     {current ? " ✓" : ""}
                   </>
                 )}
@@ -276,11 +278,11 @@ export function TeamPrivacySettings({ paramsPromise }: { paramsPromise: Promise<
         ) : null}
         <div className="mt-4 flex items-center gap-3 border-t border-border pt-4">
           <span title={can("team.sso") ? undefined : roleHint("team.sso")}>
-            <Switch checked={ssoOn} disabled={plan !== "enterprise" || !can("team.sso")} onChange={toggleSso} label="Org SSO" />
+            <Switch checked={ssoOn} disabled={!ssoUnlocked || !can("team.sso")} onChange={toggleSso} label="Org SSO" />
           </span>
           <span className="text-sm text-secondary">Team / Org SSO (SAML &amp; OIDC) login</span>
-          {plan !== "enterprise" && (
-            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">Enterprise</span>
+          {!ssoUnlocked && (
+            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">Enterprise minimum</span>
           )}
         </div>
       </SettingCard>

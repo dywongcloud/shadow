@@ -6,6 +6,7 @@ import { Button, Switch, Input, SettingCard } from "@/components/ui";
 import { RegionMap } from "@/components/region-map";
 import { apiGet, apiSend, type FunctionSettings, type RegionCatalog } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { planLabel, planRank } from "@/lib/plan-change";
 
 export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
@@ -18,8 +19,9 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
 
   const [err, setErr] = useState("");
 
-  const planMaxDurationSecs = plan === "enterprise" ? 3600 : plan === "pro" ? 800 : 300;
-  const canFailover = plan === "enterprise";
+  const rank = planRank(plan);
+  const planMaxDurationSecs = rank >= planRank("enterprise") ? 3600 : rank >= planRank("pro") ? 800 : 300;
+  const canFailover = rank >= planRank("enterprise");
 
   const load = useCallback(async () => {
     try {
@@ -149,7 +151,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
             optionally override it at the function level. A new deployment is required for changes to take effect.
           </>
         }
-        footer={`Hobby max 300s · Pro max 800s · Enterprise max 3600s (1 hour). Your plan (${plan}) allows up to ${planMaxDurationSecs}s.`}
+        footer={`Hobby max 300s · Pro and Business max 800s · Enterprise and Enterprise Plus max 3600s (1 hour). Your plan (${planLabel(plan)}) allows up to ${planMaxDurationSecs}s.`}
         footerAction={
           <Button
             onClick={() => save({ ...fs, default_max_duration_secs: Math.min(planMaxDurationSecs, Math.max(1, parseInt(maxDur || "300", 10))) })}
@@ -159,8 +161,8 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
         }
       >
         <div className="rounded-lg border border-border bg-subtle p-4 text-sm text-secondary">
-          <span className="font-medium text-fg">Longer functions:</span> {plan === "enterprise"
-            ? "your Enterprise plan supports function runtimes up to 1 hour (3600s)."
+          <span className="font-medium text-fg">Longer functions:</span> {rank >= planRank("enterprise")
+            ? "your plan supports function runtimes up to 1 hour (3600s)."
             : <>upgrade to <span className="font-medium text-fg">Enterprise</span> for 1-hour (3600s) function runtimes. Your current cap is {planMaxDurationSecs}s.</>}
         </div>
         <div className="mt-4">
@@ -268,7 +270,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
       <SettingCard
         title="Automatic Region Fail-over"
         desc="Automatically fail functions over to the nearest healthy region when one becomes unavailable. A new deployment is required for changes to take effect."
-        footer={canFailover ? "Enterprise: automatic multi-region fail-over." : "Available on the Enterprise plan."}
+        footer={canFailover ? "Enterprise and Enterprise Plus: automatic multi-region fail-over." : "Available on Enterprise and Enterprise Plus."}
       >
         <div className="flex items-center gap-3">
           <Switch
@@ -279,7 +281,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
           />
           <span className="text-sm font-medium">{fs.failover ? "Enabled" : "Disabled"}</span>
           {!canFailover && (
-            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">Enterprise</span>
+            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">Enterprise minimum</span>
           )}
         </div>
       </SettingCard>
