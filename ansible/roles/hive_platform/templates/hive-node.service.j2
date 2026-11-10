@@ -38,6 +38,8 @@ Environment=HIVE_CP_VOTERS={{ hive_cp_voters | default('') }}
 Environment=HIVE_GOSSIP_IROH={{ hive_gossip_iroh }}
 Environment=HIVE_GOSSIP_SIGN={{ hive_gossip_sign }}
 Environment=HIVE_GOSSIP_VERIFY={{ hive_gossip_verify }}
+# Operator opt-in: metering always runs; charging fails closed on an unprofitable RATE_CARD.
+Environment=HIVE_BILLING_METER_RESOURCES={{ hive_billing_meter_resources | default('0') }}
 Environment=HIVE_DISCOVERY_N0={{ hive_discovery_n0 }}
 # Public mainline-DHT address lookup. Additive and last in the provider list:
 # bootstrap seeds and the Seer pkarr resolver stay registered and still win on

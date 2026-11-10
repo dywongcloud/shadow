@@ -1,4 +1,4 @@
-//! Billing & compute credits — Hobby vs Pro, pay-as-you-go + prepaid credits.
+//! Billing & compute credits — five plan tiers, metered usage + prepaid credits.
 //!
 //! Stripe-ready: when `STRIPE_SECRET_KEY` is set the checkout endpoint creates a
 //! real Stripe Checkout Session; otherwise a fully-working **mock checkout** is
@@ -31,8 +31,9 @@ pub struct PlanSpec {
     pub name: &'static str,
     pub price_cents: u64,
     /// The Stripe recurring Price id of this plan's subscription (`price_...`), `None` until wired.
-    /// Checkout uses it directly (`mode=subscription`): ad-hoc `price_data` only supports one-time
-    /// payments.
+    /// Checkout uses a wired id directly (`mode=subscription`); an unwired paid plan instead uses
+    /// inline recurring `price_data` under `mode=subscription`. Only credits/addons use one-time
+    /// ad-hoc `price_data`.
     pub stripe_price_id: Option<&'static str>,
     pub included_cents: u64,
     pub overage: bool,
@@ -207,11 +208,10 @@ pub fn plan_ids() -> String {
     PLANS.iter().map(|p| p.id).collect::<Vec<_>>().join(", ")
 }
 
-/// The recurring Stripe Price id for `plan`, if one is wired. NEVER invent a `price_...` id: an
-/// unwired paid plan has no recurring Price, and `stripe_checkout` with `None` uses `mode=payment`
-/// (one-time ad-hoc `price_data`), which is WRONG for a monthly plan; `admin::billing_checkout`
-/// refuses those. A catalog id wins; otherwise the operator wires the real Price on the node with
-/// `HIVE_STRIPE_PRICE_<PLAN_ID_UPPERCASE>` (uppercase the plan id, trim, empty = unwired).
+/// The recurring Stripe Price id for `plan`, if one is wired. NEVER invent a `price_...` id: the
+/// catalog id wins; otherwise the operator wires the real Price on the node with
+/// `HIVE_STRIPE_PRICE_<PLAN_ID_UPPERCASE>` (uppercase the plan id, trim, empty = unwired); otherwise
+/// an inline recurring Price is created at checkout under `mode=subscription`.
 pub fn plan_stripe_price_id(plan: &str) -> Option<String> {
     let spec = known_plan(plan)?;
     if let Some(id) = spec.stripe_price_id.map(str::to_string) {
@@ -1992,16 +1992,19 @@ fn stripe_api_base() -> String {
     }
 }
 
-/// Creates a real Stripe Checkout Session (best-effort). `price_id` is `Some` for a plan upgrade (a
-/// recurring subscription, `mode=subscription`) and `None` for a one-time purchase (a credit
-/// top-up, `mode=payment` with ad-hoc `price_data`). `checkout_id` is OUR `Checkout.id`, stamped
-/// into the session `metadata` (and the SUBSCRIPTION's, since `customer.subscription.*` webhooks
-/// carry only that) so webhooks can find the local record. Returns `(hosted_checkout_url,
-/// stripe_session_id)`; the session id is stored via `attach_stripe_session` so `billing_confirm`
-/// verifies real payment before applying anything.
+/// Creates a real Stripe Checkout Session (best-effort). `price_id` and `recurring` select one of
+/// three cases: `Some(pid)` uses a catalog/operator-wired recurring Price (`mode=subscription`);
+/// `None` with `recurring = true` creates an inline monthly recurring Price for an unwired paid
+/// plan (`mode=subscription`); `None` with `recurring = false` is a one-time credit/addon
+/// (`mode=payment` with ad-hoc `price_data`). `checkout_id` is OUR `Checkout.id`, stamped into
+/// session `metadata` and, for both subscription cases, `subscription_data[metadata][checkout_id]`
+/// (since `customer.subscription.*` webhooks carry only that) so webhooks can find the local
+/// record. Returns `(hosted_checkout_url, stripe_session_id)`; the session id is stored via
+/// `attach_stripe_session` so `billing_confirm` verifies real payment before applying anything.
 pub async fn stripe_checkout(
     http: &reqwest::Client,
     price_id: Option<&str>,
+    recurring: bool,
     amount_cents: u64,
     product_name: &str,
     success_url: &str,
@@ -2019,6 +2022,29 @@ pub async fn stripe_checkout(
         Some(pid) => {
             params.push(("mode".into(), "subscription".into()));
             params.push(("line_items[0][price]".into(), pid.to_string()));
+            params.push((
+                "subscription_data[metadata][checkout_id]".into(),
+                checkout_id.to_string(),
+            ));
+        }
+        None if recurring => {
+            params.push(("mode".into(), "subscription".into()));
+            params.push((
+                "line_items[0][price_data][currency]".into(),
+                "usd".into(),
+            ));
+            params.push((
+                "line_items[0][price_data][unit_amount]".into(),
+                amount_cents.to_string(),
+            ));
+            params.push((
+                "line_items[0][price_data][product_data][name]".into(),
+                product_name.to_string(),
+            ));
+            params.push((
+                "line_items[0][price_data][recurring][interval]".into(),
+                "month".into(),
+            ));
             params.push((
                 "subscription_data[metadata][checkout_id]".into(),
                 checkout_id.to_string(),

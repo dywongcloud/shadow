@@ -1614,6 +1614,22 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_memory_pressure_alarm();
 
     usage_metering::spawn_saver(cloud.clone());
+    let opted_in = std::env::var("HIVE_BILLING_METER_RESOURCES")
+        .map(|raw| {
+            let v = raw.trim().to_ascii_lowercase();
+            v == "1" || v == "true"
+        })
+        .unwrap_or(false);
+    let charging_enabled = crate::billing::resource_charging_enabled();
+    if opted_in && !charging_enabled {
+        let unprofitable = billing::RATE_CARD.assert_profitable().err();
+        tracing::warn!(
+            ?unprofitable,
+            "billing: rate card failed assert_profitable(); metered charging is therefore OFF (shadow mode)"
+        );
+    } else if charging_enabled {
+        tracing::info!("billing: metered charging is ON");
+    }
     if let Err(unprofitable) = billing::RATE_CARD.assert_profitable() {
         tracing::error!(
             ?unprofitable,

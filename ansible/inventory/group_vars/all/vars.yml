@@ -80,6 +80,10 @@ hive_public_node_tenants: "thoth-division"
 
 hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
 
+# Resource metering: measurement always runs; charging fails closed unless the
+# RATE_CARD is profitable, and only the leader-elected BillingMeter writer charges.
+hive_billing_meter_resources: "1"
+
 # the interval must stay GREATER than the timeout or probe rounds overlap
 hive_health_timeout: 10
 hive_health_interval: 15

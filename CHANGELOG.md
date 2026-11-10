@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-11-10 - feat(billing): charging stays on
+
+The operator opt-in for the five resource SKUs is now tracked as
+`hive_billing_meter_resources: "1"` in `ansible/inventory/group_vars/all/vars.yml`
+and rendered into `ansible/roles/hive_platform/templates/hive-node.service.j2`
+with a Jinja default of `0`, so an unset value still fails closed and, once the
+operator authorizes the roll, those five SKUs stay ON across subsequent rolls.
+Resource metering (managed-database row ops, storage, ingress/egress) is opt-in;
+compute metering always runs and charges. The profitability gate is unchanged:
+`resource_charging_enabled()` still requires both the opt-in and
+`RATE_CARD.assert_profitable()`, and only adds the five resource SKUs to the
+leader-elected `may_act(BillingMeter)` tick. `meter_usage` debits compute
+unconditionally within that tick. Boot now warns when the opt-in is set but the
+profitability gate leaves resource charging off, and logs when resource charging
+is on; the original profitability error remains.
+
+A paid plan with no catalog or operator-wired Stripe Price id now opens a
+recurring Checkout Session using inline `price_data[recurring][interval]=month`
+under `mode=subscription`, so all five tiers remain chargeable; the guard that
+made Business and Enterprise Plus unbuyable is removed. No `price_...` id is
+invented, and credits and addons stay one-time purchases.
+
+A fleet roll is REQUIRED to enable the five resource SKUs on the fleet. Compute
+metering already charges. No roll was performed.
+
 ## 2026-11-10 - feat(billing): Business and Enterprise Plus tiers
 
 `billing::PLANS` now carries five tiers. Business is $200/mo and Enterprise Plus is

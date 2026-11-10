@@ -16957,6 +16957,7 @@ async fn billing_checkout(
         ""
     };
     let stripe = crate::billing::stripe_configured();
+    let recurring_plan = req.kind != "credits" && req.kind != "addon";
     if !stripe && !crate::billing::mock_checkout_allowed() {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -16965,27 +16966,8 @@ async fn billing_checkout(
                 .into(),
         ));
     }
-    // A paid PLAN checkout whose recurring Stripe Price is not wired would otherwise reach
-    // `billing::stripe_checkout` with `price_id = None`: that path switches to `mode=payment`
-    // plus ad-hoc `price_data`, a ONE-TIME charge for a MONTHLY plan. Refuse before any
-    // checkout record is opened. Credits and addons are one-time purchases by design, so
-    // only plan checkouts are gated: req.kind == "plan", plus the match's `_` arm which
-    // also treats an unknown kind as a plan (exclude the two non-plan kinds).
-    if stripe
-        && req.kind != "credits"
-        && req.kind != "addon"
-        && price_id.is_none()
-        && amount > 0
-    {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!(
-                "no recurring Stripe Price is configured for the '{plan}' plan: nothing was \
-                 purchased or charged; set HIVE_STRIPE_PRICE_{} to a real recurring price id",
-                plan.to_ascii_uppercase()
-            ),
-        ));
-    }
+    // A paid plan with no wired Stripe Price id charges via inline recurring `price_data`
+    // (mode=subscription), so charging stays on; credits/addons remain one-time payments.
     let co = c
         .billing
         .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
@@ -17012,6 +16994,7 @@ async fn billing_checkout(
         match crate::billing::stripe_checkout(
             &c.http,
             price_id.as_deref(),
+            recurring_plan,
             amount,
             &label,
             &success,
