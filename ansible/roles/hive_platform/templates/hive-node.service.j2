@@ -63,6 +63,10 @@ Environment=HIVE_RELAY_URLS={{ hive_relay_urls }}
 {% if hive_bootstrap_peers %}
 Environment=HIVE_BOOTSTRAP_PEERS={{ hive_bootstrap_peers }}
 {% endif %}
+{% if hive_expected_node_ids | default('', true) | trim | length > 0 %}
+# Boot-immutable active-only mesh roster; peer trust stays the complete allowlist.
+Environment=HIVE_EXPECTED_NODE_IDS={{ hive_expected_node_ids }}
+{% endif %}
 {% if hive_fc_boot_args is defined %}
 Environment="HIVE_FC_BOOT_ARGS={{ hive_fc_boot_args }}"
 {% endif %}

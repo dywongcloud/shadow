@@ -18,6 +18,7 @@
 
 use crate::databases::{Database, DbKind};
 use crate::state::CloudState;
+use axum::body::HttpBody as _;
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -54,12 +55,28 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
     if req.method() == Method::OPTIONS {
         return with_cors(StatusCode::NO_CONTENT.into_response());
     }
+    // The ONE byte-accounting session for this request. The LAST `Arc` drop records, so a
+    // client disconnect that cancels this future still contributes the bytes already copied.
+    // It records ONLY bytes: `tally` below stays the single `requests` writer for `db_row_ops`.
+    let db = cloud.databases.by_db_host(&host);
+    let session = crate::db_metrics::SessionBytes::new(
+        db.as_ref().map(|d| d.id.as_str()).unwrap_or_default(),
+    );
+    req.extensions_mut().insert(Arc::clone(&session));
+    let resp = handle_inner(cloud, db, req).await;
+    // Buffered err()/ok_json()/Studio envelopes report an exact size hint; a streaming Studio
+    // body has none and contributes 0 (documented residual). Nothing is buffered here, and no
+    // tenant-controlled header is read.
+    session.add_egress(resp.body().size_hint().exact().unwrap_or(0));
+    resp
+}
 
+async fn handle_inner(cloud: Arc<CloudState>, db: Option<Database>, mut req: Request) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let headers = req.headers().clone();
 
-    let Some(db) = cloud.databases.by_db_host(&host) else {
+    let Some(db) = db else {
         return with_cors(err(StatusCode::NOT_FOUND, "no database at this hostname"));
     };
     // Per-INSTANCE accounting: every request this gateway serves belongs to exactly one database
@@ -127,7 +144,7 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
     }
 
     if db.kind == DbKind::Sqlite {
-        let (_parts, body) = req.into_parts();
+        let (parts, body) = req.into_parts();
         let bytes = match axum::body::to_bytes(body, BODY_CAP).await {
             Ok(b) => b,
             Err(_) => {
@@ -135,6 +152,13 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, mut req: Request) -> R
                 return with_cors(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
             }
         };
+        // The ACTUAL buffered length, never Content-Length. Bounded by BODY_CAP above.
+        if let Some(session) = parts
+            .extensions
+            .get::<Arc<crate::db_metrics::SessionBytes>>()
+        {
+            session.add_ingress(bytes.len() as u64);
+        }
         let resp = crate::hrana::serve(cloud, db, bearer, method, path, bytes).await;
         tally(resp.status());
         return with_cors(resp);
@@ -2611,8 +2635,17 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn read_body(req: Request) -> Option<axum::body::Bytes> {
-    let (_parts, body) = req.into_parts();
-    axum::body::to_bytes(body, BODY_CAP).await.ok()
+    let (parts, body) = req.into_parts();
+    let bytes = axum::body::to_bytes(body, BODY_CAP).await.ok()?;
+    // The ACTUAL buffered length (BODY_CAP-bounded), from the server-side request extension
+    // the front door installed. Never a tenant-controlled header, never a 64 MiB Studio body.
+    if let Some(session) = parts
+        .extensions
+        .get::<Arc<crate::db_metrics::SessionBytes>>()
+    {
+        session.add_ingress(bytes.len() as u64);
+    }
+    Some(bytes)
 }
 
 fn ok_json(v: Value) -> Response {

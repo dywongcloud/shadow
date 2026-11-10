@@ -37,6 +37,8 @@ export const TEAM_ACTIONS = {
   "database.console": { floor: "member", routes: ["POST /v1/databases/:id/console"] },
   /** The destructive tier of the console: same route, higher floor — the handler refuses a DROP/FLUSHALL without it. */
   "database.console.destructive": { floor: "admin", routes: ["POST /v1/databases/:id/console"] },
+  "usage.summary": { floor: "viewer", routes: ["GET /v1/usage/summary"] },
+  "usage.economics": { floor: "admin", routes: ["GET /v1/admin/usage/economics"] },
   "edge.security": { floor: "admin", routes: ["POST /v1/waf/rules", "DELETE /v1/waf/rules/:id", "PUT /v1/waf/managed", "PUT /v1/ratelimit", "PUT /v1/bot"] },
   "sms.provider": { floor: "admin", routes: ["POST /v1/push/sms-key", "POST /v1/push/sms-direct-mx", "POST /v1/push/sms-relay"] },
   "repo.link": { floor: "admin", routes: ["PUT /v1/gitops", "DELETE /v1/gitops"] },

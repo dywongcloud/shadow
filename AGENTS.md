@@ -186,18 +186,19 @@ refuses NEW placement; stranded databases are reported, never re-hosted (re-prov
 ## Contract and execution transparency (managed-db)
 
 - `crates/hive-contract`: a contract is DATA, not code. `Contract::declare` refuses `OpenParticipation` +
-`StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` must
-recheck. `crates/hive-cloud/src/db_contract.rs` is the ONLY seam: it does NOT authorize or fail the request —
-**the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD, never a prevention.
-It DOES maintain the write counter (`record_write`) even on refusal. A `db.write` outcome is a MEASUREMENT,
-never `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass `Ok(())`. An unattributed write is a
-REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`; a store failure leaves NO entry. Docs:
+`StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` MUST
+recheck that pair (unmet: row contract-pair-deserialize-bypass). `crates/hive-cloud/src/db_contract.rs` is
+the ONLY seam: it does NOT authorize or fail the request —
+**the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD, not a prevention.
+It counts writes (`record_write`) even on refusal. A `db.write` outcome is a MEASUREMENT,
+not `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass `Ok(())`. An unattributed write is a
+REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`; store failure leaves NO entry. Docs:
 `docs/README.md`, `docs/contract-platform-seam.md`.
 - Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>` (a bare join is NOT injective). `entry_sig_preimage`
 folds `Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical());
 it cannot cover the ack, since `ack.log_head` IS that hash). No PINNED identity = Inadmissible, never Dishonest.
-A checkpoint close normally defers to the engine drain, NOT inline in `submit`; inline fallback fires when
-deferred closes exceed 1, and rebuild repair closes inline. Read EVERY segment a window's range touches.
+A checkpoint close defers to the drain, not inline in `submit`; inline fallback fires past 1
+deferred close, and rebuild repair closes inline. Read EVERY segment a window's range touches.
 - **Vitra has no consensus**: honesty by REPLAY (`replicate.rs`, `audit.rs`), not agreement. Inclusion and
 append-only violation proofs exist; **NO bond or incentive model** (whitepaper §4.4 leaves it unspecified).
 Proofs show an entry WAS published, not freshness.

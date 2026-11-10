@@ -172,13 +172,24 @@ Enabling is a production change: the operator's word first, then `ansible/AGENTS
   health probes are platform overhead, not tenant-metered ingress/egress.
 - Egress is measured at the gateway, not per origin. A peer-cache hit may be counted once rather
   than once per hop.
-- The per-tenant database REST gateway (`db_rest`) and the Postgres/Redis wire proxies
-  (`db_gateway`) are HARD-BOUNDED but contribute no byte counts: `db_rest` tallies each
-  request through `db_metrics::record_http`, which supplies zero bytes, and the wire pumps
-  record nothing. Only `/v1/storage/*` native lanes and the DB console pass real
-  `bytes_in`/`bytes_out` into `db_metrics`, so `ingress_bytes`/`egress_bytes` cover
-  those lanes and read zero for the per-tenant DB data plane. Step 3 of the enable procedure
-  treats this as a blocker: a counter that never moves cannot be reconciled.
+- The per-tenant DB data plane now measures REAL bytes. `db_metrics::record_bytes` is the
+  ONE byte-only writer: it never touches `requests`, which is the `db_row_ops` delta source,
+  uses `saturating_add`, sets `last_ms` and keeps the 4096-entry bound. An
+  `Arc<db_metrics::SessionBytes>` (db_id + two atomics, `Drop -> record_bytes`) is created
+  when SNI resolves the database and cloned into `pump_up`/`pump_down`; the LAST drop
+  records, so a client disconnect still counts the chunks actually copied. `db_gateway`
+  counts decrypted payload in both directions (TLS handshake / Postgres preamble excluded).
+  The `db_rest` front door counts ingress only from the ACTUAL `BODY_CAP`-bounded `Bytes`
+  already buffered by `read_body` and the SQLite arm's `to_bytes`, and egress from
+  `Response::body().size_hint().exact()`; it never reads a tenant-controlled header and never
+  buffers a 64 MiB Studio body. Owner-forward Studio arms add NO second tally: the owner's
+  `studio-mesh` route is a separate admin mount that installs no session guard.
+  `record_http` still supplies zero bytes but remains the `requests` writer, so
+  `db_row_ops` is unchanged. RESIDUALS: streaming Studio responses have no exact size hint
+  and contribute ZERO egress; Studio request bodies (already hard-bounded at
+  `STUDIO_BODY_CAP`/`STUDIO_MESH_BODY_CAP`) are not attributed to ingress; cached Studio
+  assets are counted once, at the front door. Step 3 of the enable procedure must reconcile
+  these lanes against the new deltas before enabling charging.
 - `db_row_ops` counts at ONE engine chokepoint; nested triggers, CRR clock-table writes and
   background index-walker writes are not separately attributed to a tenant.
 - `blocked` counts WAF blocks, not inspected requests that passed; passed inspections have no SKU.

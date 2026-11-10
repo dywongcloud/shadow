@@ -44,6 +44,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// One observation at a request boundary. `err` is a FIXED CLASS, never an engine message: a
@@ -104,10 +105,10 @@ impl Counters {
     /// and last-* MAX (the newest observation anywhere is the newest one). Exactly the direction
     /// `/v1/metrics` merges its peer series.
     fn merge(&mut self, other: &Counters) {
-        self.requests += other.requests;
-        self.errors += other.errors;
-        self.bytes_in += other.bytes_in;
-        self.bytes_out += other.bytes_out;
+        self.requests = self.requests.saturating_add(other.requests);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.bytes_in = self.bytes_in.saturating_add(other.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(other.bytes_out);
         self.last_ms = self.last_ms.max(other.last_ms);
         self.last_latency_ms = self.last_latency_ms.max(other.last_latency_ms);
         if other.last_error_ms >= self.last_error_ms {
@@ -158,13 +159,13 @@ pub fn record(
     let now = hive_core::now_ms();
     let mut m = counters().lock();
     let c = m.entry(db_id.to_string()).or_default();
-    c.requests += 1;
-    c.bytes_in += bytes_in;
-    c.bytes_out += bytes_out;
+    c.requests = c.requests.saturating_add(1);
+    c.bytes_in = c.bytes_in.saturating_add(bytes_in);
+    c.bytes_out = c.bytes_out.saturating_add(bytes_out);
     c.last_ms = now;
     c.last_latency_ms = latency_ms;
     if !ok {
-        c.errors += 1;
+        c.errors = c.errors.saturating_add(1);
         c.last_error_ms = now;
         c.last_error = err.label().to_string();
     }
@@ -172,6 +173,70 @@ pub fn record(
     // id-keyed map on a request path is a slow leak.
     if m.len() > 4096 {
         m.retain(|_, v| now.saturating_sub(v.last_ms) < 24 * 60 * 60 * 1000);
+    }
+}
+
+/// Adds REAL data-plane bytes to ONE instance's counters. Deliberately BYTE-ONLY: `requests`
+/// is the `db_row_ops` source (`usage_metering::sample_once` reads its delta), so a wire pump
+/// must never increment it here or every chunk would double-count a row op. `last_ms` advances
+/// so the shared 4096-entry bound cannot prune a live instance.
+pub fn record_bytes(db_id: &str, bytes_in: u64, bytes_out: u64) {
+    if db_id.is_empty() {
+        return;
+    }
+    let now = hive_core::now_ms();
+    let mut m = counters().lock();
+    let c = m.entry(db_id.to_string()).or_default();
+    c.bytes_in = c.bytes_in.saturating_add(bytes_in);
+    c.bytes_out = c.bytes_out.saturating_add(bytes_out);
+    c.last_ms = now;
+    // The SAME bound as `record`: a deleted database's counters are never read again.
+    if m.len() > 4096 {
+        m.retain(|_, v| now.saturating_sub(v.last_ms) < 24 * 60 * 60 * 1000);
+    }
+}
+
+/// ONE session's byte counters, shared by both splice directions (or the REST front door and
+/// its buffered-body readers) through an `Arc`. The LAST clone to drop records ONCE: a client
+/// disconnect, a cancelled future or an early error still contributes the bytes actually copied,
+/// because axum/tokio drops the future and every guard with it. Atomics keep the two directions
+/// independent of the `&mut Accounting` that `pump_down` already holds.
+pub struct SessionBytes {
+    db_id: String,
+    ingress: AtomicU64,
+    egress: AtomicU64,
+}
+
+impl SessionBytes {
+    pub fn new(db_id: &str) -> Arc<SessionBytes> {
+        Arc::new(SessionBytes {
+            db_id: db_id.to_string(),
+            ingress: AtomicU64::new(0),
+            egress: AtomicU64::new(0),
+        })
+    }
+
+    /// O(1) per chunk: one atomic update, no allocation, no lock, no buffering.
+    pub fn add_ingress(&self, n: u64) {
+        let _ = self
+            .ingress
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(n))
+            });
+    }
+
+    pub fn add_egress(&self, n: u64) {
+        let _ = self
+            .egress
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_add(n))
+            });
+    }
+}
+
+impl Drop for SessionBytes {
+    fn drop(&mut self) {
+        record_bytes(&self.db_id, *self.ingress.get_mut(), *self.egress.get_mut());
     }
 }
 

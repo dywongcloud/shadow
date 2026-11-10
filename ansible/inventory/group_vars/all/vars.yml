@@ -28,6 +28,21 @@ hive_gossip_verify: "enforce"
 hive_peer_trust_enabled: false
 hive_trusted_node_ids: []   # populated automatically by node-join.yml when enabled
 
+# Active-only boot roster for mesh health. The complete trust allowlist stays
+# separate, so retired and parked ids keep their trust while the roll gate
+# measures only non-retired inventory lines.
+hive_expected_node_ids: >-
+  {{ groups['platform']
+     | map('extract', hostvars)
+     | rejectattr('hive_retired', 'defined')
+     | selectattr('hive_bootstrap_peers', 'defined')
+     | map(attribute='hive_bootstrap_peers')
+     | map('regex_findall', '[0-9a-f]{64}')
+     | flatten
+     | unique
+     | list
+     | join(',') }}
+
 hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
 
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode

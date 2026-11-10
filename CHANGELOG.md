@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-11-09 - fix: real ingress/egress bytes on the per-tenant managed-DB data plane
+
+`ingress_bytes`/`egress_bytes` no longer read zero for tenant database traffic. The live
+fleet witness (2026-11-07, `GET /v1/usage/metering?local=true` on sj) showed both zero while
+`db_row_ops`/`db_storage_byte_ms` moved: `db_rest::handle` tallied through
+`db_metrics::record_http` (hard-coded `bytes_in=bytes_out=0`) and `db_gateway`'s wire
+pumps made no `db_metrics` call at all. `db_metrics::record_bytes` is now the ONE byte-only
+writer: it never touches `requests`, which is the `db_row_ops` delta source, uses
+`saturating_add`, sets `last_ms` and keeps the existing 4096-entry bound. `record` and
+`Counters::merge` now saturate too, so no lane can wrap while another saturates. An
+`Arc<db_metrics::SessionBytes>` (db_id + two atomics, `Drop -> record_bytes`) is created
+when SNI resolves the database and cloned into `pump_up`/`pump_down`; the LAST drop
+records, so a client disconnect or a cancelled splice still counts the bytes actually copied.
+The REST front door measures ingress from the ACTUAL `BODY_CAP`-bounded `Bytes` already
+buffered by `read_body` / the SQLite arm's `to_bytes`, and egress from
+`Response::body().size_hint().exact()` -- never a tenant-controlled header, never a 64 MiB
+Studio body buffered at the front door. Owner-forward Studio arms add no second tally.
+
+Residuals: streaming Studio responses have no exact size hint and contribute 0 egress; Studio
+request bodies (already hard-bounded at `STUDIO_BODY_CAP`/`STUDIO_MESH_BODY_CAP`) are not
+attributed to ingress; TLS handshake and Postgres preamble bytes are not tenant payload.
+`/v1/storage/*` (`native_tally`) and the DB console keep their own `record` tallies on the
+platform API host -- `edge.rs` returns from the `<slug>.{db_domain}` branch before the admin
+router, so no byte is counted twice. `db_metrics::merge_peer` merges a COPY of local counters
+into a `/v1/databases/:id/metrics` response Value only; `usage_metering::sample_once` reads
+`counters_for` node-local counters directly and never that merged view. Docs:
+`docs/usage-metering.md`.
+
 ## 2026-11-07 - feature: profitable 11-SKU usage metering, storage/network view and shadow-mode gate
 
 `billing::RATE_CARD` is the ONE public price list with 11 SKUs; the five new ones are managed

@@ -622,6 +622,9 @@ async fn handle(
         .databases
         .by_db_host(&sni)
         .ok_or_else(|| anyhow::anyhow!("no database for SNI {sni}"))?;
+    // ONE session guard per connection: its LAST Arc drop records the bytes, so a client
+    // disconnect or a cancelled splice cannot lose them.
+    let session = crate::db_metrics::SessionBytes::new(&db.id);
 
     let local_port = db
         .connection
@@ -642,6 +645,8 @@ async fn handle(
     if n == 0 {
         return Ok(());
     }
+    // The first client read after TLS is real payload, not handshake bytes.
+    session.add_ingress(n as u64);
 
     if !accounting.admit() {
         warn_session_cap(accounting.peer);
@@ -657,7 +662,7 @@ async fn handle(
         .map_err(|_| anyhow::anyhow!("backend {backend_addr} first write timed out"))?
         .map_err(|e| anyhow::anyhow!("backend {backend_addr} first write failed: {e}"))?;
 
-    splice(tls, backend, accounting, proof).await
+    splice(tls, backend, accounting, proof, session).await
 }
 
 /// Postgres `AuthenticationOk`: message type `R`, length 8, code 0. A NUL-free text field (an error
@@ -807,6 +812,7 @@ async fn pump_up(
     mut client: ReadHalf<TlsStream<TcpStream>>,
     mut backend: OwnedWriteHalf,
     phase: &watch::Sender<Phase>,
+    session: Arc<crate::db_metrics::SessionBytes>,
 ) -> std::io::Result<Exit> {
     let mut buf = vec![0u8; PUMP_BUF];
     loop {
@@ -817,7 +823,10 @@ async fn pump_up(
                 phase.send_modify(|p| *p = Phase::Draining);
                 return Ok(Exit::Eof);
             }
-            Some(n) => backend.write_all(&buf[..n]).await?,
+            Some(n) => {
+                session.add_ingress(n as u64);
+                backend.write_all(&buf[..n]).await?
+            }
         }
     }
 }
@@ -832,6 +841,7 @@ async fn pump_down(
     phase: &watch::Sender<Phase>,
     accounting: &mut Accounting,
     proof: &mut AuthProof,
+    session: Arc<crate::db_metrics::SessionBytes>,
 ) -> std::io::Result<Exit> {
     let mut buf = vec![0u8; PUMP_BUF];
     let mut proven = false;
@@ -844,6 +854,7 @@ async fn pump_down(
                 return Ok(Exit::Eof);
             }
             Some(n) => {
+                session.add_egress(n as u64);
                 if !proven && proof.accepted(&buf[..n]) {
                     proven = true;
                     accounting.proven();
@@ -871,6 +882,7 @@ async fn splice(
     backend: TcpStream,
     mut accounting: Accounting,
     mut proof: AuthProof,
+    session: Arc<crate::db_metrics::SessionBytes>,
 ) -> anyhow::Result<()> {
     let peer = accounting.peer;
     let (client_read, client_write) = tokio::io::split(client);
@@ -878,13 +890,19 @@ async fn splice(
     let (phase, _observer) = watch::channel(Phase::Authenticating {
         deadline: Instant::now() + auth_deadline(),
     });
-    let up = pump_up(client_read, backend_write, &phase);
+    let up = pump_up(
+        client_read,
+        backend_write,
+        &phase,
+        Arc::clone(&session),
+    );
     let down = pump_down(
         backend_read,
         client_write,
         &phase,
         &mut accounting,
         &mut proof,
+        Arc::clone(&session),
     );
     tokio::pin!(up, down);
     let (mut up_ended, mut down_ended) = (false, false);

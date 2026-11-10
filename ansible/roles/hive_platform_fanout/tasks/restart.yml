@@ -160,6 +160,18 @@
     state: absent
   when: inventory_hostname != hive_group_build_host
 
+- name: Refuse a unit without an active-only expected roster
+  ansible.builtin.assert:
+    that:
+      - hive_expected_node_ids | default('', true) | trim | length > 0
+      - >-
+        (hive_expected_node_ids | trim | split(',')
+          | reject('match', '^[0-9a-f]{64}$') | list | length) == 0
+    fail_msg: >-
+      hive_expected_node_ids must render nonempty 64-lowercase-hex ids.
+      An omitted HIVE_EXPECTED_NODE_IDS would fall back to the full
+      HIVE_TRUSTED_NODE_IDS allowlist and keep retired peers in the roll gate.
+
 - name: Template the hive-node systemd unit (in case env/vars changed)
   ansible.builtin.template:
     src: "{{ role_path }}/../hive_platform/templates/hive-node.service.j2"
