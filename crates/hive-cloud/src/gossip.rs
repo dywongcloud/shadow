@@ -391,6 +391,14 @@ async fn dispatch_verified(
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/metering") => {
             crate::browser_metering::mesh_local(cloud)
         }
+        // Managed-DB usage metering, local slice: the iroh-only-peer counterpart of
+        // `GET /v1/usage/metering?local=true`. Without this arm `fleet_totals` silently drops
+        // every peer with no HTTP admin URL. Flat tenants[] only, never a merged view. Operator
+        // gating already happened on the outer request the caller fans out from. Distinct prefix
+        // from /v1/usage/summary, so the tenant-scoped billing arm below is unaffected.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/usage/metering") => {
+            crate::usage_metering::mesh_local()
+        }
         // Generic leader->follower store snapshot, `GET /v1/store-snapshot/<name>`, for any store
         // in `store_sync::REGISTRY`; it supersedes the two bespoke compat arms above.
         p if method == hive_p2p::GOSSIP_GET
