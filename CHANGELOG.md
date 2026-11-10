@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-10 - ops: roll charging + five-tier billing to the fleet
+
+The operator authorized the production roll. `scripts/audit-secret-keys.sh` passed
+clean on all six live hosts (fc-orlando, va, va3, sj, sj7, phx) before the run.
+Backend `ansible-playbook playbooks/parallel-deploy.yml --tags backend` with an
+explicit live `--limit`: 6/6 hosts verified against the release pair built in
+that run (controller 4254c1981034, cell agent 512793d13112), no-op detector
+passed, failed=0. UI `--tags ui`: 6/6 hosts serving one BUILD_ID
+2Gdf5a1QhvW1YEElEsAMU. No retired host was targeted.
+
+Post-roll proof on every live node: the RUNNING controller carries
+`billing: metered charging is ON` (strings -a /proc/<MainPID>/exe),
+`HIVE_BILLING_METER_RESOURCES=1` in /proc/<MainPID>/environ and in the
+rendered unit, and the node-local /v1/admin/usage/economics reports
+resource_charging_enabled=true with a profitable card. Mesh 3/3 expected
+peers, NRestarts=0, zero hive-cloud panics. Node-local and public-domain
+GETs of /pricing serve all five tiers. No git push: that path auto-deploys
+through two triggers and would re-deploy an already-rolled tree.
+
 ## 2026-11-10 - feat(billing): charging stays on
 
 The operator opt-in for the five resource SKUs is now tracked as

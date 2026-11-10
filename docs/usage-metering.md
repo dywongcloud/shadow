@@ -4,12 +4,13 @@ Status: landed in the tree. Resource metering (managed-database row ops, storage
 is opt-in; compute metering always runs and charges. The operator opt-in for the five resource
 SKUs is now tracked in `ansible/inventory/group_vars/all/vars.yml` and rendered into
 `ansible/roles/hive_platform/templates/hive-node.service.j2`, so those five SKUs stay ON across
-rolls after that enablement roll. `resource_charging_enabled()` STILL fails closed unless the
-operator opt-in is present and `RATE_CARD.assert_profitable()` passes; that gate only adds the
-five resource SKUs to the leader-elected `may_act(BillingMeter)` tick. Only that writer runs the
-tick, and compute metering is charged unconditionally within it. The live fleet has not been
-rolled: the five resource SKUs are not enabled on the live fleet yet, and the roll still needs the
-operator's word. History lives in `CHANGELOG.md`.
+rolls. `resource_charging_enabled()` STILL fails closed unless the operator opt-in is present
+and `RATE_CARD.assert_profitable()` passes; that gate only adds the five resource SKUs to the
+leader-elected `may_act(BillingMeter)` tick. Only that writer runs the tick, and compute metering
+is charged unconditionally within it. The operator authorized the fleet roll on 2026-11-10:
+all six live nodes run a controller carrying `billing: metered charging is ON`, carry
+`HIVE_BILLING_METER_RESOURCES=1` in `/proc/<MainPID>/environ`, and report
+`resource_charging_enabled=true` with a profitable card. History lives in `CHANGELOG.md`.
 
 A paid plan with no catalog or operator-wired Stripe Price id now opens a recurring Checkout
 Session via inline `price_data[recurring][interval]=month` (never an invented `price_...` id),
