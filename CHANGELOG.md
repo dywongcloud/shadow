@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-11-09 - feat(ui): Team Domains layout matching the reference console
+
+`/domains` now uses the Team Domains console structure: a three-part header bar
+(All Projects scope selector left, centered Team Domains, Create New / Agent right)
+with a hairline rule, a toolbar with a square filter button, a wide "Search any
+domain" input with a "/" key hint, Connect External / Transfer In / dark Buy, a
+Select all checkbox band, and tall bordered rows with a checkbox, bold domain,
+muted status line, right-side date/avatar/kebab column. No colored badge chips,
+no per-row chevrons. The "/" key focuses search; the filter chips, project scope,
+selection and per-row menus are real controls; both pollers, the search filter,
+the DomainWizard and every `/domains/[domain]` href are preserved.
+
+Honesty: `GET /v1/domains` returns only project/domain/verify_status. The
+reference's "Auto-renews <date>" and date column are registrar facts that
+`dns.rs:45-48` says are never measured and no client may show, so those cells
+render an absent marker with an explanatory tooltip and footnote, and the status
+line uses only real `verify_status` / kind. Agent and Buy are marked
+`aria-disabled` and explain on click that those features do not exist here.
+
+Security: the three mutation entry points are gated with `useCan()("work")` plus
+`disabled` and `roleHint`; `ui/lib/team-role.ts` now mirrors the Member-floor
+`POST /v1/projects/:project/domains` and `POST /v1/domains/:domain/verify`
+RULES rows it was missing.
+
+Checks: source-only `tsc --noEmit` exit 0, `npm run lint` exit 0. Headful CDP
+witness on a local `next dev`: 1440/375/320px all `scrollWidth === clientWidth`,
+`Auto-renews` absent, 14 real checkboxes, "/" focuses the search input.
+
 ## 2026-11-09 - feat(ui): responsive phone layout and honest database metrics/logs
 
 The wordmark squashed at phone widths because `logo.tsx`'s `<span>` and the brand `Link` had no

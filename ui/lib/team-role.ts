@@ -6,7 +6,7 @@ export type TeamRole = (typeof TEAM_ROLES)[number];
  *  against `RULES`. The backend stays the authority and answers 403 "insufficient team role"; the UI only decides whether to offer a control. A request no row names needs viewer to read and ADMIN
  *  to change anything: a member's route is listed there deliberately, and `work` stands for those (day-to-day project work). */
 export const TEAM_ACTIONS = {
-  work: { floor: "member", routes: ["POST /v1/apikeys", "POST /v1/git/deploy", "POST /v1/deploy/zip", "POST /v1/projects/:project/env", "POST /v1/databases", "POST /v1/teams"] },
+  work: { floor: "member", routes: ["POST /v1/apikeys", "POST /v1/git/deploy", "POST /v1/deploy/zip", "POST /v1/projects/:project/env", "POST /v1/databases", "POST /v1/teams", "POST /v1/projects/:project/domains", "POST /v1/domains/:domain/verify"] },
   /** Optional per-account 2FA: `roles.rs` RULES lists all four self-service actions (the status GET
    *  and the three POSTs) at the LOWEST role, viewer. The OTP gate lives in `admin::mint_token`
    *  BEFORE `auth::issue`, never in a rule. `roleRefusalFor` / `roleRefusalSentence` remain the
