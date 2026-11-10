@@ -175,7 +175,7 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
         <Triangle />
         <div className="flex items-center gap-2">
           <span className="h-2 w-2 rounded-full bg-green" />
-          <Link href={`/projects/${encodeURIComponent(project)}`} className="text-lg font-semibold hover:underline">{project}</Link>
+          <Link href={`/projects/${encodeURIComponent(project)}`} className="min-w-0 break-all text-lg font-semibold hover:underline">{project}</Link>
           <span className="text-muted">/</span>
           <span className="text-lg font-semibold">Logs</span>
         </div>
@@ -213,6 +213,7 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
           <div className="mb-4">
             <div className="mb-1.5 text-xs font-medium text-secondary">Timeline</div>
             <select
+              aria-label="Timeline"
               value={range}
               onChange={(e) => setRange(e.target.value)}
               className="w-full rounded-md border border-border bg-card px-2 py-1.5 text-xs focus:outline-none"
@@ -253,18 +254,52 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
 
         <div className="min-w-0">
           <div className="flex items-center gap-2 border-b border-border p-3">
-            <div className="relative flex-1">
+            <div className="relative min-w-0 flex-1">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
-              <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search logs…" className="w-full rounded-md border border-border bg-card py-1.5 pl-9 pr-2 text-sm focus:outline-none" />
+              <input aria-label="Search logs" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search logs…" className="w-full rounded-md border border-border bg-card py-1.5 pl-9 pr-2 text-sm focus:outline-none" />
             </div>
             <button onClick={() => setLive(!live)} className={cn("flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-sm", live ? "border-green/40 text-green" : "border-border text-secondary")}>
               <Play className="h-3.5 w-3.5" /> {live ? "Live" : "Paused"}
             </button>
-            <button onClick={load} className="rounded-md border border-border p-1.5 text-secondary hover:bg-subtle"><RotateCw className="h-4 w-4" /></button>
+            <button onClick={load} aria-label="Refresh logs" className="shrink-0 rounded-md border border-border p-1.5 text-secondary hover:bg-subtle"><RotateCw className="h-4 w-4" /></button>
           </div>
 
-          <div className="flex">
-            <div className="min-w-0 flex-1 overflow-x-auto">
+          <div className="flex min-w-0 flex-col sm:flex-row">
+            <div className="min-w-0 flex-1">
+              <ul className="min-w-0 sm:hidden" aria-label="Project log events">
+                {events.map((e, i) => (
+                  <li key={i} className="min-w-0 border-b border-border">
+                    <button type="button" aria-label="Show event details" onClick={() => selectEvent(e)} className={cn("block w-full min-w-0 p-3 text-left", sel === e && "bg-subtle")}>
+                      <dl className="min-w-0 space-y-1.5 font-mono text-xs">
+                        <div className="min-w-0">
+                          <dt className="text-[10px] uppercase tracking-wide text-muted">Time</dt>
+                          <dd className="min-w-0 break-all text-secondary">{fmtTime(e.ts_ms)}</dd>
+                        </div>
+                        <div className="min-w-0">
+                          <dt className="text-[10px] uppercase tracking-wide text-muted">Method / Status</dt>
+                          <dd className={cn("min-w-0 break-all", statusTone(e.status))}>{e.method} {e.status || "---"}</dd>
+                        </div>
+                        <div className="min-w-0">
+                          <dt className="text-[10px] uppercase tracking-wide text-muted">Path</dt>
+                          <dd className="min-w-0 break-all">{e.path}</dd>
+                        </div>
+                        <div className="min-w-0">
+                          <dt className="text-[10px] uppercase tracking-wide text-muted">Host</dt>
+                          <dd className="min-w-0 break-all text-secondary">{e.host}</dd>
+                        </div>
+                        {e.detail ? (
+                          <div className="min-w-0">
+                            <dt className="text-[10px] uppercase tracking-wide text-muted">Detail</dt>
+                            <dd className="min-w-0 break-all text-secondary">{e.detail}</dd>
+                          </div>
+                        ) : null}
+                      </dl>
+                    </button>
+                  </li>
+                ))}
+                {!events.length && !err && <li className="min-w-0"><p className="p-3 text-center text-sm text-secondary">No logs match these filters.</p></li>}
+              </ul>
+              <div className="hidden max-w-full overflow-x-auto sm:block">
               <table className="w-full text-sm">
                 <thead>
                   <tr className="text-xs uppercase tracking-wide text-muted">
@@ -286,7 +321,8 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
                   {!events.length && !err && <tr><td colSpan={4} className="px-3 py-10 text-center text-sm text-secondary">No logs match these filters.</td></tr>}
                 </tbody>
               </table>
-              <div className="flex items-center justify-between gap-3 border-t border-border px-3 py-2 text-xs text-secondary">
+              </div>
+              <div className="flex min-w-0 flex-wrap items-center justify-between gap-3 border-t border-border px-3 py-2 text-xs text-secondary">
                 <span>
                   {events.length
                     ? `${offset + 1}–${offset + events.length} of ${total}${hasMore ? "+" : ""}`
@@ -319,10 +355,10 @@ export function ProjectLogs({ paramsPromise }: { paramsPromise: Promise<{ projec
             </div>
 
             {sel && (
-              <div className="w-80 shrink-0 border-l border-border p-4">
-                <div className="mb-3 flex items-center justify-between">
-                  <span className="font-mono text-xs">{sel.method} {sel.path}</span>
-                  <button onClick={() => setSel(null)} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button>
+              <div className="min-w-0 w-full border-t border-border p-4 sm:w-80 sm:shrink-0 sm:border-l sm:border-t-0">
+                <div className="mb-3 flex min-w-0 items-center justify-between gap-2">
+                  <span className="min-w-0 break-all font-mono text-xs">{sel.method} {sel.path}</span>
+                  <button onClick={() => setSel(null)} aria-label="Close event details" className="shrink-0 text-muted hover:text-fg"><X className="h-4 w-4" /></button>
                 </div>
                 <Field label="Request ID" value={`${selRequestId}-${sel.ts_ms}`} mono />
                 <Field label="Path" value={sel.path} mono />
@@ -395,7 +431,7 @@ function Field({ label, value, mono }: { label: string; value: string; mono?: bo
   return (
     <div className="mb-2">
       <div className="text-[11px] uppercase tracking-wide text-muted">{label}</div>
-      <div className={cn("truncate text-xs", mono && "font-mono")}>{value}</div>
+      <div className={cn("min-w-0 break-all text-xs", mono && "font-mono")}>{value}</div>
     </div>
   );
 }

@@ -73,9 +73,9 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
   return null;
 }
 
-/** Thin breadcrumb separator matching the brand slash. */
-function Slash() {
-  return <span className="px-1 text-2xl font-thin text-border-strong">/</span>;
+/** Thin breadcrumb separator. Only a crumb that stays visible on phones gets `mobile`; the others are hidden below sm along with their crumb, so no dangling slash is left behind. */
+function Slash({ mobile = false }: { mobile?: boolean }) {
+  return <span className={mobile ? "px-1 text-2xl font-thin text-border-strong" : "hidden px-1 text-2xl font-thin text-border-strong sm:block"}>/</span>;
 }
 
 export function TopNav() {
@@ -99,13 +99,15 @@ export function TopNav() {
       style={{ paddingTop: "env(safe-area-inset-top)" }}
     >
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
-        <div className="flex min-w-0 items-center gap-2 text-sm">
-          <Link href="/" className="flex items-center"><Logo className="h-5 w-auto" /></Link>
+        <div className="flex min-w-0 flex-1 items-center gap-2 text-sm">
+          <Link href="/" className="flex shrink-0 items-center"><Logo className="h-5 w-auto" /></Link>
           <Slash />
-          <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
+          <div className="hidden min-w-0 sm:flex">
+            <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
+          </div>
           {projectSeg && (
             <>
-              <Slash />
+              <Slash mobile />
               <Link
                 href={`/projects/${encodeURIComponent(projectSeg)}`}
                 className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
@@ -120,10 +122,10 @@ export function TopNav() {
           )}
           {deploymentSeg && (
             <>
-              <Slash />
+              <Slash mobile />
               <span className="flex min-w-0 items-center gap-2 px-1.5 py-1 font-medium">
                 <span className="truncate font-mono text-[13px]">{deploymentSeg}</span>
-                <span className="rounded bg-fg px-1.5 py-0.5 text-[10px] font-semibold uppercase text-bg">Deployment</span>
+                <span className="hidden rounded bg-fg px-1.5 py-0.5 text-[10px] font-semibold uppercase text-bg sm:inline-block">Deployment</span>
               </span>
             </>
           )}
@@ -132,7 +134,7 @@ export function TopNav() {
               <Slash />
               <Link
                 href="/workflows"
-                className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
+                className="hidden min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle sm:flex"
               >
                 <Workflow className="h-4 w-4 shrink-0" />
                 <span className="truncate">Workflows</span>
@@ -140,7 +142,7 @@ export function TopNav() {
             </>
           )}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {isOwner && (
             <Link
               href="/admin"
@@ -156,13 +158,24 @@ export function TopNav() {
           <Link
             href="/account"
             title="Account & settings"
-            className="flex h-8 w-8 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"
+            aria-label="Account & settings"
+            className="tap-44 flex h-8 w-8 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"
           >
             <Settings className="h-4 w-4" />
           </Link>
         </div>
       </div>
       <div className="mx-auto max-w-[1400px] px-2 sm:px-4">
+        <details className="border-b border-border px-1 py-1 text-xs text-secondary sm:hidden">
+          <summary aria-label="All platform sections" className="tap-44 cursor-pointer py-1 font-medium">All {teamTabs.length} sections</summary>
+          <div className="flex flex-wrap gap-1 pb-1">
+            {teamTabs.map((t) => (
+              <Link key={t.href} href={t.href} className="rounded-md border border-border px-2 py-1 hover:bg-subtle hover:text-fg">
+                {t.label}
+              </Link>
+            ))}
+          </div>
+        </details>
         <Suspense fallback={<div className="h-[38px]" />}>
           <SectionTabs isActive={isActive} />
         </Suspense>
@@ -181,7 +194,7 @@ function ProjectWorkflowsCrumb({ project }: { project: string }) {
       <Slash />
       <Link
         href={`/projects/${encodeURIComponent(project)}?tab=workflows`}
-        className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
+        className="hidden min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle sm:flex"
       >
         <Workflow className="h-4 w-4 shrink-0" />
         <span className="truncate">Workflows</span>

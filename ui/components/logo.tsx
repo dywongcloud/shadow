@@ -1,11 +1,11 @@
 import Image from "next/image";
 
-/** The shadw wordmark: the black logo on light backgrounds, the white one on dark, toggled with CSS (`dark:`) so there is no hydration flash. Size it with a height utility; width follows (~3:1). */
+/** The shadw wordmark: black on light, white on dark, toggled with CSS (`dark:`) so there is no hydration flash. Size it with a height utility; `w-auto` keeps the ~3:1 ratio and `max-w-none` stops Tailwind's `img { max-width: 100% }` preflight from capping the width while the height stays fixed in a squeezed flex row. */
 export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
   return (
-    <span className="inline-flex items-center" aria-label="shadw">
-      <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={`${className} block dark:hidden`} />
-      <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={`${className} hidden dark:block`} />
+    <span className="inline-flex shrink-0 items-center" aria-label="shadw">
+      <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={`${className} block max-w-none dark:hidden`} />
+      <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={`${className} hidden max-w-none dark:block`} />
     </span>
   );
 }

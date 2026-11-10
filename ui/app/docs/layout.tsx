@@ -118,17 +118,17 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
       </a>
       <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
         <div className="flex h-14 items-center justify-between px-4 lg:px-6">
-          <div className="flex items-center gap-3">
-            <Link href="/" className="tap-44 inline-flex items-center"><Logo className="h-6 w-auto" /></Link>
+          <div className="flex min-w-0 items-center gap-3">
+            <Link href="/" className="tap-44 inline-flex shrink-0 items-center"><Logo className="h-5 w-auto max-w-none sm:h-6" /></Link>
             <span className="text-muted">/</span>
             <Link href="/docs" className="tap-44 inline-flex items-center text-[15px] font-semibold">Docs</Link>
-            <nav aria-label="Docs sections" className="ml-6 hidden items-center gap-6 text-sm text-secondary md:flex">
+            <nav aria-label="Docs sections" className="ml-6 hidden min-w-0 items-center gap-6 text-sm text-secondary md:flex">
               <Link href="/docs/getting-started" className="tap-44 inline-flex items-center hover:text-fg">Guides</Link>
               <Link href="/docs/api-reference" className="tap-44 inline-flex items-center hover:text-fg">API</Link>
               <Link href="/docs/getting-started" className="tap-44 inline-flex items-center hover:text-fg">Getting Started</Link>
             </nav>
           </div>
-          <div className="flex items-center gap-2.5">
+          <div className="flex min-w-0 items-center gap-2.5">
             <button
               onClick={() => searchRef.current?.focus()}
               className="tap-44 hidden items-center gap-1.5 rounded-full border border-border px-3 py-1.5 text-sm font-medium hover:bg-subtle sm:flex"

@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-11-09 - feat(ui): responsive phone layout and honest database metrics/logs
+
+The wordmark squashed at phone widths because `logo.tsx`'s `<span>` and the brand `Link` had no
+`shrink-0`, so a 4+ crumb breadcrumb compressed the 274:91 image while Tailwind's `img{max-width:100%}`
+preflight capped its width. `logo.tsx` now pins the span and adds `max-w-none`; `topnav.tsx` gives
+the crumb chain `min-w-0 flex-1`, hides non-essential crumbs below `sm`, and makes `Slash` opt-in
+(`mobile`) so no dangling separator remains. All 12 `<Logo` render sites were enumerated and are
+shrink-proof. A `<details>` on phones declares and enumerates all 14 sections rather than hiding
+them behind a suppressed scrollbar. Headful CDP witness at 320/375/414px: `scrollWidth ===
+clientWidth`; brand box 50.05x16.63 = ratio 3.0108 vs intrinsic 274:91 = 3.0110 (0.006% delta).
+
+`/storage` now renders an 8-field card list below `sm` (`sm+` Table unchanged, same `row.href`),
+with a full-width `85dvh` bottom sheet, safe-area padding and a scrollable body. `Stat`,
+`PageHeader`, `Table` and `Card` gained `min-w-0`/`break-words` and a one-column floor; usage,
+observability and logs views collapse to one column and wrap only the wide element. The usage view
+no longer invents numbers: a `measured()` primitive maps absent/non-finite API values to `-`,
+removes the fabricated `$20` included credit and its proportional bar, drops flat sparklines that
+faked a time series, and restores the stacked chart's legend.
+
+The selected database under `/storage/[id]` now has a Metrics / Related events tab. Metrics shows
+ALL measured gauges in named groups (no `slice(0, 8)`), an absolute UTC `observed_at_ms` sampled
+label with a 20 s cadence, and the tenant-readable `counters` (`requests`, `errors`, `bytes_in`,
+`bytes_out`, latency, error rate) with an explicit scope line derived from `sources`/`served_by`.
+The events tab uses the REAL bounded `/v1/logs?limit=100&route=...&q=...` filter and is explicitly
+labelled tenant-wide: the backend has no database-id dimension and DB gateway traffic is counted in
+`db_metrics`, not the Event log. `/v1/usage/metering` is operator-only and never appears in tenant
+dashboard code. Error/empty states now render through a shared `StateNotice` (`role=alert`,
+`aria-live=polite`, non-colour icon, `text-sm`) beside the action; icon-only controls keep `tap-44`.
+
+Checks: source-only `tsc --noEmit` exit 0 and `npm run lint` exit 0. Full-project `tsc` still exits
+2 on four stale generated `.next/*/validator.ts` diagnostics for routes (`blog`, `case-studies`,
+`/status`) that no longer exist; `ui/next-env.d.ts` was restored, never committed. No test files,
+no new dependency, no new backend route, no secrets. `next build` was not run.
+
 ## 2026-11-09 - fix: real ingress/egress bytes on the per-tenant managed-DB data plane
 
 `ingress_bytes`/`egress_bytes` no longer read zero for tenant database traffic. The live

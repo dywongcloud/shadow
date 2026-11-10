@@ -45,8 +45,8 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
   },
 ];
 
-function Logo({ className = "h-7" }: { className?: string }) {
-  return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto select-none`} />;
+function Logo({ className = "h-6 sm:h-7" }: { className?: string }) {
+  return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto max-w-none shrink-0 select-none`} />;
 }
 
 const MARKETING_SURFACE_COLOR = "#000000";
@@ -136,9 +136,9 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
       <header className="sticky top-0 z-40 border-b border-white/10 bg-black/85 backdrop-blur-xl">
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
           <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
-            <Logo className="h-7 sm:h-8" />
+            <Logo className="h-6 sm:h-8" />
           </Link>
-          <nav aria-label="Primary" className="col-start-2 hidden items-center gap-10 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex">
+          <nav aria-label="Primary" className="col-start-2 hidden min-w-0 items-center gap-10 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex">
             {MARKETING_NAV.map((n) => (
               <Link
                 key={n.href}
@@ -152,7 +152,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
               </Link>
             ))}
           </nav>
-          <div className="col-start-3 flex items-center gap-2 justify-self-end sm:gap-3">
+          <div className="col-start-3 flex min-w-0 items-center gap-2 justify-self-end sm:gap-3">
             <Link
               href="/sign-in"
               className="hidden rounded-full px-4 py-[13px] text-[13px] uppercase tracking-[0.18em] text-zinc-300 transition-colors hover:text-white lg:inline-flex"
@@ -171,7 +171,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
               aria-label={menuOpen ? "Close menu" : "Open menu"}
               aria-expanded={menuOpen}
               onClick={() => setMenuOpen((o) => !o)}
-              className="inline-flex h-[44px] w-[44px] items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10 lg:hidden"
+              className="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10 lg:hidden"
             >
               {menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
             </button>
@@ -195,16 +195,16 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
             className="fixed inset-0 z-[200] flex flex-col bg-[#000000] text-white lg:hidden"
             style={{ fontFamily: ELECTROLIZE_FONT }}
           >
-            <div className="flex items-center justify-between border-b border-white/10 px-6 py-3.5">
+            <div className="flex min-w-0 items-center justify-between border-b border-white/10 px-6 py-3.5">
               <Link href="/" onClick={() => setMenuOpen(false)} className="inline-flex min-h-[44px] shrink-0 items-center">
-                <Logo className="h-7" />
+                <Logo className="h-6 sm:h-7" />
               </Link>
               <button
                 ref={closeRef}
                 type="button"
                 aria-label="Close menu"
                 onClick={() => setMenuOpen(false)}
-                className="inline-flex h-[44px] w-[44px] items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10"
+                className="inline-flex h-[44px] w-[44px] shrink-0 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10"
               >
                 <X className="h-5 w-5" />
               </button>
@@ -279,7 +279,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         <div className="relative z-10 mx-auto max-w-[1500px] px-6 pt-14 lg:px-10">
           <div className="grid grid-cols-2 gap-10 md:grid-cols-4">
             <div className="col-span-2 md:col-span-1">
-              <Logo className="h-7" />
+              <Logo className="h-6 sm:h-7" />
               <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-400">
                 Serverless functions and containers deployed from Git, plus managed data.
               </p>

@@ -1,7 +1,7 @@
 "use client";
 
-import { Activity, Info } from "lucide-react";
-import { Badge, Card, Stat } from "@/components/ui";
+import { Activity, Info, Radio } from "lucide-react";
+import { Badge, Card, Stat, StateNotice } from "@/components/ui";
 import { apiGet, usePoll, type DbInstanceMetrics } from "@/lib/api";
 import type { Database } from "@/lib/api";
 
@@ -46,6 +46,27 @@ const LABELS: Record<string, string> = {
 /** Keys that name a size or a duration, so the value reads as one. */
 const BYTE_KEYS = /bytes|memory|maxmemory/;
 
+/** Small-multiple groups, in the order a reader scans them. A key no group names is still
+ *  measured and still shown, under "Other" — nothing the node reported is dropped. */
+const GROUPS: { name: string; keys: string[] }[] = [
+  {
+    name: "Size & storage",
+    keys: ["bytes", "file_bytes", "objects", "depth", "vectors", "dimensions", "tables", "dbsize", "keys", "expires", "used_memory", "used_memory_peak"],
+  },
+  {
+    name: "Throughput & operations",
+    keys: ["xact_commit", "xact_rollback", "tup_inserted", "tup_updated", "tup_deleted", "tup_returned", "blks_hit", "blks_read", "total_commands_processed", "instantaneous_ops_per_sec", "published", "open_streams", "uptime_in_seconds"],
+  },
+  {
+    name: "Connections & clients",
+    keys: ["backends", "connected_clients", "subscribers"],
+  },
+  {
+    name: "Health",
+    keys: ["deadlocks", "expired_keys", "evicted_keys"],
+  },
+];
+
 function humanBytes(n: number): string {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let v = n;
@@ -76,19 +97,62 @@ function label(key: string): string {
   return LABELS[key] ?? key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
 }
 
-/** Per-INSTANCE metrics for one database: the gauges this kind actually has, plus how the number was
- *  obtained. A value the node did not measure renders as an absence with a reason, never as a zero. */
+/** Server-derived timestamps are formatted as UTC so a server render and a client render agree
+ *  (React #418); a missing observation time is stated as absent, never as a client-side "now". */
+function sampledAt(ms?: number): string {
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) return "observation time not reported";
+  return `sampled ${new Date(ms).toISOString().slice(11, 19)} UTC`;
+}
+
+/** The counters are measured on a node. A fleet-merged payload names its contributors in
+ *  `sources`; an owner-proxied payload names `served_by`; otherwise the reading is local to the
+ *  answering node. No scope is ever guessed. */
+function counterScope(data: DbInstanceMetrics): string {
+  const sources = data.sources;
+  if (Array.isArray(sources) && sources.length > 1) return `fleet sum across ${sources.length} nodes`;
+  if (data.served_by) return `owner reading via ${data.served_by}`;
+  const node = data.node || data.host_node;
+  return node ? `this node's local slice (${node})` : "scope not reported";
+}
+
+const count = (v?: number) =>
+  typeof v === "number" && Number.isFinite(v) ? v.toLocaleString() : null;
+
+/** Per-INSTANCE metrics for one database: every gauge this kind actually has, grouped, plus
+ *  when it was sampled and where the counters came from. A value the node did not measure
+ *  renders as an absence with a reason, never as a zero. */
 export function InstanceMetrics({ db }: { db: Database }) {
   const { data, error } = usePoll<DbInstanceMetrics>(`/v1/databases/${db.id}/metrics`, POLL_MS);
   const stats = data?.stats ?? null;
   const entries = Object.entries(stats ?? {}).filter(([, v]) => typeof v !== "object");
   const reach = data?.reachability ?? "";
   const measured = data?.measured === true;
+  const scope = data ? counterScope(data) : "scope not reported";
+
+  const used = new Set<string>();
+  const grouped: { name: string; entries: [string, unknown][] }[] = [];
+  for (const g of GROUPS) {
+    const groupEntries = entries.filter(([k]) => g.keys.includes(k) && !used.has(k));
+    for (const [k] of groupEntries) used.add(k);
+    if (groupEntries.length > 0) grouped.push({ name: g.name, entries: groupEntries });
+  }
+  const other = entries.filter(([k]) => !used.has(k));
+  if (other.length) grouped.push({ name: "Other", entries: other });
+
+  const counters = data?.counters;
+  const counterRows: { key: string; label: string; value: string | null }[] = [
+    { key: "requests", label: "Gateway requests", value: count(counters?.requests) },
+    { key: "errors", label: "Gateway errors", value: count(counters?.errors) },
+    { key: "bytes_in", label: "Ingress", value: typeof counters?.bytes_in === "number" && Number.isFinite(counters.bytes_in) ? humanBytes(counters.bytes_in) : null },
+    { key: "bytes_out", label: "Egress", value: typeof counters?.bytes_out === "number" && Number.isFinite(counters.bytes_out) ? humanBytes(counters.bytes_out) : null },
+    { key: "last_latency_ms", label: "Last latency", value: typeof counters?.last_latency_ms === "number" && Number.isFinite(counters.last_latency_ms) ? `${counters.last_latency_ms} ms` : null },
+    { key: "error_rate", label: "Error rate", value: typeof counters?.error_rate === "number" && Number.isFinite(counters.error_rate) ? `${(counters.error_rate * 100).toFixed(1)}%` : null },
+  ].filter((r) => r.value !== null);
 
   return (
-    <Card>
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <Activity className="h-4 w-4 text-secondary" />
+    <Card className="min-w-0 w-full max-w-full">
+      <div className="mb-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
+        <Activity className="h-4 w-4 shrink-0 text-secondary" />
         <h3 className="text-sm font-semibold">Instance metrics</h3>
         {measured ? (
           <Badge tone="green">measured</Badge>
@@ -97,42 +161,56 @@ export function InstanceMetrics({ db }: { db: Database }) {
         )}
         {data?.served_by && <Badge tone="default">via {data.served_by}</Badge>}
         {data?.host_node && <span className="text-xs text-muted">host {data.host_node}</span>}
+        {data && (
+          <span className="flex min-w-0 items-center gap-1 text-xs text-muted">
+            <Radio className="h-3 w-3 shrink-0" />
+            {sampledAt(data.observed_at_ms)} · every {POLL_MS / 1000} s
+          </span>
+        )}
       </div>
 
       {error && (
-        <p className="text-xs text-red-500">
-          Couldn&apos;t load metrics: {String(error).replace(/^Error:\s*/, "")}
-        </p>
+        <StateNotice>Couldn&apos;t load metrics: {String(error).replace(/^Error:\s*/, "")}</StateNotice>
       )}
 
       {!error && !data && <p className="text-xs text-muted">Loading…</p>}
 
       {data && entries.length === 0 ? (
-        <p className="text-xs text-muted">{data.note || "No gauge is available for this instance."}</p>
+        <p className="min-w-0 break-words text-xs text-muted">{data.note || "No gauge is available for this instance."}</p>
       ) : (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          {entries.slice(0, 8).map(([k, v]) => (
-            <Stat key={k} label={label(k)} value={fmt(k, v)} />
+        <div className="flex min-w-0 flex-col gap-4">
+          {grouped.map((g) => (
+            <section key={g.name} className="min-w-0" aria-label={g.name}>
+              <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">{g.name}</h4>
+              <div className="grid grid-cols-1 gap-3 min-[380px]:grid-cols-2 lg:grid-cols-4">
+                {g.entries.map(([k, v]) => (
+                  <Stat key={k} label={label(k)} value={fmt(k, v)} />
+                ))}
+              </div>
+            </section>
           ))}
         </div>
       )}
 
       {data?.note && entries.length > 0 && (
-        <p className="mt-3 flex items-start gap-1.5 text-xs text-muted">
+        <p className="mt-3 flex min-w-0 items-start gap-1.5 text-xs text-muted">
           <Info className="mt-0.5 h-3 w-3 shrink-0" />
-          {data.note}
+          <span className="min-w-0 break-words">{data.note}</span>
         </p>
       )}
-      {data?.counters && typeof data.counters.requests === "number" && data.counters.requests > 0 && (
-        <p className="mt-3 text-xs text-muted">
-          {data.counters.requests.toLocaleString()} gateway requests
-          {typeof data.counters.errors === "number" && data.counters.errors > 0
-            ? ` · ${data.counters.errors} errors`
-            : ""}
-          {typeof data.counters.last_latency_ms === "number"
-            ? ` · last ${data.counters.last_latency_ms} ms`
-            : ""}
-        </p>
+
+      {counterRows.length > 0 && (
+        <section className="mt-4 min-w-0" aria-label="Gateway counters">
+          <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">Gateway counters</h4>
+          <p className="mb-2 min-w-0 break-words text-xs text-muted">
+            {scope}. Server-derived from this database&apos;s measured counters.
+          </p>
+          <div className="grid grid-cols-1 gap-3 min-[380px]:grid-cols-2 lg:grid-cols-4">
+            {counterRows.map((r) => (
+              <Stat key={r.key} label={r.label} value={r.value as string} hint={scope} />
+            ))}
+          </div>
+        </section>
       )}
     </Card>
   );

@@ -6,7 +6,7 @@ import {
   Database as DbIcon, Plus, X, Loader2, ChevronRight, ArrowLeft, Search, ExternalLink,
   Gauge, Copy, Check, FileStack, Info,
 } from "lucide-react";
-import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/components/ui";
+import { Card, Badge, Button, Input, PageHeader, StateNotice, Table, Th, Td } from "@/components/ui";
 import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
 import {
   apiGet, apiSend, usePoll,
@@ -127,6 +127,12 @@ export default function StoragePage() {
         </Card>
       ) : (
         <>
+          <div className="flex flex-col gap-3 sm:hidden">
+            {rows.map((row) => (
+              <StorageCard key={row.id} row={row} />
+            ))}
+          </div>
+          <div className="hidden sm:block">
           <Table>
             <thead>
               <tr>
@@ -136,10 +142,12 @@ export default function StoragePage() {
             </thead>
             <tbody>
               {rows.map((row) => (
-                <tr key={row.id} className="cursor-pointer hover:bg-subtle">
+                <tr key={row.id} className="hover:bg-subtle">
                   <Td className="font-medium">
-                    <Link href={row.href} className="flex items-center gap-2">
-                      <span className="text-muted">{KIND_ICON[row.kind]}</span>{row.name}
+                    <Link href={row.href} className="tap-44 flex min-w-0 items-center gap-2">
+                      <span className="shrink-0 text-muted">{KIND_ICON[row.kind]}</span>
+                      <span className="min-w-0 break-words">{row.name}</span>
+                      <ChevronRight className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
                     </Link>
                   </Td>
                   <Td className="text-secondary">{row.provider}</Td>
@@ -162,6 +170,7 @@ export default function StoragePage() {
               ))}
             </tbody>
           </Table>
+          </div>
           <p className="mt-3 flex items-start gap-1.5 text-xs text-muted">
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{POOLING_NOTE}</span>
@@ -258,15 +267,75 @@ function ConnectionCell({ row }: { row: UnifiedDb }) {
       {endpoint.reach === "internal" && (
         <span title={REACH_NOTE.internal}><Badge tone="amber">internal</Badge></span>
       )}
-      <button onClick={copy} className="shrink-0 text-muted hover:text-fg" title={`Copy ${endpoint.key}`}>
+      <button onClick={copy} className="tap-44 inline-flex shrink-0 items-center justify-center text-muted hover:text-fg" title={`Copy ${endpoint.key}`} aria-label={`Copy ${endpoint.key}`}>
         {copied ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
       </button>
     </span>
   );
 }
 
-/** Vercel-style "Browse Storage" right-side slide-over — one create flow for
- *  every kind, SQLite included. */
+/** Browse Storage: a full-height right-side slide-over at sm+, a full-width bottom sheet below sm.
+ *  One create flow for every kind, SQLite included. */
+function StorageCard({ row }: { row: UnifiedDb }) {
+  return (
+    <Card className="min-w-0 p-4">
+      <dl className="m-0 flex min-w-0 flex-col gap-2">
+        <div className="flex min-w-0 flex-wrap items-start justify-between gap-2">
+          <div className="min-w-0 flex-1">
+            <dt className="sr-only">Name</dt>
+            <dd className="m-0 min-w-0 break-words text-xl font-semibold leading-tight text-fg sm:text-2xl lg:text-3xl">
+              <Link href={row.href} className="tap-44 flex min-w-0 items-center gap-2">
+                <span className="shrink-0 text-muted">{KIND_ICON[row.kind]}</span>
+                <span className="min-w-0 break-words">{row.name}</span>
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
+              </Link>
+            </dd>
+          </div>
+          <div className="min-w-0 shrink-0">
+            <dt className="sr-only">Status</dt>
+            <dd className="m-0 flex min-w-0 flex-wrap [&>span]:max-w-full [&>span]:whitespace-normal">
+              <StatusBadge row={row} />
+            </dd>
+          </div>
+        </div>
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs leading-tight text-secondary">
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Provider</dt>
+            <dd className="m-0 break-words">{row.provider}</dd>
+          </div>
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Type</dt>
+            <dd className="m-0 flex min-w-0 flex-wrap"><KindBadge kind={row.kind} /></dd>
+          </div>
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Project</dt>
+            <dd className="m-0 break-words">{row.project || "—"}</dd>
+          </div>
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Region</dt>
+            <dd className="m-0 flex min-w-0 flex-wrap items-center gap-1">
+              <span title={row.regionTitle}><Badge tone="blue">{row.region}</Badge></span>
+              {row.replicas.map((r) => (
+                <span key={r} title="read replica"><Badge tone="default">↳ {r}</Badge></span>
+              ))}
+            </dd>
+          </div>
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Connection</dt>
+            <dd className="m-0 min-w-0 overflow-hidden [&>span]:max-w-full [&>span]:min-w-0 [&_code]:min-w-0">
+              <ConnectionCell row={row} />
+            </dd>
+          </div>
+          <div className="min-w-0 max-w-full">
+            <dt className="sr-only">Created</dt>
+            <dd className="m-0"><span title={row.createdTitle}>{row.createdMs ? timeAgo(row.createdMs) : "—"}</span></dd>
+          </div>
+        </div>
+      </dl>
+    </Card>
+  );
+}
+
 function BrowseStorage({
   projects,
   onClose,
@@ -334,8 +403,11 @@ function BrowseStorage({
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={onClose}>
-      <div className="flex h-full w-full max-w-xl flex-col border-l border-border bg-card shadow-pop" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-start justify-between border-b border-border p-6">
+      <div
+        className="absolute inset-x-0 bottom-0 flex max-h-[85vh] max-h-[85dvh] supports-[height:85dvh]:max-h-[85dvh] w-full flex-col overflow-hidden rounded-t-xl border-t border-border bg-card shadow-pop sm:inset-y-0 sm:left-auto sm:right-0 sm:h-full sm:max-h-none sm:w-full sm:max-w-xl sm:overflow-visible sm:rounded-none sm:border-l sm:border-t-0 sm:supports-[height:85dvh]:max-h-none"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between border-b border-border p-4 sm:p-6">
           <div>
             <h2 className="text-xl font-semibold">{step === "browse" ? "Browse Storage" : "Configure"}</h2>
             <p className="mt-1 text-sm text-secondary">
@@ -349,7 +421,7 @@ function BrowseStorage({
           <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-5 w-5" /></button>
         </div>
 
-        <div className="flex-1 overflow-y-auto p-6">
+        <div className="min-h-0 flex-1 overflow-y-auto p-4 pb-[calc(1rem_+_env(safe-area-inset-bottom))] sm:p-6 sm:pb-6">
           {step === "browse" ? (
             <>
               <div className="relative mb-5">
@@ -380,7 +452,7 @@ function BrowseStorage({
 
               {!!market.length && (
                 <>
-                  <div className="mb-2 flex items-center justify-between">
+                  <div className="mb-2 flex items-center justify-between border-t border-border pt-5 sm:pt-6">
                     <span className="text-xs font-medium uppercase tracking-wide text-muted">Marketplace Database Providers</span>
                     <span className="flex items-center gap-1 text-xs text-link">Learn more <ExternalLink className="h-3 w-3" /></span>
                   </div>
@@ -436,7 +508,7 @@ function BrowseStorage({
                 <label className="mb-1 block text-xs font-medium text-secondary">Database name</label>
                 <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={`${sel?.provider?.toLowerCase()}-db`} />
               </div>
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div>
                   <label className="mb-1 block text-xs font-medium text-secondary">Project</label>
                   <Input value={project} onChange={(e) => setProject(e.target.value)} placeholder="my-project" />
@@ -485,17 +557,20 @@ function BrowseStorage({
           )}
         </div>
 
-        <div className="flex items-center justify-between border-t border-border p-4">
-          {step === "configure"
-            ? <Button variant="ghost" onClick={() => setStep("browse")}><ArrowLeft className="h-4 w-4" /> Back</Button>
-            : <span className="text-xs text-muted">{sel ? `Selected: ${sel.provider}` : "Select a database or provider"}</span>}
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={onClose}>Cancel</Button>
-            {step === "browse" ? (
-              <Button onClick={() => setStep("configure")} disabled={!sel}>Continue <ChevronRight className="h-4 w-4" /></Button>
-            ) : (
-              <Button onClick={create} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />} Create</Button>
-            )}
+        <div className="flex min-w-0 flex-col gap-3 border-t border-border p-4 pb-[calc(1rem_+_env(safe-area-inset-bottom))] sm:pb-4">
+          {error && <StateNotice>{error}</StateNotice>}
+          <div className="flex min-w-0 flex-col items-stretch gap-3 sm:flex-row sm:items-center sm:justify-between">
+            {step === "configure"
+              ? <Button variant="ghost" className="w-full sm:w-auto" onClick={() => setStep("browse")}><ArrowLeft className="h-4 w-4" /> Back</Button>
+              : <span className="text-center text-xs text-muted sm:text-left">{sel ? `Selected: ${sel.provider}` : "Select a database or provider"}</span>}
+            <div className="flex min-w-0 flex-col gap-2 sm:flex-row">
+              <Button variant="outline" className="w-full sm:w-auto" onClick={onClose}>Cancel</Button>
+              {step === "browse" ? (
+                <Button className="w-full sm:w-auto" onClick={() => setStep("configure")} disabled={!sel}>Continue <ChevronRight className="h-4 w-4" /></Button>
+              ) : (
+                <Button className="w-full sm:w-auto" onClick={create} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />} Create</Button>
+              )}
+            </div>
           </div>
         </div>
       </div>

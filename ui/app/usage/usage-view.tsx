@@ -6,20 +6,58 @@ import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide
 
 const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), {
   ssr: false,
-  loading: () => <div className="h-72 animate-pulse rounded-lg bg-subtle" aria-label="Loading chart" />,
+  loading: () => <div className="h-72 w-full max-w-full animate-pulse rounded-lg bg-subtle" aria-label="Loading chart" />,
 });
 const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.SparkAreaChart), {
   ssr: false,
-  loading: () => <div className="h-7 w-28 animate-pulse rounded bg-subtle" />,
+  loading: () => <div className="h-7 w-full max-w-full animate-pulse rounded bg-subtle" />,
 });
 import { Card } from "@/components/ui";
 import { usePoll, type FunctionStats, type BillingInfo, type Metrics, type UsageSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-/** A flat sparkline at the real current level, for metrics tracked as a running total rather than a time series (CPU/memory/instances): it shows
- *  the real magnitude without fabricating a growth curve. */
-function flat(value: number, n: number) {
-  return Array.from({ length: n }, () => Math.round(value));
+const ABSENT = "-";
+
+/** Only a finite numeric API value is a measurement. A rejected poll, an older node, or a
+ *  missing optional field stays absent ("-") instead of becoming an invented zero. */
+function measured(v: number | null | undefined): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function sumMeasured<T>(rows: T[] | null | undefined, pick: (row: T) => number | null | undefined): number | null {
+  if (!Array.isArray(rows)) return null;
+  let total = 0;
+  for (const row of rows) {
+    const value = measured(pick(row));
+    if (value === null) return null;
+    total += value;
+  }
+  return total;
+}
+
+function fmtMeasured(n: number | null): string {
+  const value = measured(n);
+  return value === null ? ABSENT : fmt(value);
+}
+
+function unitMeasured(n: number | null, digits: number, unit: string): string {
+  const value = measured(n);
+  return value === null ? ABSENT : `${value.toFixed(digits)} ${unit}`;
+}
+
+function moneyMeasured(n: number | null): string {
+  const value = measured(n);
+  return value === null ? ABSENT : `$${value.toFixed(2)}`;
+}
+
+function chargeMeasured(units: number | null, cents: number | undefined): number | null {
+  const u = measured(units);
+  const c = measured(cents);
+  return u === null || c === null ? null : (u * c) / 100;
+}
+
+function rowCharge(v: number | null): number {
+  return measured(v) ?? Number.NaN;
 }
 
 function fmt(n: number) {
@@ -53,26 +91,28 @@ export default function UsageView() {
   const { minutes: granMinutes, apiGran, pollMs } = GRAN[gran];
   const { data: metrics } = usePoll<Metrics>(`/v1/metrics?minutes=${granMinutes}&gran=${apiGran}`, pollMs);
 
-  const requests = metrics?.totals?.requests ?? 0;
-  const blocked = metrics?.totals?.blocked ?? 0;
-  const cacheHits = (metrics?.series ?? []).reduce((a, b) => a + b.cache_hits, 0);
-  const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
-  const activeCpuMs = (fns ?? []).reduce((a, f) => a + (f.active_cpu_ms ?? 0), 0);
-  const memGbHrs = (fns ?? []).reduce((a, f) => a + (f.memory_gb_hrs ?? 0), 0);
-  const instances = (fns ?? []).reduce((a, f) => a + f.instances, 0);
+  const requests = measured(metrics?.totals?.requests);
+  const blocked = measured(metrics?.totals?.blocked);
+  const cacheHits = sumMeasured(metrics?.series, (b) => b.cache_hits);
+  const invocations = sumMeasured(fns, (f) => f.requests);
+  const activeCpuMs = sumMeasured(fns, (f) => f.active_cpu_ms);
+  const memGbHrs = sumMeasured(fns, (f) => f.memory_gb_hrs);
+  const instances = sumMeasured(fns, (f) => f.instances);
 
   const rc = billing?.rate_card;
-  const edgeCharge = (requests / 1_000_000) * ((rc?.requests_per_million_cents ?? 0) / 100);
-  const cpuCharge = (activeCpuMs / 1000 / 3600) * ((rc?.active_cpu_hr_cents ?? 0) / 100);
-  const memCharge = memGbHrs * ((rc?.mem_gb_hr_cents ?? 0) / 100);
-  const fnCharge = cpuCharge + memCharge;
-  const wafCharge = (blocked / 1_000_000) * ((rc?.waf_per_million_cents ?? 0) / 100);
+  const edgeCharge = chargeMeasured(requests === null ? null : requests / 1_000_000, rc?.requests_per_million_cents);
+  const cpuCharge = chargeMeasured(activeCpuMs === null ? null : activeCpuMs / 1000 / 3600, rc?.active_cpu_hr_cents);
+  const memCharge = chargeMeasured(memGbHrs, rc?.mem_gb_hr_cents);
+  const wafCharge = chargeMeasured(blocked === null ? null : blocked / 1_000_000, rc?.waf_per_million_cents);
   const acc = billing?.account;
-  const includedTotal = acc ? acc.included_cents / 100 : 20;
-  const includedUsed = acc ? acc.used_cents / 100 : Math.min(includedTotal, edgeCharge + fnCharge + wafCharge);
-  const onDemand = acc ? Math.max(0, -acc.balance_cents) / 100 : edgeCharge + fnCharge + wafCharge;
-  const creditBalance = acc ? acc.balance_cents / 100 : 0;
-  const planName = acc?.plan ?? "hobby";
+  const includedCents = measured(acc?.included_cents);
+  const usedCents = measured(acc?.used_cents);
+  const balanceCents = measured(acc?.balance_cents);
+  const includedTotal = includedCents === null ? null : includedCents / 100;
+  const includedUsed = usedCents === null ? null : usedCents / 100;
+  const onDemand = balanceCents === null ? null : Math.max(0, -balanceCents) / 100;
+  const creditBalance = balanceCents === null ? null : balanceCents / 100;
+  const planName = acc?.plan ?? ABSENT;
 
   const buckets = metrics?.series ?? [];
   const perBucketEdge = buckets.map((b) => b.requests);
@@ -85,16 +125,16 @@ export default function UsageView() {
   const edgeS = cumulative ? cum(perBucketEdge) : perBucketEdge;
   const cacheS = cumulative ? cum(perBucketCache) : perBucketCache;
   const blockedS = cumulative ? cum(perBucketBlocked) : perBucketBlocked;
-  const N = Math.max(buckets.length, 1);
-  const fnS = flat(invocations, N);
   const chart = buckets.map((b, i) => ({
     date: bucketLabel(gran, b.t_ms),
-    "Edge Requests": edgeS[i] ?? 0,
-    "Cache Hits": cacheS[i] ?? 0,
-    "Blocked": blockedS[i] ?? 0,
+    "Edge Requests": edgeS[i] ?? null,
+    "Cache Hits": cacheS[i] ?? null,
+    "Blocked": blockedS[i] ?? null,
   }));
 
-  const pct = Math.min(100, includedTotal ? (includedUsed / includedTotal) * 100 : 0);
+  const includedPct = includedTotal !== null && includedTotal > 0 && includedUsed !== null
+    ? Math.max(0, Math.min(100, (includedUsed / includedTotal) * 100))
+    : null;
 
   /** The five storage/network SKUs come ONLY from `/v1/usage/summary`, whose usage key is `usage`.
    *  A rejected session (401, or `x-hive-anon: 1` with an empty body) yields no payload, so `data`
@@ -106,13 +146,31 @@ export default function UsageView() {
   const summaryReady = !!summary && !!summary.usage && !!summary.rate_card;
   const GB = 1_000_000_000;
   const MS_MONTH = 30 * 24 * 3600 * 1000;
-  const perM = (v?: number) => (v === undefined ? null : v / 1_000_000);
-  const gb = (v?: number) => (v === undefined ? null : v / GB);
-  const gbMonth = (v?: number) => (v === undefined ? null : v / (GB * MS_MONTH));
-  const count = (v?: number) => (v === undefined ? "-" : fmt(v));
-  const shown = (v: number | null, digits: number) => (v === null ? "-" : v.toFixed(digits));
-  const price = (c: number | undefined, suffix: string) => (c === undefined ? "-" : `$${(c / 100).toFixed(3)}${suffix}`);
-  const charge = (units: number | null, c?: number) => (units === null || c === undefined ? null : (units * c) / 100);
+  const perM = (v?: number) => {
+    const n = measured(v);
+    return n === null ? null : n / 1_000_000;
+  };
+  const gb = (v?: number) => {
+    const n = measured(v);
+    return n === null ? null : n / GB;
+  };
+  const gbMonth = (v?: number) => {
+    const n = measured(v);
+    return n === null ? null : n / (GB * MS_MONTH);
+  };
+  const count = (v?: number) => {
+    const n = measured(v);
+    return n === null ? ABSENT : fmt(n);
+  };
+  const shown = (v: number | null, digits: number) => {
+    const n = measured(v);
+    return n === null ? ABSENT : n.toFixed(digits);
+  };
+  const price = (c: number | undefined, suffix: string) => {
+    const n = measured(c);
+    return n === null ? ABSENT : `$${(n / 100).toFixed(3)}${suffix}`;
+  };
+  const charge = (units: number | null, c?: number) => chargeMeasured(units, c);
   const storageRows = [
     {
       key: "db-rows",
@@ -156,50 +214,62 @@ export default function UsageView() {
     },
   ];
 
-  return (
-    <div>
-      <h1 className="mb-5 text-2xl font-semibold capitalize tracking-tight">{planName} Plan Usage</h1>
+  const heading = planName === ABSENT ? "Plan Usage" : `${planName} Plan Usage`;
 
-      <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
-        <Pill icon={<ChevronDown className="h-4 w-4" />}>Current Billing Cycle</Pill>
-        <Pill icon={<Calendar className="h-4 w-4" />}>{billingRange()}</Pill>
-        <Pill icon={<ChevronDown className="h-4 w-4" />}>All Products</Pill>
-        <Pill icon={<ChevronDown className="h-4 w-4" />}>All Projects</Pill>
-        <Pill icon={<ChevronDown className="h-4 w-4" />}>By Product</Pill>
-        <button className="rounded-md border border-border px-2 py-2 text-secondary hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
+  return (
+    <div className="min-w-0 w-full max-w-full">
+      <h1 className="mb-5 min-w-0 break-words text-2xl font-semibold capitalize tracking-tight">{heading}</h1>
+
+      <div className="mb-4 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3">
+        <Pill icon={<ChevronDown className="h-4 w-4 shrink-0" />}>Current Billing Cycle</Pill>
+        <Pill icon={<Calendar className="h-4 w-4 shrink-0" />}>{billingRange()}</Pill>
+        <Pill icon={<ChevronDown className="h-4 w-4 shrink-0" />}>All Products</Pill>
+        <Pill icon={<ChevronDown className="h-4 w-4 shrink-0" />}>All Projects</Pill>
+        <Pill icon={<ChevronDown className="h-4 w-4 shrink-0" />}>By Product</Pill>
+        <button className="flex w-full max-w-full items-center justify-center rounded-md border border-border px-2 py-2 text-secondary hover:bg-subtle"><MoreHorizontal className="h-4 w-4 shrink-0" /></button>
       </div>
 
-      <Card className="mb-4">
-        <div className="flex items-start justify-between">
-          <div className="flex items-center gap-3">
-            <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-500/10 text-blue-500"><Coins className="h-4 w-4" /></span>
-            <div>
+      <Card className="mb-4 min-w-0 w-full max-w-full">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-500"><Coins className="h-4 w-4 shrink-0" /></span>
+            <div className="min-w-0">
               <div className="text-sm text-secondary">Included Credit</div>
-              <div className="text-lg font-semibold tabular-nums">${includedUsed.toFixed(2)} / ${includedTotal.toFixed(2)}</div>
-            </div>
-            <div className="ml-6 border-l border-border pl-6">
-              <div className="text-sm text-secondary">Credit Balance</div>
-              <div className={cn("text-lg font-semibold tabular-nums", creditBalance < 0 && "text-red-500")}>${creditBalance.toFixed(2)}</div>
+              <div className="min-w-0 break-words text-lg font-semibold tabular-nums whitespace-normal">
+                {includedUsed === null || includedTotal === null ? ABSENT : `$${includedUsed.toFixed(2)} / $${includedTotal.toFixed(2)}`}
+              </div>
             </div>
           </div>
-          <div className="flex items-center gap-3 text-right">
-            <div>
+          <div className="min-w-0 border-l border-border pl-6 sm:pl-6">
+            <div className="text-sm text-secondary">Credit Balance</div>
+            <div className={cn("min-w-0 break-words text-lg font-semibold tabular-nums whitespace-normal", creditBalance !== null && creditBalance < 0 && "text-red-500")}>
+              {moneyMeasured(creditBalance)}
+            </div>
+          </div>
+          <div className="flex min-w-0 items-center gap-3 sm:justify-end sm:text-right">
+            <div className="min-w-0">
               <div className="text-sm text-secondary">On-Demand Charges</div>
-              <div className="text-lg font-semibold tabular-nums">${onDemand.toFixed(2)}</div>
+              <div className="min-w-0 break-words text-lg font-semibold tabular-nums whitespace-normal">{moneyMeasured(onDemand)}</div>
             </div>
-            <span className="flex h-9 w-9 items-center justify-center rounded-full bg-purple-500/10 text-purple-500"><DollarSign className="h-4 w-4" /></span>
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-purple-500/10 text-purple-500"><DollarSign className="h-4 w-4 shrink-0" /></span>
           </div>
         </div>
-        <div className="mt-4 flex h-2.5 overflow-hidden rounded-full bg-subtle">
-          <div className="h-full bg-[#0070f3]" style={{ width: `${pct}%` }} />
-          <div className="h-full bg-[#7928ca]" style={{ width: `${100 - pct}%` }} />
-        </div>
+        {includedPct === null ? (
+          <div className="mt-4 min-w-0 break-words rounded-lg border border-dashed border-border px-4 py-3 text-sm text-secondary">
+            Included credit usage is unavailable for this session.
+          </div>
+        ) : (
+          <div className="mt-4 flex h-2.5 overflow-hidden rounded-full bg-subtle">
+            <div className="h-full bg-[#0070f3]" style={{ width: `${includedPct}%` }} />
+            <div className="h-full bg-[#7928ca]" style={{ width: `${100 - includedPct}%` }} />
+          </div>
+        )}
       </Card>
 
-      <Card>
-        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-          <h2 className="text-lg font-semibold">Consumption Breakdown</h2>
-          <div className="flex items-center gap-3 sm:gap-4">
+      <Card className="min-w-0 w-full max-w-full">
+        <div className="mb-4 flex min-w-0 w-full max-w-full flex-wrap items-center justify-between gap-2">
+          <h2 className="min-w-0 break-words text-lg font-semibold">Consumption Breakdown</h2>
+          <div className="flex min-w-0 w-full max-w-full flex-wrap items-center gap-3 sm:gap-4">
             <div className="flex rounded-lg border border-border p-0.5 text-sm">
               {(["Daily", "Weekly", "Monthly"] as const).map((g) => (
                 <button
@@ -218,61 +288,72 @@ export default function UsageView() {
           </div>
         </div>
 
-        <BarChart
-          data={chart}
-          index="date"
-          categories={["Edge Requests", "Cache Hits", "Blocked"]}
-          colors={["blue", "emerald", "rose"]}
-          stack
-          showLegend={false}
-          showAnimation
-          valueFormatter={(v) => fmt(v)}
-          className="h-72"
-        />
+        <div className="min-w-0 w-full max-w-full overflow-x-auto">
+          <BarChart
+            data={chart}
+            index="date"
+            categories={["Edge Requests", "Cache Hits", "Blocked"]}
+            colors={["blue", "emerald", "rose"]}
+            stack
+            showLegend
+            showAnimation
+            valueFormatter={(v) => fmt(v)}
+            className="h-72 w-full max-w-full"
+          />
+        </div>
 
-        <div className="mt-6">
-          <div className="grid grid-cols-[1fr_auto_auto] gap-4 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted">
+        <div className="mt-6 min-w-0 w-full max-w-full overflow-x-auto">
+          <div className="hidden grid-cols-1 gap-4 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted sm:grid sm:grid-cols-3">
             <span>Product</span><span className="text-right">Usage</span><span className="text-right">Charge</span>
           </div>
 
           <GroupHeader name="OpenEdge Delivery Network" />
-          <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={`${fmt(requests)}`} charge={edgeCharge} />
-          <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={`${fmt(cacheHits)}`} charge={0} />
-          <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={blockedS} usage={`${fmt(blocked)}`} charge={wafCharge} />
+          <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={fmtMeasured(requests)} charge={rowCharge(edgeCharge)} />
+          <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={fmtMeasured(cacheHits)} charge={Number.NaN} />
+          <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={blockedS} usage={fmtMeasured(blocked)} charge={rowCharge(wafCharge)} />
 
           <GroupHeader name="OpenEdge Functions (Fluid · Active CPU pricing)" />
-          <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
-          <Row color="bg-purple-500" name="Active CPU" spark={flat(activeCpuMs, N)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
-          <Row color="bg-teal-500" name="Provisioned Memory" spark={flat(Math.round(memGbHrs * 1000), N)} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
-          <Row color="bg-cyan-500" name="Provisioned Instances" spark={flat(instances * 100, N)} usage={`${instances}`} charge={0} />
+          <Row color="bg-amber-500" name="Function Invocations" spark={[]} usage={fmtMeasured(invocations)} charge={Number.NaN} />
+          <Row color="bg-purple-500" name="Active CPU" spark={[]} usage={unitMeasured(activeCpuMs === null ? null : activeCpuMs / 1000, 1, "s")} charge={rowCharge(cpuCharge)} />
+          <Row color="bg-teal-500" name="Provisioned Memory" spark={[]} usage={unitMeasured(memGbHrs, 3, "GB-hr")} charge={rowCharge(memCharge)} />
+          <Row color="bg-cyan-500" name="Provisioned Instances" spark={[]} usage={fmtMeasured(instances)} charge={Number.NaN} />
         </div>
       </Card>
 
-      <Card className="mt-4">
-        <h2 className="text-lg font-semibold">Storage &amp; network</h2>
-        <p className="mb-4 mt-1 text-sm text-secondary">
+      <Card className="mt-4 min-w-0 w-full max-w-full">
+        <h2 className="min-w-0 break-words text-lg font-semibold">Storage &amp; network</h2>
+        <p className="mb-4 mt-1 min-w-0 break-words text-sm text-secondary">
           Five metered SKUs from your usage summary. Rates are the public rate card; these sit apart from the compute totals above.
         </p>
         {!summaryReady || summaryError ? (
-          <div className="rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-secondary">
+          <div className="min-w-0 break-words rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-secondary">
             {summaryError
               ? "Usage summary is unavailable for this session. Sign in to see storage and network usage."
               : "No storage or network usage reported for this billing cycle."}
           </div>
         ) : (
-          <div>
-            <div className="grid grid-cols-[1fr_auto_auto_auto] gap-2 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted sm:gap-4">
+          <div className="min-w-0 w-full max-w-full overflow-x-auto">
+            <div className="hidden grid-cols-1 gap-2 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted sm:grid sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
               <span>SKU</span><span className="text-right">Usage</span><span className="text-right">Rate</span><span className="text-right">Charge</span>
             </div>
             {storageRows.map((r) => (
-              <div key={r.key} className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2 border-b border-border py-3 text-sm sm:gap-4">
-                <span className="min-w-0">
-                  <span className="block truncate text-fg">{r.name}</span>
-                  <span className="block text-xs text-secondary">{r.unit}</span>
+              <div key={r.key} className="grid grid-cols-1 items-center gap-2 border-b border-border py-3 text-sm sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
+                <span className="min-w-0 w-full max-w-full">
+                  <span className="block break-words text-fg">{r.name}</span>
+                  <span className="block break-words text-xs text-secondary">{r.unit}</span>
                 </span>
-                <span className="w-20 text-right tabular-nums text-secondary sm:w-24">{r.usage}</span>
-                <span className="w-24 text-right tabular-nums text-secondary sm:w-28">{r.rate}</span>
-                <span className="w-16 text-right tabular-nums">{r.amount === null ? "-" : `$${r.amount.toFixed(2)}`}</span>
+                <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums text-secondary sm:block">
+                  <span className="text-xs text-secondary sm:hidden">Usage</span>
+                  <span className="min-w-0 break-words">{r.usage}</span>
+                </span>
+                <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums text-secondary sm:block">
+                  <span className="text-xs text-secondary sm:hidden">Rate</span>
+                  <span className="min-w-0 break-words">{r.rate}</span>
+                </span>
+                <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums sm:block">
+                  <span className="text-xs text-secondary sm:hidden">Charge</span>
+                  <span className="min-w-0 break-words">{moneyMeasured(r.amount)}</span>
+                </span>
               </div>
             ))}
           </div>
@@ -284,30 +365,36 @@ export default function UsageView() {
 
 function Pill({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {
   return (
-    <button className="flex items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-secondary hover:bg-subtle">
+    <button className="flex min-w-0 w-full max-w-full items-center gap-2 rounded-md border border-border bg-card px-3 py-2 text-left text-secondary hover:bg-subtle">
       {icon}
-      <span className="text-fg">{children}</span>
+      <span className="min-w-0 break-words text-fg">{children}</span>
     </button>
   );
 }
 
 function GroupHeader({ name }: { name: string }) {
-  return <div className="border-b border-border bg-subtle/60 px-1 py-2 text-sm font-medium text-secondary">{name}</div>;
+  return <div className="min-w-0 w-full max-w-full break-words border-b border-border bg-subtle/60 px-1 py-2 text-sm font-medium text-secondary">{name}</div>;
 }
 
 function Row({ color, name, spark, usage, charge }: { color: string; name: string; spark: number[]; usage: string; charge: number }) {
   const data = spark.map((v, i) => ({ i, v }));
   return (
-    <div className="grid grid-cols-[1fr_auto_auto] items-center gap-2 border-b border-border py-3 sm:gap-4">
-      <span className="flex min-w-0 items-center gap-2.5 text-sm">
+    <div className="grid grid-cols-1 items-center gap-2 border-b border-border py-3 sm:grid-cols-3 sm:gap-4">
+      <span className="flex min-w-0 w-full max-w-full items-center gap-2.5 text-sm">
         <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", color)} />
-        <span className="truncate">{name}</span>
+        <span className="min-w-0 break-words">{name}</span>
       </span>
-      <span className="flex items-center justify-end gap-3">
-        <SparkAreaChart data={data} index="i" categories={["v"]} colors={["slate"]} className="hidden h-7 w-28 sm:block" />
-        <span className="w-20 text-right text-sm tabular-nums text-secondary sm:w-28">{usage}</span>
+      <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-3 sm:justify-end">
+        <span className="text-xs text-secondary sm:hidden">Usage</span>
+        {spark.length ? (
+          <SparkAreaChart data={data} index="i" categories={["v"]} colors={["slate"]} className="hidden h-7 w-full max-w-full sm:block" />
+        ) : null}
+        <span className="min-w-0 w-full max-w-full break-words text-right text-sm tabular-nums text-secondary whitespace-normal">{usage}</span>
       </span>
-      <span className="w-16 text-right text-sm tabular-nums">${charge.toFixed(2)}</span>
+      <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-3 text-sm tabular-nums sm:justify-end">
+        <span className="text-xs text-secondary sm:hidden">Charge</span>
+        <span className="min-w-0 break-words text-right whitespace-normal">{moneyMeasured(measured(charge))}</span>
+      </span>
     </div>
   );
 }

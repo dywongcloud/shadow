@@ -46,8 +46,8 @@ export function SchemaTableEditor({
   }
 
   return (
-    <div className="rounded-lg border border-border p-3">
-      <div className="mb-2 flex items-center gap-2">
+    <div className="min-w-0 w-full rounded-lg border border-border p-3">
+      <div className="mb-2 flex min-w-0 w-full flex-col items-stretch gap-2 sm:flex-row sm:items-center">
         <Input
           value={table.name}
           onChange={(e) => {
@@ -55,18 +55,18 @@ export function SchemaTableEditor({
             onChange({ ...table, name, ddl: raw ? table.ddl : ddlFromColumns(name, columns) });
           }}
           placeholder="table_name"
-          className="max-w-[220px] font-mono"
+          className="min-w-0 w-full break-all font-mono sm:max-w-[220px]"
         />
         <button
           type="button"
           onClick={() => setRaw((r) => !r)}
-          className="ml-auto flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-secondary hover:bg-subtle"
+          className="flex min-w-0 w-full items-center justify-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-secondary hover:bg-subtle sm:ml-auto sm:w-auto"
           title={raw ? "Switch to column builder" : "Edit raw DDL"}
         >
           {raw ? <Table2 className="h-3.5 w-3.5" /> : <Code2 className="h-3.5 w-3.5" />}
           {raw ? "Columns" : "Raw DDL"}
         </button>
-        <button type="button" onClick={onRemove} className="text-muted hover:text-red-500" title="Remove table">
+        <button type="button" onClick={onRemove} className="flex min-w-0 w-full items-center justify-center text-muted hover:text-red-500 sm:w-auto" title="Remove table">
           <Trash2 className="h-4 w-4" />
         </button>
       </div>
@@ -77,12 +77,12 @@ export function SchemaTableEditor({
           onChange={(e) => onChange({ ...table, ddl: e.target.value })}
           rows={3}
           placeholder="CREATE TABLE IF NOT EXISTS my_table (id INTEGER PRIMARY KEY, value TEXT)"
-          className="w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-border"
+          className="min-w-0 w-full break-all rounded-md border border-border bg-card px-3 py-2 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-border"
         />
       ) : (
-        <div className="flex flex-col gap-1.5">
+        <div className="flex min-w-0 w-full flex-col gap-1.5">
           {columns.map((c, i) => (
-            <div key={i} className="flex items-center gap-1.5">
+            <div key={i} className="flex min-w-0 w-full flex-col items-stretch gap-1.5 sm:flex-row sm:items-center">
               <Input
                 value={c.name}
                 onChange={(e) => {
@@ -91,7 +91,7 @@ export function SchemaTableEditor({
                   setColumnsAndDdl(next);
                 }}
                 placeholder="column_name"
-                className="flex-1 font-mono"
+                className="min-w-0 w-full flex-1 break-all font-mono"
               />
               <select
                 value={c.type}
@@ -100,13 +100,13 @@ export function SchemaTableEditor({
                   next[i] = { ...c, type: e.target.value as ColumnDraft["type"] };
                   setColumnsAndDdl(next);
                 }}
-                className="rounded-md border border-border bg-card px-2 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-border"
+                className="min-w-0 w-full rounded-md border border-border bg-card px-2 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-border sm:w-auto"
               >
                 {(["TEXT", "INTEGER", "REAL", "BLOB"] as const).map((t) => (
                   <option key={t} value={t}>{t}</option>
                 ))}
               </select>
-              <label className={cn("flex items-center gap-1 rounded-md border px-2 py-1.5 text-xs", c.pk ? "border-link text-link" : "border-border text-muted")}>
+              <label className={cn("flex min-w-0 w-full items-center justify-center gap-1 rounded-md border px-2 py-1.5 text-xs sm:w-auto", c.pk ? "border-link text-link" : "border-border text-muted")}>
                 <input
                   type="checkbox"
                   checked={c.pk}
@@ -118,7 +118,7 @@ export function SchemaTableEditor({
               <button
                 type="button"
                 onClick={() => setColumnsAndDdl(columns.filter((_, j) => j !== i))}
-                className="text-muted hover:text-red-500"
+                className="flex min-w-0 w-full items-center justify-center text-muted hover:text-red-500 sm:w-auto"
                 disabled={columns.length <= 1}
               >
                 <Trash2 className="h-3.5 w-3.5" />
@@ -128,11 +128,11 @@ export function SchemaTableEditor({
           <button
             type="button"
             onClick={() => setColumnsAndDdl([...columns, { name: "", type: "TEXT", pk: false }])}
-            className="mt-1 flex w-fit items-center gap-1 text-xs text-link hover:underline"
+            className="mt-1 flex min-w-0 w-full items-center justify-center gap-1 text-xs text-link hover:underline sm:w-auto"
           >
             <Plus className="h-3 w-3" /> Add column
           </button>
-          {table.ddl && <div className="mt-1.5 truncate font-mono text-[11px] text-muted" title={table.ddl}>{table.ddl}</div>}
+          {table.ddl && <div className="mt-1.5 min-w-0 w-full break-all font-mono text-[11px] text-muted" title={table.ddl}>{table.ddl}</div>}
         </div>
       )}
     </div>

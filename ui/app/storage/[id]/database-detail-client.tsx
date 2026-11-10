@@ -17,6 +17,7 @@ import {
 import { SqliteDatabaseDetail } from "./sqlite-detail";
 import { DbConsole } from "./db-console";
 import { InstanceMetrics } from "./instance-metrics";
+import { DatabaseEvents } from "./database-events";
 
 type StudioOpenResponse = {
   action: string;
@@ -47,6 +48,7 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
   const [openingStudio, setOpeningStudio] = useState(false);
+  const [observeTab, setObserveTab] = useState<"metrics" | "events">("metrics");
   const mayDestroy = useCan()("database.destroy");
 
   /** The UNMASKED credentials from the tenant-scoped `/credentials` endpoint (the list/detail poll masks url/password/token/secret keys), cached so a
@@ -214,18 +216,44 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         }
       />
 
-      <div className="mb-6 grid grid-cols-2 gap-4 sm:grid-cols-4">
+      <div className="mb-6 grid grid-cols-1 gap-4 min-[380px]:grid-cols-2 lg:grid-cols-4">
         <Mini label="Type" value={db.kind} />
         <Mini label="Region" value={db.region} />
         <Mini label="Mode" value={db.mode} />
         <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)}` : "unknown"} />
       </div>
 
-      {db.status === "ready" && (
-        <div className="mb-4">
-          <InstanceMetrics db={db} />
+      <div className="mb-4 min-w-0">
+        <div role="tablist" aria-label="Database observability" className="no-scrollbar -mb-px mb-3 flex min-w-0 items-center gap-1 overflow-x-auto border-b border-border">
+          {(["metrics", "events"] as const).map((t) => (
+            <button
+              key={t}
+              type="button"
+              role="tab"
+              aria-selected={observeTab === t}
+              onClick={() => setObserveTab(t)}
+              className={`shrink-0 whitespace-nowrap border-b-2 px-3 pb-2 pt-1 text-sm transition-colors ${
+                observeTab === t ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
+              }`}
+            >
+              {t === "metrics" ? "Metrics" : "Related events"}
+            </button>
+          ))}
         </div>
-      )}
+        <div role="tabpanel" className="min-w-0">
+          {observeTab === "metrics" ? (
+            db.status === "ready" ? (
+              <InstanceMetrics db={db} />
+            ) : (
+              <Card className="min-w-0 text-sm text-secondary">
+                Instance metrics are available once this database is ready (currently {db.status}).
+              </Card>
+            )
+          ) : (
+            <DatabaseEvents dbId={db.id} />
+          )}
+        </div>
+      </div>
 
       {db.mode === "simulated" && (
         <Card className="mb-4 border-amber-500/40 bg-amber-500/5 text-sm">

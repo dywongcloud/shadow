@@ -1,5 +1,33 @@
 import * as React from "react";
+import { AlertCircle } from "lucide-react";
 import { cn } from "@/lib/utils";
+
+/** An error or empty state a phone user can SEE and a screen reader can HEAR, at the point of
+ *  action. Colour alone is never the only signal, and the text is at least `text-sm`. */
+export function StateNotice({
+  children,
+  tone = "error",
+  className,
+}: {
+  children: React.ReactNode;
+  tone?: "error" | "muted";
+  className?: string;
+}) {
+  return (
+    <div
+      role="alert"
+      aria-live="polite"
+      className={cn(
+        "flex min-w-0 items-start gap-2 rounded-md border px-3 py-2 text-sm",
+        tone === "error" ? "border-red-500/40 bg-red-500/5 text-red-500" : "border-border bg-subtle text-secondary",
+        className,
+      )}
+    >
+      <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+      <span className="min-w-0 break-words">{children}</span>
+    </div>
+  );
+}
 
 export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
@@ -24,13 +52,15 @@ export function Stat({
   icon?: React.ReactNode;
 }) {
   return (
-    <Card className="flex flex-col gap-1">
-      <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">
-        {icon}
-        {label}
+    <Card className="flex min-w-0 flex-col gap-1">
+      <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium uppercase leading-tight tracking-wide text-muted">
+        {icon != null && icon !== false ? <span className="shrink-0">{icon}</span> : null}
+        <span className="min-w-0 break-words">{label}</span>
       </span>
-      <span className="text-3xl font-semibold tabular-nums text-fg">{value}</span>
-      {hint ? <span className="text-xs text-secondary">{hint}</span> : null}
+      <span className="min-w-0 break-words text-lg font-semibold leading-tight tabular-nums text-fg sm:text-2xl lg:text-3xl">
+        {value}
+      </span>
+      {hint ? <span className="min-w-0 break-words text-xs text-secondary">{hint}</span> : null}
     </Card>
   );
 }
@@ -147,19 +177,25 @@ export function PageHeader({
   action?: React.ReactNode;
 }) {
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-      <div>
-        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight text-fg">{title}</h1>
-        {desc ? <p className="mt-1 text-sm text-secondary">{desc}</p> : null}
+    <div className="mb-6 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+      <div className="min-w-0">
+        <h1 className="min-w-0 break-words text-xl font-semibold leading-tight tracking-tight text-fg sm:text-2xl">
+          {title}
+        </h1>
+        {desc ? <p className="mt-1 min-w-0 break-words text-sm leading-snug text-secondary">{desc}</p> : null}
       </div>
-      {action}
+      {action != null && action !== false ? (
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-2 [&>*]:min-w-0 [&>*]:max-w-full sm:w-auto sm:shrink-0">
+          {action}
+        </div>
+      ) : null}
     </div>
   );
 }
 
 export function Table({ children }: { children: React.ReactNode }) {
   return (
-    <div className="overflow-x-auto rounded-xl border border-border bg-card">
+    <div className="min-w-0 max-w-full overflow-x-auto rounded-xl border border-border bg-card">
       <table className="w-full text-sm">{children}</table>
     </div>
   );
@@ -235,12 +271,16 @@ export function Skeleton({ className }: { className?: string }) {
 /** Placeholder matching `<PageHeader>`'s title/description/action layout. */
 export function SkeletonPageHeader({ withAction }: { withAction?: boolean }) {
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-      <div className="flex flex-col gap-2">
-        <Skeleton className="h-7 w-48" />
+    <div className="mb-6 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-end sm:justify-between sm:gap-4">
+      <div className="flex min-w-0 flex-col gap-2">
+        <Skeleton className="h-7 w-48 max-w-full" />
         <Skeleton className="h-4 w-72 max-w-full" />
       </div>
-      {withAction ? <Skeleton className="h-9 w-28 shrink-0" /> : null}
+      {withAction ? (
+        <div className="flex w-full min-w-0 sm:w-auto sm:shrink-0">
+          <Skeleton className="h-9 w-28 max-w-full shrink-0" />
+        </div>
+      ) : null}
     </div>
   );
 }
