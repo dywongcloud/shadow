@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-10 - ops: attribution is dywongcloud, never lanmower
+
+The operator corrected the commit-identity rule: every commit is
+attributed to dywongcloud <dywong@hglobal.tencent.com>, not lanmower.
+gm.config.json already resolved git.author_name to dywongcloud, but the
+served worker prose still said "Commit as lanmower", and nine published
+close commits carried the lanmower author identity. The standing prose is
+corrected, and a root .mailmap canonicalizes the published lanmower
+commits plus the dylanwongtencent alias for git log, shortlog and blame.
+No published history is rewritten: a rewrite changes every later SHA and
+would re-trigger the two deploy triggers. GitHub author pages read the raw
+commit header, so the rewrite remains an operator-word one-way door.
+
 ## 2026-11-10 - ops: publish the rolled tree to origin/main
 
 The operator asked for the push. `refs/remotes/origin/main` now resolves to
