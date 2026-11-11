@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-11-10 - ops: publish the rolled tree to origin/main
+
+The operator asked for the push. `refs/remotes/origin/main` now resolves to
+5aeb4f2b6b59321c7c2f5521ae36d7c86998c0be, a 28-commit fast-forward;
+CI on that sha is green (4/4 Rust CI jobs, `sha_on_remote: true`).
+
+The `git_push` verifier returned `push_verification_failed` because a stray
+local `refs/heads/origin/main` points at
+10bebf3461df68126d66bbb6c168c34e85c6d36c; the verifier read that ref instead
+of the remote-tracking one. A fresh `git_fetch` plus `git_show` on
+`refs/remotes/origin/main` confirms delivery. No force-push, no rewrite,
+no inventory file or inventory backup name in HEAD.
+
+CI is tests-only (`.github/workflows/rust-ci.yml` has no deploy job): the
+dashboard on shadw.cloud is served by the fleet's hive-ui roll, not by a
+GitHub Actions deploy. The push does not replace that roll.
+
 ## 2026-11-10 - ops: roll charging + five-tier billing to the fleet
 
 The operator authorized the production roll. `scripts/audit-secret-keys.sh` passed
