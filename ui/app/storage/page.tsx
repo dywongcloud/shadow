@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   Database as DbIcon, Plus, X, Loader2, ChevronRight, ArrowLeft, Search, ExternalLink,
-  Gauge, Copy, Check, FileStack, Info,
+  Gauge, BarChart3, Copy, Check, FileStack, Info,
 } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader, StateNotice, Table, Th, Td } from "@/components/ui";
 import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
@@ -17,6 +17,7 @@ import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 import Image from "next/image";
 import { RedeployModal } from "@/components/redeploy-modal";
+import { StorageQuotaCards } from "@/components/storage-quota-cards";
 import { KIND_ICON, KindBadge } from "./kind";
 import {
   KIND_LABEL, POOLING_NOTE, REACH_NOTE, sqliteDatabases, unifiedDatabases,
@@ -92,6 +93,10 @@ export default function StoragePage() {
   const { rows, error, refresh, refreshProject, projects, deployments, loaded } = useDatabases();
   const [open, setOpen] = useState(false);
   const [redeployTarget, setRedeployTarget] = useState<Deployment | null>(null);
+  const managedIds = useMemo(
+    () => rows.filter((row) => row.source === "managed").map((row) => row.id),
+    [rows],
+  );
 
   useEffect(() => {
     if (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("browse")) {
@@ -105,8 +110,20 @@ export default function StoragePage() {
       <PageHeader
         title="Storage"
         desc="Every database in one place — managed engines and browser-replicated SQLite, provisioned per project."
-        action={<Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Database</Button>}
+        action={
+          <>
+            <Link
+              href="/storage/analytics"
+              className="tap-44 inline-flex min-h-11 min-w-11 items-center justify-center gap-2 rounded-md border border-border-strong px-3 text-sm font-medium text-secondary transition-colors hover:bg-subtle hover:text-fg"
+            >
+              <BarChart3 className="h-4 w-4" aria-hidden="true" /> Analytics
+            </Link>
+            <Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Database</Button>
+          </>
+        }
       />
+
+      <StorageQuotaCards managedIds={managedIds} />
 
       {error && !rows.length ? (
         <Card className="flex flex-col items-center gap-3 py-16 text-center">

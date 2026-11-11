@@ -2,10 +2,12 @@
 
 import { Activity, Info, Radio } from "lucide-react";
 import { Badge, Card, Stat, StateNotice } from "@/components/ui";
-import { apiGet, usePoll, type DbInstanceMetrics } from "@/lib/api";
-import type { Database } from "@/lib/api";
+import { apiGet, type DbInstanceMetrics } from "@/lib/api";
 
-const POLL_MS = 20000;
+/** ONE poll for the whole observability section lives in `database-detail-client.tsx`; every
+ *  panel (gauges, charts, routing, quota cards, request log) reads that same response, so a
+ *  chart and a counter can never disagree about which reading they are showing. */
+export const INSTANCE_METRICS_POLL_MS = 20000;
 
 /** Human labels for the per-kind gauges the backend measures. Unknown keys fall through to a
  *  title-cased key, because a node newer than this dashboard can add one. */
@@ -108,7 +110,7 @@ function sampledAt(ms?: number): string {
  *  `sources`; an owner-proxied payload names `served_by`; otherwise the reading is local to the
  *  answering node. No scope is ever guessed. */
 function counterScope(data: DbInstanceMetrics): string {
-  const sources = data.sources;
+  const sources = data.series_sources ?? data.sources;
   if (Array.isArray(sources) && sources.length > 1) return `fleet sum across ${sources.length} nodes`;
   if (data.served_by) return `owner reading via ${data.served_by}`;
   const node = data.node || data.host_node;
@@ -121,8 +123,7 @@ const count = (v?: number) =>
 /** Per-INSTANCE metrics for one database: every gauge this kind actually has, grouped, plus
  *  when it was sampled and where the counters came from. A value the node did not measure
  *  renders as an absence with a reason, never as a zero. */
-export function InstanceMetrics({ db }: { db: Database }) {
-  const { data, error } = usePoll<DbInstanceMetrics>(`/v1/databases/${db.id}/metrics`, POLL_MS);
+export function InstanceMetrics({ data, error }: { data: DbInstanceMetrics | null; error: string | null }) {
   const stats = data?.stats ?? null;
   const entries = Object.entries(stats ?? {}).filter(([, v]) => typeof v !== "object");
   const reach = data?.reachability ?? "";
@@ -153,7 +154,7 @@ export function InstanceMetrics({ db }: { db: Database }) {
     <Card className="min-w-0 w-full max-w-full">
       <div className="mb-3 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1.5">
         <Activity className="h-4 w-4 shrink-0 text-secondary" />
-        <h3 className="text-sm font-semibold">Instance metrics</h3>
+        <h3 className="text-sm font-semibold">Instance gauges</h3>
         {measured ? (
           <Badge tone="green">measured</Badge>
         ) : (
@@ -164,13 +165,13 @@ export function InstanceMetrics({ db }: { db: Database }) {
         {data && (
           <span className="flex min-w-0 items-center gap-1 text-xs text-muted">
             <Radio className="h-3 w-3 shrink-0" />
-            {sampledAt(data.observed_at_ms)} · every {POLL_MS / 1000} s
+            {sampledAt(data.observed_at_ms)} · every {INSTANCE_METRICS_POLL_MS / 1000} s
           </span>
         )}
       </div>
 
       {error && (
-        <StateNotice>Couldn&apos;t load metrics: {String(error).replace(/^Error:\s*/, "")}</StateNotice>
+        <StateNotice>Couldn&apos;t load metrics: {error.replace(/^Error:\s*/, "")}</StateNotice>
       )}
 
       {!error && !data && <p className="text-xs text-muted">Loading…</p>}
@@ -216,8 +217,6 @@ export function InstanceMetrics({ db }: { db: Database }) {
   );
 }
 
-/** Server-side prefetch is not used here: the read is tenant-scoped and node-addressed, so it runs
- *  from the browser like every other poller on this page. `apiGet` stays exported so a future
- *  prefetch uses the same tenant-scoped cache key rather than a second fetch path. */
-export const INSTANCE_METRICS_POLL_MS = POLL_MS;
+/** `apiGet` stays exported so a future prefetch uses the same tenant-scoped cache key rather
+ *  than a second fetch path. */
 export { apiGet };

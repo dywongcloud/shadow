@@ -5,11 +5,13 @@ import { Play, Terminal, TriangleAlert } from "lucide-react";
 import { Badge, Button, Card } from "@/components/ui";
 import {
   apiSend,
+  apiPutBytes,
   useCan,
   type Database,
   type DbConsoleResponse,
   type DbKind,
 } from "@/lib/api";
+import { DbQueryBuilder, type BrowserTable } from "@/components/db-query-builder";
 import { roleHint } from "@/lib/team-role";
 import { toast } from "@/components/toast";
 
@@ -27,6 +29,29 @@ const DIALECT: Record<DbKind, { write: boolean; destructive: boolean; hint: stri
   pubsub: { write: true, destructive: false, hint: "INFO · PUBLISH message" },
   realtime: { write: false, destructive: false, hint: "INFO" },
 };
+
+/** The data browser's neutral view of a real console reply: every field is copied, never invented. */
+function toBrowserTable(r: DbConsoleResponse): BrowserTable {
+  return {
+    ok: r.ok,
+    columns: r.columns ?? [],
+    rows: r.rows ?? [],
+    truncated: r.truncated,
+    durationMs: r.duration_ms,
+    engine: r.engine ?? undefined,
+    tier: r.tier,
+    op: r.op,
+    message: r.message ?? r.error ?? null,
+  };
+}
+
+/** db_console::split_cmd groups with quotes and has no escapes: choose the quote the text does
+ *  not contain. Newlines INSIDE quotes survive, so pretty JSON stays byte-for-byte. */
+function quoteToken(s: string): string {
+  if (!s.includes("'")) return "'" + s + "'";
+  if (!s.includes('"')) return '"' + s + '"';
+  throw new Error("the console's command grammar cannot carry text holding both quote characters");
+}
 
 /** The command console for ONE database instance. Read-only by default: a write has to be switched
  *  on per request, and a destructive command needs a second switch AND a team admin — the server
@@ -64,8 +89,57 @@ export function DbConsole({ db }: { db: Database }) {
     }
   }
 
+  /** One real console execution, shared by the data browser and the original Run button. */
+  async function execute(command: string, w: boolean, d: boolean): Promise<BrowserTable> {
+    return toBrowserTable(
+      await apiSend<DbConsoleResponse>("POST", "/v1/databases/" + db.id + "/console", {
+        input: command,
+        write: w,
+        destructive: d,
+      }),
+    );
+  }
+
+  /** Save is a REAL key-addressed write: Redis SET on the console route, or the blob object
+   *  route with raw bytes (a console PUT would collapse newlines into spaces). */
+  async function saveValue(key: string, text: string): Promise<BrowserTable> {
+    if (db.kind === "redis") {
+      return execute("SET " + quoteToken(key) + " " + quoteToken(text), true, false);
+    }
+    if (db.kind === "blob") {
+      const bucket = db.connection.bucket;
+      if (!bucket) throw new Error("this database record carries no bucket name");
+      const r = await apiPutBytes<{ key: string; size: number }>(
+        "/v1/storage/blob/" + encodeURIComponent(bucket) + "/" + encodeURIComponent(key),
+        new Blob([text], { type: "application/json" }),
+        "application/json",
+      );
+      return { ok: true, columns: ["key", "size"], rows: [[r.key, r.size]], op: "PUT " + key };
+    }
+    throw new Error("no key-addressed write route for this kind");
+  }
+
   return (
-    <Card>
+    <div className="flex min-w-0 flex-col gap-4">
+      <DbQueryBuilder
+        kind={db.kind}
+        hint={hint || "command"}
+        capabilities={{ write: caps.write, destructive: caps.destructive, note: caps.note }}
+        mayRun={mayConsole}
+        mayDestructive={mayDestructive}
+        runHint={roleHint("database.console")}
+        runCommand={execute}
+        saveValue={db.kind === "redis" || db.kind === "blob" ? saveValue : undefined}
+        saveRoute={
+          db.kind === "redis"
+            ? "POST /v1/databases/:id/console (SET)"
+            : db.kind === "blob"
+              ? "PUT /v1/storage/blob/:bucket/:key"
+              : undefined
+        }
+        title="Data browser"
+      />
+      <Card>
       <div className="mb-3 flex items-center gap-2">
         <Terminal className="h-4 w-4 text-secondary" />
         <h3 className="text-sm font-semibold">Console</h3>
@@ -186,7 +260,8 @@ export function DbConsole({ db }: { db: Database }) {
         One command per request, no shell and no host filesystem access. Connection secrets are never
         shown here and are never echoed back by the server.
       </p>
-    </Card>
+      </Card>
+    </div>
   );
 }
 

@@ -52,19 +52,24 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
   const proj = pathname.match(/^\/projects\/([^/]+)/);
   if (proj) {
     const p = proj[1];
+    const project = decodeURIComponent(p);
     const base = `/projects/${p}`;
+    const analyticsHref = `/projects/${encodeURIComponent(project)}/analytics`;
+    const onRoute = (path: string) => pathname === path || pathname.startsWith(`${path}/`);
     const items: TabItem[] = [
       { href: `${base}?tab=overview`, label: "Overview", key: "overview" },
       { href: `${base}?tab=graph`, label: "Service Graph", key: "graph" },
       { href: `${base}?tab=workflows`, label: "Workflows", key: "workflows" },
       { href: `${base}?tab=resources`, label: "Resources", key: "resources" },
       { href: `${base}?tab=deployments`, label: "Deployments", key: "deployments" },
+      { href: analyticsHref, label: "Analytics", key: "analytics" },
       { href: `${base}/logs`, label: "Logs", key: "logs" },
       { href: `${base}/sandboxes`, label: "Sandboxes", key: "sandboxes" },
       { href: `${base}/settings`, label: "Settings", key: "settings" },
     ];
     let activeKey = "overview";
-    if (pathname.includes("/settings")) activeKey = "settings";
+    if (onRoute(analyticsHref)) activeKey = "analytics";
+    else if (pathname.includes("/settings")) activeKey = "settings";
     else if (pathname.includes("/logs")) activeKey = "logs";
     else if (pathname.includes("/sandboxes")) activeKey = "sandboxes";
     else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
@@ -165,7 +170,7 @@ export function TopNav() {
           </Link>
         </div>
       </div>
-      <div className="mx-auto max-w-[1400px] px-2 sm:px-4">
+      <div className="mx-auto min-w-0 max-w-[1400px] px-2 sm:px-4">
         <details className="border-b border-border px-1 py-1 text-xs text-secondary sm:hidden">
           <summary aria-label="All platform sections" className="tap-44 cursor-pointer py-1 font-medium">All {teamTabs.length} sections</summary>
           <div className="flex flex-wrap gap-1 pb-1">
@@ -220,7 +225,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
 
   if (ctx) {
     return (
-      <nav ref={navRef} className="no-scrollbar -mb-px flex items-center gap-0.5 overflow-x-auto">
+      <nav ref={navRef} className="no-scrollbar -mb-px flex min-w-0 items-center gap-0.5 overflow-x-auto">
         {ctx.items.map((t) => {
           const active = t.key === ctx.activeKey;
           return (
@@ -229,7 +234,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
               href={t.href}
               data-active={active}
               className={cn(
-                "shrink-0 whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
+                "inline-flex min-h-[44px] shrink-0 items-center whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
                 active ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
               )}
             >
@@ -242,7 +247,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   }
 
   return (
-    <nav ref={navRef} className="no-scrollbar -mb-px flex items-center gap-0.5 overflow-x-auto">
+    <nav ref={navRef} className="no-scrollbar -mb-px flex min-w-0 items-center gap-0.5 overflow-x-auto">
       {teamTabs.map((t) => {
         const active = isActive(t.href);
         return (
@@ -251,7 +256,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
             href={t.href}
             data-active={active}
             className={cn(
-              "shrink-0 whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
+              "inline-flex min-h-[44px] shrink-0 items-center whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
               active ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
             )}
           >

@@ -40,7 +40,7 @@ const ServiceGraph = dynamic(
   }
 );
 import { reportError, toast } from "@/components/toast";
-import { apiGet, apiSend, useCan, usePoll, currentTeam, type Deployment, type Metrics, type Overview } from "@/lib/api";
+import { apiGet, apiSend, useCan, usePoll, currentTeam, type Deployment, type MetricBucket, type Metrics, type Overview } from "@/lib/api";
 import { roleHint } from "@/lib/team-role";
 import { usePendingBuilds, removePendingBuild, mergePending, addPendingBuild } from "@/lib/pending-builds";
 import { SUMMARY_PATH, type ProjectSummary } from "@/lib/projects";
@@ -49,6 +49,10 @@ import { deploymentUrl, deploymentHost, openDeployment, zkEnabled, deploymentSel
 import { RawPortConnections } from "@/components/raw-port-connections";
 
 const PROJECT_METRICS_WINDOW_MINUTES = 180;
+
+/** One row of `GET /v1/domains`: a custom domain attached to a project. A domain still pending
+ *  ownership verification is NOT routed, so it does not count as an added custom domain. */
+interface DomainEntry { project: string; domain: string; verify_status?: string }
 
 export function ProjectDetail({ paramsPromise }: { paramsPromise: Promise<{ project: string }> }) {
   const params = use(paramsPromise);
@@ -68,6 +72,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const { data: summaryRows, refresh: refreshSummary } = usePoll<ProjectSummary[]>(SUMMARY_PATH, 5000);
   const summary = (summaryRows ?? []).find((row) => row.project === name) ?? null;
   const { data: pm } = usePoll<Metrics>(`/v1/metrics?minutes=${PROJECT_METRICS_WINDOW_MINUTES}&project=${encodeURIComponent(name)}`, 8000);
+  const { data: domains } = usePoll<DomainEntry[]>("/v1/domains", 15000);
+  const analyticsHref = `/projects/${encodeURIComponent(name)}/analytics`;
   const tabParam = searchParams.get("tab");
   const tab: "overview" | "graph" | "workflows" | "resources" | "deployments" =
     tabParam === "graph" || tabParam === "deployments" || tabParam === "workflows" || tabParam === "resources"
@@ -148,12 +154,11 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     }
   }
 
+  const customDomainAttached = (domains ?? []).some((d) => d.project === name && d.verify_status !== "pending");
   const checklist = [
     { label: "Connect Git Repository", done: !!prod?.git || !!retrySource },
-    { label: "Add Custom Domain", done: false },
+    { label: "Add Custom Domain", done: customDomainAttached },
     { label: "Preview Deployment", done: mine.length > 0 },
-    { label: "Enable Web Analytics", done: true },
-    { label: "Enable Speed Insights", done: false },
     { label: "Enable Firewall", done: ov?.waf_managed ?? false },
   ];
   const doneCount = checklist.filter((c) => c.done).length;
@@ -302,41 +307,55 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
           )}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-            <Card className="p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <span className="font-medium">Production Checklist</span>
-                <Badge>{doneCount}/{checklist.length}</Badge>
+            <Card className="min-w-0 p-5">
+              <div className="mb-4 flex min-w-0 items-center justify-between gap-2">
+                <span className="min-w-0 break-words font-medium">Production Checklist</span>
+                <Badge className="shrink-0">{doneCount}/{checklist.length}</Badge>
               </div>
-              <div className="flex flex-col gap-2">
+              <div className="flex min-w-0 flex-col gap-2">
                 {checklist.map((c) => (
-                  <div key={c.label} className="flex items-center gap-2.5 rounded-lg border border-border px-3 py-2 text-sm">
+                  <div key={c.label} className="flex min-w-0 items-center gap-2.5 rounded-lg border border-border px-3 py-2 text-sm">
                     {c.done ? (
-                      <Check className="h-4 w-4 text-green" />
+                      <Check className="h-4 w-4 shrink-0 text-green" />
                     ) : (
-                      <span className="h-4 w-4 rounded-full border border-border-strong" />
+                      <span className="h-4 w-4 shrink-0 rounded-full border border-border-strong" />
                     )}
-                    <span className={c.done ? "text-secondary line-through" : ""}>{c.label}</span>
+                    <span className={`min-w-0 break-words ${c.done ? "text-secondary line-through" : ""}`}>{c.label}</span>
                   </div>
                 ))}
               </div>
             </Card>
 
-            <Card className="p-5">
-              <div className="mb-4 flex items-center justify-between">
-                <span className="font-medium">Observability</span>
-                <ChevronRight className="h-4 w-4 text-muted" />
+            <Card className="relative min-w-0 overflow-hidden p-5">
+              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400" />
+              <div className="mb-4 flex min-w-0 items-center justify-between gap-2">
+                <span className="min-w-0 break-words font-medium">Observability</span>
+                <Link
+                  href={analyticsHref}
+                  aria-label={`View analytics for ${name}`}
+                  className="inline-flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-secondary hover:text-fg"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Link>
               </div>
               <Metric label="Requests" value={pm?.totals?.requests ?? 0} />
               <Metric label="Errors" value={pm?.totals?.errors ?? 0} />
               <Metric label="Blocked (firewall)" value={pm?.totals?.blocked ?? 0} />
               <Metric label="Cache hit ratio" value={`${Math.round((pm?.totals?.cache_hit_ratio ?? 0) * 100)}%`} />
+              <RequestSparkline buckets={pm?.series ?? []} label={`Measured requests · last ${PROJECT_METRICS_WINDOW_MINUTES} minutes`} />
             </Card>
 
-            <Card className="flex flex-col items-center justify-center gap-3 p-5 text-center">
-              <Activity className="h-8 w-8 text-muted" />
-              <div className="font-medium">Analytics</div>
-              <p className="text-sm text-secondary">Track visitors and page views across regions.</p>
-              <Button variant="outline">Enable Analytics</Button>
+            <Card className="relative flex min-w-0 flex-col items-center justify-center gap-3 overflow-hidden p-5 text-center">
+              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400" />
+              <Activity className="h-8 w-8 text-indigo-500 dark:text-indigo-400" />
+              <div className="min-w-0 break-words font-medium">Analytics</div>
+              <p className="min-w-0 break-words text-sm text-secondary">Measured request series, status classes and top paths.</p>
+              <Link
+                href={analyticsHref}
+                className="inline-flex min-h-[44px] min-w-0 max-w-full items-center justify-center rounded-md border border-border-strong px-4 text-sm font-medium text-fg hover:bg-subtle"
+              >
+                <span className="min-w-0 break-words">View analytics</span>
+              </Link>
             </Card>
           </div>
         </>
@@ -546,9 +565,33 @@ function EmptyProjectCard({ name, summary, retrySource, busy, retryError, onRetr
 
 function Metric({ label, value }: { label: string; value: React.ReactNode }) {
   return (
-    <div className="mb-3 flex items-center justify-between">
-      <span className="text-sm text-secondary">{label}</span>
-      <span className="font-semibold tabular-nums">{value}</span>
+    <div className="mb-3 flex min-w-0 items-center justify-between gap-2">
+      <span className="min-w-0 break-words text-sm text-secondary">{label}</span>
+      <span className="shrink-0 font-semibold tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+/** A real-data sparkline: every point is a request count the metrics endpoint measured for this project. With fewer than
+ *  two buckets there is no series to draw, so the card's gradient accent is the only colour. */
+function RequestSparkline({ buckets, label }: { buckets: MetricBucket[]; label: string }) {
+  if (buckets.length < 2) return null;
+  const values = buckets.map((b) => (Number.isFinite(b.requests) ? b.requests : 0));
+  const max = Math.max(1, ...values);
+  const points = values.map((v, i) => `${(i / (values.length - 1)) * 100},${26 - (v / max) * 22}`).join(" ");
+  return (
+    <div className="mt-1 min-w-0">
+      <svg viewBox="0 0 100 28" preserveAspectRatio="none" className="h-8 w-full" aria-hidden="true">
+        <defs>
+          <linearGradient id="project-request-spark" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stopColor="#6366f1" />
+            <stop offset="50%" stopColor="#22d3ee" />
+            <stop offset="100%" stopColor="#34d399" />
+          </linearGradient>
+        </defs>
+        <polyline points={points} fill="none" stroke="url(#project-request-spark)" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+      </svg>
+      <div className="min-w-0 break-words text-xs text-muted">{label}</div>
     </div>
   );
 }

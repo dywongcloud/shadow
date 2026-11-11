@@ -2958,13 +2958,36 @@ async fn invoke(
     Ok((status, body))
 }
 
-/// Build the workflow step invoker (each step hits a function route).
-pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
+/// Build the workflow step invoker (each step hits a function route). This is the ONE
+/// point where a WORKFLOW step begins execution, so it carries the per-tenant daily cap
+/// gate and the step measurement. `tenant` is the SERVER-DERIVED tenant resolved at the
+/// run entry (`admin::wf_run`) from the verified JWT claim: never a header, a path, or a
+/// step-supplied string (`step.deployment` is only the gateway Host to invoke, untrusted).
+pub fn wf_invoker(cloud: Arc<CloudState>, tenant: String) -> hive_edge::StepInvoker {
+    // One plan lookup per RUN, not per step; the closure captures a plain f64-free u64.
+    let cap = crate::billing::plan_max_workflow_steps_per_day(&cloud.billing.account(&tenant).plan);
+    // Fail closed: an anonymous/untagged run lands in UNATTRIBUTED, never billed.
+    let tenant = crate::usage_metering::workflow_step_tenant(&tenant).to_string();
     Arc::new(move |step: WorkflowStep| {
         let cloud = cloud.clone();
+        let tenant = tenant.clone();
         let fut: Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> =
             Box::pin(async move {
-                let (status, body) = invoke(&cloud, &step.deployment, &step.path).await?;
+                // Cap gate is BEFORE the invoke. A refused step reserves nothing in
+                // the day window and records nothing: never metered, never billed,
+                // never executed. `cap == 0` is unlimited (Enterprise Plus).
+                if !crate::usage_metering::workflow_step_admitted(&tenant, cap) {
+                    anyhow::bail!("workflow steps/day plan limit reached");
+                }
+                let result = invoke(&cloud, &step.deployment, &step.path).await;
+                // Measurement ALWAYS runs for a step that actually executed; charging
+                // stays gated by billing::resource_charging_enabled() in the meter fold.
+                crate::usage_metering::record(
+                    &tenant,
+                    crate::usage_metering::UsageKind::WorkflowSteps,
+                    1,
+                );
+                let (status, body) = result?;
                 anyhow::ensure!(status < 500, "step {} -> HTTP {status}", step.name);
                 Ok(format!(
                     "HTTP {status}: {}",
@@ -4979,6 +5002,7 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                         .saturating_add(u.object_storage_byte_ms);
                     t.ingress_bytes = t.ingress_bytes.saturating_add(u.ingress_bytes);
                     t.egress_bytes = t.egress_bytes.saturating_add(u.egress_bytes);
+                    t.workflow_steps = t.workflow_steps.saturating_add(u.workflow_steps);
                 }
             }
             let mut charged_any = 0u64;

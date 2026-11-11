@@ -57,6 +57,9 @@ pub struct PlanSpec {
     /// Max total live bytes across a project's shadw drive (0 = unlimited), enforced only at the
     /// `PUT file` handler (`drive_api.rs`).
     pub max_drive_bytes: u64,
+    /// Max WORKFLOW steps a tenant may execute per UTC day (0 = unlimited). Enforced
+    /// before each step begins; a refused step is never metered or billed.
+    pub max_workflow_steps_per_day: u64,
     pub features: &'static [&'static str],
 }
 
@@ -77,6 +80,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_env_vars: 50,
         max_sandbox_ports: 4,
         max_drive_bytes: 1024 * 1024 * 1024,
+        max_workflow_steps_per_day: 1_000,
         features: &[
             "$5 of included compute / month",
             "1 concurrent build",
@@ -100,6 +104,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_env_vars: 100,
         max_sandbox_ports: 8,
         max_drive_bytes: 25 * 1024 * 1024 * 1024,
+        max_workflow_steps_per_day: 100_000,
         features: &[
             "$20 of included compute / month",
             "Pay-as-you-go beyond included",
@@ -123,6 +128,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_env_vars: 200,
         max_sandbox_ports: 16,
         max_drive_bytes: 100 * 1024 * 1024 * 1024,
+        max_workflow_steps_per_day: 1_000_000,
         features: &[
             "$200 of included compute / month",
             "Pay-as-you-go beyond included compute",
@@ -147,6 +153,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_env_vars: 0,
         max_sandbox_ports: 0,
         max_drive_bytes: 0,
+        max_workflow_steps_per_day: 10_000_000,
         features: &[
             "$1,000 of included compute / month",
             "Automatic multi-region fail-over",
@@ -171,6 +178,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_env_vars: 0,
         max_sandbox_ports: 0,
         max_drive_bytes: 0,
+        max_workflow_steps_per_day: 0,
         features: &[
             "$5,000 of included compute / month",
             "Automatic multi-region fail-over",
@@ -265,6 +273,12 @@ pub fn plan_max_sandbox_ports(plan: &str) -> u32 {
 pub fn plan_max_drive_bytes(plan: &str) -> u64 {
     plan_spec(plan).max_drive_bytes
 }
+/// Max WORKFLOW steps per UTC day on a plan (0 = unlimited). Uses plan_spec so a
+/// stored legacy plan string resolves to Hobby's 1_000: an unknown plan never
+/// gains unlimited steps.
+pub fn plan_max_workflow_steps_per_day(plan: &str) -> u64 {
+    plan_spec(plan).max_workflow_steps_per_day
+}
 
 /// The plan's hard overage ceiling in cents. Uses plan_spec so a stored legacy plan
 /// string resolves to Hobby's 0 (fail closed: unknown plans get no overage).
@@ -300,6 +314,9 @@ pub struct RateCard {
     pub ingress_gb_cents: f64,
     /// Outbound network transfer, cents per decimal GB.
     pub egress_gb_cents: f64,
+    /// Workflow steps executed, cents per million. 1000.0c = $10 per million
+    /// steps = $1 per 100K steps, matching Upstash Workflow Pay-as-You-Go.
+    pub workflow_steps_per_million_cents: f64,
 }
 
 pub const RATE_CARD: RateCard = RateCard {
@@ -314,6 +331,7 @@ pub const RATE_CARD: RateCard = RateCard {
     object_storage_gb_month_cents: 1.5,
     ingress_gb_cents: 0.2,
     egress_gb_cents: 1.0,
+    workflow_steps_per_million_cents: 1000.0,
 };
 
 /// Platform COGS per billed unit, in cents, derived from fetched public infra
@@ -331,6 +349,13 @@ pub const RATE_CARD: RateCard = RateCard {
 /// - object_storage_gb_month: Backblaze B2 $0.005 per GB-month = 0.5c per GB-month.
 /// - ingress_gb: 0.25x bulk egress, a stated assumption = 0.05c per GB.
 /// - egress_gb: Bunny over 1 PB tier $0.002 per GB = 0.2c per GB.
+/// - workflow_steps_per_million: a step is one durable-queue hop (QStash lists $1 per
+///   100K messages = 1000c per million) plus a short Box-class function dispatch
+///   ($0.10 per active CPU-hour Small) with workflow bandwidth free to 50 GB/month.
+///   Self-hosting that hop on platform-owned nodes is a stated public-infra-derived
+///   assumption of 250c per million steps (a quarter of the public QStash message
+///   rate); against the 1000c rate it leaves (1000 - 250) / 1000 = 7500 bps gross
+///   margin, above the 6000 bps floor.
 #[derive(Clone, Copy, Serialize)]
 pub struct CostCard {
     pub active_cpu_hr_cents: f64,
@@ -344,6 +369,7 @@ pub struct CostCard {
     pub object_storage_gb_month_cents: f64,
     pub ingress_gb_cents: f64,
     pub egress_gb_cents: f64,
+    pub workflow_steps_per_million_cents: f64,
 }
 
 pub const COST_CARD: CostCard = CostCard {
@@ -358,6 +384,7 @@ pub const COST_CARD: CostCard = CostCard {
     object_storage_gb_month_cents: 0.5,
     ingress_gb_cents: 0.05,
     egress_gb_cents: 0.2,
+    workflow_steps_per_million_cents: 250.0,
 };
 
 /// Minimum gross margin, in basis points, every priced SKU must clear before
@@ -407,6 +434,11 @@ pub struct UsageTotals {
     /// Outbound network transfer, cumulative bytes (decimal GB).
     #[serde(default)]
     pub egress_bytes: u64,
+    /// Workflow steps executed, cumulative. serde(default) is load-bearing:
+    /// UsageTotals is nested inside the persisted MeterWatermark, so a required
+    /// key would make an old snapshot fail to deserialize.
+    #[serde(default)]
+    pub workflow_steps: u64,
 }
 
 impl RateCard {
@@ -425,13 +457,14 @@ impl RateCard {
             + (u.object_storage_byte_ms as f64 / BYTE_MS_PER_GB_MONTH)
                 * self.object_storage_gb_month_cents
             + (u.ingress_bytes as f64 / 1_000_000_000.0) * self.ingress_gb_cents
-            + (u.egress_bytes as f64 / 1_000_000_000.0) * self.egress_gb_cents;
+            + (u.egress_bytes as f64 / 1_000_000_000.0) * self.egress_gb_cents
+            + (u.workflow_steps as f64 / 1_000_000.0) * self.workflow_steps_per_million_cents;
         if total.is_finite() { total } else { 0.0 }
     }
 
     /// Price vs COGS per SKU: margin = (price - cogs) / price * 10_000 basis points.
     pub fn margin_report(&self) -> Vec<SkuMargin> {
-        let skus: [(&'static str, f64, f64); 11] = [
+        let skus: [(&'static str, f64, f64); 12] = [
             ("active_cpu_hr", self.active_cpu_hr_cents, COST_CARD.active_cpu_hr_cents),
             ("mem_gb_hr", self.mem_gb_hr_cents, COST_CARD.mem_gb_hr_cents),
             ("requests_per_million", self.requests_per_million_cents, COST_CARD.requests_per_million_cents),
@@ -443,6 +476,11 @@ impl RateCard {
             ("object_storage_gb_month", self.object_storage_gb_month_cents, COST_CARD.object_storage_gb_month_cents),
             ("ingress_gb", self.ingress_gb_cents, COST_CARD.ingress_gb_cents),
             ("egress_gb", self.egress_gb_cents, COST_CARD.egress_gb_cents),
+            (
+                "workflow_steps_per_million",
+                self.workflow_steps_per_million_cents,
+                COST_CARD.workflow_steps_per_million_cents,
+            ),
         ];
         let mut rows = Vec::with_capacity(skus.len());
         for (sku, price_cents, cogs_cents) in skus {
@@ -717,6 +755,11 @@ pub struct Checkout {
 struct MeterState {
     last: UsageTotals,
     frac_cents: f64,
+    /// A SKU added after a watermark was written has no baseline there. The first tick adopts the
+    /// live cumulative counter without charging it, so restoring an older snapshot can never
+    /// re-bill usage already charged before the restore. One under-counted tick is the safe
+    /// direction, the same rule as a counter reset after a node restart.
+    workflow_baseline_done: bool,
 }
 
 /// One tenant's meter cursor as it crosses the persistence boundary
@@ -1044,7 +1087,7 @@ impl BillingStore {
                 && !meters.contains_key(tenant);
             let st = meters.entry(tenant.to_string()).or_default();
             let sub = |cur: u64, last: u64| if cur >= last { cur - last } else { 0 };
-            let delta = if seeding {
+            let mut delta = if seeding {
                 tracing::info!(
                     tenant,
                     "billing meter: no persisted watermark for this tenant — adopting the live \
@@ -1064,8 +1107,13 @@ impl BillingStore {
                     object_storage_byte_ms: sub(current.object_storage_byte_ms, st.last.object_storage_byte_ms),
                     ingress_bytes: sub(current.ingress_bytes, st.last.ingress_bytes),
                     egress_bytes: sub(current.egress_bytes, st.last.egress_bytes),
+                    workflow_steps: sub(current.workflow_steps, st.last.workflow_steps),
                 }
             };
+            if !st.workflow_baseline_done {
+                st.workflow_baseline_done = true;
+                delta.workflow_steps = 0;
+            }
             st.last = current;
             (delta, st.frac_cents)
         };
@@ -1574,6 +1622,7 @@ impl BillingStore {
                     MeterState {
                         last: w.last,
                         frac_cents: w.frac_cents,
+                        workflow_baseline_done: false,
                     },
                 )
             })

@@ -1192,8 +1192,37 @@ export interface DbConsoleResponse {
   capabilities?: DbConsoleCapabilities;
   hint?: string;
 }
+/** One 60,000 ms bucket of measured activity for ONE database (`GET /v1/databases/:id/metrics`
+ *  `series`). ASCENDING, at most 180 buckets. Every field is measured by the node: a bucket with
+ *  no requests is a REAL zero, not a missing reading. Average latency is
+ *  `latency_sum_ms / requests` computed at render time, never carried on the wire. */
+export interface DbMetricBucket {
+  t_ms: number;
+  requests: number;
+  errors: number;
+  bytes_in: number;
+  bytes_out: number;
+  latency_sum_ms: number;
+  latency_max_ms: number;
+}
+
+/** One measured gateway request for ONE database (`events`). MOST RECENT FIRST, at most 200.
+ *  `ok` is the outcome; `error` is a FIXED error class (`engine_unreachable`, `bad_request`,
+ *  `query_error`, `timeout`, `denied`) or an empty string. The backend never puts an engine
+ *  message here because a connection failure can carry a DSN with a password. */
+export interface DbMetricEvent {
+  t_ms: number;
+  ok: boolean;
+  latency_ms: number;
+  bytes_in: number;
+  bytes_out: number;
+  error: string;
+}
+
 /** Per-INSTANCE metrics (never per-project): `stats` is null when nothing could be measured, and `reachability` says
- *  why, so a stranded database never reads as a healthy zero. */
+ *  why, so a stranded database never reads as a healthy zero. The five series/log fields are
+ *  OPTIONAL: during a roll an older node answers without them, and the dashboard must render an
+ *  honest absence instead of a fabricated curve or request row. */
 export interface DbInstanceMetrics {
   db_id: string;
   name?: string;
@@ -1210,6 +1239,19 @@ export interface DbInstanceMetrics {
   note?: string;
   served_by?: string;
   sources?: string[];
+  /** Wire v2: 60,000 ms buckets, ASCENDING, at most 180. Absent on older nodes. Elements are
+   *  Partial because this is untrusted JSON: a node mid-roll can omit a field, and every
+   *  consumer validates before plotting. `DbMetricBucket` is the validated, exact shape. */
+  series?: Partial<DbMetricBucket>[];
+  /** Width of one bucket in ms. 60,000 on nodes that report `series`. */
+  granularity_ms?: number;
+  /** Window covered by `series`, in minutes. 180 on nodes that report `series`. */
+  window_minutes?: number;
+  /** Node names that contributed measured buckets. May be empty or absent. */
+  series_sources?: string[];
+  /** Recent gateway requests, MOST RECENT FIRST, at most 200. Absent on older nodes; each row
+   *  is validated before it is rendered. */
+  events?: Partial<DbMetricEvent>[];
   counters?: {
     requests?: number;
     errors?: number;
@@ -1217,6 +1259,7 @@ export interface DbInstanceMetrics {
     bytes_out?: number;
     last_ms?: number;
     last_latency_ms?: number;
+    last_error_ms?: number;
     last_error?: string;
     error_rate?: number;
   };

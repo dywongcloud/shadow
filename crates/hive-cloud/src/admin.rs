@@ -11241,7 +11241,7 @@ async fn wf_run(
             ));
         }
     }
-    let invoker = crate::wf_invoker(c.clone());
+    let invoker = crate::wf_invoker(c.clone(), t.clone());
     match c.workflows.start(&id, invoker) {
         Ok(run_id) => Ok(Json(json!({ "run_id": run_id }))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
@@ -16552,6 +16552,9 @@ pub(crate) fn usage_summary_for(c: &Arc<CloudState>, t: &str) -> Value {
             .unwrap_or_default(),
         egress_bytes: row
             .and_then(|r| r["egress_bytes"].as_u64())
+            .unwrap_or_default(),
+        workflow_steps: row
+            .and_then(|r| r["workflow_steps"].as_u64())
             .unwrap_or_default(),
         ..Default::default()
     };

@@ -46,6 +46,7 @@ const TIERS: Tier[] = [
       "Custom domains & DNS",
       "Build cache",
       "Cron & workflows",
+      "1,000 workflow steps / day",
     ],
     cta: { label: "Start free", href: "/sign-up" },
     variant: "outline",
@@ -65,6 +66,7 @@ const TIERS: Tier[] = [
       "Deployment protection and microfrontends",
       "30 days of log history",
       "Email support",
+      "100,000 workflow steps / day",
     ],
     cta: { label: "Start Pro", href: "/sign-up" },
     variant: "primary",
@@ -85,6 +87,7 @@ const TIERS: Tier[] = [
       "Deployment protection and microfrontends",
       "30 days of log history",
       "800s function runtime",
+      "1,000,000 workflow steps / day",
     ],
     cta: { label: "Start Business", href: "/sign-up" },
     variant: "outline",
@@ -97,6 +100,7 @@ const TIERS: Tier[] = [
     features: [
       "Everything in Business",
       "10,000 projects",
+      "10,000,000 workflow steps / day",
       "$1,000 of included compute / month",
       "Multi-region fail-over",
       "SAML SSO, SCIM and SIEM audit-log streaming",
@@ -117,6 +121,7 @@ const TIERS: Tier[] = [
     features: [
       "Everything in Enterprise",
       "Unlimited projects",
+      "Unlimited workflow steps / day",
       "Unlimited team members",
       "Unlimited sandboxes",
       "$5,000 of included compute / month",
@@ -148,6 +153,10 @@ const FAQS: { q: string; a: string }[] = [
   {
     q: "Can I bring my own domain?",
     a: "Yes. Custom domains and DNS are available on every plan, with automatic HTTPS for every verified domain once its DNS points at shadw.",
+  },
+  {
+    q: "How are workflow steps counted?",
+    a: "A workflow step is one step of a workflow run. Each plan caps the steps it will run per UTC day: 1,000 on Hobby, 100,000 on Pro, 1,000,000 on Business, 10,000,000 on Enterprise and unlimited on Enterprise Plus. Steps are metered at $1 per 100,000 steps on the usage rate card.",
   },
 ];
 
@@ -219,6 +228,9 @@ export default function PricingPage() {
             </div>
           ))}
         </div>
+        <p className="mx-auto mt-10 max-w-2xl text-center text-sm text-zinc-500">
+          Workflow steps: $1 per 100,000 steps on the metered rate card; each plan caps the steps it runs per day.
+        </p>
       </MarketingSection>
 
       <MarketingSection className="py-16">

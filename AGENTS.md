@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Present tense: what is true now; history in `CHANGELOG.md`. Past ~30 KB (`wc -c`), recompile from code,
-git log and memory: keep load-bearing, drop absorbed. Nested files load where you work:
+Present tense: what is true now; history in `CHANGELOG.md`. Past ~30 KB, recompile from code:
+keep load-bearing, drop absorbed. Nested:
 `ui/AGENTS.md`, `ui/components/landing/AGENTS.md`, `ansible/AGENTS.md` (ansible, `scripts/`).
 
 ## Process & verification
@@ -192,13 +192,14 @@ the ONLY seam: it does NOT authorize or fail the request —
 **the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD, not a prevention.
 It counts writes (`record_write`) even on refusal. A `db.write` outcome is a MEASUREMENT,
 not `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass `Ok(())`. An unattributed write is a
-REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`; store failure leaves NO entry. Docs:
-`docs/README.md`, `docs/contract-platform-seam.md`.
+REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`; unopenable log: NO entry; later
+persist fault: `persist_error`. Docs: `docs/contract-platform-seam.md`.
 - Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>` (a bare join is NOT injective). `entry_sig_preimage`
 folds `Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical());
 it cannot cover the ack, since `ack.log_head` IS that hash). No PINNED identity = Inadmissible, never Dishonest.
-A checkpoint close defers to the drain, not inline in `submit`; inline fallback fires past 1
-deferred close, and rebuild repair closes inline. Read EVERY segment a window's range touches.
+Checkpoint close normally defers to the drain; `submit` starts it, `wrote` awaits `submit`, not the
+close. `Store::append` closes inline past 1 deferred close; rebuild repair closes inline. Read EVERY
+segment a window spans.
 - **Vitra has no consensus**: honesty by REPLAY (`replicate.rs`, `audit.rs`), not agreement. Inclusion and
 append-only violation proofs exist; **NO bond or incentive model** (whitepaper §4.4 leaves it unspecified).
 Proofs show an entry WAS published, not freshness.

@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-11 - storage analytics and public pricing reference
+
+Committed locally on main, not pushed or deployed: managed-database metrics now carry real
+one-minute time-series buckets and bounded real request observations keyed by database id, and peer
+reads merge those series and events. The storage index gained quota cards backed by measured
+database and billing fields, plus a storage-wide dashboard with measured multi-series charts, a
+real per-database request event log and breakdowns. The project overview's dead analytics controls
+now link to a measured project analytics route and sparkline; project and top navigation carry the
+Analytics tab.
+
+The six Upstash pricing pages were fetched through gm's fetch verb and recorded in
+`docs/upstash-pricing-reference.md` as a public pricing reference, not as shadw prices. Workflow
+steps now join metering and tiering: a `workflow_steps_per_million` SKU on both the rate and cost
+cards (1000.0c / 250.0c, 7500 bps against a 6000 bps floor), a `WorkflowSteps` usage kind with a
+persisted `workflow_steps` row that replicates across the mesh, per-plan daily step caps of 1,000 /
+100,000 / 1,000,000 / 10,000,000 / unlimited, and a cap gate BEFORE each step executes in
+`wf_invoker` with exactly one measurement recorded afterwards. The plan caps are server-derived
+from the verified claim; untagged runs fail closed to the unattributed bucket. Charging stays off
+unless `HIVE_BILLING_METER_RESOURCES=1` and every SKU clears the margin floor. A new meter SKU also
+adopts the live counter as its baseline on the first tick, so restoring an older watermark cannot
+retroactively charge steps accumulated before the restore. No push or roll was made for this entry.
+
 ## 2026-11-10 - ops: attribution is dywongcloud, never lanmower
 
 The operator corrected the commit-identity rule: every commit is

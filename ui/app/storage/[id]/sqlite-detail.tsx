@@ -6,7 +6,8 @@ import { useRouter } from "next/navigation";
 import {
   ArrowLeft, Copy, Check, Trash2, Globe2, Users, Info, Rocket, Pencil, FileStack, KeyRound,
 } from "lucide-react";
-import { Card, Badge, Button, PageHeader } from "@/components/ui";
+import { Card, Badge, Button, Input, PageHeader } from "@/components/ui";
+import { DbQueryBuilder, type BrowserTable } from "@/components/db-query-builder";
 import {
   apiGet, apiSend, usePoll, mintBrowserDbRestToken,
   type Deployment, type ProjectSettings, type BrowserDbPolicy,
@@ -63,6 +64,37 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
   const rest = dbStatus && dbStatus.opted_in ? dbStatus.rest : null;
   const [minting, setMinting] = useState<"team" | "public" | null>(null);
   const [justMinted, setJustMinted] = useState<BrowserDbRestMint | null>(null);
+  const [replicaToken, setReplicaToken] = useState("");
+
+  /** The ONLY route this browser calls: POST /v1/browser-db/:project/sql, authenticated by the
+   *  project's own REST bearer (auth::is_open_route), never by the dashboard JWT. The token lives
+   *  in memory for this page only; a mint rotates it for every app, so the browser never mints. */
+  async function replicaQuery(input: string): Promise<BrowserTable> {
+    const token = (replicaToken.trim() || justMinted?.token || "").trim();
+    if (!token) throw new Error("Paste a team or public REST token to query this replica.");
+    const query = input.trim();
+    if (!/^(select|with)\b/i.test(query)) {
+      throw new Error("This browser runs read-only SELECT / WITH statements against the replica.");
+    }
+    const started = performance.now();
+    const r = await fetch("/cloud/v1/browser-db/" + encodeURIComponent(project) + "/sql", {
+      method: "POST",
+      headers: { "content-type": "application/json", Authorization: "Bearer " + token },
+      body: JSON.stringify({ query, params: [] }),
+    });
+    const text = await r.text();
+    if (!r.ok) throw new Error(text.trim() || ("SQL -> " + String(r.status)));
+    const reply = JSON.parse(text) as { fields?: { name: string }[]; rows?: Record<string, unknown>[] };
+    const columns = (reply.fields ?? []).map((f) => String(f.name));
+    const rows = (reply.rows ?? []).map((row) => columns.map((c) => row[c] ?? null));
+    return {
+      ok: true,
+      columns,
+      rows,
+      durationMs: Math.round(performance.now() - started),
+      op: query,
+    };
+  }
 
   async function mint(scope: "team" | "public") {
     setMinting(scope);
@@ -318,6 +350,43 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
         <h3 className="mb-3 text-sm font-semibold">Replication</h3>
         <BrowserDbStatusPanel project={db.project} />
       </Card>
+
+      <Card className="mt-4 min-w-0">
+        <div className="mb-2 flex min-w-0 flex-wrap items-center gap-2">
+          <KeyRound className="h-4 w-4 text-muted" aria-hidden />
+          <h3 className="min-w-0 break-words text-sm font-semibold">Replica data browser</h3>
+          <Badge tone="blue">token-gated REST</Badge>
+        </div>
+        <p className="min-w-0 break-words text-xs text-secondary">
+          Queries run on <code className="font-mono">POST /v1/browser-db/{project}/sql</code> with the project&apos;s
+          own REST bearer. The dashboard never stores that token: paste the team or public token minted above, or
+          use one minted in this session. Read-only SELECT / WITH only.
+        </p>
+        <div className="mt-3 flex min-w-0 flex-wrap items-center gap-2">
+          <Input
+            type="password"
+            aria-label="Browser database REST token"
+            placeholder="Paste REST token (memory only)"
+            value={replicaToken}
+            onChange={(e) => setReplicaToken(e.target.value)}
+            className="min-h-[44px] min-w-0 max-w-xs flex-1"
+          />
+          <Button variant="outline" onClick={() => setReplicaToken("")} disabled={!replicaToken} className="min-h-[44px]">Clear</Button>
+        </div>
+      </Card>
+
+      <div className="mt-4 min-w-0">
+        <DbQueryBuilder
+          kind="browser_sqlite"
+          title="Replica data browser"
+          hint="SELECT * FROM table_name LIMIT 50"
+          capabilities={{ write: false, destructive: false, note: "Read-only replica queries; the REST route binds parameters server-side." }}
+          mayRun
+          mayDestructive={false}
+          tables={db.policy.schema.map((t) => t.name)}
+          runCommand={replicaQuery}
+        />
+      </div>
 
       {editing && (
         <BrowserDbConfigModal

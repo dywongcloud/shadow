@@ -1,8 +1,8 @@
 //! Per-tenant RESOURCE usage metering — a NODE-LOCAL cumulative counter sidecar.
 //!
-//! This is the `browser_metering.rs` precedent applied to the five billable resource
+//! This is the `browser_metering.rs` precedent applied to the six billable resource
 //! dimensions: `db_row_ops`, `db_storage_byte_ms`, `object_storage_byte_ms`,
-//! `ingress_bytes`, `egress_bytes`. It is MEASUREMENT ONLY: it never charges, never writes a
+//! `ingress_bytes`, `egress_bytes`, `workflow_steps`. It is MEASUREMENT ONLY: it never charges, never writes a
 //! ledger, and never runs on a request path. A single background task on the `bulkhead`
 //! runtime samples the existing counter/byte boundaries and a debounced saver persists the
 //! cumulative rows to `$HIVE_DATA/usage_metering.json`.
@@ -57,6 +57,8 @@ const METER_FILE: &str = "usage_metering.json";
 const FORMAT_VERSION: u32 = 1;
 /// A corrupt sidecar must never become an OOM at boot.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// UTC-day length in ms for the WORKFLOW step cap window (a stated assumption).
+const WORKFLOW_DAY_MS: u64 = 86_400_000;
 /// Bytes whose tenant cannot be resolved from a server-derived record: never guessed, never
 /// silently dropped, NEVER billed.
 pub const UNATTRIBUTED: &str = "_unattributed";
@@ -83,11 +85,14 @@ pub struct TenantUsage {
     pub object_storage_byte_ms: u64,
     pub ingress_bytes: u64,
     pub egress_bytes: u64,
+    /// WORKFLOW steps that actually executed, cumulative. serde(default) on the
+    /// whole struct keeps pre-workflow persisted rows loading as honest zeros.
+    pub workflow_steps: u64,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
 }
 
-/// The five measurable dimensions. `record` is the ONLY writer; each kind maps to exactly one
+/// The six measurable dimensions. `record` is the ONLY writer; each kind maps to exactly one
 /// field so two kinds can never race onto the same counter.
 #[derive(Clone, Copy, Debug)]
 pub enum UsageKind {
@@ -96,11 +101,17 @@ pub enum UsageKind {
     ObjectStorageByteMs,
     IngressBytes,
     EgressBytes,
+    WorkflowSteps,
 }
 
 #[derive(Default)]
 struct MeterState {
     tenants: BTreeMap<String, TenantUsage>,
+    /// Bounded, node-local per-UTC-day WORKFLOW step window for the plan cap.
+    /// Keyed by (tenant, UTC day number); pruned to the current day on each
+    /// admission, so a long-lived node holds at most one bucket per tenant that
+    /// ran a step today. NOT persisted: a restart re-baselines the window.
+    workflow_day: HashMap<(String, u64), u64>,
     dirty: bool,
 }
 
@@ -162,12 +173,48 @@ pub fn record(tenant: &str, kind: UsageKind, delta: u64) {
         }
         UsageKind::IngressBytes => row.ingress_bytes = row.ingress_bytes.saturating_add(delta),
         UsageKind::EgressBytes => row.egress_bytes = row.egress_bytes.saturating_add(delta),
+        UsageKind::WorkflowSteps => row.workflow_steps = row.workflow_steps.saturating_add(delta),
     }
     if row.first_seen_ms == 0 {
         row.first_seen_ms = now;
     }
     row.last_seen_ms = now;
     state.dirty = true;
+}
+
+/// Atomically RESERVE one WORKFLOW step against a tenant's per-UTC-day cap.
+/// `cap == 0` is unlimited. Returns false (reserving nothing) once the cap is
+/// reached, so the caller REFUSES before executing. The window is a stated
+/// assumption: node-local, UTC-midnight to UTC-midnight, bounded to today's
+/// buckets. This gate never writes a tenant row: measurement of an executed
+/// step is a separate `record` call at the ONE step-execution site, so `record`
+/// stays the single meter writer.
+pub fn workflow_step_admitted(tenant: &str, cap: u64) -> bool {
+    let now = hive_core::now_ms();
+    let day = now / WORKFLOW_DAY_MS;
+    let key = resolve_tenant(tenant).to_string();
+    let mut state = meter().inner.lock();
+    state.workflow_day.retain(|(_, d), _| *d == day);
+    let used = state
+        .workflow_day
+        .get(&(key.clone(), day))
+        .copied()
+        .unwrap_or(0);
+    if cap > 0 && used >= cap {
+        return false;
+    }
+    let bucket = state.workflow_day.entry((key, day)).or_insert(0);
+    *bucket = bucket.saturating_add(1);
+    true
+}
+
+/// The server-derived tenant for a WORKFLOW step: `resolve_tenant` maps an
+/// empty, untagged or unattributed input to UNATTRIBUTED rather than guessing.
+pub fn workflow_step_tenant(tenant: &str) -> &str {
+    if tenant.trim() == crate::admin::ANON_TENANT {
+        return UNATTRIBUTED;
+    }
+    resolve_tenant(tenant)
 }
 
 /// This node's own cumulative rows.
@@ -194,7 +241,7 @@ pub fn mesh_local() -> Vec<u8> {
     serde_json::to_vec(&local_view()).unwrap_or_default()
 }
 
-/// Tenant rows as a stable, bytes-descending JSON array (all five dimensions plus the
+/// Tenant rows as a stable, bytes-descending JSON array (all six dimensions plus the
 /// first/last observation timestamps).
 fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
     let mut rows: Vec<Value> = tenants
@@ -205,7 +252,8 @@ fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
                 .saturating_add(u.db_storage_byte_ms)
                 .saturating_add(u.object_storage_byte_ms)
                 .saturating_add(u.ingress_bytes)
-                .saturating_add(u.egress_bytes);
+                .saturating_add(u.egress_bytes)
+                .saturating_add(u.workflow_steps);
             json!({
                 "tenant": tenant,
                 "db_row_ops": u.db_row_ops,
@@ -213,6 +261,7 @@ fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
                 "object_storage_byte_ms": u.object_storage_byte_ms,
                 "ingress_bytes": u.ingress_bytes,
                 "egress_bytes": u.egress_bytes,
+                "workflow_steps": u.workflow_steps,
                 "first_seen_ms": u.first_seen_ms,
                 "last_seen_ms": u.last_seen_ms,
                 "_total": total,
@@ -314,6 +363,9 @@ fn merge_rows(fleet: &mut BTreeMap<String, TenantUsage>, view: &Value) {
         merged.egress_bytes = merged
             .egress_bytes
             .saturating_add(row["egress_bytes"].as_u64().unwrap_or_default());
+        merged.workflow_steps = merged
+            .workflow_steps
+            .saturating_add(row["workflow_steps"].as_u64().unwrap_or_default());
         let first = row["first_seen_ms"].as_u64().unwrap_or_default();
         if first > 0 && (merged.first_seen_ms == 0 || first < merged.first_seen_ms) {
             merged.first_seen_ms = first;
@@ -451,7 +503,9 @@ fn bounded_dt_ms(from_ms: u64, now_ms: u64) -> u64 {
 
 /// Samples the EXISTING boundaries. Measurement only: no charge, no ledger, no mutation of
 /// platform state, and it runs on the bulkhead runtime so a slow SQL gauge or a directory
-/// walk can never stall a serving tokio worker.
+/// walk can never stall a serving tokio worker. WORKFLOW steps are NOT sampled here:
+/// they are discrete events recorded at the ONE step-execution site (main.rs::wf_invoker)
+/// through this same `record` writer, so this sampler invents no second writer for them.
 async fn sample_once(cloud: &Arc<CloudState>, state: &mut SampleState) {
     let now = hive_core::now_ms();
     let dt = bounded_dt_ms(state.last_sample_ms, now);

@@ -43,7 +43,7 @@ use crate::state::CloudState;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -77,6 +77,344 @@ impl ErrorClass {
             ErrorClass::Denied => "denied",
         }
     }
+}
+
+// One-minute buckets, kept for the last 180 minutes; the request log keeps the last 200 real
+// request observations. Both are node-local and deliberately not persisted, so a restarted node
+// reports an honest short history rather than a stale sum it cannot attribute.
+const SERIES_BUCKET_MS: u64 = 60_000;
+const SERIES_WINDOW_BUCKETS: usize = 180;
+const SERIES_WINDOW_MINUTES: u64 = SERIES_WINDOW_BUCKETS as u64;
+const SERIES_WINDOW_MS: u64 = SERIES_BUCKET_MS * SERIES_WINDOW_MINUTES;
+const EVENT_LIMIT: usize = 200;
+const MAX_METRIC_DB_IDS: usize = 4096;
+const METRIC_DB_IDLE_PRUNE_MS: u64 = 24 * 60 * 60 * 1000;
+const MAX_SERIES_SOURCES: usize = 64;
+const MAX_NODE_NAME_CHARS: usize = 128;
+const MAX_EVENT_ERROR_CHARS: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+struct BucketDelta {
+    requests: u64,
+    errors: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    latency_sum_ms: u64,
+    latency_max_ms: u64,
+}
+
+#[derive(Clone, Default)]
+struct Bucket {
+    t_ms: u64,
+    requests: u64,
+    errors: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    latency_sum_ms: u64,
+    latency_max_ms: u64,
+}
+
+impl Bucket {
+    fn fold(&mut self, d: BucketDelta) {
+        self.requests = self.requests.saturating_add(d.requests);
+        self.errors = self.errors.saturating_add(d.errors);
+        self.bytes_in = self.bytes_in.saturating_add(d.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(d.bytes_out);
+        self.latency_sum_ms = self.latency_sum_ms.saturating_add(d.latency_sum_ms);
+        self.latency_max_ms = self.latency_max_ms.max(d.latency_max_ms);
+    }
+
+    fn merge(&mut self, other: &Bucket) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.errors = self.errors.saturating_add(other.errors);
+        self.bytes_in = self.bytes_in.saturating_add(other.bytes_in);
+        self.bytes_out = self.bytes_out.saturating_add(other.bytes_out);
+        self.latency_sum_ms = self.latency_sum_ms.saturating_add(other.latency_sum_ms);
+        self.latency_max_ms = self.latency_max_ms.max(other.latency_max_ms);
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "t_ms": self.t_ms,
+            "requests": self.requests,
+            "errors": self.errors,
+            "bytes_in": self.bytes_in,
+            "bytes_out": self.bytes_out,
+            "latency_sum_ms": self.latency_sum_ms,
+            "latency_max_ms": self.latency_max_ms,
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+struct Event {
+    t_ms: u64,
+    ok: bool,
+    latency_ms: u64,
+    bytes_in: u64,
+    bytes_out: u64,
+    error: String,
+}
+
+impl Event {
+    fn json(&self) -> Value {
+        json!({
+            "t_ms": self.t_ms,
+            "ok": self.ok,
+            "latency_ms": self.latency_ms,
+            "bytes_in": self.bytes_in,
+            "bytes_out": self.bytes_out,
+            "error": self.error,
+        })
+    }
+}
+
+struct History {
+    last_ms: u64,
+    series: VecDeque<Bucket>,
+    events: VecDeque<Event>,
+}
+
+impl History {
+    fn new() -> Self {
+        Self {
+            last_ms: 0,
+            series: VecDeque::with_capacity(SERIES_WINDOW_BUCKETS),
+            events: VecDeque::with_capacity(EVENT_LIMIT),
+        }
+    }
+}
+
+fn bucket_start(now: u64) -> u64 {
+    now - (now % SERIES_BUCKET_MS)
+}
+
+fn series_oldest_bucket_start(now: u64) -> u64 {
+    bucket_start(now).saturating_sub(SERIES_WINDOW_MS - SERIES_BUCKET_MS)
+}
+
+fn bounded_text(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+fn counters_from_json(v: &Value) -> Counters {
+    Counters {
+        requests: u64_field(v, "requests"),
+        errors: u64_field(v, "errors"),
+        bytes_in: u64_field(v, "bytes_in"),
+        bytes_out: u64_field(v, "bytes_out"),
+        last_ms: u64_field(v, "last_ms"),
+        last_latency_ms: u64_field(v, "last_latency_ms"),
+        last_error_ms: u64_field(v, "last_error_ms"),
+        last_error: bounded_text(
+            v.get("last_error").and_then(|x| x.as_str()).unwrap_or_default(),
+            MAX_EVENT_ERROR_CHARS,
+        ),
+    }
+}
+
+fn u64_field(v: &Value, key: &str) -> u64 {
+    v.get(key).and_then(|x| x.as_u64()).unwrap_or(0)
+}
+
+fn bucket_from_json(v: &Value) -> Option<Bucket> {
+    let t_ms = v.get("t_ms")?.as_u64()?;
+    Some(Bucket {
+        t_ms,
+        requests: u64_field(v, "requests"),
+        errors: u64_field(v, "errors"),
+        bytes_in: u64_field(v, "bytes_in"),
+        bytes_out: u64_field(v, "bytes_out"),
+        latency_sum_ms: u64_field(v, "latency_sum_ms"),
+        latency_max_ms: u64_field(v, "latency_max_ms"),
+    })
+}
+
+/// A peer payload is untrusted: only the six fixed ErrorClass labels cross the wire. An unknown
+/// label is dropped rather than echoed, so engine text or a DSN fragment can never reach a
+/// dashboard through a merged event.
+fn safe_error_class(s: &str) -> &str {
+    match s {
+        "engine_unreachable" | "bad_request" | "query_error" | "timeout" | "denied" => s,
+        _ => "",
+    }
+}
+
+fn event_from_json(v: &Value) -> Option<Event> {
+    let t_ms = v.get("t_ms")?.as_u64()?;
+    Some(Event {
+        t_ms,
+        ok: v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false),
+        latency_ms: u64_field(v, "latency_ms"),
+        bytes_in: u64_field(v, "bytes_in"),
+        bytes_out: u64_field(v, "bytes_out"),
+        error: safe_error_class(v.get("error").and_then(|x| x.as_str()).unwrap_or_default())
+            .to_string(),
+    })
+}
+
+fn histories() -> &'static Mutex<HashMap<String, History>> {
+    static H: OnceLock<Mutex<HashMap<String, History>>> = OnceLock::new();
+    H.get_or_init(Default::default)
+}
+
+fn prune_series(h: &mut History, now: u64) {
+    let oldest = series_oldest_bucket_start(now);
+    while matches!(h.series.front(), Some(b) if b.t_ms < oldest) {
+        h.series.pop_front();
+    }
+    while h.series.len() > SERIES_WINDOW_BUCKETS {
+        h.series.pop_front();
+    }
+}
+
+fn prune_history_map(m: &mut HashMap<String, History>, now: u64) {
+    if m.len() > MAX_METRIC_DB_IDS {
+        m.retain(|_, v| now.saturating_sub(v.last_ms) < METRIC_DB_IDLE_PRUNE_MS);
+    }
+}
+
+fn fold_observation(db_id: &str, now: u64, delta: BucketDelta, event: Option<Event>) {
+    if db_id.is_empty() {
+        return;
+    }
+    let mut m = histories().lock();
+    {
+        let h = m.entry(db_id.to_string()).or_insert_with(History::new);
+        h.last_ms = h.last_ms.max(now);
+        prune_series(h, now);
+        let t_ms = bucket_start(now);
+        let oldest = series_oldest_bucket_start(now);
+        if t_ms >= oldest {
+            let mut bucket = Bucket {
+                t_ms,
+                ..Default::default()
+            };
+            bucket.fold(delta);
+            if let Some(i) = h.series.iter().position(|b| b.t_ms == t_ms) {
+                if let Some(existing) = h.series.get_mut(i) {
+                    existing.merge(&bucket);
+                }
+            } else if h.series.back().map_or(true, |b| b.t_ms < t_ms) {
+                h.series.push_back(bucket);
+            } else if h.series.front().map_or(true, |b| b.t_ms > t_ms) {
+                h.series.push_front(bucket);
+            } else if let Some(i) = h.series.iter().position(|b| b.t_ms > t_ms) {
+                h.series.insert(i, bucket);
+            }
+            prune_series(h, now);
+        }
+        if let Some(event) = event {
+            h.events.push_back(event);
+            while h.events.len() > EVENT_LIMIT {
+                h.events.pop_front();
+            }
+        }
+    }
+    prune_history_map(&mut m, now);
+}
+
+fn history_snapshot(db_id: &str) -> (Vec<Bucket>, Vec<Event>) {
+    if db_id.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let now = hive_core::now_ms();
+    let mut m = histories().lock();
+    let Some(h) = m.get_mut(db_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    prune_series(h, now);
+    let mut series = Vec::with_capacity(SERIES_WINDOW_BUCKETS);
+    series.extend(h.series.iter().cloned());
+    let mut events = Vec::with_capacity(EVENT_LIMIT);
+    events.extend(h.events.iter().rev().cloned());
+    (series, events)
+}
+
+fn add_series_source(base: &mut Value, node: &str) {
+    let Some(obj) = base.as_object_mut() else {
+        return;
+    };
+    let mut names = Vec::with_capacity(MAX_SERIES_SOURCES);
+    if let Some(rows) = obj.get("series_sources").and_then(|v| v.as_array()) {
+        for row in rows.iter().take(MAX_SERIES_SOURCES) {
+            if let Some(s) = row.as_str() {
+                let name = bounded_text(s, MAX_NODE_NAME_CHARS);
+                if !names.iter().any(|n| n == &name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    let name = bounded_text(node, MAX_NODE_NAME_CHARS);
+    if !names.iter().any(|n| n == &name) {
+        names.push(name);
+    }
+    names.truncate(MAX_SERIES_SOURCES);
+    obj.insert("series_sources".into(), json!(names));
+}
+
+fn merge_series(base: &mut Value, peer: &Value) {
+    let Some(peer_rows) = peer.get("series").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let Some(obj) = base.as_object_mut() else {
+        return;
+    };
+    let mut merged: BTreeMap<u64, Bucket> = BTreeMap::new();
+    if let Some(base_rows) = obj.get("series").and_then(|v| v.as_array()) {
+        for row in base_rows.iter().rev().take(SERIES_WINDOW_BUCKETS) {
+            if let Some(b) = bucket_from_json(row) {
+                merged
+                    .entry(b.t_ms)
+                    .and_modify(|existing| existing.merge(&b))
+                    .or_insert(b);
+            }
+        }
+    }
+    for row in peer_rows.iter().rev().take(SERIES_WINDOW_BUCKETS) {
+        if let Some(b) = bucket_from_json(row) {
+            merged
+                .entry(b.t_ms)
+                .and_modify(|existing| existing.merge(&b))
+                .or_insert(b);
+        }
+    }
+    let oldest = series_oldest_bucket_start(hive_core::now_ms());
+    let mut rows = Vec::with_capacity(SERIES_WINDOW_BUCKETS);
+    for (_, b) in merged.range(oldest..).rev().take(SERIES_WINDOW_BUCKETS) {
+        rows.push(b.json());
+    }
+    rows.reverse();
+    obj.insert("series".into(), Value::Array(rows));
+}
+
+fn merge_events(base: &mut Value, peer: &Value) {
+    let Some(peer_rows) = peer.get("events").and_then(|v| v.as_array()) else {
+        return;
+    };
+    let Some(obj) = base.as_object_mut() else {
+        return;
+    };
+    let mut merged: Vec<Event> = Vec::with_capacity(EVENT_LIMIT * 2);
+    if let Some(base_rows) = obj.get("events").and_then(|v| v.as_array()) {
+        for row in base_rows.iter().take(EVENT_LIMIT) {
+            if let Some(e) = event_from_json(row) {
+                merged.push(e);
+            }
+        }
+    }
+    for row in peer_rows.iter().take(EVENT_LIMIT) {
+        if let Some(e) = event_from_json(row) {
+            merged.push(e);
+        }
+    }
+    merged.sort_by(|a, b| b.t_ms.cmp(&a.t_ms));
+    merged.truncate(EVENT_LIMIT);
+    obj.insert(
+        "events".into(),
+        Value::Array(merged.iter().map(|e| e.json()).collect()),
+    );
 }
 
 /// Per-instance request counters. Accumulated on the node that SERVED the request, which for the
@@ -157,23 +495,49 @@ pub fn record(
         return;
     }
     let now = hive_core::now_ms();
-    let mut m = counters().lock();
-    let c = m.entry(db_id.to_string()).or_default();
-    c.requests = c.requests.saturating_add(1);
-    c.bytes_in = c.bytes_in.saturating_add(bytes_in);
-    c.bytes_out = c.bytes_out.saturating_add(bytes_out);
-    c.last_ms = now;
-    c.last_latency_ms = latency_ms;
-    if !ok {
-        c.errors = c.errors.saturating_add(1);
-        c.last_error_ms = now;
-        c.last_error = err.label().to_string();
+    {
+        let mut m = counters().lock();
+        let c = m.entry(db_id.to_string()).or_default();
+        c.requests = c.requests.saturating_add(1);
+        c.bytes_in = c.bytes_in.saturating_add(bytes_in);
+        c.bytes_out = c.bytes_out.saturating_add(bytes_out);
+        c.last_ms = now;
+        c.last_latency_ms = latency_ms;
+        if !ok {
+            c.errors = c.errors.saturating_add(1);
+            c.last_error_ms = now;
+            c.last_error = err.label().to_string();
+        }
+        // Bound the map: a deleted database's counters are never read again, and an unbounded
+        // id-keyed map on a request path is a slow leak.
+        if m.len() > MAX_METRIC_DB_IDS {
+            m.retain(|_, v| now.saturating_sub(v.last_ms) < METRIC_DB_IDLE_PRUNE_MS);
+        }
     }
-    // Bound the map: a deleted database's counters are never read again, and an unbounded
-    // id-keyed map on a request path is a slow leak.
-    if m.len() > 4096 {
-        m.retain(|_, v| now.saturating_sub(v.last_ms) < 24 * 60 * 60 * 1000);
-    }
+    fold_observation(
+        db_id,
+        now,
+        BucketDelta {
+            requests: 1,
+            errors: if ok { 0 } else { 1 },
+            bytes_in,
+            bytes_out,
+            latency_sum_ms: latency_ms,
+            latency_max_ms: latency_ms,
+        },
+        Some(Event {
+            t_ms: now,
+            ok,
+            latency_ms,
+            bytes_in,
+            bytes_out,
+            error: if ok {
+                String::new()
+            } else {
+                err.label().to_string()
+            },
+        }),
+    );
 }
 
 /// Adds REAL data-plane bytes to ONE instance's counters. Deliberately BYTE-ONLY: `requests`
@@ -185,15 +549,28 @@ pub fn record_bytes(db_id: &str, bytes_in: u64, bytes_out: u64) {
         return;
     }
     let now = hive_core::now_ms();
-    let mut m = counters().lock();
-    let c = m.entry(db_id.to_string()).or_default();
-    c.bytes_in = c.bytes_in.saturating_add(bytes_in);
-    c.bytes_out = c.bytes_out.saturating_add(bytes_out);
-    c.last_ms = now;
-    // The SAME bound as `record`: a deleted database's counters are never read again.
-    if m.len() > 4096 {
-        m.retain(|_, v| now.saturating_sub(v.last_ms) < 24 * 60 * 60 * 1000);
+    {
+        let mut m = counters().lock();
+        let c = m.entry(db_id.to_string()).or_default();
+        c.bytes_in = c.bytes_in.saturating_add(bytes_in);
+        c.bytes_out = c.bytes_out.saturating_add(bytes_out);
+        c.last_ms = now;
+        // The SAME bound as record: a deleted database's counters are never read again.
+        if m.len() > MAX_METRIC_DB_IDS {
+            m.retain(|_, v| now.saturating_sub(v.last_ms) < METRIC_DB_IDLE_PRUNE_MS);
+        }
     }
+    // A wire pump is byte-only: it is not a row op, so it never adds a request or a latency sample.
+    fold_observation(
+        db_id,
+        now,
+        BucketDelta {
+            bytes_in,
+            bytes_out,
+            ..Default::default()
+        },
+        None,
+    );
 }
 
 /// ONE session's byte counters, shared by both splice directions (or the REST front door and
@@ -327,7 +704,11 @@ async fn kind_stats(cloud: &Arc<CloudState>, db: &Database) -> Result<Option<Val
                 Err(_) => return Ok(None),
             };
             let dbname = g("database");
-            let dbname = if dbname.is_empty() { "postgres" } else { &dbname };
+            let dbname = if dbname.is_empty() {
+                "postgres"
+            } else {
+                &dbname
+            };
             match crate::db_rest::postgres_engine_stats(port, &g("user"), &g("password"), dbname)
                 .await
             {
@@ -493,9 +874,7 @@ pub async fn local_payload(cloud: &Arc<CloudState>, db: &Database) -> Value {
                 "hosted on {}; read it there or drop ?local=true to proxy",
                 db.host_node
             ),
-            Reach::Simulated => {
-                "simulated mode: no backing engine exists to measure".to_string()
-            }
+            Reach::Simulated => "simulated mode: no backing engine exists to measure".to_string(),
             _ => String::new(),
         });
     }
@@ -509,6 +888,7 @@ fn payload(
     stats: Option<Value>,
     note: Option<String>,
 ) -> Value {
+    let (series, events) = history_snapshot(&db.id);
     json!({
         "db_id": db.id,
         "name": db.name,
@@ -524,6 +904,11 @@ fn payload(
         "stats": stats,
         "note": note.unwrap_or_default(),
         "counters": counters_for(&db.id).json(),
+        "series": Value::Array(series.iter().map(|b| b.json()).collect()),
+        "granularity_ms": SERIES_BUCKET_MS,
+        "window_minutes": SERIES_WINDOW_MINUTES,
+        "series_sources": json!([cloud.node_name.clone()]),
+        "events": Value::Array(events.iter().map(|e| e.json()).collect()),
     })
 }
 
@@ -536,6 +921,17 @@ pub fn merge_peer(db_id: &str, base: &mut Value, peer: &Value, sources: &mut Vec
     };
     if !sources.iter().any(|s| s == node) {
         sources.push(node.to_string());
+    }
+    let has_series = peer.get("series").and_then(|v| v.as_array()).is_some();
+    let has_events = peer.get("events").and_then(|v| v.as_array()).is_some();
+    // Only a peer that actually sent buckets is a series source. A mixed-version peer can send
+    // `events` without `series`; naming it as a source would claim buckets it never contributed.
+    if has_series {
+        add_series_source(base, node);
+    }
+    if has_series || has_events {
+        merge_series(base, peer);
+        merge_events(base, peer);
     }
     // A peer that could not measure anything contributes nothing to the gauges; its counters still
     // count, because a request served there really happened.
@@ -564,7 +960,12 @@ pub fn merge_peer(db_id: &str, base: &mut Value, peer: &Value, sources: &mut Vec
         }
     }
     if let Some(pc) = peer.get("counters").and_then(|c| c.as_object()) {
-        let mut mine = counters_for(db_id);
+        // Accumulate from the BASE counters (local + every peer merged so far). Rebuilding from
+        // this node's counters on each call dropped every earlier peer when several peers reply.
+        let mut mine = base
+            .get("counters")
+            .map(counters_from_json)
+            .unwrap_or_else(|| counters_for(db_id));
         mine.merge(&Counters {
             requests: pc.get("requests").and_then(|v| v.as_u64()).unwrap_or(0),
             errors: pc.get("errors").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -575,12 +976,16 @@ pub fn merge_peer(db_id: &str, base: &mut Value, peer: &Value, sources: &mut Vec
                 .get("last_latency_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
-            last_error_ms: pc.get("last_error_ms").and_then(|v| v.as_u64()).unwrap_or(0),
-            last_error: pc
-                .get("last_error")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
+            last_error_ms: pc
+                .get("last_error_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            last_error: bounded_text(
+                pc.get("last_error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default(),
+                MAX_EVENT_ERROR_CHARS,
+            ),
         });
         if let Some(bc) = base.get_mut("counters").and_then(|c| c.as_object_mut()) {
             for (k, v) in mine.json().as_object().cloned().unwrap_or_default() {

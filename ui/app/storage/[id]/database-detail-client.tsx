@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check, Info } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
-import { apiGet, apiSend, usePoll, useCan, type Database } from "@/lib/api";
+import { apiGet, apiSend, usePoll, useCan, type Database, type DbInstanceMetrics } from "@/lib/api";
 import { roleHint } from "@/lib/team-role";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
@@ -16,8 +16,21 @@ import {
 } from "../db-model";
 import { SqliteDatabaseDetail } from "./sqlite-detail";
 import { DbConsole } from "./db-console";
-import { InstanceMetrics } from "./instance-metrics";
+import { InstanceMetrics, INSTANCE_METRICS_POLL_MS } from "./instance-metrics";
 import { DatabaseEvents } from "./database-events";
+import { DbChartGrid, DB_PALETTE_CSS } from "@/components/db-chart";
+import { DbLogTable } from "@/components/db-log-table";
+import { DbRouting } from "@/components/db-routing";
+import { DbQuotaCards } from "@/components/db-quota-cards";
+
+const OBSERVE_TABS = [
+  { id: "overview", label: "Overview" },
+  { id: "charts", label: "Charts" },
+  { id: "routing", label: "Routing" },
+  { id: "requests", label: "Requests" },
+  { id: "events", label: "Platform events" },
+] as const;
+type ObserveTab = (typeof OBSERVE_TABS)[number]["id"];
 
 type StudioOpenResponse = {
   action: string;
@@ -48,7 +61,14 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
   const [openingStudio, setOpeningStudio] = useState(false);
-  const [observeTab, setObserveTab] = useState<"metrics" | "events">("metrics");
+  /** ONE metrics poll for every observability panel. The gauges, charts, routing table, quota
+   *  cards and request log all read this same response, so no two panels can disagree about a
+   *  counter. Newer nodes add `series`/`events`; older nodes answer without them. */
+  const { data: metrics, error: metricsError, refresh: refreshMetrics } = usePoll<DbInstanceMetrics>(
+    `/v1/databases/${id}/metrics`,
+    INSTANCE_METRICS_POLL_MS,
+  );
+  const [observeTab, setObserveTab] = useState<ObserveTab>("overview");
   const mayDestroy = useCan()("database.destroy");
 
   /** The UNMASKED credentials from the tenant-scoped `/credentials` endpoint (the list/detail poll masks url/password/token/secret keys), cached so a
@@ -223,37 +243,54 @@ function ManagedDatabaseDetail({ id }: { id: string }) {
         <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)}` : "unknown"} />
       </div>
 
-      <div className="mb-4 min-w-0">
+      <section className="hive-db-observe mb-4 min-w-0 w-full max-w-full" aria-label="Database observability">
+        <style>{DB_PALETTE_CSS}</style>
         <div role="tablist" aria-label="Database observability" className="no-scrollbar -mb-px mb-3 flex min-w-0 items-center gap-1 overflow-x-auto border-b border-border">
-          {(["metrics", "events"] as const).map((t) => (
+          {OBSERVE_TABS.map((t) => (
             <button
-              key={t}
+              key={t.id}
               type="button"
               role="tab"
-              aria-selected={observeTab === t}
-              onClick={() => setObserveTab(t)}
-              className={`shrink-0 whitespace-nowrap border-b-2 px-3 pb-2 pt-1 text-sm transition-colors ${
-                observeTab === t ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
+              id={`observe-tab-${t.id}`}
+              aria-selected={observeTab === t.id}
+              aria-controls={`observe-panel-${t.id}`}
+              onClick={() => setObserveTab(t.id)}
+              className={`min-h-[44px] shrink-0 whitespace-nowrap border-b-2 px-3 text-sm transition-colors ${
+                observeTab === t.id ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
               }`}
             >
-              {t === "metrics" ? "Metrics" : "Related events"}
+              {t.label}
             </button>
           ))}
         </div>
-        <div role="tabpanel" className="min-w-0">
-          {observeTab === "metrics" ? (
-            db.status === "ready" ? (
-              <InstanceMetrics db={db} />
-            ) : (
-              <Card className="min-w-0 text-sm text-secondary">
-                Instance metrics are available once this database is ready (currently {db.status}).
-              </Card>
-            )
+        <div
+          role="tabpanel"
+          id={`observe-panel-${observeTab}`}
+          aria-labelledby={`observe-tab-${observeTab}`}
+          className="flex min-w-0 w-full max-w-full flex-col gap-4"
+        >
+          {observeTab === "overview" ? (
+            <>
+              <DbQuotaCards data={metrics} />
+              {db.status === "ready" ? (
+                <InstanceMetrics data={metrics} error={metricsError} />
+              ) : (
+                <Card className="min-w-0 text-sm text-secondary">
+                  Instance gauges are available once this database is ready (currently {db.status}).
+                </Card>
+              )}
+            </>
+          ) : observeTab === "charts" ? (
+            <DbChartGrid data={metrics} error={metricsError} onRefresh={refreshMetrics} />
+          ) : observeTab === "routing" ? (
+            <DbRouting data={metrics} error={metricsError} />
+          ) : observeTab === "requests" ? (
+            <DbLogTable events={metrics?.events} available={metrics !== null} error={metricsError} />
           ) : (
             <DatabaseEvents dbId={db.id} />
           )}
         </div>
-      </div>
+      </section>
 
       {db.mode === "simulated" && (
         <Card className="mb-4 border-amber-500/40 bg-amber-500/5 text-sm">
