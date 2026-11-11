@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-11 - mobile navbar: restore team switcher, remove sections dropdown
+
+The phone layout hid the team/org switcher behind `hidden ... sm:flex`, leaving no way to change
+teams on a phone, and added an "All N sections" `<details>` dropdown to the navbar. The switcher is
+now visible at every width: on phones it is a compact 44px avatar/chevron button with an accessible
+name, and its menu is pinned inside the viewport below the header. On wider screens the label and
+plan badge return and the menu anchors to the button. The dropdown is gone; the horizontally
+scrolling section tab bar remains the one section navigation on phones.
+
+Witnessed headfully at 320px on /storage: viewport 320, scrollWidth 320 (no horizontal scroll),
+one switcher button at [70,4,43,44], no "All 14 sections" text, picker opens at [7,55,307,224],
+and switching to an organization updates the active avatar. Source-only tsc and lint both exit 0.
+
+No push or roll was made for this entry.
 ## 2026-11-11 - storage analytics and public pricing reference
 
 Committed locally on main, not pushed or deployed: managed-database metrics now carry real

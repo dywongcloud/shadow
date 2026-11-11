@@ -107,7 +107,7 @@ export function TopNav() {
         <div className="flex min-w-0 flex-1 items-center gap-2 text-sm">
           <Link href="/" className="flex shrink-0 items-center"><Logo className="h-5 w-auto" /></Link>
           <Slash />
-          <div className="hidden min-w-0 sm:flex">
+          <div className="flex shrink-0 items-center">
             <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
           </div>
           {projectSeg && (
@@ -171,16 +171,6 @@ export function TopNav() {
         </div>
       </div>
       <div className="mx-auto min-w-0 max-w-[1400px] px-2 sm:px-4">
-        <details className="border-b border-border px-1 py-1 text-xs text-secondary sm:hidden">
-          <summary aria-label="All platform sections" className="tap-44 cursor-pointer py-1 font-medium">All {teamTabs.length} sections</summary>
-          <div className="flex flex-wrap gap-1 pb-1">
-            {teamTabs.map((t) => (
-              <Link key={t.href} href={t.href} className="rounded-md border border-border px-2 py-1 hover:bg-subtle hover:text-fg">
-                {t.label}
-              </Link>
-            ))}
-          </div>
-        </details>
         <Suspense fallback={<div className="h-[38px]" />}>
           <SectionTabs isActive={isActive} />
         </Suspense>
@@ -403,7 +393,13 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
 
   return (
     <div className="relative" ref={ref}>
-      <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-subtle">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        aria-label={`Switch team or organization (${label})`}
+        aria-expanded={open}
+        title={`Switch team or organization - ${label}`}
+        className="tap-44 flex min-h-[44px] items-center gap-1.5 rounded-md px-1 py-1 hover:bg-subtle sm:gap-2 sm:px-1.5"
+      >
         {labelImg ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={labelImg} alt="" loading="lazy" decoding="async" width={24} height={24} className={cn("h-6 w-6 object-cover", isPersonal ? "rounded-full" : "rounded-md")} />
@@ -412,15 +408,15 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
             {(label?.[0] || "?").toUpperCase()}
           </span>
         )}
-        <span className="font-medium">{label}</span>
+        <span className="hidden max-w-[128px] truncate font-medium sm:inline">{label}</span>
         {activePlan && (
-          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{activePlan}</span>
+          <span className="hidden rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary sm:inline-block">{activePlan}</span>
         )}
         <ChevronsUpDown className="h-3.5 w-3.5 text-muted" />
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 max-w-[90vw] overflow-hidden rounded-lg border border-border bg-card shadow-pop">
+        <div className="fixed inset-x-2 top-[calc(52px+env(safe-area-inset-top))] z-40 mt-1 w-auto max-w-none overflow-hidden rounded-lg border border-border bg-card shadow-pop sm:absolute sm:inset-x-auto sm:left-0 sm:top-full sm:mt-1.5 sm:w-64 sm:max-w-[90vw]">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option
             label={identity.name}
@@ -513,7 +509,10 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
     <div className="relative" ref={ref}>
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-subtle"
+        aria-label={`Switch team or organization (${label})`}
+        aria-expanded={open}
+        title={`Switch team or organization - ${label}`}
+        className="tap-44 flex min-h-[44px] items-center gap-1.5 rounded-md px-1 py-1 hover:bg-subtle sm:gap-2 sm:px-1.5"
       >
         {!current && identity.imageUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
@@ -526,15 +525,15 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
             {current ? label.slice(0, 1).toUpperCase() : identity.initial}
           </span>
         )}
-        <span className="font-medium">{label}</span>
+        <span className="hidden max-w-[128px] truncate font-medium sm:inline">{label}</span>
         {plan && (
-          <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{plan}</span>
+          <span className="hidden rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary sm:inline-block">{plan}</span>
         )}
         <ChevronsUpDown className="h-3.5 w-3.5 text-muted" />
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 max-w-[90vw] overflow-hidden rounded-lg border border-border bg-card shadow-pop">
+        <div className="fixed inset-x-2 top-[calc(52px+env(safe-area-inset-top))] z-40 mt-1 w-auto max-w-none overflow-hidden rounded-lg border border-border bg-card shadow-pop sm:absolute sm:inset-x-auto sm:left-0 sm:top-full sm:mt-1.5 sm:w-64 sm:max-w-[90vw]">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option label={identity.name} hint={sel === PERSONAL ? activePlan ?? undefined : undefined} icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
           <div className="mt-1 border-t border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Teams</div>
