@@ -1,0 +1,232 @@
+{
+  "bindings": [
+    {
+      "assertion": "cargo test -p shadw-cli --locked --verbose",
+      "canonical_sha256": "62d0ad4b0f6a8857bea293e9ee346f392b7f679fb62ac669df82208e2dea56c8",
+      "id": "unit.cli.cmd",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "auth login saves config + verifies",
+      "canonical_sha256": "6db699c4719747ec71cc67db0bdd0f313b4280d6b1e8b9149ca5ad1880dc2375",
+      "id": "unit.cli.auth",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "keys create returns id+token",
+      "canonical_sha256": "60a397d9d82139e1c146319ad6a0148a2bd835f8a77c117e4578989fa11290ca",
+      "id": "unit.cli.keys",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "obs overview",
+      "canonical_sha256": "e1fec6bdb94c1ff97d789e9a24979061a96315dfad89862adba40a88d29898de",
+      "id": "unit.cli.obs",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "env list shows the key",
+      "canonical_sha256": "0170565d559b7974fd3d149cb55368e5ceef24559db8916ed2f4e26d31eaf109",
+      "id": "unit.cli.projects",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "domains record add returns id",
+      "canonical_sha256": "2e0541bb73a5b00c7e3589bacd6e75293e3a6f427a3ed593c7458227216f2c78",
+      "id": "unit.cli.domains",
+      "layer": "unit",
+      "path": "crates/shadw-cli/src/main.rs"
+    },
+    {
+      "assertion": "cargo test -p shadw-cli --locked --verbose",
+      "canonical_sha256": "5ab410fd3666bd734ed0937ac57c3fcc7d5f6a22f414c0e06281e6453a67c618",
+      "id": "unit.cli.bin",
+      "layer": "unit",
+      "path": "crates/shadw-cli/Cargo.toml"
+    },
+    {
+      "assertion": "cargo test -p hive-cloud --locked --verbose",
+      "canonical_sha256": "b7ddc1b7d5db5e37e8961720822df4b992801c6d64656a1d52c4b70d9a5c8b82",
+      "id": "unit.node.bin",
+      "layer": "unit",
+      "path": "crates/hive-cloud/Cargo.toml"
+    },
+    {
+      "assertion": "beta BLOCKED from alpha's database (404)",
+      "canonical_sha256": "4a3e6bd35f70426cbfc7a3e8a7e964e81757d3c77883f708a73bcfc8595cc698",
+      "id": "unit.roles.rules",
+      "layer": "unit",
+      "path": "crates/hive-cloud/src/roles.rs"
+    },
+    {
+      "assertion": "npm run lint",
+      "canonical_sha256": "4fb76bee99bcb6052e60c3f8981c72851a49717b6ae167cb50c29b77337e15ae",
+      "id": "ui.roles.mirror",
+      "layer": "integration",
+      "path": "ui/lib/team-role.ts"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "98d536b02314e4b50ad31b6da654d615c6eddebc6ecb04265e41e28930cd4e89",
+      "id": "integration.store.registry",
+      "layer": "integration",
+      "path": "crates/hive-cloud/src/store_sync.rs"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "a2ce20605982e7fe7bcf3430fbf0b941a3254a5434310b00c8cfa2033e0e3960",
+      "id": "integration.store.merge",
+      "layer": "integration",
+      "path": "crates/hive-cloud/src/store_sync.rs"
+    },
+    {
+      "assertion": "cargo test -p fluid-core --locked",
+      "canonical_sha256": "2c2506c9438d07cba26f57c157339a048f2083e942c0ae0457da2cd40f268132",
+      "id": "integration.browser.policy.rust",
+      "layer": "integration",
+      "path": "crates/fluid-core/src/lib.rs"
+    },
+    {
+      "assertion": "cargo test -p fluid-core --locked",
+      "canonical_sha256": "0015caa59857da2304c7d3acf39def9fb7017aa9a2c8419081d583d8de0650cb",
+      "id": "integration.browser.policy.js",
+      "layer": "integration",
+      "path": "crates/hive-browser/www/artifact-policy.js"
+    },
+    {
+      "assertion": "cargo test -p fluid-core --locked",
+      "canonical_sha256": "65919d6d69638393ec1d5da13a661be52490c15e2ab255be9e58a7f0d8cf5eab",
+      "id": "integration.browser.mesh.rust",
+      "layer": "integration",
+      "path": "crates/hive-browser/src/lib.rs"
+    },
+    {
+      "assertion": "cargo test -p fluid-core --locked",
+      "canonical_sha256": "260ac6b40cae82ba61f4de6a5695d25ae38a9e6221ac3b762d6c11684eddd79f",
+      "id": "integration.browser.mesh.js",
+      "layer": "integration",
+      "path": "crates/hive-browser/www/peer-mesh.js"
+    },
+    {
+      "assertion": "npm run lint",
+      "canonical_sha256": "bedb338843bb845fe9b35a1805c7ca54a208731dfb48c547fb1e49388a5885b2",
+      "id": "integration.landing.cache.proxy",
+      "layer": "integration",
+      "path": "ui/proxy.ts"
+    },
+    {
+      "assertion": "npm run lint",
+      "canonical_sha256": "33d83a017af9aaabf191f0a97ee14bdf62b33360eefd4fbabad4af1a9af78331",
+      "id": "integration.landing.cache.next",
+      "layer": "integration",
+      "path": "ui/next.config.mjs"
+    },
+    {
+      "assertion": "npm run build",
+      "canonical_sha256": "8deba91a17cd600c910a259d4df6493d09f82fded064580a7c9fb8607401877c",
+      "id": "integration.sync.node_worker",
+      "layer": "integration",
+      "path": "ui/scripts/sync-browser-node.mjs"
+    },
+    {
+      "assertion": "npm run build",
+      "canonical_sha256": "6e8e9369431e517d38fc7de189a658089d6214fbde1f2da7d7210ade7dd5ab48",
+      "id": "integration.sync.sqlite",
+      "layer": "integration",
+      "path": "ui/scripts/sync-browser-node.mjs"
+    },
+    {
+      "assertion": "npm run build",
+      "canonical_sha256": "a963c263cc0c399772a225787abd592f7feba88c36bb16ebdb9dee3c648640bf",
+      "id": "integration.sync.musql",
+      "layer": "integration",
+      "path": "ui/scripts/sync-browser-node.mjs"
+    },
+    {
+      "assertion": "./scripts/cli-acceptance.sh",
+      "canonical_sha256": "d22285410a86d07c18ffd3148f3505709164a734353a3db2b3196a81a4a4a8d7",
+      "id": "system.harness",
+      "layer": "system",
+      "path": "scripts/cli-acceptance.sh"
+    },
+    {
+      "assertion": "./scripts/cli-acceptance.sh",
+      "canonical_sha256": "86daf316ff8ebaab844bc4b4672549e90addd5997b79cde269b2198bf43dbba0",
+      "id": "acceptance.harness.paths",
+      "layer": "acceptance",
+      "path": "scripts/cli-acceptance.sh"
+    }
+  ],
+  "domain": "hive-contract-binding-v1",
+  "fail_open": [
+    {
+      "reason": "pre-existing cargo-fmt drift across the workspace",
+      "step": "rustfmt (check)"
+    },
+    {
+      "reason": "pre-existing workspace lint nits outside shadw-cli",
+      "step": "clippy"
+    },
+    {
+      "reason": "known advisory backlog in the pinned Cargo.lock; see CHANGELOG.md",
+      "step": "cargo audit (Rust dependencies)"
+    },
+    {
+      "reason": "known advisory backlog in the pinned ui/package-lock.json; see CHANGELOG.md",
+      "step": "npm audit (dashboard)"
+    }
+  ],
+  "gate_sha256": "cd5e5b950506ca30509f720c7075fce362d35526a97b1be6d25d49650679c71b",
+  "gates": [
+    {
+      "command": "cargo test --workspace --locked --verbose",
+      "id": "unit"
+    },
+    {
+      "command": "cargo test -p shadw-cli --locked --verbose",
+      "id": "integration"
+    },
+    {
+      "command": "cargo test -p fluid-core --locked",
+      "id": "system"
+    },
+    {
+      "command": "./scripts/cli-acceptance.sh",
+      "id": "acceptance"
+    },
+    {
+      "command": "npx tsc --noEmit -p tsconfig.ci.json",
+      "id": "dashboard.types"
+    },
+    {
+      "command": "npm run lint",
+      "id": "dashboard.lint"
+    },
+    {
+      "command": "npm run build",
+      "id": "dashboard.build"
+    },
+    {
+      "command": "npm ci",
+      "id": "dashboard.install"
+    },
+    {
+      "command": "git diff --check",
+      "id": "whitespace"
+    },
+    {
+      "command": "python3 -I scripts/check-contract-bindings.py --check",
+      "id": "bindings"
+    }
+  ],
+  "generator": "python3 -I scripts/check-contract-bindings.py --sync",
+  "history": [],
+  "overrides": {},
+  "removed": [],
+  "schema": 1
+}

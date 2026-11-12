@@ -1,5 +1,48 @@
 # Changelog
 
+## 2026-11-12 - ci: make all four test layers blocking, bind assertions to constructs
+
+A read-only audit of both workflows found 11 fail-open gaps: six
+`continue-on-error: true` steps, a warning-only secret scan that always exited
+zero, `npm ci || npm install` masking a stale lockfile, no Dashboard typecheck
+or lint, no `timeout-minutes` or `permissions`, `cancel-in-progress` cutting a
+run for a SHA that had already auto-deployed, and a `cli-v*` tag publishing to
+npm with ZERO Rust/UI tests. All are closed.
+
+`AGENTS.md` refuses new test files, `#[cfg(test)]` modules and mocking
+libraries, so the four layers are RUN, not authored. The "mocks with their own
+update path" are `scripts/check-contract-bindings.py` +
+`scripts/contract-bindings.json`: 23 bindings pin live assertions to the
+canonical bytes of the REAL constructs they spend (CLI enums, both binaries,
+`roles::RULES` and its `TEAM_ACTIONS` mirror, store-sync REGISTRY/MERGE_STORES,
+both sides of the browser policy digest and MESH_SIG_DOMAIN, both
+LANDING_CACHE copies, the three sync-browser-node module sets, the acceptance
+harness's assertion inventory and admin-API paths). A construct that changes,
+moves or disappears fails with the exact regeneration command.
+
+`--sync` is the only update path; `--sync --move ID:path:start` follows a
+migration and `--sync --remove ID:reason` records a retirement, both with a
+`history` row. Plain `--sync` REFUSES to launder a MISSING/MOVED construct.
+CI may never run `--sync` (the checker scans both workflows for it), the
+`contracts` job asserts `git diff --exit-code` on the manifest, and the
+checker binds ITSELF with `gate_sha256`, so weakening a gate needs a manifest
+diff. Canonical bytes are length-prefixed under `hive-contract-binding-v1\0`;
+SHA-256 is a BINDING here, not a BLAKE3 content identity.
+
+Witnessed: `RESULT PASS bindings=23 layers=4 gates=22 fail_open=4
+secrets_clean=1`; drift attacks CHANGED / MISSING / MOVED / UNBOUND / ORPHAN /
+GATE_CHANGED, a full `--move` migration, a full `--remove` retirement and a CI
+run attempting `--sync` each failed or were detected, tree restored. Gates:
+`cargo test --workspace --locked` exit 0 (57 `test result: ok` lines),
+`cd ui && npx tsc --noEmit -p tsconfig.ci.json` exit 0, `npm run lint` exit 0,
+`npm run build` exit 0, `git diff --check HEAD^ HEAD` exit 0. On macOS
+`scripts/cli-acceptance.sh` = 31 pass / 4 fail from the pre-existing
+`BUILD_ISOLATION_UNAVAILABLE` probe (no Linux build executor on this host),
+not a regression. Docs: `docs/ci-contract-bindings.md`.
+
+NOT pushed or rolled: a `git push` auto-deploys, which is the operator's
+one-way door.
+
 ## 2026-11-12 - fix(ui): harden the phone GitOps lane after an adversarial refuter
 
 A verifier that had not read the implementation attacked the phone fix by live

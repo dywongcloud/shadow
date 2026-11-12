@@ -9,19 +9,19 @@ keep load-bearing, drop absorbed. Nested:
 - Every task runs through the `gm` skill (`mcp__gm__gm`), subagents too: `codeinsight`/`codesearch`/`grep` verbs, never shell
 grep/find; git only via `git_*` verbs (`git_commit paths:[...]` stages EVERY dirty hunk of a named file: `git_status` first).
 Attribution is dywongcloud ONLY: no `Co-Authored-By`, no Claude/Anthropic trailer.
-- **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries). Verify with `cargo test
---workspace --locked` (CI's hard gate, with `scripts/cli-acceptance.sh`: on macOS use temp dirs under `/private/tmp`) plus live
-execution; fix a failure CLASS at the shared primitive. `cargo check` skips `cfg(target_os = "linux")` code AND test targets,
-so a behaviour change needs the run, not `--no-run`. A dependency change ships its `Cargo.lock` diff in the same pass
-(`--locked`).
+- **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries). `cargo test
+--workspace --locked` + `scripts/cli-acceptance.sh` (macOS `/private/tmp`) + live execution; fix a failure CLASS at the
+shared primitive. `cargo check` skips `cfg(target_os="linux")` AND test targets, so run, not `--no-run`; a dep change ships
+`Cargo.lock` (`--locked`). `scripts/check-contract-bindings.py --check` gates CI; drift names `--sync`, never in CI.
+`docs/ci-contract-bindings.md`.
 - Cargo/disk traps: keep the user's PATH (Homebrew cargo has no cross std); `hive-cloud` is bin-only; `df` before a build; never
-build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work with
+build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work via
 `refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup name form (removing a pushed
 copy needs a force-push rewrite). `hive_health_interval` > `hive_health_timeout`; an empty reviewed public resolver set
 fails build-executor preflight; raise `deploy_serial_backend` only with quorum-safety evidence.
 - A roll/deploy is a production change: operator's word first, then `ansible/AGENTS.md` (dashboard: `ui/AGENTS.md`);
 prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never by grepping a Rust format literal;
-never `git_reword` during a roll (it rewrites every later SHA).
+never `git_reword` during a roll (rewrites every later SHA).
 
 ## Fleet, hosts, access
 
@@ -32,7 +32,7 @@ node drop-in overrides the unit: read `/proc/<pid>/environ`.
 - SSH `ssh -i ~/.ssh/id_ed25519 root@<ip>` (billing.pem refused); fc-orlando needs `sysadmin@` + `sudo -n`.
 Admin API is plain HTTP loopback :8786, not :8787/https. Verify ports from a FLEET vantage, never the laptop,
 and serve a URL from the node to itself first (a vendor policy-drop hides a fully-serving node). TCP+UDP
-20000-29999 is SG-open: never run an ad-hoc file server. `scripts/hive-lockdown.sh` is the only host firewall;
+20000-29999 is SG-open: never run an ad-hoc file server. `scripts/hive-lockdown.sh` is the sole host firewall;
 PEERS is generated (`gen-hive-lockdown.sh`, `site.yml --tags lockdown`). A priority -95 accept table does NOT
 stop a later policy-drop base chain: put the accept in the chain INPUT jumps to.
 - fc-orlando SHARES its host with a second hive-cloud (`hive-devhub.service`): stop by MainPID, never `pkill -x hive-cloud`, or
