@@ -12,6 +12,11 @@ export async function POST(req: NextRequest) {
   const authToken = authTokenFrom(req);
 
   const linkRes = await backend("/v1/gitops", team, authToken);
+  // An auth-enforced node answers an anonymous GET 200 with `x-hive-anon: 1`: never seed a
+  // write from it. `/api(.*)` is Clerk-public, so this route asserts its own caller.
+  if (!authToken || linkRes.headers.get("x-hive-anon") === "1") {
+    return NextResponse.json({ ok: false, error: "Sign in to sync GitOps." }, { status: 401 });
+  }
   const link = linkRes.ok ? await linkRes.json() : null;
   if (!link?.repo || !link.repo.includes("/")) {
     return NextResponse.json({ skipped: true, reason: "no-config-repo" });

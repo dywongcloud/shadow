@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/github";
+import { authTokenFrom, claimedRole, gitopsCallerProof } from "@/lib/gitops-server";
+import { can, roleRefusalFor } from "@/lib/team-role";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
 /** Parse "owner/repo" from a clone URL or full_name. */
@@ -25,8 +27,21 @@ export async function POST(req: NextRequest) {
   if (!parsed) return NextResponse.json({ skipped: true, reason: "bad-repo" });
 
   const { owner, repo } = parsed;
-  // The webhook/workflow/variable writers each resolve the repo's own credential, so an OAuth
-  // cookie pre-gate here refused an install the App installation token can perform on any device.
+  // `/api(.*)` is Clerk-public and `repo` here is CALLER-CHOSEN, while the App installation token
+  // is a platform credential that a bare HTTP client could otherwise spend on any installed repo.
+  // A browser GitHub grant is NOT the gate (a phone has none): require an ASSERTED platform JWT,
+  // which the backend verifies, plus the admin floor `roles::RULES` applies to an unlisted write.
+  const team = req.headers.get("x-hive-team") || "personal";
+  const caller = await gitopsCallerProof(req, team);
+  if (!caller.ok) {
+    return NextResponse.json({ ok: false, reason: "unauthorized", error: caller.error }, { status: 401 });
+  }
+  const claimed = claimedRole(authTokenFrom(req));
+  // `can(null, ...)` offers every control because the SERVER is meant to decide. There is no
+  // backend write on this route to decide it, so an unknown role claim must fail CLOSED.
+  if (!claimed.operator && (claimed.role === null || !can(claimed.role, "repo.link"))) {
+    return NextResponse.json({ ok: false, reason: "role-refused", error: roleRefusalFor("repo.link") }, { status: 403 });
+  }
   const entity = await resolveEntity();
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
   const secret = process.env.GITHUB_WEBHOOK_SECRET || undefined;

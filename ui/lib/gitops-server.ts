@@ -56,6 +56,33 @@ export function claimedRole(token: string | null): { role: TeamRole | null; oper
   }
 }
 
+/** A GitOps WRITE spends a GitHub credential that may be the platform's device-independent App
+ *  installation token. `/api(.*)` is Clerk-public and `x-hive-team` is spoofable, so require an
+ *  ASSERTED platform identity before any repo is touched: `backend` forwards the caller's HS256
+ *  JWT, `require_auth` verifies it and stamps `x-hive-anon: 1` when it did not. A forged cookie
+ *  or a bare HTTP client cannot pass. Never conflate this with a GitHub OAuth grant. */
+export async function gitopsCallerProof(
+  req: { cookies?: { get(name: string): { value: string } | undefined }; headers: { get(name: string): string | null } },
+  team: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const authToken = authTokenFrom(req);
+  if (!authToken) return { ok: false, error: "Sign in to use GitOps." };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = backend("/v1/gitops", team, authToken);
+    const bound = new Promise<null>((res) => (timer = setTimeout(() => res(null), 3000)));
+    const r = await Promise.race([read, bound]);
+    if (!r || !r.ok || r.headers.get("x-hive-anon") === "1") {
+      return { ok: false, error: "Your session was not accepted — sign in again." };
+    }
+    return { ok: true };
+  } catch {
+    return { ok: false, error: "The platform could not verify your session; retry." };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** The signed-in user's platform JWT for a Server Component (the httpOnly `hive_jwt` cookie), or null when the request carries none. */
 export async function sessionAuthToken(): Promise<string | null> {
   return (await cookies()).get("hive_jwt")?.value ?? null;

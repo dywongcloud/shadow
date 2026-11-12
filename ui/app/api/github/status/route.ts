@@ -28,8 +28,12 @@ async function linkedConfigRepo(req: NextRequest): Promise<{ owner: string; repo
   const authToken = authTokenFrom(req);
   if (!authToken) return null;
   const team = req.headers.get("x-hive-team") || "personal";
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const r = await backend("/v1/gitops", team, authToken);
+    const read = backend("/v1/gitops", team, authToken);
+    const bound = new Promise<null>((res) => (timer = setTimeout(() => res(null), 1600)));
+    const r = await Promise.race([read, bound]);
+    if (!r) return null;
     if (!r.ok || r.headers.get("x-hive-anon") === "1") return null;
     const link = await r.json().catch(() => null);
     const parts = (typeof link?.repo === "string" ? link.repo : "").split("/");
@@ -37,6 +41,8 @@ async function linkedConfigRepo(req: NextRequest): Promise<{ owner: string; repo
     return { owner: parts[0], repo: parts[1] };
   } catch {
     return null;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -60,11 +66,15 @@ export async function GET(req: NextRequest) {
             ? (async () => {
                 const linked = await linkedConfigRepo(req);
                 return linked ? githubInstallationDetail(entity, linked.owner, linked.repo).catch(() => null) : null;
-              })()
+              })().catch(() => null)
             : Promise.resolve(null);
-        const [a, b] = await Promise.all([own, installed]);
-        if (a?.connected) return a;
+        // The repo-scoped mint is bounded at 1.6 s. Await it FIRST: the platform-wide
+        // /app/installations decoration in `own` can take 10 s and must never hold back an
+        // answer GitHub has already given, nor eat the client's 6 s abort.
+        const b = await installed;
         if (b) return b;
+        const a = await own;
+        if (a?.connected) return a;
         // With a tenant token, GitHub answered and granted nothing: "not connected" is real. With
         // NO token we cannot even ask about the tenant's link, so the answer is incomplete, not false.
         return tenantToken ? a : null;

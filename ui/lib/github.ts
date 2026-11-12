@@ -12,7 +12,7 @@ import {
   updateBundleMeta,
 } from "./github-app";
 import * as rest from "./github-rest";
-import { installationAuthConfigured, installationTokenForRepo, listAppInstallations } from "./github-installation";
+import { installationAuthConfigured, installationTokenForRepo, listAppInstallations, type InstallationsResult } from "./github-installation";
 
 /** GitHub facade, the ONE import for GitHub in the dashboard. Credential order per request: the first-party GitHub App user
  *  token (encrypted cookie); for WRITES then a server-to-server installation token under the App's own identity; then the
@@ -188,7 +188,12 @@ export async function githubConnectionDetail(
   let installationState: GithubDetail["installationState"];
   let installationError: string | undefined;
   if (installationAuthConfigured()) {
-    const inst = await listAppInstallations();
+    // Decoration only: bounding this keeps `githubConnectionDetail` (and every status reader)
+    // well inside the client's abort, so a slow global list cannot discard a repo-scoped answer.
+    const inst: InstallationsResult = await withTimeout(listAppInstallations(), 1200, {
+      ok: false,
+      error: "installation list timed out",
+    });
     installationState = inst.ok ? (inst.installations.length > 0 ? "present" : "none") : "error";
     if (!inst.ok) installationError = inst.error;
   } else {
@@ -285,11 +290,11 @@ async function resolveWriterToken(
   return { appError: r.error };
 }
 
-/** A GitHub WRITE capability for `owner/repo`, independent of the browser's own OAuth grant.
+/** A resolved GitHub writer credential for `owner/repo`, independent of the browser's OAuth grant.
  *  `resolveWriterToken` prefers the sealed per-browser cookie, then mints an installation token
- *  with the App's own identity; GitHub answering with that token is the proof a fresh device
- *  (a phone that never authorised) can still sync a tenant's linked config repo. Never returns
- *  the token itself. */
+ *  with the App's own identity. `ok` means a credential EXISTS; it is NOT proof GitHub will accept
+ *  a push to this repo — the commit itself is that proof, so callers must link only after it lands.
+ *  Never returns the token itself. */
 export interface GithubWriteCapability {
   ok: boolean;
   via?: "user-token" | "installation";

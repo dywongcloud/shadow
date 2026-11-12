@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-11-12 - fix(ui): harden the phone GitOps lane after an adversarial refuter
+
+A verifier that had not read the implementation attacked the phone fix by live
+execution and found four defects. All four are fixed at the shared primitive.
+
+The removed `githubStatus()` pre-gates had also been an IDENTITY gate:
+`/api(.*)` is Clerk-public and `init`/`sync`/`project-ci` can spend the
+platform's device-independent App installation token. An anonymous HTTP client
+could POST a caller-chosen repo to `/api/gitops/project-ci` and create a webhook,
+commit a workflow and set an Actions variable on any repo where the App is
+installed. Every GitOps write now requires an ASSERTED platform JWT
+(`gitopsCallerProof`): `backend` forwards the HS256 cookie, `require_auth`
+verifies it and stamps `x-hive-anon: 1` when it did not. `project-ci` takes a
+caller-chosen repo, so it ALSO needs the admin floor in `TEAM_ACTIONS` and fails
+CLOSED on an unknown role (`can(null, ...)` offers every control only because the
+server is meant to decide, and this route has no backend write to decide it.
+`init` now links with `PUT /v1/gitops` only AFTER `commitFiles` succeeds: a
+token's existence is NOT proof GitHub will accept a push to that repo, and the
+old order left a linked-but-unwritable tenant on any 403/404.
+
+The status chain could lose an already-proven installation answer: the
+platform-wide `/app/installations` decoration in `githubConnectionDetail` has a
+10 s timeout and was awaited in `Promise.all` with the repo-scoped mint.
+`listAppInstallations()` is now bounded at the shared primitive and the status
+route awaits the bounded repo mint FIRST; the node-local `/v1/gitops` read is
+bounded too. `gitops` is a WHOLESALE-REPLACE store, but `GitOpsStore::load`
+only inserted rows, so an unlink on the leader never reached followers and a
+stale node-local GET could claim a connection. `load()` now clears first; the
+`adopt` guard still declines an empty payload, so a booting leader cannot wipe
+a follower.
+
+Live-witnessed on localhost:3046 with the real App identity: phone status 200
+in 0.52 s with `connected:true`, the installation state, no scopes/login; an
+anonymous `project-ci` POST is 401 in 44 ms and a forged `hive_jwt` is 401 in
+8 ms (both BEFORE any GitHub call). With a valid JWT the write reaches GitHub
+and returns its typed installation error. `init` with an unwritable repo 502s
+and leaves the stored link byte-identical; `sync` on a phone reaches the real
+writer (200 in 50 s with the per-file fallback). `npx tsc --noEmit`,
+`npm run lint` and `cargo test --workspace --locked` (57 test result lines)
+are clean. No grant cookie was widened, no secret persisted, no security gate
+weakened. NOT pushed or rolled: that is the operator's one-way door.
+
 ## 2026-11-12 - fix(ui): GitOps on a phone, without widening the GitHub grant
 
 A second device has no `gh_app_tok` cookie by design: the first-party OAuth grant is
@@ -11,8 +53,8 @@ server-to-server installation credential is device-independent and already drive
 `commitFiles`, `commitFile`, `createRepoWebhook` and `setRepoVariable`.
 
 `init`, `sync` and `project-ci` now let the repo-scoped writer be the source of
-truth. `init` proves `githubCanWriteRepo(owner, repo)` BEFORE `PUT /v1/gitops`,
-so an unwritable repo is never linked; CREATING a repository still needs a
+truth. `init` checks `githubCanWriteRepo(owner, repo)` before committing, and
+links only AFTER the commit succeeds; CREATING a repository still needs a
 user-level grant (`githubCanCreateRepo`), with an actionable refusal.
 `GET /api/github/status` reads the tenant's linked config repo from `/v1/gitops`
 (bearer-derived tenant, never the sticky `connected` flag) and reports a distinct
@@ -33,7 +75,8 @@ the instant 400; `project-ci` surfaces the real writer errors; `sync` reaches th
 real writer. `npx tsc --noEmit` (source-only, excluding generated .next/dev types),
 `npm run lint`, `git diff --check` and `cargo test --workspace --locked` (57 test
 result lines) are all clean. No grant cookie was widened and no third-party bearer
-was persisted. NOT pushed or rolled: that is the operator's one-way door.
+was persisted. NOT pushed or rolled: that is the operator's one-way door. `ui/AGENTS.md`
+stays at its 14,000-byte cap after compaction.
 
 ## 2026-11-12 - ops: push and roll the mobile GitHub fix
 

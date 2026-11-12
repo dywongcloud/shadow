@@ -145,8 +145,12 @@ impl GitOpsStore {
         self.map.read().values().cloned().collect()
     }
 
+    /// WHOLESALE-REPLACE from a full owner snapshot (persist restore / store-sync adopt). `gitops`
+    /// is in `store_sync::REGISTRY`, not `MERGE_STORES`: insert-only here kept unlinked tenants
+    /// forever on followers, so a stale node-local GET could serve a repo the leader had removed.
     pub fn load(&self, data: Vec<GitOpsLink>) {
         let mut m = self.map.write();
+        m.clear();
         for link in data {
             m.insert(link.tenant.clone(), link);
         }

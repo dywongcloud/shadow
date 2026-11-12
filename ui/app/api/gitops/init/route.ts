@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, createRepo, commitFiles, githubCanCreateRepo, githubCanWriteRepo, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
-import { authTokenFrom, backend, buildOrgArtifacts, claimedRole } from "@/lib/gitops-server";
+import { authTokenFrom, backend, buildOrgArtifacts, claimedRole, gitopsCallerProof } from "@/lib/gitops-server";
 import { can, roleRefusalFor, roleRefusalSentence } from "@/lib/team-role";
 
 interface GitopsInitBody {
@@ -27,6 +27,9 @@ export async function POST(req: NextRequest) {
   const entity = await resolveEntity();
   // A browser grant is NOT required to write an existing config repo: the App's installation token
   // is device-independent. Creating a NEW repo does need a user-level grant (see githubCanCreateRepo).
+  // An ASSERTED platform identity is still required: `/api(.*)` is Clerk-public.
+  const caller = await gitopsCallerProof(req, team);
+  if (!caller.ok) return NextResponse.json({ ok: false, error: caller.error }, { status: 401 });
 
   const authToken = authTokenFrom(req);
   const claimed = claimedRole(authToken);
@@ -69,22 +72,12 @@ export async function POST(req: NextRequest) {
   const [owner, repo] = fullName.split("/");
   const path = "openedge.yaml";
 
-  // Prove GitHub will accept a write BEFORE linking: a linked-but-unwritable repo is a stuck tenant.
+  // A writer must exist, but a token alone is NOT proof it can push to THIS owner/repo: the commit
+  // below is the real proof. Fail fast on a missing writer; link only after the commit succeeds,
+  // so a refused write never leaves a linked-but-unwritable tenant behind.
   const capability = await githubCanWriteRepo(owner, repo);
   if (!capability.ok) {
     return NextResponse.json({ ok: false, repo: fullName, created, error: capability.error }, { status: 502 });
-  }
-
-  const linked = await backend("/v1/gitops", team, authToken, {
-    method: "PUT",
-    body: JSON.stringify({ repo: fullName, branch, path, scope }),
-  });
-  if (!linked.ok) {
-    const refusal = linked.status === 403 ? roleRefusalSentence(await linked.text().catch(() => "")) : null;
-    return NextResponse.json(
-      { ok: false, repo: fullName, created, error: refusal ?? `the platform refused the repository link (HTTP ${linked.status})` },
-      { status: refusal ? 403 : 502 }
-    );
   }
 
   const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, authToken, path);
@@ -110,6 +103,18 @@ export async function POST(req: NextRequest) {
       `[gitops/init] commit failed repo=${fullName} branch=${branch} team=${team} created=${created}: ${result.error}`
     );
     return NextResponse.json({ ok: false, repo: fullName, created, error: result.error }, { status: 502 });
+  }
+
+  const linked = await backend("/v1/gitops", team, authToken, {
+    method: "PUT",
+    body: JSON.stringify({ repo: fullName, branch, path, scope }),
+  });
+  if (!linked.ok) {
+    const refusal = linked.status === 403 ? roleRefusalSentence(await linked.text().catch(() => "")) : null;
+    return NextResponse.json(
+      { ok: false, repo: fullName, created, error: refusal ?? `the platform refused the repository link (HTTP ${linked.status})` },
+      { status: refusal ? 403 : 502 }
+    );
   }
 
   if (!result.deletionsSkipped) {
