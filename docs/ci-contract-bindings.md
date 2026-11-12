@@ -32,7 +32,7 @@ a failed build, not a silently weaker pipeline.
 
 ## What is bound
 
-`scripts/contract-bindings.json` holds 23 bindings across the CLI subcommand
+`scripts/contract-bindings.json` holds 30 bindings across the CLI subcommand
 enums, both binary crates, `roles::RULES` and its `TEAM_ACTIONS` mirror, the
 store-sync `REGISTRY`/`MERGE_STORES` sets, both implementations of the browser
 policy digest and `MESH_SIG_DOMAIN`, the two `LANDING_CACHE` copies, the three
@@ -122,8 +122,14 @@ Linux CI (run 43151853515) is green at 35/35 acceptance and all four jobs.
 
 ## Verified
 
-Measured on 2026-11-12: `RESULT PASS bindings=25 layers=4 gates=33
-fail_open=4 secrets_clean=1`; `cargo test --workspace --locked` 57 `test
+The Rust lane adds a blocking live witness to the `test` job (all three OSes): an unmodified
+Vercel Rust handler builds OFFLINE against the first-party shim and curls `/` and `/_vercel/ping`.
+Five bindings pin the shim `$PORT` listener, the clean cargo argv, the platform-owned
+`[patch.crates-io]`, the probed `cargo`/`rustc` capability bit and the `Runtime::Command` label.
+See `docs/rust-functions.md` for the honest compatibility boundary.
+
+Measured on 2026-11-12: `RESULT PASS bindings=30 layers=4 gates=36
+fail_open=4 secrets_clean=1`; `cargo test --workspace --locked` 59 `test
 result: ok` lines, exit 0; `cd ui && npx tsc --noEmit -p tsconfig.ci.json` exit 0;
 `npm run lint` exit 0; `npm run build` exit 0 (with and without `.env.local`),
 `npm ci --dry-run` exit 0, `cargo clippy -p shadw-cli --all-targets --locked

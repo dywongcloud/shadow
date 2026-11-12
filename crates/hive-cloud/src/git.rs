@@ -2512,10 +2512,20 @@ async fn run_build(
             == Some(hive_core::Runtime::Wasmer);
         let known_bun = hive_core::Runtime::from_config_str(&placement_settings.build.runtime)
             == Some(hive_core::Runtime::Bun);
+        // A saved Rust framework needs cargo/rustc PROBED on the build filesystem. The build
+        // lane also probes directly, but placement must not send a Rust build to a node that
+        // never advertised the toolchain (one predicate, shared by place/lease/fallbacks).
         let known_build_toolchain = build_toolchain_need(
             &placement_settings.build.install_command,
             &placement_settings.build.build_command,
-        );
+        )
+        .or_else(|| {
+            placement_settings
+                .build
+                .framework
+                .eq_ignore_ascii_case("rust")
+                .then_some("cargo")
+        });
         let needs_build_isolation = !known_container;
         let targets = crate::schedule::place_for_project(
             cloud,
@@ -3480,7 +3490,15 @@ async fn run_build(
     let vercel_config = fluid_build::load_vercel_config_checked(&build_dir).map_err(|error| {
         fluid_build::BuildContractError::invalid_metadata("load selected-app vercel.json", error)
     })?;
+    // Rust source repos take the dedicated native lane in produce_manifest. Running Node FDI
+    // preparation on them would seal a fake "npm install" step and feed cargo into the npm
+    // launcher, so exclude them here exactly as fluid.json is excluded.
+    let rust_app_present = fluid_build::rust::parse(&build_dir)
+        .ok()
+        .flatten()
+        .is_some();
     let mut fdi_preparation = if req.image_ref.is_none()
+        && !rust_app_present
         && tokio::fs::read_to_string(build_dir.join("fluid.json"))
             .await
             .is_err()
@@ -6133,6 +6151,25 @@ async fn produce_manifest(
         }
         log("Detected fluid.json — using project configuration.".into());
         Ok(m)
+    } else if let Some(rust_app) = fluid_build::rust::parse(dir).map_err(|error| {
+        anyhow::anyhow!("invalid Rust application manifest: {error:#}")
+    })? {
+        // Native Rust functions. A Vercel-shaped Cargo.toml ([[bin]] -> api/*.rs) is built into
+        // plain $PORT binaries. This lane never runs a package manager: the only repository
+        // command is `cargo build --offline --bins` through require_build_session (which does
+        // env_clear() on the host lane and is isolated on the BuildExecutor lane).
+        let mut rust_isolated = isolated;
+        build_rust_lane(
+            cloud,
+            bid,
+            &mut rust_isolated,
+            dir,
+            project,
+            incarnation,
+            &rust_app,
+            build_env,
+        )
+        .await
     } else {
         let preparation = fdi_preparation.ok_or_else(|| {
             anyhow::anyhow!(
@@ -10773,6 +10810,142 @@ async fn adapter_manifest(
             ..Default::default()
         })
     }
+}
+
+
+/// Stage the first-party vercel_runtime shim into a Rust checkout. Embedded in the binary via
+/// include_str!, so a fleet node holding only hive-cloud can still build Vercel-shaped handlers
+/// OFFLINE. Every path is platform-templated: no tenant string becomes a host path.
+async fn stage_rust_shim(dir: &Path) -> anyhow::Result<()> {
+    let shim = dir.join(fluid_build::SHIM_DIR);
+    let parent = dir.join(".hive-rust-runtime");
+    for path in [&parent, &dir.join(".cargo")] {
+        if let Ok(meta) = tokio::fs::symlink_metadata(path).await {
+            anyhow::ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "{} must be a real directory, not a symlink",
+                path.display()
+            );
+        }
+    }
+    // A tenant-supplied cargo config could inject [patch], rustflags or a rustc-wrapper. Refuse
+    // rather than clobber it or merge untrusted TOML: fail closed with an actionable message.
+    for name in ["config.toml", "config"] {
+        let path = dir.join(".cargo").join(name);
+        anyhow::ensure!(
+            tokio::fs::symlink_metadata(&path).await.is_err(),
+            "Rust checkout ships .cargo/{name}; the platform owns cargo config for this lane. \
+             Remove it (or set an explicit fluid.json with a prebuilt binary) to deploy."
+        );
+    }
+    tokio::fs::create_dir_all(shim.join("src")).await?;
+    // [workspace] makes the shim a standalone patch target outside our own workspace.
+    let manifest = format!("{}\n[workspace]\n", fluid_build::SHIM_CARGO_TOML);
+    tokio::fs::write(shim.join("Cargo.toml"), manifest).await?;
+    tokio::fs::write(shim.join("src/lib.rs"), fluid_build::SHIM_LIB_RS).await?;
+    tokio::fs::create_dir_all(dir.join(".cargo")).await?;
+    tokio::fs::write(dir.join(".cargo/config.toml"), fluid_build::SHIM_CONFIG).await?;
+    Ok(())
+}
+
+/// Build a Vercel-shaped Rust checkout into native $PORT binaries and return its manifest.
+/// Runs ONE repository command through require_build_session (env_clear() on the host lane,
+/// an isolated BuildExecutor v1 session on Firecracker). Cargo's --offline flag keeps tenant
+/// build.rs off the network; the platform-owned .cargo/config.toml pins vercel_runtime to the
+/// embedded shim. Nothing here assumes cargo exists: the probe is authoritative.
+async fn build_rust_lane(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    isolated: &mut Option<&mut IsolatedBuild>,
+    dir: &Path,
+    project: &str,
+    incarnation: ProjectIncarnation,
+    app: &fluid_build::RustApp,
+    build_env: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<Manifest> {
+    let log = |s: String| cloud.builds.log(bid, s);
+    // Persist the detected framework so the NEXT deploy gates placement on the probed cargo
+    // toolchain. Same idempotent shape as the FDI auto-detection save.
+    let settings = cloud.projects.get_exact(project, incarnation)?;
+    if settings.build.framework_auto || settings.build.framework.trim().is_empty() {
+        let mut next = settings.build;
+        next.framework = "rust".to_string();
+        next.framework_auto = true;
+        cloud.projects.set_build_exact(project, incarnation, next)?;
+    }
+    let available = probe_build_toolchains(isolated, dir, cloud, bid, build_env).await;
+    if !available
+        .as_ref()
+        .is_some_and(|tools| tools.iter().any(|t| t == "cargo"))
+    {
+        anyhow::bail!(
+            "BUILD_TOOLCHAIN_MISSING: this Rust deployment needs cargo AND rustc on the build \
+             filesystem, but the live probe reported [{}]. Provision the Rust toolchain (and a \
+             seeded offline crate registry) in this node's build environment.",
+            available.unwrap_or_default().join(",")
+        );
+    }
+    stage_rust_shim(dir).await?;
+    log(format!(
+        "Detected {} Rust function(s) (Vercel Rust runtime API); building native $PORT binaries offline.",
+        app.functions.len()
+    ));
+    // Unset compiler-injection variables a project env could otherwise supply. cargo still reads
+    // the offline registry from $HOME/.cargo, which env_clear() leaves intact.
+    let command = format!(
+        "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC CARGO_TARGET_DIR || true\n{}",
+        fluid_build::RUST_BUILD_COMMAND
+    );
+    run_streamed(
+        require_build_session(isolated)?,
+        dir,
+        &command,
+        cloud,
+        bid,
+        build_env,
+    )
+    .await
+    .map_err(|error| classify_command_failure("Rust build failed", &command, error))?;
+    fluid_build::rust::verify_binaries(dir, app).map_err(|error| {
+        anyhow::anyhow!("Rust build produced no usable native function binary: {error:#}")
+    })?;
+    if let Some(session) = isolated.as_deref_mut() {
+        session.finish().await?;
+    }
+    Ok(rust_function_manifest(project, app))
+}
+
+/// One plain-HTTP $PORT process per [[bin]]. runtime "rust" resolves to Runtime::Command, so no
+/// new launch-side runtime variant is needed and every backend's env_clear()/PORT contract holds.
+fn rust_function_manifest(project: &str, app: &fluid_build::RustApp) -> Manifest {
+    let mut functions = Vec::with_capacity(app.functions.len());
+    let mut routes = Vec::with_capacity(app.functions.len() + 1);
+    for function in &app.functions {
+        functions.push(FunctionConfig {
+            name: function.name.clone(),
+            runtime: "rust".into(),
+            start_cmd: vec![fluid_build::RustApp::binary(&function.name)],
+            ..Default::default()
+        });
+        routes.push(Route {
+            pattern: fluid_build::RustApp::route(&function.name),
+            target: RouteTarget::Function(function.name.clone()),
+        });
+    }
+    if let Some(first) = app.functions.first() {
+        routes.push(Route {
+            pattern: "/".into(),
+            target: RouteTarget::Function(first.name.clone()),
+        });
+    }
+    let mut manifest = Manifest {
+        project: project.to_string(),
+        functions,
+        routes,
+        ..Default::default()
+    };
+    manifest.framework = "rust".to_string();
+    manifest
 }
 
 fn function_manifest(

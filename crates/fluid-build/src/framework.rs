@@ -161,6 +161,16 @@ pub const PRESETS: &[FrameworkPreset] = &[
         emits_build_output: false,
     },
     FrameworkPreset {
+        slug: "rust",
+        name: "Rust Functions",
+        install_command: "",
+        build_command: "cargo build --release --offline --bins",
+        dev_command: "cargo run",
+        output_dir: "target/release",
+        primitive: Primitive::Serverless,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
         slug: "static",
         name: "Static",
         install_command: "",
@@ -630,6 +640,9 @@ pub struct BuildPlan {
 /// Detect the framework for a repo by inspecting marker files + package.json
 /// dependencies. Order matters: most specific first.
 pub fn detect_checked(repo: &Path) -> Result<&'static FrameworkPreset, BuildContractError> {
+    if crate::rust::detect_checked(repo)? {
+        return Ok(preset("rust").unwrap());
+    }
     let package_bytes = read_package_json_bounded(repo)
         .map_err(|error| BuildContractError::invalid_metadata("detect framework", error))?;
     let package = package_bytes
@@ -669,6 +682,11 @@ fn detect_with_package(
     repo: &Path,
     package: Option<&serde_json::Value>,
 ) -> &'static FrameworkPreset {
+    // A Vercel-shaped Cargo.toml outranks every JavaScript marker: the repo has no
+    // package.json, so falling through would silently ship Rust source as a static site.
+    if crate::rust::parse(repo).ok().flatten().is_some() {
+        return preset("rust").unwrap();
+    }
     for f in [
         "open-next.config.ts",
         "open-next.config.js",

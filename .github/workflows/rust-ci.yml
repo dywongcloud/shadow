@@ -97,6 +97,65 @@ jobs:
       - name: Unit tests (workspace)
         run: cargo test --workspace --locked --verbose
 
+      # Native Rust lane: an UNMODIFIED Vercel Rust handler must compile OFFLINE against the
+      # first-party shim and serve $PORT plus /_vercel/ping (the Vercel internal probe; the
+      # public gateway reserves /_vercel/*). Live execution, not a test file; the same cargo
+      # command and shim layout build_rust_lane uses on a node. Runs on all three OSes.
+      - name: Rust runtime (offline build + live HTTP witness, all OSes)
+        run: |
+          set -eu
+          case "$(uname -s)" in
+            Darwin) TMP_ROOT=/private/tmp ;;
+            *) TMP_ROOT="${TMPDIR:-/tmp}" ;;
+          esac
+          APP="$(mktemp -d "$TMP_ROOT/hive-rust-witness.XXXXXX")"
+          mkdir -p "$APP/api" "$APP/.cargo" "$APP/.hive-rust-runtime/vercel-runtime/src"
+          cp crates/vercel-runtime/Cargo.toml "$APP/.hive-rust-runtime/vercel-runtime/Cargo.toml"
+          printf '\n[workspace]\n' >> "$APP/.hive-rust-runtime/vercel-runtime/Cargo.toml"
+          cp crates/vercel-runtime/src/lib.rs "$APP/.hive-rust-runtime/vercel-runtime/src/lib.rs"
+          printf '%s\n' '[patch.crates-io]' 'vercel_runtime = { path = ".hive-rust-runtime/vercel-runtime" }' > "$APP/.cargo/config.toml"
+          cat > "$APP/Cargo.toml" <<'TOML'
+          [package]
+          name = "hello-world"
+          version = "0.1.0"
+          edition = "2021"
+
+          [[bin]]
+          name = "hello"
+          path = "api/hello.rs"
+
+          [dependencies]
+          tokio = { version = "1", features = ["full"] }
+          serde_json = "1"
+          vercel_runtime = "2"
+          TOML
+          cat > "$APP/api/hello.rs" <<'RS'
+          use serde_json::{Value, json};
+          use vercel_runtime::{Error, Request, run, service_fn};
+
+          #[tokio::main]
+          async fn main() -> Result<(), Error> { run(service_fn(handler)).await }
+
+          async fn handler(_req: Request) -> Result<Value, Error> {
+              Ok(json!({ "message": "Hello, world!" }))
+          }
+          RS
+          ( cd "$APP" && cargo build --release --offline --bins )
+          test -x "$APP/target/release/hello"
+          PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+          PORT="$PORT" "$APP/target/release/hello" > "$APP/serve.log" 2>&1 &
+          PID=$!
+          READY=0
+          for i in $(seq 1 60); do
+            if curl -sf -m1 "http://127.0.0.1:$PORT/_vercel/ping" > "$APP/ping.out" 2>/dev/null; then READY=1; break; fi
+            sleep 0.2
+          done
+          test "$READY" = 1
+          grep -qx OK "$APP/ping.out"
+          curl -sf -m3 "http://127.0.0.1:$PORT/" > "$APP/root.out"
+          grep -qxF '{"message":"Hello, world!"}' "$APP/root.out"
+          kill "$PID"
+
       # Declared fail-open in scripts/contract-bindings.json with a reason: the
       # pre-existing style/lint backlog. A NEW admit is refused by `contracts`.
       - name: rustfmt (check)

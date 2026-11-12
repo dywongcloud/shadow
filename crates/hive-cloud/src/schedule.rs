@@ -167,6 +167,15 @@ pub fn build_toolchain_capable(n: &NodeInfo, manager: Option<&str>) -> bool {
     let Some(manager) = manager else {
         return true;
     };
+    // `cargo` is a COMPILER toolchain, not a package manager: npm is never a substitute for it,
+    // and an unreported (pre-upgrade or image-lane) node is NOT assumed capable. One predicate,
+    // shared by `place`, lease stickiness and `dispatch_fallbacks` through `capable`.
+    if manager == "cargo" {
+        return n
+            .build_toolchains
+            .as_ref()
+            .is_some_and(|have| have.iter().any(|t| t == "cargo"));
+    }
     let Some(have) = n.build_toolchains.as_ref() else {
         return true;
     };
@@ -185,6 +194,19 @@ pub fn build_toolchain_rank(n: &NodeInfo, manager: Option<&str>) -> u8 {
     let Some(manager) = manager else {
         return TOOLCHAIN_EXACT;
     };
+    // Same NO-SUBSTITUTE rule as `build_toolchain_capable`: npm is never a stand-in for a
+    // compiler, and an unreported node is not preferred for a Rust build.
+    if manager == "cargo" {
+        return if n
+            .build_toolchains
+            .as_ref()
+            .is_some_and(|have| have.iter().any(|t| t == "cargo"))
+        {
+            TOOLCHAIN_EXACT
+        } else {
+            TOOLCHAIN_CANNOT_BUILD
+        };
+    }
     let Some(have) = n.build_toolchains.as_ref() else {
         return TOOLCHAIN_SUBSTITUTE_OR_UNREPORTED;
     };

@@ -200,7 +200,10 @@ fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
 /// asserted by provisioning (`ansible/roles/build_executor`, whose live probe requires `node npm
 /// corepack bun python3 go`) and re-probed at build time through the same session that will run the
 /// command, never inferred from the host.
-pub const BUILD_TOOLCHAINS: [(&str, u32); 7] = [
+/// The probe reports its bitmask through a shell EXIT CODE, so the total of every bit must stay
+/// <= 255. `1 << 7` is the last free bit; `cargo` therefore represents the whole Rust toolchain
+/// and its probe requires BOTH `cargo` and `rustc` (a driver without a compiler cannot build).
+pub const BUILD_TOOLCHAINS: [(&str, u32); 8] = [
     ("node", 1),
     ("npm", 1 << 1),
     ("pnpm", 1 << 2),
@@ -208,7 +211,14 @@ pub const BUILD_TOOLCHAINS: [(&str, u32); 7] = [
     ("bun", 1 << 4),
     ("go", 1 << 5),
     ("python3", 1 << 6),
+    ("cargo", 1 << 7),
 ];
+
+/// A Rust toolchain is PRESENT only when both binaries resolve on the build filesystem. Unlike
+/// package managers, `cargo` has NO substitute: `build_toolchain_capable` gates it exactly.
+pub fn rust_toolchain_present() -> bool {
+    which_on_path("cargo").is_some() && which_on_path("rustc").is_some()
+}
 
 /// Bit for `name`, or `None` when it is not a toolchain the build lane probes
 /// (a bare-word command naming anything else is never substituted).
@@ -234,7 +244,13 @@ pub fn build_toolchain_names(bits: u32) -> Vec<String> {
 pub fn detect_host_build_toolchains() -> Vec<String> {
     BUILD_TOOLCHAINS
         .iter()
-        .filter(|(tool, _)| which_on_path(tool).is_some())
+        .filter(|(tool, _)| {
+            if *tool == "cargo" {
+                rust_toolchain_present()
+            } else {
+                which_on_path(tool).is_some()
+            }
+        })
         .map(|(tool, _)| (*tool).to_string())
         .collect()
 }
@@ -249,8 +265,13 @@ pub fn detect_host_build_toolchains() -> Vec<String> {
 pub fn build_toolchain_probe_script() -> String {
     let mut script = String::from("bits=0");
     for (tool, bit) in BUILD_TOOLCHAINS {
+        let check = if tool == "cargo" {
+            "command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1".to_string()
+        } else {
+            format!("command -v {tool} >/dev/null 2>&1")
+        };
         script.push_str(&format!(
-            "\nif command -v {tool} >/dev/null 2>&1; then bits=$((bits + {bit})); fi"
+            "\nif {check}; then bits=$((bits + {bit})); fi"
         ));
     }
     script.push_str("\nexit $bits\n");

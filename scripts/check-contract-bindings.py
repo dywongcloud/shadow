@@ -139,6 +139,28 @@ BINDINGS = [
          start="if [ -n \"${HIVE_CI_PLATFORM:-}\" ]", end=None,
          assertion="./scripts/cli-acceptance.sh",
          why="CI's declared platform must agree with uname's probe; a mislabeled runner cannot hide a missing Mac leg"),
+    # Native Rust lane: a changed build command, shim layout or capability bit breaks a LIVE
+    # offline build + HTTP witness, so CI must fail and name --sync rather than drift silently.
+    dict(id="unit.rust.shim.run", layer="unit", path="crates/vercel-runtime/src/lib.rs",
+         start="pub async fn run<S>(service: S)", end=None,
+         assertion="cargo test --workspace --locked --verbose",
+         why="the $PORT listener an unmodified Vercel Rust handler binds; PORT wins over VERCEL_DEV_PORT"),
+    dict(id="system.rust.build_command", layer="system", path="crates/fluid-build/src/rust.rs",
+         start="pub const RUST_BUILD_COMMAND", end=None,
+         assertion="cargo build --release --offline --bins",
+         why="clean cargo argv; --offline keeps tenant build.rs off the network"),
+    dict(id="system.rust.shim_config", layer="system", path="crates/fluid-build/src/rust.rs",
+         start="pub const SHIM_CONFIG", end=None,
+         assertion="cargo build --release --offline --bins",
+         why="the platform-owned [patch.crates-io] that resolves vercel_runtime offline"),
+    dict(id="system.rust.capability", layer="system", path="crates/hive-cloud/src/resources.rs",
+         start="pub const BUILD_TOOLCHAINS: [(&str, u32); 8]", end=None,
+         assertion="cargo test --workspace --locked --verbose",
+         why="probed cargo/rustc bit 1<<7, the last free exit-code bit; None is NOT capable"),
+    dict(id="system.rust.runtime_label", layer="system", path="crates/hive-core/src/proto.rs",
+         start='"rust" | "rustlang" => Some(Runtime::Command),', end=None,
+         assertion="cargo test --workspace --locked --verbose",
+         why="native Rust binaries ride Runtime::Command; no variant breaks exhaustive matches"),
 ]
 
 # Blocking commands, one per layer. A layer with no blocking command in
@@ -155,6 +177,9 @@ GATES = [
     dict(id="whitespace", command="git diff --check"),
     dict(id="bindings", command="python3 -I scripts/check-contract-bindings.py --check"),
     dict(id="acceptance.count", command="grep -qE '35 passed, 0 failed'"),
+    dict(id="rust.runtime.offline_build", command="cargo build --release --offline --bins"),
+    dict(id="rust.runtime.http_body", command='grep -qxF \'{"message":"Hello, world!"}\''),
+    dict(id="rust.runtime.ping", command="grep -qx OK"),
 ]
 
 # Every blocking layer must run on BOTH platforms. A removed macOS leg is a

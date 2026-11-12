@@ -410,7 +410,6 @@ async fn unsupported_root_markers(root: &Path) -> anyhow::Result<Vec<&'static st
         "pyproject.toml",
         "requirements.txt",
         "Pipfile",
-        "Cargo.toml",
         "go.mod",
         "Gemfile",
         "mix.exs",
@@ -435,6 +434,12 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
         return Ok(None);
     }
     let mut frameworks = BTreeSet::new();
+    // A Vercel-shaped Cargo.toml ([[bin]] -> api/*.rs) is positive Rust evidence, so a Rust
+    // workspace is SELECTED rather than refused as an unsupported root marker. Nothing here
+    // assumes cargo exists: placement probes the build filesystem separately.
+    if fluid_build::rust::parse(dir).ok().flatten().is_some() {
+        frameworks.insert("rust");
+    }
     let mut start = false;
     if let Some(package) = package.as_ref() {
         let dependencies = dependency_names(package)?;

@@ -14,6 +14,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 sha2 = { workspace = true }
+# Strict Cargo.toml [[bin]] detection for the native Rust function lane. Already pinned in
+# Cargo.lock (iroh-relay); no new external package, and toml::Value ignores unknown keys.
+toml = "1"
 
 [dev-dependencies]
 # Test-only: the `bun_fixtures` integration test cross-checks a parsed

@@ -174,6 +174,41 @@
       "id": "system.harness.platform.probe",
       "layer": "system",
       "path": "scripts/cli-acceptance.sh"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "3828982273e7c8e7feb6372b12889d9623bd868225b0eafc396862bbb86cb09c",
+      "id": "unit.rust.shim.run",
+      "layer": "unit",
+      "path": "crates/vercel-runtime/src/lib.rs"
+    },
+    {
+      "assertion": "cargo build --release --offline --bins",
+      "canonical_sha256": "e0d738bd6571afdf5071afa629eabdf904edcb881d5cb44580fb5a9378803ac7",
+      "id": "system.rust.build_command",
+      "layer": "system",
+      "path": "crates/fluid-build/src/rust.rs"
+    },
+    {
+      "assertion": "cargo build --release --offline --bins",
+      "canonical_sha256": "3db8769882fd85dc3ad7b8889e4d2dccb21db296d0af39f22df49c0246d7d194",
+      "id": "system.rust.shim_config",
+      "layer": "system",
+      "path": "crates/fluid-build/src/rust.rs"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "e6232e2219572b628e40f71c8d50469be64d381ded405b7b6be4ecead33fb785",
+      "id": "system.rust.capability",
+      "layer": "system",
+      "path": "crates/hive-cloud/src/resources.rs"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "d0a076e235d69fd449ca5aab1564bddd350549d86a2f1463481cd17205bf4d19",
+      "id": "system.rust.runtime_label",
+      "layer": "system",
+      "path": "crates/hive-core/src/proto.rs"
     }
   ],
   "domain": "hive-contract-binding-v1",
@@ -195,7 +230,7 @@
       "step": "npm audit (dashboard)"
     }
   ],
-  "gate_sha256": "59499e3071f2bcf93e3478460407dd3438a7623d4e50557a96a21d9ccc2c8db9",
+  "gate_sha256": "fb91e6305c9a21801be30ab8448964fe33c47f6831f27ac3037059d6eca163c1",
   "gates": [
     {
       "command": "cargo test --workspace --locked --verbose",
@@ -240,6 +275,18 @@
     {
       "command": "grep -qE '35 passed, 0 failed'",
       "id": "acceptance.count"
+    },
+    {
+      "command": "cargo build --release --offline --bins",
+      "id": "rust.runtime.offline_build"
+    },
+    {
+      "command": "grep -qxF '{\"message\":\"Hello, world!\"}'",
+      "id": "rust.runtime.http_body"
+    },
+    {
+      "command": "grep -qx OK",
+      "id": "rust.runtime.ping"
     }
   ],
   "generator": "python3 -I scripts/check-contract-bindings.py --sync",

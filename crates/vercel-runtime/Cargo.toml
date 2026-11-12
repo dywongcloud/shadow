@@ -1,0 +1,43 @@
+[package]
+name = "vercel_runtime"
+version = "2.4.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# First-party, source-compatible shim for the PUBLIC `vercel_runtime` 2.4 handler contract.
+# A Vercel-shaped `api/*.rs` handler compiles against this UNCHANGED:
+#   use vercel_runtime::{run, service_fn, Request, Error, Response, ResponseBody, AppState};
+# but it binds the platform's `$PORT` with plain HTTP/1 instead of Vercel's proprietary IPC bridge.
+# Vercel's `VERCEL_IPC_PATH` start/end/log frames, invocation-id headers, `waitUntil` drain and
+# `.func` provisioning are NOT implemented — see docs/rust-functions.md for the honest boundary.
+#
+# The package name/version match crates.io's vercel_runtime 2.4 so `[patch.crates-io]
+# vercel_runtime = { path = "crates/vercel-runtime" }` resolves an unmodified Vercel Cargo.toml
+# OFFLINE. Built ONLY from crates already pinned in the workspace Cargo.lock; no new external dep.
+[lib]
+name = "vercel_runtime"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Accepted so a Vercel-shaped Cargo.toml declaring `features = ["axum"]` resolves offline. The
+# module is a generic Tower layer + streaming helper built on hyper/tower; it does NOT pull axum
+# 0.8 / axum-streams (neither is in the locked graph).
+axum = []
+actix = []
+
+[dependencies]
+# Explicit versions, NOT workspace inheritance: the build lane materializes this crate into a
+# tenant checkout as a `[patch.crates-io]` target, outside any workspace, so `workspace = true`
+# would not resolve. Every version is already pinned in the platform Cargo.lock; no new dep.
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+serde_json = "1"
+libc = "0.2"

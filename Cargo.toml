@@ -21,6 +21,7 @@ members = [
     "crates/hive-edge",
     "crates/hive-cloud",
     "crates/hive-contract",
+    "crates/vercel-runtime",
     "crates/hive-wg",
     "crates/hive-zkauth",
     "crates/hive-crsql",
@@ -107,6 +108,12 @@ hive-contract = { path = "crates/hive-contract" }
 # monitoring methods for the unrelated "sentinel" feature — confirmed via a
 # real 3-way diff before merging).
 [patch.crates-io]
+# A Vercel-shaped Rust checkout declares `vercel_runtime = "2"`. Patch it to this
+# first-party, source-compatible shim so an UNMODIFIED api/*.rs builds OFFLINE and
+# serves the platform's $PORT contract. See docs/rust-functions.md for the boundary:
+# Vercel IPC frames, invocation-id headers, waitUntil drain and .func provisioning
+# are deliberately NOT implemented. Built only from crates already in Cargo.lock.
+vercel_runtime = { path = "crates/vercel-runtime" }
 guardian-db = { path = "vendor/guardian-db" }
 iroh-blobs = { path = "vendor/guardian-db/iroh-blobs" }
 iroh-docs = { path = "vendor/guardian-db/iroh-docs" }

@@ -165,6 +165,10 @@ impl Runtime {
             "python" | "py" => Some(Runtime::Python),
             "container" | "docker" | "microvm" | "firecracker" => Some(Runtime::Container),
             "wasmer" | "wasm" | "wasix" | "wasi" => Some(Runtime::Wasmer),
+            // Native Rust functions are plain $PORT binaries; `Runtime::Command` already carries
+            // them. No new variant: adding one would silently break exhaustive matches in the
+            // cell agent, admin and artifact lanes.
+            "rust" | "rustlang" => Some(Runtime::Command),
             "" | "auto" | "command" => None,
             _ => None,
         }

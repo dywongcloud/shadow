@@ -1965,6 +1965,7 @@ pub(crate) async fn deployment_resources(
                 "name": f.name,
                 "runtime": match hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) {
                     _ if f.runtime == "edge" => "Edge",
+                    _ if f.runtime == "rust" => "Rust",
                     hive_core::Runtime::Container => "Container",
                     hive_core::Runtime::Bun => "Bun",
                     hive_core::Runtime::Python => "Python",

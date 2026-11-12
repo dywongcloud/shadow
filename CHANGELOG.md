@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-11-12 - feat: native Rust functions (Vercel Rust runtime source compatibility)
+
+Adds a first-party, source-compatible `vercel_runtime` shim and a dedicated native Rust build
+lane. A root `Cargo.toml` with Vercel-shaped `[[bin]]` entries (`api/*.rs`) is detected, built
+offline into plain `$PORT` binaries and served as `Runtime::Command` functions. An UNMODIFIED
+Vercel docs handler compiles against the shim unchanged; `/api/hello` and `/` both answered
+`{"message":"Hello, world!"}` through the REAL node + REAL CLI in a live deploy.
+
+- `crates/vercel-runtime`: public `run`/`service_fn`/`Request`/`Error`/`ResponseBody`/`AppState`
+  API over hyper/tower, built only from crates already in `Cargo.lock`. `PORT` wins over
+  `VERCEL_DEV_PORT`; `/_vercel/ping` answers 200 on the function listener. Workspace member plus
+  `[patch.crates-io]`, so an unmodified Vercel `Cargo.toml` resolves OFFLINE.
+- `fluid-build::rust`: strict bounded `Cargo.toml` parser (closed ASCII names, `api/*.rs` only,
+  no `..`/absolute/symlink traversal), the `rust` framework preset, and post-build binary
+  verification. `app_discovery` no longer treats `Cargo.toml` as an unsupported root marker.
+- `git::build_rust_lane`: ONE repository command through `require_build_session`
+  (`cargo build --release --offline --bins`), a platform-owned `.cargo/config.toml` pointing
+  `vercel_runtime` at the shim materialized from `include_str!`, and one function + route per
+  `[[bin]]`. A tenant-supplied `.cargo/config.toml` is REFUSED. `RUSTFLAGS`/`RUSTC_WRAPPER`/
+  `RUSTC`/`CARGO_TARGET_DIR` are unset before the build.
+- Capability is PROBED, never assumed: `cargo` AND `rustc` occupy bit `1 << 7` (the last free
+  shell exit-code bit) in `BUILD_TOOLCHAINS`; `None` = NOT CAPABLE, no npm substitute, and
+  `place`/lease-stickiness/`dispatch_fallbacks` gate through one predicate. A missing toolchain
+  fails the build with `BUILD_TOOLCHAIN_MISSING`.
+- CI: a blocking `test`-job step on all three OSes builds a Vercel-shaped handler OFFLINE and
+  curls `/` and `/_vercel/ping`; 5 new contract bindings + 3 new gates
+  (`RESULT PASS bindings=30 layers=4 gates=36 fail_open=4 secrets_clean=1`).
+
+Honest boundary (docs/rust-functions.md): this is source compatibility with Vercel's PUBLIC
+handler contract, NOT Vercel's runtime. No IPC frames, invocation-id headers, `waitUntil` drain,
+`.func` provisioning, axum 0.8 / axum-streams / actix-web adapters, or arbitrary crates.io
+dependencies (`--offline` is a security gate). The isolated builder image has no `cargo`/`rustc`
+yet: Rust source builds work on host-exec lanes and fail CLOSED on isolated-executor nodes until
+an authorized roll adds a pinned toolchain and seeded offline registry.
+
+**NOT pushed, NOT rolled.** `git push` auto-deploys via the webhook and
+`git::spawn_git_poll_reconcile`; a roll is the operator's one-way door. Witness: `cargo check
+--workspace --offline` 0, `cargo test --workspace --locked` 59 `test result: ok` / 0 failed,
+contract gate 0, `git diff --check` 0, live deploy `dpl-036be041a1` -> ready with the Rust
+function serving both routes. Adversarial refusals witnessed live: tenant `.cargo/config.toml`
+and a `[[bin]]` path traversal both failed the build loudly.
+
 ## 2026-11-12 - ci: run all four test layers on macOS too
 
 An audit of macOS coverage found three defects. (1) Both workflows were
