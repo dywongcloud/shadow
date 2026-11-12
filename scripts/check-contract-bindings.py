@@ -131,6 +131,14 @@ BINDINGS = [
     dict(id="acceptance.harness.paths", layer="acceptance", path=HARNESS,
          extractor="harness_paths", assertion="./scripts/cli-acceptance.sh",
          why="the admin API paths and ports the acceptance run spends"),
+    dict(id="system.harness.macos.temp", layer="system", path=HARNESS,
+         start="Darwin) TMP_ROOT=/private/tmp", end=None,
+         assertion="./scripts/cli-acceptance.sh",
+         why="the /private/tmp temp root: measured 35/0 there vs 31/4 under the macOS default"),
+    dict(id="system.harness.platform.probe", layer="system", path=HARNESS,
+         start="if [ -n \"${HIVE_CI_PLATFORM:-}\" ]", end=None,
+         assertion="./scripts/cli-acceptance.sh",
+         why="CI's declared platform must agree with uname's probe; a mislabeled runner cannot hide a missing Mac leg"),
 ]
 
 # Blocking commands, one per layer. A layer with no blocking command in
@@ -146,7 +154,15 @@ GATES = [
     dict(id="dashboard.install", command="npm ci"),
     dict(id="whitespace", command="git diff --check"),
     dict(id="bindings", command="python3 -I scripts/check-contract-bindings.py --check"),
+    dict(id="acceptance.count", command="grep -qE '35 passed, 0 failed'"),
 ]
+
+# Every blocking layer must run on BOTH platforms. A removed macOS leg is a
+# failed build, not a silently narrower pipeline. `macos-15` is arm64 and
+# `macos-15-intel` is x64; the retired macos-13/macos-14 labels are refused.
+REQUIRED_MACOS_JOBS = ["contracts", "test", "dashboard", "core-tests", "cli", "verify"]
+MACOS_LABELS = ["macos-15", "macos-15-intel"]
+RETIRED_MACOS_LABELS = ["macos-13", "macos-14"]
 
 # The ONLY steps allowed to stay non-blocking. Each needs a reason. Adding a
 # new fail-open step without an entry here is refused; removing the step while
@@ -451,6 +467,47 @@ def check_workflows(errors: list[str]) -> int:
         )
     else:
         checked += 1
+
+    # macOS coverage is a gate, not a nice-to-have. Parse each job's own block
+    # so a macOS runner added to an unrelated job cannot satisfy a missing leg,
+    # and a retired label cannot masquerade as a live runner.
+    def job_slices(text: str) -> dict[str, str]:
+        block = text.split("\njobs:\n", 1)[1] if "\njobs:\n" in text else ""
+        heads = list(re.finditer(r"^  ([a-z][a-z0-9_-]*):$", block, re.M))
+        return {
+            m.group(1): block[m.start():heads[i + 1].start() if i + 1 < len(heads) else len(block)]
+            for i, m in enumerate(heads)
+        }
+
+    ci_jobs = job_slices(ci)
+    release_jobs = job_slices(release)
+    for job in REQUIRED_MACOS_JOBS:
+        owner = release if job == "verify" else ci
+        slices = release_jobs if job == "verify" else ci_jobs
+        slice_text = slices.get(job, "")
+        if "macos-15" not in slice_text:
+            errors.append(
+                f"CI_GATE MACOS {job} MISSING no macOS runner in the {owner} "
+                f"{job!r} job; all four test layers must gate both platforms"
+            )
+        else:
+            checked += 1
+    for label in MACOS_LABELS:
+        if label not in ci or label not in release:
+            errors.append(
+                f"CI_GATE MACOS label {label!r} absent from one of the workflows; "
+                f"both arm64 and x64 darwin must be covered"
+            )
+        else:
+            checked += 1
+    for label in RETIRED_MACOS_LABELS:
+        if label in executable:
+            errors.append(
+                f"CI_GATE MACOS retired runner {label!r} (retired 2026-11-02); "
+                f"this matrix leg cannot boot"
+            )
+        else:
+            checked += 1
     return checked
 
 

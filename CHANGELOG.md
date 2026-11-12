@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-11-12 - ci: run all four test layers on macOS too
+
+An audit of macOS coverage found three defects. (1) Both workflows were
+`ubuntu-latest` only; the npm release workflow's `macos-14`/`macos-13` legs
+were also retired on 2026-11-02, so a `cli-v*` tag could not boot them.
+(2) `scripts/cli-acceptance.sh` was 31 pass / 4 fail on macOS. The cause was
+NOT build isolation: `mktemp` on Darwin ignores `TMPDIR` and used
+`/var/folders/...`, where the real build pipeline never reached ready. With
+the AGENTS.md `/private/tmp` template the SAME harness is 35 pass / 0 fail,
+identical to Linux, zero skips. Reverting the temp root reproduced 31/4, so
+the fix is causal; the host build lane runs on macOS even though
+`build_isolation_protocol` is `null`. (3) CI had no assertion that a macOS
+leg exists at all.
+
+`rust-ci.yml` now runs contracts, unit, dashboard, core-tests and CLI
+acceptance on `macos-15` (arm64) and `macos-15-intel` (x64) alongside Linux;
+`release-npm-cli.yml` gates the tagged SHA on the same three runners and
+builds darwin packages on the two Mac labels. `REQUIRED_MACOS_JOBS` in
+`scripts/check-contract-bindings.py` checks each job's OWN block for a macOS
+runner, requires both arch labels in each workflow, and refuses retired
+labels in executable lines. The `cli` job declares `HIVE_CI_PLATFORM` and the
+harness exits 1 on a mismatch with `uname -s`, so a mislabeled runner cannot
+hide a missing Mac leg. Two new bindings pin the temp root and the probe.
+
+Witnessed on Darwin 25.3.0 arm64: `HIVE_CI_PLATFORM=macos
+scripts/cli-acceptance.sh` 35/0 exit 0; declared `linux` on macOS exits 1
+with `PLATFORM MISMATCH`; `cargo test --workspace --locked` 57 `test result:
+ok` lines exit 0; `npm ci --dry-run`, tsc, lint, build (with and without
+`.env.local`), strict CLI clippy all exit 0; `RESULT PASS bindings=25
+layers=4 gates=33 fail_open=4 secrets_clean=1`; a drift on the macOS
+temp-root construct is detected. Linux CI run 43151853515 was green at 35/35
+acceptance. Both workflow YAMLs parse. Docs: `docs/ci-contract-bindings.md`.
+
+NOT pushed or rolled: a `git push` auto-deploys, which is the operator's
+one-way door.
+
 ## 2026-11-12 - ci: make all four test layers blocking, bind assertions to constructs
 
 A read-only audit of both workflows found 11 fail-open gaps: six

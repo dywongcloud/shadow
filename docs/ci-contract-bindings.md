@@ -93,15 +93,44 @@ silently skip every later check in the job. `npm ci` no longer falls back to
 a floating `npm install`. The committed-secret scan exits nonzero on a PEM
 body or an assigned fleet-secret literal instead of printing a warning.
 
+## macOS runners
+
+Every blocking layer runs on macOS too. `rust-ci.yml` uses `macos-15`
+(arm64) and `macos-15-intel` (x64) alongside `ubuntu-latest`; the npm release
+workflow gates the tagged SHA on the same three runners and builds darwin
+packages on the two Mac labels. `macos-13`/`macos-14` were retired on
+2026-11-02 and are refused by the contract gate.
+
+`REQUIRED_MACOS_JOBS` in the checker asserts each job's OWN block carries a
+macOS runner (a macOS leg in an unrelated job cannot satisfy a missing one),
+that both arch labels appear in each workflow, and that no retired label
+remains in an executable line. The `cli` job passes `HIVE_CI_PLATFORM` and the
+harness refuses a mismatch with `uname -s`, so a mislabeled runner cannot
+silently drop the Mac leg.
+
+The real macOS defect was the temp root, not build isolation. `mktemp` on
+Darwin ignores `TMPDIR` and uses `/var/folders/...`; measured there the
+acceptance harness was **31 passed / 4 failed** (deploy never reached ready).
+With the AGENTS.md `/private/tmp` template it is **35 passed / 0 failed** —
+the identical assertion set as Linux, no platform branch, zero skips. The
+revert-to-default refutation reproduced 31/4, so the fix is causal. The host
+build lane runs on macOS even though `build_isolation_protocol` is `null`.
+Two bindings (`system.harness.macos.temp`, `system.harness.platform.probe`)
+pin these constructs, so changing either without `--sync` fails CI.
+
+Linux CI (run 43151853515) is green at 35/35 acceptance and all four jobs.
+
 ## Verified
 
-Measured on 2026-11-12: `RESULT PASS bindings=23 layers=4 gates=22
+Measured on 2026-11-12: `RESULT PASS bindings=25 layers=4 gates=33
 fail_open=4 secrets_clean=1`; `cargo test --workspace --locked` 57 `test
 result: ok` lines, exit 0; `cd ui && npx tsc --noEmit -p tsconfig.ci.json` exit 0;
-`npm run lint` exit 0; `npm run build` exit 0; `git diff --check` exit 0.
+`npm run lint` exit 0; `npm run build` exit 0 (with and without `.env.local`),
+`npm ci --dry-run` exit 0, `cargo clippy -p shadw-cli --all-targets --locked
+-- -D warnings` exit 0, `git diff --check` exit 0. macOS acceptance
+`HIVE_CI_PLATFORM=macos ./scripts/cli-acceptance.sh` = 35 passed / 0 failed,
+exit 0; `HIVE_CI_PLATFORM=linux` on macOS exits 1 with `PLATFORM MISMATCH`.
 Witnessed drift attacks: `CHANGED`, `MISSING`, `MOVED`, `UNBOUND`, `ORPHAN`,
-`GATE_CHANGED`, a full `--move` migration, a full `--remove` retirement, and
-a CI run attempting `--sync` — each refused or detected, tree restored.
-`scripts/cli-acceptance.sh` on macOS: 31 pass, 4 fail from the
-`BUILD_ISOLATION_UNAVAILABLE` probe (no Linux build executor on this host);
-those four are environmental, not a regression.
+`GATE_CHANGED`, a drift on the macOS temp-root construct, a full `--move`
+migration, a full `--remove` retirement, and a CI run attempting `--sync` —
+each refused or detected, tree restored.

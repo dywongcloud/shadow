@@ -1,13 +1,21 @@
 name: Rust CI
 
-# Four BLOCKING test layers: unit (cargo test --workspace --locked), integration
-# (per-crate tests + shadw-cli), system (real node + real CLI + persistence
-# restart), acceptance (scripts/cli-acceptance.sh end to end). No test files are
-# authored here: AGENTS.md runs the existing suites and verifies against the real
-# system. `contracts` is the gate ASSERTING those four layers are blocking, and
-# pinning each live assertion to the canonical bytes of the construct it spends
-# (scripts/contract-bindings.json). A construct that changes, moves or is removed
-# fails with the regeneration command; --sync never runs in CI.
+# Four BLOCKING test layers on BOTH Linux and macOS: unit
+# (cargo test --workspace --locked), integration (per-crate tests + shadw-cli),
+# system (real node + real CLI + persistence restart), acceptance
+# (scripts/cli-acceptance.sh end to end). No test files are authored here:
+# AGENTS.md runs the existing suites and verifies against the real system.
+# `contracts` is the gate ASSERTING those four layers are blocking on BOTH
+# platforms, pinning each live assertion to the canonical bytes of the
+# construct it spends (scripts/contract-bindings.json). A construct that
+# changes, moves or is removed fails with the regeneration command; --sync
+# never runs in CI.
+#
+# macOS has no Linux BuildExecutor for isolated repository builds, but the
+# REAL host build lane still runs: with the AGENTS.md /private/tmp temp root,
+# macOS passes the SAME 35 acceptance assertions as Linux, zero skips. The
+# harness probes the host and cross-checks CI's declared platform.
+# See docs/ci-contract-bindings.md.
 
 on:
   push:
@@ -21,6 +29,8 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # The harness passes an explicit /private/tmp template on macOS (mktemp there
+  # ignores TMPDIR); on Linux it uses TMPDIR or /tmp. No workflow-level override.
 
 concurrency:
   group: rust-ci-${{ github.ref }}
@@ -31,9 +41,13 @@ concurrency:
 
 jobs:
   contracts:
-    name: contract bindings + CI gate assertions
-    runs-on: ubuntu-latest
+    name: contract bindings + CI gate assertions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     steps:
       # HEAD^ is needed to check the COMMITTED diff; a depth-1 checkout makes
       # `git diff --check` a no-op against an empty working tree.
@@ -44,9 +58,9 @@ jobs:
       - name: Whitespace (hard gate)
         run: git diff --check HEAD^ HEAD
 
-      # stdlib-only; asserts every layer is blocking, refuses an undeclared
-      # continue-on-error, verifies the release workflow is gated, and checks
-      # all 23 construct bindings + committed-secret material.
+      # stdlib-only; asserts every layer is blocking on BOTH platforms, refuses
+      # an undeclared fail-open, verifies the release workflow is gated, and
+      # checks all construct bindings + committed-secret material.
       - name: Contract bindings (hard gate)
         run: python3 -I scripts/check-contract-bindings.py --check
 
@@ -56,9 +70,15 @@ jobs:
         run: git diff --exit-code -- scripts/contract-bindings.json
 
   test:
-    name: build + unit tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: build + unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 = arm64, macos-15-intel = x64. macos-14/macos-13 were
+        # retired on 2026-11-02; the old release labels would not boot.
+        os: [ubuntu-latest, macos-15, macos-15-intel]
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +90,7 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
-      # Hard gate: the whole workspace must compile and all unit tests must pass.
+      # Hard gate: the whole workspace must compile and all unit tests pass.
       - name: Build (workspace)
         run: cargo build --workspace --locked --verbose
 
@@ -88,9 +108,13 @@ jobs:
         run: cargo clippy --workspace --all-targets
 
   dashboard:
-    name: dashboard (types + lint + build)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    name: dashboard (types + lint + build) (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -175,9 +199,13 @@ jobs:
           echo "PASS: no committed private-key material"
 
   core-tests:
-    name: core (deploy + edge + build) tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    name: core (deploy + edge + build) tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -190,9 +218,21 @@ jobs:
           cargo test -p hive-cloud --locked
 
   cli:
-    name: shadw CLI (unit + integration + acceptance)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    name: shadw CLI (unit + integration + acceptance) (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # All three runners execute the IDENTICAL 35-assertion harness.
+          # HIVE_CI_PLATFORM makes the declared runner agree with uname's probe.
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-15
+            platform: macos
+          - os: macos-15-intel
+            platform: macos
     steps:
       - uses: actions/checkout@v4
 
@@ -212,10 +252,14 @@ jobs:
       - name: clippy (shadw-cli, strict)
         run: cargo clippy -p shadw-cli --all-targets --locked -- -D warnings
 
-      # System + acceptance: a throwaway node on isolated ports with a temp data
-      # dir, the REAL compiled CLI, a real deploy, multi-tenant isolation and
-      # survival across a node restart. Hermetic: a local file:// repo.
+      # System + acceptance on ALL THREE runners: a throwaway node on isolated
+      # ports with a temp data dir, the REAL compiled CLI, a real deploy,
+      # multi-tenant isolation and survival across a node restart. Hermetic:
+      # a local file:// repo under /private/tmp on macOS. No platform branch.
       - name: End-to-end acceptance (real node + real CLI)
+        env:
+          HIVE_CI_PLATFORM: ${{ matrix.platform }}
         run: |
           chmod +x scripts/cli-acceptance.sh
-          ./scripts/cli-acceptance.sh
+          ./scripts/cli-acceptance.sh | tee "$RUNNER_TEMP/acceptance.log"
+          grep -qE '35 passed, 0 failed' "$RUNNER_TEMP/acceptance.log"

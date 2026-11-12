@@ -160,6 +160,20 @@
       "id": "acceptance.harness.paths",
       "layer": "acceptance",
       "path": "scripts/cli-acceptance.sh"
+    },
+    {
+      "assertion": "./scripts/cli-acceptance.sh",
+      "canonical_sha256": "ff35d71d5bdcea1e14edef13bc88a8ce31120ac23b6b0fc9a43ea1a89b1c0683",
+      "id": "system.harness.macos.temp",
+      "layer": "system",
+      "path": "scripts/cli-acceptance.sh"
+    },
+    {
+      "assertion": "./scripts/cli-acceptance.sh",
+      "canonical_sha256": "7f888f28ade24aa9e5fed02875fc226d6e6c76890f51d690ac499b5af7a228e3",
+      "id": "system.harness.platform.probe",
+      "layer": "system",
+      "path": "scripts/cli-acceptance.sh"
     }
   ],
   "domain": "hive-contract-binding-v1",
@@ -181,7 +195,7 @@
       "step": "npm audit (dashboard)"
     }
   ],
-  "gate_sha256": "cd5e5b950506ca30509f720c7075fce362d35526a97b1be6d25d49650679c71b",
+  "gate_sha256": "59499e3071f2bcf93e3478460407dd3438a7623d4e50557a96a21d9ccc2c8db9",
   "gates": [
     {
       "command": "cargo test --workspace --locked --verbose",
@@ -222,6 +236,10 @@
     {
       "command": "python3 -I scripts/check-contract-bindings.py --check",
       "id": "bindings"
+    },
+    {
+      "command": "grep -qE '35 passed, 0 failed'",
+      "id": "acceptance.count"
     }
   ],
   "generator": "python3 -I scripts/check-contract-bindings.py --sync",

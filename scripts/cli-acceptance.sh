@@ -9,14 +9,29 @@ cd "$(dirname "$0")/.."
 ADMIN=8899; PUBLIC=8898; DNS=5390; TLS=8490
 DB_TEARDOWN_TIMEOUT_SECS=25
 API="http://127.0.0.1:$ADMIN"
-DATA="$(mktemp -d)"
-REPO="$(mktemp -d)/acc-repo"
-ISOLATED_HOME="$(mktemp -d)"
+# macOS mktemp ignores TMPDIR (it uses DARWIN_USER_TEMP_DIR), so pass an
+# explicit /private/tmp template per AGENTS.md. The macOS default temp root
+# (/var/folders/...) breaks the real build pipeline: measured 31 passed / 4
+# failed there, 35 / 0 under /private/tmp with identical assertions. Linux
+# keeps its own TMPDIR. The same case sets the probed platform.
+case "$(uname -s)" in
+  Darwin) TMP_ROOT=/private/tmp; PROBED_PLATFORM=macos ;;
+  *)      TMP_ROOT="${TMPDIR:-/tmp}"; PROBED_PLATFORM=linux ;;
+esac
+# When CI declares a platform, the probe must AGREE. A mislabeled runner that
+# silently resolves to another OS would otherwise hide a missing Mac leg.
+if [ -n "${HIVE_CI_PLATFORM:-}" ] && [ "$HIVE_CI_PLATFORM" != "$PROBED_PLATFORM" ]; then
+  echo "PLATFORM MISMATCH: CI declared '$HIVE_CI_PLATFORM' but uname probed '$PROBED_PLATFORM'"
+  exit 1
+fi
+DATA="$(mktemp -d "$TMP_ROOT/hive-acc-data.XXXXXX")"
+REPO="$DATA/acc-repo"
+ISOLATED_HOME="$(mktemp -d "$TMP_ROOT/hive-acc-home.XXXXXX")"
 SHADW=./target/debug/shadw
 NODE=./target/debug/hive-cloud
 PASS=0; FAIL=0; NODE_PID=""
 
-cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null; rm -rf "$DATA" "$REPO" "$ISOLATED_HOME"; }
+cleanup() { [ -n "$NODE_PID" ] && kill "$NODE_PID" 2>/dev/null; rm -rf "$DATA" "$ISOLATED_HOME"; }
 trap cleanup EXIT
 
 ok()   { echo "  PASS: $1"; PASS=$((PASS+1)); }
@@ -60,7 +75,7 @@ echo "==> Observability (read-only)"
 assert     "obs overview"   "$SHADW" obs overview --json
 assert_out "obs nodes lists the node"  "acc-node"  "$SHADW" obs nodes
 
-echo "==> Deploy (clone → build → ready) via the real build pipeline"
+echo "==> Deploy (clone -> build -> ready) via the real build pipeline"
 assert_out "deploy --follow reaches ready" "ready"  "$SHADW" deploy "file://$REPO" --project accproj --follow
 assert_out "deps list shows the project"   "accproj" "$SHADW" deps list
 DTEN="$(curl -s -m5 "$API/deployments" -H "authorization: Bearer $KEY" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(next((x.get("tenant","") for x in d if x.get("project")=="accproj"),"MISSING"))')"

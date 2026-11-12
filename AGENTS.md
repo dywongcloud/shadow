@@ -9,15 +9,15 @@ keep load-bearing, drop absorbed. Nested:
 - Every task runs through the `gm` skill (`mcp__gm__gm`), subagents too: `codeinsight`/`codesearch`/`grep` verbs, never shell
 grep/find; git only via `git_*` verbs (`git_commit paths:[...]` stages EVERY dirty hunk of a named file: `git_status` first).
 Attribution is dywongcloud ONLY: no `Co-Authored-By`, no Claude/Anthropic trailer.
-- **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries). `cargo test
---workspace --locked` + `scripts/cli-acceptance.sh` (macOS `/private/tmp`) + live execution; fix a failure CLASS at the
-shared primitive. `cargo check` skips `cfg(target_os="linux")` AND test targets, so run, not `--no-run`; a dep change ships
-`Cargo.lock` (`--locked`). `scripts/check-contract-bindings.py --check` gates CI; drift names `--sync`, never in CI.
-`docs/ci-contract-bindings.md`.
+- **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries): CI RUNS the four layers.
+`cargo test --workspace --locked` + `scripts/cli-acceptance.sh` + live execution; fix a failure CLASS at the shared
+primitive. `cargo check` skips `cfg(target_os="linux")` AND test targets, so run, not `--no-run`; a dep change ships
+`Cargo.lock` (`--locked`). `check-contract-bindings.py --check` gates CI; drift names `--sync`, never in CI. All four
+layers gate Linux AND macOS (`macos-15`/`-intel`). Darwin `mktemp` ignores `TMPDIR`: `/private/tmp`.
 - Cargo/disk traps: keep the user's PATH (Homebrew cargo has no cross std); `hive-cloud` is bin-only; `df` before a build; never
 build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work via
-`refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup name form (removing a pushed
-copy needs a force-push rewrite). `hive_health_interval` > `hive_health_timeout`; an empty reviewed public resolver set
+`refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup name form (a pushed copy needs a
+force-push rewrite). `hive_health_interval` > `hive_health_timeout`; an empty reviewed public resolver set
 fails build-executor preflight; raise `deploy_serial_backend` only with quorum-safety evidence.
 - A roll/deploy is a production change: operator's word first, then `ansible/AGENTS.md` (dashboard: `ui/AGENTS.md`);
 prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never by grepping a Rust format literal;
@@ -31,8 +31,8 @@ never `git_reword` during a roll (rewrites every later SHA).
 node drop-in overrides the unit: read `/proc/<pid>/environ`.
 - SSH `ssh -i ~/.ssh/id_ed25519 root@<ip>` (billing.pem refused); fc-orlando needs `sysadmin@` + `sudo -n`.
 Admin API is plain HTTP loopback :8786, not :8787/https. Verify ports from a FLEET vantage, never the laptop,
-and serve a URL from the node to itself first (a vendor policy-drop hides a fully-serving node). TCP+UDP
-20000-29999 is SG-open: never run an ad-hoc file server. `scripts/hive-lockdown.sh` is the sole host firewall;
+and serve a URL from the node to itself first (a vendor policy-drop hides it). TCP+UDP
+20000-29999 is SG-open: no ad-hoc file server. `scripts/hive-lockdown.sh` is the sole host firewall;
 PEERS is generated (`gen-hive-lockdown.sh`, `site.yml --tags lockdown`). A priority -95 accept table does NOT
 stop a later policy-drop base chain: put the accept in the chain INPUT jumps to.
 - fc-orlando SHARES its host with a second hive-cloud (`hive-devhub.service`): stop by MainPID, never `pkill -x hive-cloud`, or
@@ -114,7 +114,7 @@ refs must be qualified.
 Placement gates through ONE predicate shared by `place`, lease-stickiness and `dispatch_fallbacks` (`schedule::wasm_capable`);
 a missing runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
 - Litebox (Firecracker -> Litebox -> Mock) is NOT Firecracker/gVisor isolation (guest and enforcement share one address
-space; seccomp-bpf is the only backstop): a node is Litebox only after `hive-cloud --litebox-probe` PASSES on that host with
+space; seccomp-bpf is the only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes on that host with
 the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the flag alone, never macOS.
 `litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`, so ANY change rebuilds every artifact.
 - A sandbox's live cell exists on ONE node (`SandboxRecord::owner_node`); the leader only routes.
@@ -156,7 +156,7 @@ persisted server-side and cannot cross devices; build/deploy credentials resolve
 ## Placement & capacity
 
 - Disk is a HARD filter (`HIVE_PLACEMENT_DISK_FLOOR_GB`), never a score term; unknown free space (`NodeInfo::disk_free_gb` 0) ADMITS;
-placement requires an actually dialable path. **Every reclaim path needs a blast-radius guard**: `gc_rootfs_images` refuses an empty
+placement requires a dialable path. **Every reclaim path needs a blast-radius guard**: `gc_rootfs_images` refuses an empty
 keep-set or an orphaned fraction over `HIVE_GC_MAX_REAP_FRACTION` (data images carry a DOUBLE `dpl-dpl-` prefix: match both).
 
 ## Request path, circuits, cold start
@@ -214,7 +214,7 @@ mirrored in `ui/lib/team-role.ts`. Docs: `docs/account-2fa.md`.
 - State is per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` behind `serde(default)`.
 Secret: `secrets::encrypt`
 (FAILS OPEN, assert `is_encrypted`), read ONLY `secrets::try_decrypt`, compared `admin::ct_eq`. The
-signed `otp_at` claim sits INSIDE the HS256 payload, read only from an already-verified token,
+signed `otp_at` claim sits INSIDE the HS256 payload, read only from a verified token,
 fails closed if absent. Carve out machines before any OTP demand: `is_fleet_service`,
 `is_queue_client`, `key:`/`__untagged__`/empty subs, or all 20 fleet delegations and API keys break.
 Dev nodes, GET/HEAD/OPTIONS never gated. Single-use challenge, `step > last_used_step`, per-sub rate
@@ -236,7 +236,7 @@ restore-on-failure transaction in `vercel_dns::plan_writes` (creates before dele
 - **Advertise only what peers have PROVEN**: `NodeInfo::dns_ns` needs `dns_bind_reaches_internet` (necessary,
 never sufficient); `dns_probe` proves reachability and `validate_nameservers` admits a node attested from TWO distinct
 REGIONS, never self-attested.
-- A platform-wide public-DNS question (the `www` SAN, the `_hive-verify` TXT proof) is asked of `dns_quorum::VANTAGES` and admitted by
+- A platform-wide public-DNS question (`www` SAN, `_hive-verify` TXT) is asked of `dns_quorum::VANTAGES` and admitted by
 `Tally::admits`: a resolver that errors ABSTAINS (never a "no"), a MAJORITY of the ANSWERING operators is required with a floor of 2.
 - Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s `aliases_full`) before any first-label/wildcard lookup.
 Attachment needs observed DNS proof through ONE helper (`mark_domain_verified`); only a VERIFIED record locks to its tenant;
