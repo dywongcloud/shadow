@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { githubConfigured, githubStatus, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/github";
+import { githubConfigured, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/github";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
 /** Parse "owner/repo" from a clone URL or full_name. */
@@ -24,16 +24,10 @@ export async function POST(req: NextRequest) {
   const parsed = parseRepo(String(body?.repo || ""));
   if (!parsed) return NextResponse.json({ skipped: true, reason: "bad-repo" });
 
-  const entity = await resolveEntity();
-  const status = await githubStatus(entity);
-  if (!status.connected) {
-    return NextResponse.json(
-      { ok: false, reason: "github-not-connected", error: "GitHub is not connected — the CI webhook/workflow cannot be installed. Reconnect GitHub (Integrations), then retry." },
-      { status: 502 }
-    );
-  }
-
   const { owner, repo } = parsed;
+  // The webhook/workflow/variable writers each resolve the repo's own credential, so an OAuth
+  // cookie pre-gate here refused an install the App installation token can perform on any device.
+  const entity = await resolveEntity();
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
   const secret = process.env.GITHUB_WEBHOOK_SECRET || undefined;
 

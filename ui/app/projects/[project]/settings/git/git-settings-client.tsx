@@ -34,6 +34,8 @@ interface GhDetail {
   configured: boolean;
   connected: boolean;
   hasOrgScope?: boolean;
+  /** "installation" = a GitHub-answered App token for the linked config repo, NOT a user login. */
+  credential?: string;
 }
 
 /** Response shape from /api/gitops/project-ci (see that route for the source of
@@ -113,7 +115,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
     cachedJson<GhDetail>("/api/github/status", 30_000)
       .then(async (s) => {
         setGh({ ...s, configured: !!s.configured, connected: !!s.connected });
-        if (!s.connected) return;
+        if (!s.connected || s.credential === "installation") return;
         const personal = await cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000)
           .then((d) => d.repos || [])
           .catch(() => [] as GhRepo[]);
@@ -324,7 +326,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
           title="Connect a Git Repository"
           desc="This project was created without a Git source (a .zip upload or a container image). Connect a repository to switch it to Git-based deployments — every push will build and deploy automatically once connected."
         >
-          {gh.connected ? (
+          {gh.connected && gh.credential !== "installation" ? (
             <div className="flex flex-col gap-3">
               {ghCta ? (
                 <div className="flex flex-col gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
@@ -407,6 +409,8 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
                   ? "GitHub isn't configured on this platform yet."
                   : ghCta
                   ? ghCta.text
+                  : gh.credential === "installation"
+                  ? "GitOps writes the linked config repo on this device through the platform's GitHub App installation. Connect GitHub here to pick a repository with your own account."
                   : "Authorize GitHub on this device to connect a repository. The grant is stored in this browser, so each device connects once."}
               </p>
               {gh.configured && (

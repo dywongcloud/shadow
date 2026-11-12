@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { githubConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/github";
+import { githubConfigured, commitFiles, resolveEntity } from "@/lib/github";
 import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 /** Regenerates the org's full GitOps artifact tree and commits it to the linked repo as one atomic commit, skipping when the tree hash equals the
@@ -20,14 +20,10 @@ export async function POST(req: NextRequest) {
   const branch = link.branch || "main";
   const path = link.path || "openedge.yaml";
 
+  // No cookie pre-gate: `commitFiles` resolves the repo's own writer (browser grant, else the
+  // App's device-independent installation token) and returns its typed error. A second check here
+  // would mint a token on every 45 s sync and could race with the write that actually uses one.
   const entity = await resolveEntity();
-  const status = await githubStatus(entity);
-  if (!status.connected) {
-    return NextResponse.json(
-      { ok: false, error: "GitHub is not connected — the linked config repo cannot be synced. Reconnect GitHub (Integrations) to resume GitOps mirroring." },
-      { status: 502 }
-    );
-  }
 
   const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, authToken, path);
   if (failures.length) {

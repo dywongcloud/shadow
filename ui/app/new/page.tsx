@@ -34,6 +34,8 @@ interface GhDetail {
   hasPrivateAccess?: boolean;
   hasOrgScope?: boolean;
   live?: boolean;
+  /** "installation" = a GitHub-answered App token for the linked config repo, NOT a user login. */
+  credential?: string;
 }
 
 interface TemplateBase {
@@ -153,7 +155,7 @@ export default function NewProjectPage() {
         setGhCta({ text: "Your GitHub authorization is no longer valid. Reconnect to import your repositories." });
         return;
       }
-      if (!s.connected) return;
+      if (!s.connected || s.credential === "installation") return;
       const personal = await cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000)
         .then((d) => d.repos || [])
         .catch(() => [] as GhRepo[]);
@@ -503,7 +505,7 @@ export default function NewProjectPage() {
         <div>
           <h2 className="mb-4 text-lg font-semibold">Import Git Repository</h2>
           <Card className="p-4">
-            {gh.connected ? (
+            {gh.connected && gh.credential !== "installation" ? (
               <>
                 {ghCta ? (
                   <div className="mb-3 flex flex-col gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
@@ -549,6 +551,8 @@ export default function NewProjectPage() {
                     ? "Set COMPOSIO_API_KEY to enable multi-tenant GitHub OAuth. You can still deploy any public repo by URL above."
                     : ghCta
                     ? ghCta.text
+                    : gh.credential === "installation"
+                    ? "GitOps already writes the linked config repo on this device through the platform's GitHub App installation. Connect GitHub here to import repositories with your own account."
                     : "Authorize GitHub on this device to import and deploy your repositories. The grant is stored in this browser, so each device connects once."}
                 </p>
                 {gh.configured && (

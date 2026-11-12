@@ -45,7 +45,9 @@ export interface GithubDetail extends GithubConnectionDetail {
   /** Whether THIS request holds a GitHub credential at all (`CredentialState`), independent of whether GitHub was reached.
    *  The two facts are separate on purpose: "we hold a credential" and "GitHub just answered for it" fail for different
    *  reasons, and collapsing them is what made a transient network blip read as "not connected". */
-  credential?: CredentialState;
+  credential?: CredentialState | "installation";
+  /** The tenant's linked config repo GitHub answered for, on a device with no per-browser grant. */
+  installationRepo?: string;
   /** Whether the live probe to GitHub got an ANSWER: "reachable" = it answered for this credential, "unavailable" = no
    *  answer (network/timeout/5xx/rate limit, which says nothing about the credential), "rejected" = it answered and
    *  refused it, "unknown" = the status handler's own deadline beat the probe. */
@@ -281,6 +283,80 @@ async function resolveWriterToken(
         };
   }
   return { appError: r.error };
+}
+
+/** A GitHub WRITE capability for `owner/repo`, independent of the browser's own OAuth grant.
+ *  `resolveWriterToken` prefers the sealed per-browser cookie, then mints an installation token
+ *  with the App's own identity; GitHub answering with that token is the proof a fresh device
+ *  (a phone that never authorised) can still sync a tenant's linked config repo. Never returns
+ *  the token itself. */
+export interface GithubWriteCapability {
+  ok: boolean;
+  via?: "user-token" | "installation";
+  /** Typed, human-readable reason no writer exists; surfaced in GitOps failures. */
+  error?: string;
+}
+
+export async function githubCanWriteRepo(owner: string, repo: string): Promise<GithubWriteCapability> {
+  const w = await resolveWriterToken(owner, repo).catch(() => ({}) as Awaited<ReturnType<typeof resolveWriterToken>>);
+  if (w.token) return { ok: true, via: w.via };
+  try {
+    const d = await composio.githubConnectionDetail(await composio.resolveEntity());
+    if (d.connected) return { ok: true, via: "user-token" };
+  } catch {}
+  return {
+    ok: false,
+    error:
+      w.appError ||
+      `No writable GitHub credential for ${owner}/${repo}. Install the GitHub App on that account, or connect GitHub (Integrations) on this device.`,
+  };
+}
+
+/** HONEST connection detail for a device with no per-browser grant but a GitHub-answered installation token for the
+ *  tenant's linked config repo. `via: "installation"` names the real mechanism; `login` stays null because no user
+ *  OAuth grant exists on this device. Never claims scopes or org access the installation token does not carry, and
+ *  never returns the token. */
+export async function githubInstallationDetail(entity: string, owner: string, repo: string): Promise<GithubDetail | null> {
+  if (!installationAuthConfigured()) return null;
+  // GitHub itself answering with a token for THIS repo is the proof. The platform-wide
+  // /app/installations list spans every customer and is never evidence for a tenant.
+  // The status GET races a 3.5 s deadline: bound this probe so a slow GitHub answer degrades the
+  // page to "unknown" instead of dragging the whole status chain past the client's abort.
+  const minted = await withTimeout(installationTokenForRepo(owner, repo).catch(() => null), 1600, null);
+  if (!minted?.ok || !minted.token) return null;
+  return {
+    configured: githubConfigured(),
+    connected: true,
+    entity,
+    login: null,
+    scopes: [],
+    hasPrivateAccess: false,
+    hasOrgScope: false,
+    live: true,
+    via: "installation",
+    credential: "installation",
+    reachability: "reachable",
+    installationState: "present",
+    installations: [owner],
+    installationRepo: `${owner}/${repo}`,
+  };
+}
+
+/** A repository CREATE needs a user-level grant: an installation token is scoped to a repo that already
+ *  exists. Refuse with an actionable reason instead of letting a dead Composio fallback answer. */
+export async function githubCanCreateRepo(): Promise<GithubWriteCapability> {
+  if (await getGithubAppToken().catch(() => null)) return { ok: true, via: "user-token" };
+  if (composio.composioConfigured()) {
+    try {
+      const d = await composio.githubConnectionDetail(await composio.resolveEntity());
+      if (d.connected) return { ok: true, via: "user-token" };
+    } catch {}
+  }
+  return {
+    ok: false,
+    error:
+      "Creating a new config repository needs GitHub connected on this device. Connect GitHub (Integrations), or choose an existing repository the platform's GitHub App can write to.",
+  };
 }
 
 /** The Composio result, upgraded with the app path's reason when that is the real story (the App's reason leads once its

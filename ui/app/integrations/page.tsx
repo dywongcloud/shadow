@@ -34,7 +34,9 @@ interface GhDetail {
   installUrl?: string;
   /** Whether THIS request holds a credential at all, independent of whether GitHub was reached: the two facts fail for
    *  different reasons and collapsing them is what made one network blip read as "not connected". */
-  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected" | "unknown";
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "installation" | "refresh-unavailable" | "rejected" | "unknown";
+  /** The tenant's linked config repo, when the answer came from the App installation alone. */
+  installationRepo?: string;
   /** Whether the live probe got an ANSWER: "reachable" = GitHub answered for this credential, "unavailable" = no answer
    *  (network/timeout/5xx/rate limit, which says nothing about it), "rejected" = answered and refused it, "unknown" = the
    *  status handler's own deadline beat the probe. */
@@ -368,6 +370,7 @@ function githubSubtitle(gh: GhDetail): string {
   // to a Connect button that cannot help. Name the actual state and the action that clears it.
   if (gh.credential === "foreign") return "connected to a different account — reconnect to use yours";
   if (gh.credential === "unknown") return "connection check did not finish — retry";
+  if (gh.credential === "installation") return "connected via app installation — connect here for your own repos";
   // "rejected" is the one class that is really not connected: GitHub ANSWERED and refused the credential.
   const rejected = gh.reachability === "rejected" || gh.credential === "rejected";
   if (!gh.connected) return (gh.scopes ?? []).length > 0 || rejected ? "reconnect needed" : "not connected";
@@ -419,6 +422,7 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
   const active = gh.connected;
   const degraded = isDegraded(gh);
   const unreadable = gh.credential === "unreadable";
+  const installation = gh.credential === "installation";
   const subtitle = githubSubtitle(gh);
 
   return (
@@ -488,7 +492,18 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {active ? (
+          {installation ? (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-border bg-subtle/40 px-3 py-2 text-xs text-secondary">
+              <GitBranch className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                GitOps on this device writes through the platform&apos;s GitHub App installation, so it works
+                without a browser sign-in. Connect GitHub here to browse or create repositories with your
+                own account.
+              </span>
+            </div>
+          ) : null}
+
+          {active && !installation ? (
             <div className="mb-3 flex flex-wrap gap-1.5">
               <Badge tone={gh.hasPrivateAccess ? "green" : "default"}>
                 {gh.hasPrivateAccess ? <><Check className="h-3 w-3" /> Private access</> : "Public only"}
@@ -507,7 +522,7 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {active && !gh.hasOrgScope ? (
+          {active && !installation && !gh.hasOrgScope ? (
             <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               {gh.provider === "github-app" ? (
@@ -533,7 +548,17 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
           ) : null}
 
           <div className="flex flex-wrap items-center gap-3">
-            {active ? (
+            {installation ? (
+              <>
+                <Button variant="outline" onClick={() => window.dispatchEvent(new Event("hive-open-gitops"))}>
+                  <GitBranch className="h-3.5 w-3.5" /> Set up GitOps
+                </Button>
+                <Button onClick={() => connect("connect")} disabled={!!busy}>
+                  {busy === "connect" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Github className="h-4 w-4" />}
+                  Connect GitHub on this device
+                </Button>
+              </>
+            ) : active ? (
               <>
                 <Button variant="outline" onClick={() => window.dispatchEvent(new Event("hive-open-gitops"))}>
                   <GitBranch className="h-3.5 w-3.5" /> Set up GitOps

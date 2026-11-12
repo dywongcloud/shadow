@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-11-12 - fix(ui): GitOps on a phone, without widening the GitHub grant
+
+A second device has no `gh_app_tok` cookie by design: the first-party OAuth grant is
+sealed into a host-only httpOnly cookie and is NOT persisted server-side. Every GitOps
+route gated on `githubStatus(entity)`, so on a phone `init` answered 400 "GitHub
+not connected." instantly and `sync`/`project-ci` answered 502 before any GitHub
+call, while `GET /api/github/status` read as "not connected". The App's own
+server-to-server installation credential is device-independent and already drives
+`commitFiles`, `commitFile`, `createRepoWebhook` and `setRepoVariable`.
+
+`init`, `sync` and `project-ci` now let the repo-scoped writer be the source of
+truth. `init` proves `githubCanWriteRepo(owner, repo)` BEFORE `PUT /v1/gitops`,
+so an unwritable repo is never linked; CREATING a repository still needs a
+user-level grant (`githubCanCreateRepo`), with an actionable refusal.
+`GET /api/github/status` reads the tenant's linked config repo from `/v1/gitops`
+(bearer-derived tenant, never the sticky `connected` flag) and reports a distinct
+installation state ONLY when GitHub itself mints a token for THAT repo: `login`
+null, empty scopes, no org or private-access claim, `installationRepo` named. The
+platform-wide `/app/installations` list is never evidence for a tenant. A `none`
+grant with an unfinished check reads `unknown`, never "not connected"; with no
+`hive_jwt` there is no tenant to ask. The four status consumers (integrations,
+GitOps modal, new project, project Git settings) show honest copy plus a
+device-connect CTA, and never a repo picker or Disconnect for that state.
+
+Witnessed live on localhost:3044 with a real GitHub App identity and a phone-shaped
+request (`hive_jwt` only, NO `gh_app_tok`): status 200 in 1.79 s with
+`connected:true`, the installation state and the linked repo; a 320px headful
+Chromium shows "connected via app installation", scrollWidth 320. `init` with an
+unwritable repo answers a typed 502 from GitHub's installation lookup instead of
+the instant 400; `project-ci` surfaces the real writer errors; `sync` reaches the
+real writer. `npx tsc --noEmit` (source-only, excluding generated .next/dev types),
+`npm run lint`, `git diff --check` and `cargo test --workspace --locked` (57 test
+result lines) are all clean. No grant cookie was widened and no third-party bearer
+was persisted. NOT pushed or rolled: that is the operator's one-way door.
+
 ## 2026-11-12 - ops: push and roll the mobile GitHub fix
 
 The operator authorized the push and the production roll. `refs/remotes/origin/main`

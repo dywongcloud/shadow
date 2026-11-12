@@ -54,22 +54,21 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   are validated in the connect-time `lookup` of `node:https` (`ui/lib/public-address.ts`: one non-public
   answer refuses; IPv4-mapped/NAT64 unwrapped), redirects followed by hand (<= 3, each hop re-validated),
   bodies size- and type-bounded; never a pre-check followed by `fetch` (DNS rebinding).
-  `/api/tv/hls` stays an anonymous public relay (owner decision), so its bounds are its only protection:
-  `role=key` is CLIENT-SUPPLIED and no authorization (it relabels at most `KEY_MAX_BYTES` of a public body
-  as inert `application/octet-stream`), and gzip/deflate bodies are decoded (`boundedSource`) under caps on
-  encoded AND decoded bytes (br, zstd, chained codings 415; a 206 in a coding 502).
+  `/api/tv/hls` stays an anonymous public relay (owner decision): `role=key` is CLIENT-SUPPLIED with no
+  authorization (it relabels at most `KEY_MAX_BYTES` of a public body as inert `application/octet-stream`),
+  and gzip/deflate bodies are decoded (`boundedSource`) under caps on encoded AND decoded bytes (br, zstd,
+  chained codings 415; a 206 in a coding 502).
 - A request-derived redirect target or return path passes `ui/lib/same-origin-path.ts` `sameOriginPath`
   (`startsWith("/")` accepts `//evil.example`, `/\evil.example`, `/<TAB>/evil.example`). A host that flows
   into a URL is validated as a bare hostname before any suffix test.
 - `ui/app/api/preview-unlock` authorizes only from the node's `/v1/zkauth/project-team` answer plus the
-  Clerk identity (`teamAccess` in `ui/lib/preview-access.ts`, also behind `/api/zk-enroll`), never `?team=`,
-  failing closed: an unanswerable lookup is a retryable 503 (`Retry-After`; "unavailable", not "denied"),
-  a non-member 403; `zkauth::bootstrap` binds the ring to the project's owner. Proof URLs are built only
-  for a platform-issued host (`isKnownDeploymentHost`), `http` only for `localhost`.
+  Clerk identity (`teamAccess`, also behind `/api/zk-enroll`), never `?team=`, failing closed: an
+  unanswerable lookup is 503 (`Retry-After`), a non-member 403; `zkauth::bootstrap` binds the ring to the
+  owner. Proof URLs are built only for a platform-issued host (`isKnownDeploymentHost`), `http` only for
+  `localhost`.
 - GitHub connect state (`githubConnectionDetail`): only a token GitHub itself just answered for may report
   `connected` — HELD but unchecked: `connected`+`degraded`; `unreadable`/`foreign` never "not connected". `configured`
-  is `githubConfigured()` (App OR Composio) on EVERY branch: a browser with no cookie on an App-only deployment used
-  to get Composio's `false` and lose every Connect button. `GET /app/installations` spans every customer, never
+  is `githubConfigured()` (App OR Composio) on EVERY branch. `GET /app/installations` spans every customer, never
   evidence for THIS user. The App token lives ENCRYPTED in a host-only httpOnly cookie (widening its domain is a
   security change needing the operator's word); `getGithubAppToken()` is called ONLY from a Route Handler. OAuth
   `state` signs `returnTo` + the VERIFIED Clerk uid; a 10-min nonce binds it and the callback consumes it. The nonce
@@ -78,6 +77,13 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   entity and the OAuth state: bare `auth()` reads signed-out on iOS Safari while `__session` is valid. Every failed
   connect returns to `returnTo` with `github_error` rendered by `components/github-connect-error.tsx`; the SW skips
   `/oauth`. A failed status check never opens the onboarding modal or claims "not connected".
+- GitOps writes (`init`/`sync`/`project-ci`) are DEVICE-INDEPENDENT: never gate on `githubStatus`'s
+  cookie; `githubCanWriteRepo`'s repo-scoped writer (cookie THEN App installation token) is the truth,
+  proven BEFORE `PUT /v1/gitops`. Creating a repo needs a user grant. `GET /api/github/status` reports
+  the installation state (`login:null`, no scopes, `installationRepo`) ONLY when GitHub mints a token for
+  the tenant's linked repo from `/v1/gitops` (never its sticky `connected` flag or the global list); a
+  `none` grant with an unfinished check reads `unknown`. Status consumers show honest copy + a
+  device-connect CTA, never a repo picker or Disconnect.
 - Committed GitOps artifacts never carry secrets (`databaseNode` is a field allowlist,
   `projectNode` serializes env KEYS only). `composio.commitFiles`/`github-rest.ghCommitFiles` are ONE
   contract with TWO implementations (an unresolvable branch tree REFUSES: no `base_tree` deletes the
@@ -85,23 +91,21 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
 
 ## Data sources and polling
 
-- Every project picker uses `useProjectNames()`/`useProjects()` (`ui/lib/projects.ts`: the deployment list
-  merged with the backend inventory `SUMMARY_PATH`), never `deployments.map(d => d.project)`: a project
-  whose builds all failed has no deployment yet stays listed and actionable (`hasNoDeployment`:
-  Retry/Delete).
+- Every project picker uses `useProjectNames()`/`useProjects()` (deployments merged with the backend
+  inventory), never `deployments.map(d => d.project)`: a project whose builds all failed still stays
+  listed and actionable (`hasNoDeployment`: Retry/Delete).
 - `usePoll`/`useOpsPoll` share one loop (`usePollWith`): hidden tabs never poll and catch up on
   `visibilitychange`; a new hook binds a fetcher, never copies the body. Fan-out read polls
   (`/v1/functions`, `/v1/metrics`, `/v1/admin/overview`) stay under the backend's 15 s polled-response
   cache TTL (`OVERVIEW_POLL_MS`, `FUNCTIONS_POLL_MS`).
 - Dashboard numbers are measured or absent, never invented: tenant counters from `/v1/metrics` and
   `/v1/functions`, usage prices only from the billing API's `rate_card`; a value the node did not measure
-  renders as absent (older nodes serve `DomainRecord`'s `registrar`/`renewal_price`/`auto_renew`/`expires_ms`
-  EMPTIED; `ui/lib/api.ts` declares none, and the dashboard rolls BEFORE or WITH the nodes).
-- A value that differs between server and client render (`window.location`, `localStorage`) never seeds a
-  `useState` initializer (React #418): pass it from the server or read it in a post-mount effect.
-- The public `/status` board reads `PUBLIC_INCIDENTS_PATH` (`/v1/status/incidents`:
-  `incidents::public_board`, operator-origin incidents only, because automated ones carry node names, pids
-  and command lines); `/v1/incidents` stays operator-gated, so never point the page at it.
+  renders as absent, and the dashboard rolls BEFORE or WITH the nodes.
+- A server/client-differing value (`window.location`, `localStorage`) never seeds a `useState`
+  initializer (React #418): pass it from the server or read it in a post-mount effect.
+- The public `/status` board reads `PUBLIC_INCIDENTS_PATH` (`/v1/status/incidents`: operator-origin
+  incidents only, since automated ones carry node names, pids and command lines); `/v1/incidents` stays
+  operator-gated, so never point the page at it.
 - A new server-derived wire field is OPTIONAL in its TS type with an exact fallback: the dashboard and the
   backend deploy independently, so a fresh UI talks to nodes that predate it.
 
@@ -119,7 +123,7 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   `Vary: Origin`, never `*`.
 - `LANDING_CACHE` for `/` stays byte-identical in `ui/proxy.ts` and `ui/next.config.mjs` (config copy LAST
   so it beats the catch-all); settings/deployments/network/billing/admin/`/workflows` are `no-store`. CSP is
-  enforcing: `script-src` keeps `'unsafe-inline'` (no nonce) and `'wasm-unsafe-eval'` (run-node),
+  enforcing: `script-src` keeps `'unsafe-inline'` and `'wasm-unsafe-eval'` (run-node),
   `'unsafe-eval'` only outside production, `connect-src` adds `wss://*.shadw.cloud` (Next rewrites never
   proxy an Upgrade); a LIVE Clerk key drops the `*.clerk.accounts.dev` wildcard.
 
@@ -127,7 +131,7 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
 
 - The run-node SharedWorker is keyed by URL + name and outlives reloads, so both carry `HOST_ABI_VERSION`
   (`ui/lib/run-node-status.ts` = `ui/public/run-node-worker.js`): bump both, never ask users to close tabs.
-  Neither worker has `RTCPeerConnection`, a service worker or `Worker`, so the PAGE brokers four lanes
+  Neither worker has `RTCPeerConnection` or a `Worker`, so the PAGE brokers four lanes
   (`dbWorker`, `meshPeer`, `syncFsRegister`, `nodeWorker`); without SharedWorker one tab wins the
   `shadw-run-node-owner` Web Lock. `ui/scripts/sync-browser-node.mjs` lists every hand-written
   `crates/hive-browser/www/` module the worker imports at RUNTIME (a missing one 404s only on the fleet);
@@ -138,9 +142,8 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
 - Workflow console embed: `ui/scripts/patch-wf-console.mjs` applies idempotent sentinel-guarded patches to
   the compiled `@workflow/web` bundles (anchors target the PRISTINE package: `no-anchor` means reinstall
   fresh); `ui/lib/wf-console/hive-world.mjs` is its `WORKFLOW_TARGET_WORLD` (`HIVE_WF_TIMEOUT_MS` must
-  exceed its `/v1/workflows/runs` budgets); the iframe mounts only after the first `hive_jwt` mint (a
-  cookie-less first rpc falsely settles "No workflow runs found"). `ui/app/wf-console/[[...slug]]/route.ts`
-  keeps `import "@workflow/web/server"` so Next traces the package: never delete it as unused.
+  exceed its `/v1/workflows/runs` budgets); the iframe mounts only after the first `hive_jwt` mint.
+  `ui/app/wf-console/[[...slug]]/route.ts` keeps `import "@workflow/web/server"` so Next traces the package.
 
 ## Build, deploy, witness
 
@@ -150,11 +153,11 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   `GITHUB_WEBHOOK_SECRET`; `/api/gitops/project-ci` installs a real repo webhook first and the Actions
   workflow ONLY when the webhook could not be installed, never both.
 - Witness a dashboard change as `http://localhost:PORT`, never `127.0.0.1` (Next 16 blocks cross-origin dev
-  assets: the page renders, React never hydrates). Local dev without Clerk: `HIVE_AUTH_BYPASS=1` +
+  assets: React never hydrates). Local dev without Clerk: `HIVE_AUTH_BYPASS=1` +
   `NEXT_PUBLIC_HIVE_DEV_MINT=1` mints a LOCAL JWT so the real mint -> cookie -> tenant path runs. `next dev`
   rewrites `ui/next-env.d.ts` (`git_checkout paths:["ui/next-env.d.ts"]`, never commit it) and can miss
-  rapid edits to a route handler (restart it before measuring); time client behaviour in a production build,
-  because strict mode runs mount effects twice in dev. The sandbox-shell WebSocket needs a raw stdlib client
-  (WHATWG `WebSocket` cannot send `Authorization`): witness a NON-owner node against the owner.
+  rapid edits to a route handler (restart it before measuring); time client behaviour in a production build.
+  The sandbox-shell WebSocket needs a raw stdlib client (WHATWG `WebSocket` cannot send `Authorization`):
+  witness a NON-owner node against the owner.
 - Checks run from `ui/`: `npx tsc --noEmit` and `npm run lint`. Never dispatch gm from `ui/` as the cwd: it
   hits `ui/.gm`, a separate graph.

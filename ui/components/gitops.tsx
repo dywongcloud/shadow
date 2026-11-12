@@ -16,7 +16,9 @@ interface GhStatus {
   hasOrgScope?: boolean;
   live?: boolean;
   /** Whether a credential is held at all, separate from whether GitHub answered for it. */
-  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected" | "unknown";
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "installation" | "refresh-unavailable" | "rejected" | "unknown";
+  /** The tenant's linked config repo, when GitHub answered with an installation token alone. */
+  installationRepo?: string;
   /** Whether the live probe got an ANSWER: "unavailable"/"unknown" say nothing about the credential. */
   reachability?: "reachable" | "unavailable" | "rejected" | "unknown";
   /** True when a credential is held but GitHub could not confirm it just now. */
@@ -177,14 +179,17 @@ export function GitOps() {
   const inited = useRef(false);
   const pathname = usePathname();
   const mayLink = useCan()("repo.link");
+  /** A phone with no per-browser grant can still sync: GitHub itself minted an installation token
+   *  for the tenant's linked config repo. It is NOT a user login, so no repo browsing or creation. */
+  const installOnly = status.credential === "installation";
 
   useEffect(() => {
-    if (step !== "repo" || mode !== "existing" || !status.connected) return;
+    if (step !== "repo" || mode !== "existing" || !status.connected || installOnly) return;
     const org = scope === "org" ? orgLogin.trim() : "";
     if (scope === "org" && !org) return;
     const t = setTimeout(() => loadRepos(org), 350);
     return () => clearTimeout(t);
-  }, [step, mode, scope, orgLogin, status.connected]);
+  }, [step, mode, scope, orgLogin, status.connected, installOnly]);
 
   const finishOnboarding = useCallback(() => {
     localStorage.setItem("hive_onboarded", "1");
@@ -192,14 +197,14 @@ export function GitOps() {
   }, []);
 
   useEffect(() => {
-    if (step !== "repo" || !status.connected) return;
+    if (step !== "repo" || !status.connected || installOnly) return;
     let cancelled = false;
     fetch("/api/github/orgs")
       .then((r) => r.json())
       .then((d) => { if (!cancelled) setOrgs(Array.isArray(d.orgs) ? d.orgs : []); })
       .catch(() => { if (!cancelled) setOrgs([]); });
     return () => { cancelled = true; };
-  }, [step, status.connected]);
+  }, [step, status.connected, installOnly]);
 
   useEffect(() => {
     const open = () => {
@@ -214,8 +219,10 @@ export function GitOps() {
         .then((s: GhStatus) => {
           setStatus(s);
           setStatusNote(degradedNote(s));
-          if (s.connected) { setStep("repo"); loadRepos(); }
-          else setStep("intro");
+          if (s.connected) {
+            setStep("repo");
+            if (s.credential !== "installation") loadRepos();
+          } else setStep("intro");
         })
         .catch(() => setStep("intro"))
         .finally(() => clearTimeout(timer));
@@ -249,10 +256,10 @@ export function GitOps() {
         setStatusNote(degradedNote(s));
         if (justConnected && s.connected) {
           setStep("repo");
-          loadRepos();
+          if (s.credential !== "installation") loadRepos();
         } else if (s.connected) {
           localStorage.setItem("hive_onboarded", "1");
-        } else if (!onboarded) {
+        } else if (s.credential !== "unknown" && !onboarded) {
           setStep("intro");
         }
       })
@@ -454,7 +461,41 @@ export function GitOps() {
           </div>
         ) : null}
 
-        {step === "repo" ? (
+        {step === "repo" && installOnly ? (
+          <div className="px-5 py-5">
+            <div className="mb-4 flex items-start gap-2 rounded-md border border-border bg-subtle/40 px-3 py-2.5 text-xs text-secondary">
+              <GitBranch className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                GitOps is connected on this device through the platform&apos;s GitHub App installation
+                {status.installationRepo ? <> for <span className="font-mono">{status.installationRepo}</span></> : null}.
+                Config changes sync on their own. Connect GitHub here to browse or create repositories
+                with your own account.
+              </span>
+            </div>
+            {error ? <p className="mb-3 text-xs text-red-500">{error}</p> : null}
+            <div className="flex flex-col gap-2">
+              <button
+                onClick={() => { triggerGitopsSync(); finishOnboarding(); }}
+                className="flex items-center justify-center gap-2 rounded-md bg-fg px-3 py-2.5 text-sm font-medium text-bg hover:opacity-90"
+              >
+                <GitBranch className="h-4 w-4" /> Sync config now
+              </button>
+              <button
+                onClick={connectGithub}
+                disabled={busy || !status.configured}
+                className="flex items-center justify-center gap-2 rounded-md border border-border px-3 py-2.5 text-sm font-medium text-fg hover:bg-subtle/40 disabled:opacity-50"
+              >
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Github className="h-4 w-4" />}
+                Connect GitHub on this device
+              </button>
+              <button onClick={finishOnboarding} className="rounded-md px-3 py-2 text-sm text-secondary hover:bg-bg">
+                Use personal scope for now
+              </button>
+            </div>
+          </div>
+        ) : null}
+
+        {step === "repo" && !installOnly ? (
           <div className="px-5 py-5">
             {done && result ? (
               <div className="flex flex-col items-center gap-2 py-5 text-center">

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { githubConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
+import { githubConfigured, createRepo, commitFiles, githubCanCreateRepo, githubCanWriteRepo, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
 import { authTokenFrom, backend, buildOrgArtifacts, claimedRole } from "@/lib/gitops-server";
 import { can, roleRefusalFor, roleRefusalSentence } from "@/lib/team-role";
 
@@ -25,8 +25,8 @@ export async function POST(req: NextRequest) {
   const team = body?.team || req.headers.get("x-hive-team") || "personal";
   const scope = body?.scope === "org" ? "org" : "personal";
   const entity = await resolveEntity();
-  const status = await githubStatus(entity);
-  if (!status.connected) return NextResponse.json({ ok: false, error: "GitHub not connected." }, { status: 400 });
+  // A browser grant is NOT required to write an existing config repo: the App's installation token
+  // is device-independent. Creating a NEW repo does need a user-level grant (see githubCanCreateRepo).
 
   const authToken = authTokenFrom(req);
   const claimed = claimedRole(authToken);
@@ -39,6 +39,8 @@ export async function POST(req: NextRequest) {
   let branch = (body?.branch && String(body.branch)) || "main";
   let created = false;
   if (body?.create) {
+    const creation = await githubCanCreateRepo();
+    if (!creation.ok) return NextResponse.json({ ok: false, error: creation.error }, { status: 400 });
     const org = scope === "org" ? String(body?.org || "").trim() || undefined : undefined;
     const isPrivate = body?.isPrivate !== false;
     let made: Awaited<ReturnType<typeof createRepo>> | null = null;
@@ -66,6 +68,12 @@ export async function POST(req: NextRequest) {
   }
   const [owner, repo] = fullName.split("/");
   const path = "openedge.yaml";
+
+  // Prove GitHub will accept a write BEFORE linking: a linked-but-unwritable repo is a stuck tenant.
+  const capability = await githubCanWriteRepo(owner, repo);
+  if (!capability.ok) {
+    return NextResponse.json({ ok: false, repo: fullName, created, error: capability.error }, { status: 502 });
+  }
 
   const linked = await backend("/v1/gitops", team, authToken, {
     method: "PUT",
