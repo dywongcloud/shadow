@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-11-12 - ops: push and roll the mobile GitHub fix
+
+The operator authorized the push and the production roll. `refs/remotes/origin/main`
+now points at ba7963957dc40e6dafb3c40eeddfdda0f15eeded, a 3-commit fast-forward
+(fix mobile team switcher, DB observability and workflow metering, mobile GitHub
+connection). Rust CI is 4/4 green on that sha. The `git_push` verifier again
+reported `push_verification_failed` because the stray local
+`refs/heads/origin/main` still points at 10bebf3461df; the GitHub API reports
+main = ba7963957 and `compare/main...ba7963957` = identical.
+
+The pre-roll `scripts/audit-secret-keys.sh` passed on all six live hosts
+(fc-orlando, va, va3, sj, sj7, phx), skipped 0. UI-only roll:
+`ansible-playbook playbooks/parallel-deploy.yml --tags ui` with an explicit
+live `--limit` and the id_ed25519 key override: 6/6 hosts verified against ONE
+canonical BUILD_ID TU2ThFn-UfalYktxNYY4u, failed=0, no retired host targeted.
+Every host's hive-ui restarted during the run (ExecMainStartTimestamp after the
+deploy epoch) and answers 200 on its own :3002.
+
+Post-roll proof of the SERVED bundle: https://shadw.cloud/sw.js is `shadw-v6`
+with the `/oauth` bypass and no `shadw-v5`; `GET /api/github/status` on the
+real domain answers 200 with the honest `configured:true` + `credential:none`
+shape; the deployed .next chunks on sj and va contain the new
+`GitHub connection failed` banner code. An unauthenticated headful 320px visit
+is correctly redirected to /sign-in (scrollWidth 320, no horizontal scroll).
+
+CI is tests-only; a push does not rebuild the dashboard. No force-push, no
+rewrite, no inventory file or inventory backup name in HEAD.
+
 ## 2026-11-12 - mobile GitHub connection: fix the state, identity and OAuth failure chain
 
 A phone reported GitHub as "not logged in / not connected" while desktop showed it connected. An
