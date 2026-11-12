@@ -407,7 +407,7 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
                   ? "GitHub isn't configured on this platform yet."
                   : ghCta
                   ? ghCta.text
-                  : "Authorize GitHub to connect a repository to this project."}
+                  : "Authorize GitHub on this device to connect a repository. The grant is stored in this browser, so each device connects once."}
               </p>
               {gh.configured && (
                 <Button onClick={ghCta ? reconnectGithub : connectGithub}>

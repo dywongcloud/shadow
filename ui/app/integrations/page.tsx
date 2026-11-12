@@ -34,7 +34,7 @@ interface GhDetail {
   installUrl?: string;
   /** Whether THIS request holds a credential at all, independent of whether GitHub was reached: the two facts fail for
    *  different reasons and collapsing them is what made one network blip read as "not connected". */
-  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected";
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected" | "unknown";
   /** Whether the live probe got an ANSWER: "reachable" = GitHub answered for this credential, "unavailable" = no answer
    *  (network/timeout/5xx/rate limit, which says nothing about it), "rejected" = answered and refused it, "unknown" = the
    *  status handler's own deadline beat the probe. */
@@ -364,6 +364,10 @@ function isDegraded(gh: GhDetail): boolean {
 function githubSubtitle(gh: GhDetail): string {
   if (!gh.configured) return "not configured";
   if (gh.credential === "unreadable") return "credential unreadable on this host — reconnect GitHub";
+  // A sealed cookie exists but belongs to another signed-in user: "not connected" would send them
+  // to a Connect button that cannot help. Name the actual state and the action that clears it.
+  if (gh.credential === "foreign") return "connected to a different account — reconnect to use yours";
+  if (gh.credential === "unknown") return "connection check did not finish — retry";
   // "rejected" is the one class that is really not connected: GitHub ANSWERED and refused the credential.
   const rejected = gh.reachability === "rejected" || gh.credential === "rejected";
   if (!gh.connected) return (gh.scopes ?? []).length > 0 || rejected ? "reconnect needed" : "not connected";
@@ -452,7 +456,10 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
         </>
       ) : (
         <>
-          <p className="mb-3 text-sm text-secondary">Deploy projects automatically with Git integration.</p>
+          <p className="mb-3 text-sm text-secondary">
+            Deploy projects automatically with Git integration. The authorization is sealed into an
+            httpOnly cookie in this browser, so each device connects once on its own.
+          </p>
 
           {needsReconnect ? (
             <div className="mb-3 flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">

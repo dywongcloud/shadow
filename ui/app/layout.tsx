@@ -10,6 +10,7 @@ import { ChromeTop, ChromeBottom } from "@/components/app-chrome";
 import { ThemeProvider } from "@/components/theme-provider";
 import { PwaRegister } from "@/components/pwa-register";
 import { Toaster } from "@/components/toast";
+import { GithubConnectError } from "@/components/github-connect-error";
 import { LoginOtpChallenge } from "@/components/login-otp-challenge";
 import { VitalsBeacon } from "@/components/vitals-beacon";
 
@@ -120,7 +121,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Suspense fallback={null}>
             <ChromeTop />
           </Suspense>
-          <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
+          <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">
+            <GithubConnectError />
+            {children}
+          </main>
           <Suspense fallback={null}>
             <ChromeBottom />
           </Suspense>

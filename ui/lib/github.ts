@@ -2,6 +2,7 @@ import * as composio from "./composio";
 import type { CommitResult, CreateRepoResult, GhRepo, GithubConnectionDetail } from "./composio";
 import {
   type CredentialState,
+  type GithubCredential,
   getGithubAppToken,
   getGithubAppTokenResult,
   githubAppConfigured,
@@ -71,8 +72,10 @@ async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T
 
 /** The last known good credential state, with NO network call: for a caller whose own deadline beat GitHub's answer, so an
  *  unanswered probe is reported as "unknown" rather than as "not connected". */
-export async function githubLastKnownDetail(entity: string): Promise<GithubDetail> {
-  const { bundle, state } = await readTokenBundleResult();
+export async function githubLastKnownDetail(entity: string, cred?: GithubCredential): Promise<GithubDetail> {
+  const { bundle, state } = cred
+    ? { bundle: cred.bundle, state: cred.state }
+    : await readTokenBundleResult();
   const held = !!bundle;
   return {
     configured: githubConfigured(),
@@ -94,8 +97,14 @@ export async function githubLastKnownDetail(entity: string): Promise<GithubDetai
   };
 }
 
-export async function githubConnectionDetail(entity: string): Promise<GithubDetail> {
-  const cred = await getGithubAppTokenResult();
+/** A status GET races this call against a deadline. `readOnly` keeps that race loser from writing
+ *  a cookie to an already-sent response (and from spending a single-use refresh token twice). */
+export async function githubConnectionDetail(
+  entity: string,
+  preloaded?: GithubCredential,
+  readOnly = false,
+): Promise<GithubDetail> {
+  const cred = preloaded ?? (await getGithubAppTokenResult());
   const held = cred.state === "valid" || cred.state === "refresh-unavailable";
 
   if (held) {
@@ -114,7 +123,7 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
       const installUrl = slug
         ? `https://github.com/apps/${slug}/installations/new`
         : "https://github.com/settings/installations";
-      if (cred.bundle && (cred.bundle.login !== probe.login || (slug && cred.bundle.slug !== slug))) {
+      if (!readOnly && cred.bundle && (cred.bundle.login !== probe.login || (slug && cred.bundle.slug !== slug))) {
         await updateBundleMeta({ login: probe.login, slug }).catch(() => {});
       }
       return {
@@ -187,6 +196,10 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
   const d = await composio.githubConnectionDetail(entity);
   return {
     ...d,
+    // `d.configured` is Composio-only. A GitHub-App-only deployment (COMPOSIO_API_KEY unset) has a
+    // perfectly working connect path, but a fresh browser — a phone that has never authorised —
+    // was told "not configured" and every Connect button was hidden. The facade ORs both providers.
+    configured: githubConfigured(),
     provider: d.connected || d.scopes.length ? "composio" : undefined,
     via: d.connected || d.scopes.length ? "composio" : undefined,
     installationState,

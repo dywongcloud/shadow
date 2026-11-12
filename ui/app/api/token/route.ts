@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth, currentUser, clerkClient } from "@clerk/nextjs/server";
 import { isOwnerEmail, primaryOwnerEmail } from "@/lib/owner-emails";
+import { clerkAuthorizedParties, verifyClerkSessionToken } from "@/lib/session-identity";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
@@ -121,31 +122,8 @@ export async function POST(req: NextRequest) {
 /** Verifies a Clerk session token the BROWSER holds (JWKS, plus `azp` against HIVE_AUTHORIZED_PARTIES when present) and returns
  *  its user id, else null: the fallback for a Clerk DEV instance whose server-side `auth()` reports signed-out without the
  *  `__clerk_db_jwt` cookie. Trusts nothing the client asserts and grants no more than the cookie path would. */
-async function userIdFromSessionToken(tok: string): Promise<string | null> {
-  try {
-    const { verifyToken } = await import("@clerk/backend");
-    let azp: unknown;
-    try {
-      const p = tok.split(".")[1];
-      if (p) azp = (JSON.parse(Buffer.from(p, "base64url").toString("utf8")) as { azp?: unknown }).azp;
-    } catch {
-      azp = undefined;
-    }
-    const payload = await verifyToken(tok, {
-      secretKey: process.env.CLERK_SECRET_KEY,
-      ...(typeof azp === "string"
-        ? {
-            authorizedParties: (process.env.HIVE_AUTHORIZED_PARTIES || "http://localhost:3001,http://127.0.0.1:3001")
-              .split(",")
-              .map((v) => v.trim())
-              .filter(Boolean),
-          }
-        : {}),
-    });
-    return payload?.sub ?? null;
-  } catch {
-    return null;
-  }
+function userIdFromSessionToken(tok: string): Promise<string | null> {
+  return verifyClerkSessionToken(tok, clerkAuthorizedParties(tok));
 }
 
   const clerkTokenFromBody = typeof incoming?.clerk_token === "string" ? incoming.clerk_token.trim() : "";

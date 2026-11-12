@@ -549,7 +549,7 @@ export default function NewProjectPage() {
                     ? "Set COMPOSIO_API_KEY to enable multi-tenant GitHub OAuth. You can still deploy any public repo by URL above."
                     : ghCta
                     ? ghCta.text
-                    : "Authorize GitHub to import and deploy your repositories."}
+                    : "Authorize GitHub on this device to import and deploy your repositories. The grant is stored in this browser, so each device connects once."}
                 </p>
                 {gh.configured && (
                   <Button onClick={ghCta ? reconnectGithub : connectGithub}>

@@ -9,7 +9,7 @@
  * below). Only media/fonts are cached stale-while-revalidate. Cache is the
  * offline fallback. Bump VERSION to evict every prior cache on activate. */
 
-const VERSION = "shadw-v5";
+const VERSION = "shadw-v6";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
 const PRECACHE = [
   "/offline.html",
@@ -47,8 +47,10 @@ self.addEventListener("fetch", (event) => {
   }
   if (url.origin !== self.location.origin) return;
 
-  // Never cache dynamic / authenticated traffic — pass straight through.
-  if (url.pathname.startsWith("/cloud") || url.pathname.startsWith("/api")) return;
+  // Never cache dynamic / authenticated traffic — pass straight through. `/oauth` carries the
+  // one-shot GitHub `code` + `state`: serving /offline.html on a flaky mobile network swallows
+  // them and the connect flow dies with no error.
+  if (url.pathname.startsWith("/cloud") || url.pathname.startsWith("/api") || url.pathname.startsWith("/oauth")) return;
 
   // Page navigations: network-first, fall back to cache, then the offline page.
   if (req.mode === "navigate") {

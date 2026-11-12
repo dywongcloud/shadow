@@ -3,7 +3,7 @@
 import "server-only";
 import { randomBytes } from "crypto";
 import { cookies } from "next/headers";
-import { auth } from "@clerk/nextjs/server";
+import { verifiedUserId } from "./session-identity";
 
 const BASE = "https://backend.composio.dev/api/v3";
 export const GITHUB_SLUG = "github";
@@ -12,19 +12,19 @@ export function composioConfigured(): boolean {
   return !!process.env.COMPOSIO_API_KEY;
 }
 
-const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
-
-/** The Composio entity for this request: `gh_<clerkUserId>` when signed in, else the `hive_entity` cookie, else `default`.
- *  It must be stable per user so the GitHub link survives reloads, tabs and devices. */
+/** The Composio entity for this request: `gh_<verifiedUserId>` when signed in, else the `hive_entity` cookie, else `default`.
+ *  It must resolve the SAME identity as the GitHub App credential binding and `/api/token`: bare
+ *  `auth()` reports signed-out on iOS Safari / standalone PWAs while the Clerk session is valid,
+ *  which made a connected account look up a different entity on a phone. */
 export async function resolveEntity(): Promise<string> {
-  if (clerkEnabled) {
-    try {
-      const { userId } = await auth();
-      if (userId) return `gh_${userId}`;
-    } catch {}
+  const uid = await verifiedUserId();
+  if (uid) return `gh_${uid}`;
+  try {
+    const cookieEntity = (await cookies()).get("hive_entity")?.value;
+    return cookieEntity || "default";
+  } catch {
+    return "default";
   }
-  const cookieEntity = (await cookies()).get("hive_entity")?.value;
-  return cookieEntity || "default";
 }
 
 function key(): string {

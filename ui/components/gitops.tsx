@@ -16,7 +16,7 @@ interface GhStatus {
   hasOrgScope?: boolean;
   live?: boolean;
   /** Whether a credential is held at all, separate from whether GitHub answered for it. */
-  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected";
+  credential?: "none" | "foreign" | "unreadable" | "valid" | "refresh-unavailable" | "rejected" | "unknown";
   /** Whether the live probe got an ANSWER: "unavailable"/"unknown" say nothing about the credential. */
   reachability?: "reachable" | "unavailable" | "rejected" | "unknown";
   /** True when a credential is held but GitHub could not confirm it just now. */
@@ -257,7 +257,9 @@ export function GitOps() {
         }
       })
       .catch(() => {
-        if (localStorage.getItem("hive_onboarded") !== "1") setStep("intro");
+        // A failed status check says NOTHING about the connection. Opening the "Connect GitHub"
+        // onboarding here is what made a phone on a flaky network look signed out of GitHub.
+        // Leave the modal closed and try again on the next mount instead.
       })
       .finally(() => clearTimeout(statusTimer));
   }, []);
@@ -419,7 +421,8 @@ export function GitOps() {
             <p className="text-sm text-secondary">
               Connect GitHub to manage your org as code. We&apos;ll commit your projects&apos;
               config to a repo as <span className="font-mono text-fg">openedge.yaml</span>, and a push
-              to that repo will automatically rebuild and deploy your projects.
+              to that repo will automatically rebuild and deploy your projects. The grant is
+              sealed into this browser, so a new device connects once on its own.
             </p>
             <ul className="mt-4 space-y-2 text-sm text-secondary">
               <FeatureRow text="Declarative config, versioned in git" />

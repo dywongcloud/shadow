@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-11-12 - mobile GitHub connection: fix the state, identity and OAuth failure chain
+
+A phone reported GitHub as "not logged in / not connected" while desktop showed it connected. An
+adversarial swarm (nine independent attackers, each with a refuter) found no width-dependent state
+and no responsive hide: the first-party App grant is deliberately a sealed, host-only browser cookie,
+so a new device genuinely holds none. What WAS broken is that a phone could neither see an honest
+state nor successfully connect:
+
+- `githubConnectionDetail` let Composio's `configured` overwrite the answer on the no-cookie branch.
+  On a GitHub-App-only deployment (COMPOSIO_API_KEY unset) a fresh browser got `configured:false`,
+  which rendered "not configured" and hid EVERY Connect button. Desktop's held cookie short-circuited
+  to `configured:true`. `configured` is now `githubConfigured()` (App OR Composio) on every branch.
+- Identity was resolved two different ways: `/api/token` verified a browser Clerk session token when
+  Clerk's server-side `auth()` reported signed-out, but `bundleAuthorized`, `resolveEntity` and the
+  OAuth `state` used bare `auth()`. iOS Safari / standalone PWAs withhold the dev-browser cookie while
+  `__session` is valid, so a valid grant read as `foreign` and entity `default`. `lib/session-identity.ts`
+  is now the ONE verified resolver for all four; it fails closed on an unverifiable session. Its `azp`
+  allowlist no longer defaults to localhost-only, which silently rejected production tokens.
+- `github_error` was emitted on five callback failure paths and rendered nowhere; every failure also
+  teleported the user to `/integrations`. Failures now return to the signed `returnTo` and are rendered
+  once by `components/github-connect-error.tsx` (which strips the one-shot parameter).
+- The OAuth state nonce was host-only while the registered callback is pinned to the apex, so a flow
+  started on `www.<apex>` lost its nonce on the callback hop. The nonce alone is now parent-domain
+  scoped and only for our own apex; the credential cookie stays host-only (widening it is a security
+  change needing the operator's word). `secure` follows the request proto, so an http LAN preview no
+  longer has its cookie dropped. The service worker now bypasses `/oauth`, which previously served
+  `/offline.html` and swallowed the one-shot `code`/`state` on a flaky mobile network.
+- The status route could 500 or spend a 3500 ms deadline on a SECOND `bundleAuthorized` check, turning
+  a fine connection into the client's default "not connected". It now resolves one credential, never
+  writes a cookie from the race loser, and degrades to an honest "check did not finish" instead of a
+  500. A failed status fetch no longer opens the GitOps onboarding modal.
+- `foreign`/`unknown` no longer collapse into "not connected", and the cards say plainly that the
+  grant is sealed into this browser and each device connects once.
+
+Witnessed headfully at 320px on a fresh dev server: viewport 320, scrollWidth 320, the error banner
+renders the actual reason and strips `github_error`, and a visible 86x27 Connect button is present.
+Witnessed live on a GitHub-App-only shape (COMPOSIO unset): `/api/github/status` answers
+`configured:true` and a none credential; the state cookie carries `Domain=.shadw.cloud; Secure`
+from both `www.shadw.cloud` and the apex but stays host-only for a foreign host; a provider-denied
+callback redirects to `https://shadw.cloud/new?github_error=...` instead of `/integrations`.
+Source-only `tsc --noEmit` and `npm run lint` exit 0; full `tsc` reports only the two pre-existing
+errors in gitignored generated `.next/dev/types/validator.ts`.
+
+No push or roll was made for this entry.
+
 ## 2026-11-11 - mobile navbar: restore team switcher, remove sections dropdown
 
 The phone layout hid the team/org switcher behind `hidden ... sm:flex`, leaving no way to change

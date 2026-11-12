@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { composioConfigured, githubConnect, resolveEntity } from "@/lib/composio";
 import { authorizeUrl, currentUserId, githubAppConfigured, makeState, stateCookieName } from "@/lib/github-app";
-import { publicOrigin } from "@/lib/origin";
+import { publicOrigin, oauthStateCookieDomain, secureCookie } from "@/lib/origin";
 import { sameOriginPath } from "@/lib/same-origin-path";
 
 export async function POST(req: NextRequest) {
@@ -11,11 +11,13 @@ export async function POST(req: NextRequest) {
   if (githubAppConfigured()) {
     const { state, nonce } = makeState(returnTo, await currentUserId());
     const res = NextResponse.json({ redirectUrl: authorizeUrl(state), provider: "github-app" });
+    const domain = oauthStateCookieDomain(req.headers);
     res.cookies.set(stateCookieName(), nonce, {
       httpOnly: true,
-      secure: true,
+      secure: secureCookie(req.headers),
       sameSite: "lax",
       path: "/",
+      ...(domain ? { domain } : {}),
       maxAge: 600,
     });
     return res;

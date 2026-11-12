@@ -1,19 +1,16 @@
-import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "crypto";
-import { auth } from "@clerk/nextjs/server";
+import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "crypto";
 import { cookies } from "next/headers";
+import { verifiedUserId, cookieSecure } from "./session-identity";
 import { sameOriginPath } from "@/lib/same-origin-path";
 
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
 
-/** Current Clerk user id, or null (signed-out / local no-auth mode / non-request ctx). */
+/** Current VERIFIED Clerk user id, or null. Uses the one shared identity primitive: on iOS Safari
+ *  and standalone PWAs the Clerk dev-browser cookie can be withheld while the `__session` JWT is
+ *  valid, and bare `auth()` then reports signed-out. Every route that binds state to a user must
+ *  resolve the same identity or the GitHub connection reads as `foreign` on those devices. */
 export async function currentUserId(): Promise<string | null> {
-  if (!clerkEnabled) return null;
-  try {
-    const { userId } = await auth();
-    return userId || null;
-  } catch {
-    return null;
-  }
+  return verifiedUserId();
 }
 
 /** First-party GitHub App OAuth (user-to-server): the platform's OWN GitHub App (org-level permissions), fixing the private-repo/org access
@@ -105,6 +102,13 @@ function sign(data: string): string {
   return createHmac("sha256", key()).update(data).digest("base64url");
 }
 
+/** Constant-time MAC comparison for a signed state. */
+function macMatches(body: string, mac: string): boolean {
+  const a = Buffer.from(sign(body));
+  const b = Buffer.from(mac);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 export function makeState(returnTo: string, uid?: string | null): { state: string; nonce: string } {
   const nonce = randomBytes(16).toString("base64url");
   const body = Buffer.from(
@@ -119,13 +123,29 @@ export function verifyState(
 ): { ok: boolean; returnTo: string; uid?: string } {
   try {
     const [body, mac] = state.split(".");
-    if (!body || !mac || sign(body) !== mac) return { ok: false, returnTo: "/" };
+    if (!body || !mac || !macMatches(body, mac)) return { ok: false, returnTo: "/" };
     const j = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
     if (!cookieNonce || j.n !== cookieNonce) return { ok: false, returnTo: "/" };
     if (typeof j.t !== "number" || Date.now() - j.t > STATE_TTL_MS) return { ok: false, returnTo: "/" };
     return { ok: true, returnTo: sameOriginPath(j.r, "/"), uid: typeof j.u === "string" ? j.u : undefined };
   } catch {
     return { ok: false, returnTo: "/" };
+  }
+}
+
+/** The `returnTo` inside an HMAC-signed state, or null. Used ONLY to choose where a failed connect
+ *  shows its error; it never authorizes anything. The nonce is deliberately not required here so a
+ *  provider-level "access_denied" still returns the user to the page they started on, and
+ *  `sameOriginPath` keeps the value a path on our own origin. */
+export function returnToFromSignedState(state: string): string | null {
+  try {
+    const [body, mac] = state.split(".");
+    if (!body || !mac || !macMatches(body, mac)) return null;
+    const j = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { r?: unknown; t?: unknown };
+    if (typeof j.t !== "number" || Date.now() - j.t > STATE_TTL_MS) return null;
+    return sameOriginPath(typeof j.r === "string" ? j.r : "", "/");
+  } catch {
+    return null;
   }
 }
 
@@ -266,28 +286,30 @@ async function refreshSingleFlight(b: GhAppTokenBundle): Promise<RefreshOutcome>
 
 const REFRESH_TOKEN_LIFETIME_SECS = 180 * 24 * 3600;
 
-const COOKIE_OPTS = {
-  httpOnly: true as const,
-  secure: true as const,
-  sameSite: "lax" as const,
-  path: "/" as const,
-  maxAge: REFRESH_TOKEN_LIFETIME_SECS,
-};
-
-/** Deliberately NO `domain`: a host-only cookie. Setting one would widen the credential to every subdomain of the
- *  dashboard's parent domain (any XSS or any app on a sibling host would then be able to send it), so sharing this cookie
- *  across the shadw.cloud round-robin hosts is NOT done by widening it — that is a security change and needs the
- *  operator's word. The other half of that problem (a host whose GITHUB_APP_CLIENT_SECRET differs cannot decrypt a cookie
- *  another host minted) is a deployment-parity question, not a cookie-attribute one; `credential: "unreadable"` reports it
- *  instead of silently reading as "not connected". */
+/** `secure` follows the request protocol: a `Secure` cookie on an http LAN preview is dropped by
+ *  the browser, so the phone completes OAuth and still has no credential. Deliberately NO `domain`:
+ *  a host-only cookie. Setting one would widen the credential to every subdomain of the dashboard's
+ *  parent domain (any XSS or any app on a sibling host could then send it), so sharing this cookie
+ *  across the round-robin hosts is NOT done by widening it — that is a security change needing the
+ *  operator's word. A host whose GITHUB_APP_CLIENT_SECRET differs cannot decrypt another host's
+ *  cookie; the unreadable credential state reports that instead of reading as "not connected". */
+async function cookieOpts() {
+  return {
+    httpOnly: true as const,
+    secure: await cookieSecure(),
+    sameSite: "lax" as const,
+    path: "/" as const,
+    maxAge: REFRESH_TOKEN_LIFETIME_SECS,
+  };
+}
 
 /** Persist a token bundle into the encrypted cookie (route-handler context). */
 export async function setTokenCookie(b: GhAppTokenBundle): Promise<void> {
-  (await cookies()).set(GH_APP_COOKIE, sealToken(b), COOKIE_OPTS);
+  (await cookies()).set(GH_APP_COOKIE, sealToken(b), await cookieOpts());
 }
 
 export async function clearTokenCookie(): Promise<void> {
-  (await cookies()).set(GH_APP_COOKIE, "", { ...COOKIE_OPTS, maxAge: 0 });
+  (await cookies()).set(GH_APP_COOKIE, "", { ...(await cookieOpts()), maxAge: 0 });
 }
 
 /** How much of a GitHub connection THIS request can see. `none` = no cookie; `foreign` = a cookie that belongs to another
@@ -319,7 +341,8 @@ export type CredentialState =
   | "unreadable"
   | "valid"
   | "refresh-unavailable"
-  | "rejected";
+  | "rejected"
+  | "unknown";
 
 export interface GithubCredential {
   /** A token GitHub is expected to accept, or null when none is available right now. */
