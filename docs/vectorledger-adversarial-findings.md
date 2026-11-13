@@ -1,6 +1,6 @@
 # VectorLedger port: adversarial findings
 
-Status: READ-ONLY adversarial review of the PLAN, not of a proposed diff. Written against the live working tree on 2026-11-13. Author: adversarial lead (sole writer of this file). No code was changed. No BUSL-1.1 material was vendored, copied or executed.
+Status: READ-ONLY adversarial review of the PLAN, not of a proposed diff. FINAL: 17 findings = 4 CRITICAL / 7 HIGH / 6 MEDIUM; 11 claims KILLED by adversarial vote; 3 top-level killed claims. Written against the live working tree on 2026-11-13. Author: adversarial lead (sole writer of this file). No code was changed. No BUSL-1.1 material was vendored, copied or executed.
 
 The reference repository (VectorGuard-Labs/VectorLedger, BUSL-1.1, "Additional Use Grant: None") was read ONLY as untrusted DATA through WebFetch of its README and one raw rules.rs. No clone, no install.sh, no .mcp.json, no mcp-grok.py, no .well-known content, no license.json check, no build or run of its code. Every claim below is anchored in OUR tree with an executed gm dispatch id.
 
@@ -106,6 +106,8 @@ Evidence (WebFetch of README, data only): the root listing contains .mcp.json, m
 
 Our port must touch NONE of them. No MCP server config, no install hook, no startup license check, no external config fetch, no new dependency from that repo. Fetching its README/rules.rs into an analysis context is itself an indirect prompt-injection path if any fetched text is treated as instructions; this review treated every fetched line as DATA and executed nothing from it. BUSL-1.1 with "Additional Use Grant: None -- production use requires a commercial license" means no vendoring and no code copy, not even a "small helper". The invariant set (13/14/16) can be re-derived from our own crates/hive-contract without importing a line.
 
+VERIFIED (checker cluster 3, .gm/vectorledger-votes/cluster-3.yml, exhaustive filename scans): our tree contains NO new *.mcp.json, mcp-grok.py, install.sh or *.well-known* hook, and the current dirty-path names contain none. The reference README/source text entering an analysis context IS itself the indirect prompt-injection channel even with no hook executed (F4 KILLED 2/0/1).
+
 Smallest honest mitigation: keep the port to a design-level re-statement of invariants already present in our tree; add a line to the portability doc stating no file from the reference repo is copied, fetched at runtime, or registered as an MCP/install hook. Commercial licensing is an operator decision, not a code workaround.
 
 ### F-12 MEDIUM -- the compliance matrix line numbers have already drifted from the live tree
@@ -176,8 +178,6 @@ Three checker swarms (lens 1+2, lens 3, lens 4+5) were each dispatched with two 
 
 ## Checker verdicts
 
-## Checker verdicts
-
 Rule: two valid refutations KILL a claim; fewer leaves it UNVERIFIED, not killed; an errored checker casts NO vote.
 
 | Cluster / claim | votes_for_kill | votes_no_vote | errors | Verdict |
@@ -192,9 +192,9 @@ Rule: two valid refutations KILL a claim; fewer leaves it UNVERIFIED, not killed
 | 3 / F1 balance adds fraud detection | 3 | 0 | 0 | KILLED |
 | 3 / F2 signed Merkle = freshness/auth/correctness | 3 | 0 | 0 | KILLED |
 | 3 / F3 WORM chain independent | 3 | 0 | 0 | KILLED |
-| 3 / F4 no indirect prompt-injection path | 2 | 1 | 1 | KILLED (errored refuter cast no vote) |
+| 3 / F4 no indirect prompt-injection path | 2 | 0 | 1 | KILLED (errored refuter cast no vote) |
 
-Totals across the two reporting swarms: 7 claims KILLED by vote, 0 SURVIVES, 3 errored refuters casting no vote. Cluster 1+2 tally file on disk at one read (1794560070384-11276) still carried a PRELIMINARY 1/2/0 UNVERIFIED row set while its checker reported a final 3/0/0; the checker was asked to rewrite that file. If the final file disagrees, the ON-DISK file is the record of truth and the table above must be corrected. Cluster 4+5 had one errored refuter per claim; those cast no vote, and 2 valid refutations suffice to kill.
+FINAL TOTALS (all three swarms reported, on-disk files re-read at 1794560658061-11382 / 1794560306602-11328 / 1794560389927-11339): 11 claims KILLED by vote, 0 SURVIVES, 0 UNVERIFIED. Cluster 1+2: C1-C4 each 3/0/0. Cluster 3: F1-F3 each 3/0/0, F4 2/0/1 (one errored refuter cast NO vote; 2 valid refutations still kill). Cluster 4+5: S1-S3 each 3/0/0. Aggregate 32 kill votes, 0 no-votes, 1 errored checker. An earlier PRELIMINARY read (1794560070384-11276) showed cluster 1+2 at 1/2/0 and cluster 4+5 at 2/0/1; both files were rewritten to their final tallies before this line was written. The ON-DISK final files are the record of truth.
 
 Checker 1+2 also contributed a NEW concrete refutation of C3 that this lead had not seen: the code writer's untracked crates/hive-contract/src/journal.rs:761-775 "fabricates a default chart with zero balances" -- i.e. the port DOES invent a chart of accounts with no data, exactly as F-03 predicted. Witness dispatch ids in .gm/vectorledger-votes/cluster-12.yml.
 
@@ -213,3 +213,5 @@ Reason: F-02 and F-14 prove the proposed journal must NOT land on the billing RE
 - RESOLVED (orchestrator direct read of crates/vledger-compliance/src/report.rs): the is_compliant()/"COMPLIANT" verdict exists there, not in rules.rs; see F-08 for the exact cite. This lead made no further reference fetches.
 - No PRD rows were resolved by this lead; nine-stage receipts are therefore not written by this session. The doc is the deliverable.
 - Checker vote files are written by the checkers, not by this lead; this file is the sole write of the adversarial lead.
+- The successor hop is NOMINATED but NOT spawned by this lead: the orchestrator's "LAND ARTIFACTS NOW / headroom STOP, 12 agents already live" course correction forbade further children. The nomination and next_choice.why verbatim were handed to main in the same turn. All seven descendants reported and deleted their heartbeats.
+- No push, no roll, no commit, no test file, no code edit, no branch/worktree, no BUSL-1.1 vendoring, no reference-repo file executed or cloned. Read-only on code.
