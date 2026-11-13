@@ -1,0 +1,1 @@
+contract-verify-chain-has-no-external-anchor resolved 1794547376261-9070-ad1d107463599bf9 2026-11-13T05:23:38.676Z
