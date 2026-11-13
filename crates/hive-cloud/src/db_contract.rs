@@ -121,7 +121,7 @@ pub(crate) async fn record(
     let caller = hive_contract::Caller {
         tenant: tenant.to_string(),
         actor: actor.to_string(),
-        owns_target: owns(tenant) && owns_target,
+        owns_target: owns(tenant) && owns_target, platform_attested: false,
     };
     let result = c
         .contract_engine
@@ -396,4 +396,321 @@ pub(crate) async fn deleted(
         Ok(()),
     )
     .await
+}
+
+
+// ---- metering / billing contract mirror -----------------------------------------------------------
+// The ONLY seam also owns the metering and billing ledger mirror. Every charge, credit, plan
+// change, renewal and resource-meter sample becomes a signed, attributed, seq-checked entry in
+// hive.billing-meter.v1: the same hash-chained, Ed25519-signed, replay-verifiable oplog the
+// managed-database contract uses. Nothing here authorizes, charges or fails a request: the
+// platform has ALREADY moved the meter or written the ledger row before enqueue() is called, and
+// enqueue() is a RECORD, never a prevention. Charging stays behind
+// HIVE_BILLING_METER_RESOURCES and the single leadership::may_act(BillingMeter) writer.
+//
+// Why a bounded queue plus an async drain: ledger_push and meter_usage are SYNCHRONOUS and hold
+// BillingStore locks; Engine::submit is async and does durable fsync. Taking a runtime handle and
+// spawning one task per charge would reorder the log and lose entries on shutdown. A bounded,
+// process-wide queue drained in order from the bulkhead metering loop gives one writer, one order,
+// and an explicit, counted drop when the queue is full -- never a silent one.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+
+/// The actor label on a platform-measured event. A LABEL, never a gate: the gate is
+/// `Caller::platform_attested` plus the server-derived tenant check in `metering_owns`.
+pub const BILLING_METER_ACTOR: &str = "platform:meter";
+
+/// Bounded so a stalled drain can never turn billing into unbounded memory. Overflow is COUNTED
+/// and WARNed, and the count is reported by `drain_metering` -- an unattested event is visible.
+const MAX_PENDING_METER_OPS: usize = 4096;
+/// Submissions per drain tick, so one tick never monopolises the bulkhead runtime.
+const MAX_DRAIN_PER_TICK: usize = 256;
+
+static BILLING_CONTRACT: OnceLock<hive_contract::Contract> = OnceLock::new();
+static PENDING: parking_lot::Mutex<VecDeque<MeterOp>> =
+    parking_lot::Mutex::new(VecDeque::new());
+static METER_OPS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// One measured platform event, with the exact payload the contract declared.
+#[derive(Clone)]
+pub struct MeterOp {
+    pub kind: &'static str,
+    pub tenant: String,
+    pub target: String,
+    pub payload: BTreeMap<String, String>,
+    /// The platform's own measurement: did the meter move / did the ledger row read back?
+    /// NEVER a literal `Ok(())`; an Err is recorded as a failed entry with no index mutation.
+    pub outcome: Result<(), String>,
+}
+
+/// Enqueue one measured event. Called from `billing::ledger_push`, `billing::meter_usage` and
+/// the invoice rollover; never from a request-path authorization decision.
+pub fn enqueue_meter_op(op: MeterOp) {
+    let mut q = PENDING.lock();
+    if q.len() >= MAX_PENDING_METER_OPS {
+        METER_OPS_DROPPED.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            kind = op.kind,
+            tenant = %op.tenant,
+            entry_id = op.payload.get("entry_id").map(String::as_str).unwrap_or(""),
+            "contract: metering event queue full; event DROPPED (NOT attested)"
+        );
+        return;
+    }
+    q.push_back(op);
+}
+
+/// Whether a tenant tag is one the platform actually derived from a stored record. An anonymous,
+/// untagged or `_unattributed` tag is recorded as a REFUSED entry with no index mutation: it is
+/// measured but never attested, and never collapsed into a billable namespace.
+fn metering_owns(tenant: &str) -> bool {
+    let t = tenant.trim();
+    !t.is_empty()
+        && t != crate::admin::ANON_TENANT
+        && t != crate::admin::UNTAGGED_TENANT
+        && t != crate::usage_metering::UNATTRIBUTED
+        && crate::admin::record_tenant(t) == t
+}
+
+#[derive(Debug, Default)]
+pub struct DrainReport {
+    pub submitted: usize,
+    pub refused: usize,
+    pub persist_errors: usize,
+    pub dropped: u64,
+}
+
+/// Submit queued events through the ONE seam, in queue order, one writer. Runs on the bulkhead
+/// metering loop (never a serving tokio worker). Returns a report the caller logs, so a dropped or
+/// unpersisted charge reaches the platform's log instead of disappearing.
+pub async fn drain_metering(c: &Arc<CloudState>) -> DrainReport {
+    let ops: Vec<MeterOp> = {
+        let mut q = PENDING.lock();
+        (0..MAX_DRAIN_PER_TICK)
+            .filter_map(|_| q.pop_front())
+            .collect()
+    };
+    let mut report = DrainReport {
+        dropped: METER_OPS_DROPPED.swap(0, Ordering::Relaxed),
+        ..DrainReport::default()
+    };
+    if ops.is_empty() {
+        return report;
+    }
+    let contract = BILLING_CONTRACT.get_or_init(hive_contract::billing_meter_contract);
+    // Completeness comes from CANONICAL STATE, not from the in-memory queue. A restart, a crashed
+    // drain or a full queue can drop a queued event, but it cannot drop a ledger row that still
+    // exists: this pull-based mirror behind a durable cursor re-attests every row it has not yet
+    // seen, so an omitted charge is recoverable rather than silently lost.
+    let (mirrored, mirror_failures) = mirror_ledger_rows(c, contract).await;
+    report.submitted += mirrored;
+    report.persist_errors += mirror_failures;
+    for op in ops {
+        let retry = op.clone();
+        let caller = hive_contract::Caller {
+            tenant: op.tenant.clone(),
+            actor: BILLING_METER_ACTOR.to_string(),
+            owns_target: metering_owns(&op.tenant),
+            platform_attested: true,
+        };
+        match c
+            .contract_engine
+            .submit(
+                contract,
+                caller,
+                op.kind,
+                op.payload,
+                &op.target,
+                hive_core::now_ms(),
+                op.outcome,
+            )
+            .await
+        {
+            Ok(r) => {
+                report.submitted += 1;
+                if !r.committed {
+                    report.refused += 1;
+                }
+                if r.persist_error.is_some() {
+                    report.persist_errors += 1;
+                }
+                tracing::info!(
+                    op = op.kind,
+                    tenant = %op.tenant,
+                    seq = r.seq,
+                    committed = r.committed,
+                    log_head = %r.log_head,
+                    proof = r.proof.is_some(),
+                    persist_error = r.persist_error.is_some(),
+                    error = r.error.as_deref().unwrap_or(""),
+                    "contract: metering/billing event recorded"
+                );
+            }
+            Err(e) => {
+                // Requeue at the FRONT so order is preserved and a transient store failure does
+                // not become a permanent omission. Bounded by the same cap as enqueue.
+                let mut q = PENDING.lock();
+                if q.len() < MAX_PENDING_METER_OPS {
+                    q.push_front(retry);
+                } else {
+                    METER_OPS_DROPPED.fetch_add(1, Ordering::Relaxed);
+                }
+                drop(q);
+                // The store could not open: NO entry was produced. Loud, and the platform's own
+                // ledger row still stands -- a contract recording problem never fails billing.
+                report.persist_errors += 1;
+                tracing::error!(
+                    op = op.kind,
+                    tenant = %op.tenant,
+                    error = %e,
+                    "contract: metering/billing event NOT recorded"
+                );
+            }
+        }
+    }
+    report
+}
+
+/// BLAKE3 digest of a ledger row's free-text note. A NEW content identity, so BLAKE3 per the
+/// repo's hashing rule; it keeps an operator-supplied note from growing an append-only log
+/// without bound while still binding the note's bytes into the signed entry.
+pub fn note_hash(note: &str) -> String {
+    fluid_core::content_hash(b"hive-contract/billing-note/v1", note.as_bytes())
+}
+
+
+/// Node-local durable cursor of the ledger row ids already attested into the contract log.
+/// Plain text, one id per line: a corrupt or missing file degrades to an empty set, which
+/// re-attests rows (an idempotent index PUT) rather than losing one.
+fn cursor_path() -> std::path::PathBuf {
+    crate::persist::data_dir().join("contract-billing-cursor.txt")
+}
+
+fn load_cursor() -> std::collections::BTreeSet<String> {
+    std::fs::read_to_string(cursor_path())
+        .map(|s| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty() && l.len() <= 128)
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn save_cursor(ids: &std::collections::BTreeSet<String>) {
+    let path = cursor_path();
+    let tmp = path.with_extension("txt.tmp");
+    let body = ids.iter().map(|id| id.as_str()).collect::<Vec<_>>().join("\n");
+    let body = format!("{body}\n");
+    if let Ok(()) = std::fs::create_dir_all(crate::persist::data_dir()) {
+        if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+            return;
+        }
+    }
+    tracing::warn!(path = %path.display(), "contract: billing mirror cursor could not be saved");
+}
+
+/// The exact declared payload of one canonical ledger row. The raw note is bounded: it is
+/// evidence, not a place to grow an append-only log without limit.
+fn ledger_row_payload(e: &crate::billing::LedgerEntry) -> BTreeMap<String, String> {
+    let note: String = e.note.chars().take(256).collect();
+    BTreeMap::from([
+        ("tenant_tag".to_string(), e.tenant.clone()),
+        ("entry_id".to_string(), e.id.clone()),
+        ("entry_ts_ms".to_string(), e.ts_ms.to_string()),
+        ("entry_kind".to_string(), e.kind.clone()),
+        ("amount_cents".to_string(), e.amount_cents.to_string()),
+        (
+            "balance_after_cents".to_string(),
+            e.balance_after_cents.to_string(),
+        ),
+        ("note_hash".to_string(), note_hash(&e.note)),
+        ("note".to_string(), note),
+    ])
+}
+
+/// Pull-based completeness mirror: every raw `LedgerEntry` in canonical billing state that this
+/// node has not yet attested becomes one signed `billing.ledger` entry through this seam. The
+/// outcome is a MEASUREMENT -- the row is in the snapshot read from BillingStore -- and the id is
+/// added to the durable cursor only after a submitted entry has no persist error.
+///
+/// This is the answer to a lost queue: an event enqueue is volatile, canonical state is not.
+async fn mirror_ledger_rows(
+    c: &Arc<CloudState>,
+    contract: &hive_contract::Contract,
+) -> (usize, usize) {
+    let (_, rows) = c.billing.snapshot();
+    let present: std::collections::BTreeSet<String> =
+        rows.iter().map(|e| e.id.clone()).collect();
+    let mut cursor = load_cursor();
+    // A pruned row no longer needs a cursor entry; the period remains anchored by the signed
+    // billing.checkpoint entry. This keeps the cursor bounded by the live raw ledger.
+    cursor.retain(|id| present.contains(id));
+    let mut pending: Vec<crate::billing::LedgerEntry> = rows
+        .into_iter()
+        .filter(|e| !cursor.contains(&e.id))
+        .collect();
+    pending.sort_by(|a, b| a.ts_ms.cmp(&b.ts_ms).then_with(|| a.id.cmp(&b.id)));
+    pending.truncate(MAX_DRAIN_PER_TICK);
+    let mut ok = 0usize;
+    let mut bad = 0usize;
+    for e in pending {
+        let caller = hive_contract::Caller {
+            tenant: e.tenant.clone(),
+            actor: BILLING_METER_ACTOR.to_string(),
+            owns_target: metering_owns(&e.tenant),
+            platform_attested: true,
+        };
+        let payload = ledger_row_payload(&e);
+        let outcome = if present.contains(&e.id) {
+            Ok(())
+        } else {
+            Err(format!("ledger row {} is no longer in canonical state", e.id))
+        };
+        match c
+            .contract_engine
+            .submit(
+                contract,
+                caller,
+                hive_contract::BILLING_LEDGER,
+                payload,
+                &e.tenant,
+                hive_core::now_ms(),
+                outcome,
+            )
+            .await
+        {
+            Ok(r) if r.persist_error.is_none() => {
+                cursor.insert(e.id.clone());
+                ok += 1;
+                tracing::info!(
+                    op = "billing.ledger",
+                    tenant = %e.tenant,
+                    entry_id = %e.id,
+                    seq = r.seq,
+                    committed = r.committed,
+                    proof = r.proof.is_some(),
+                    "contract: canonical ledger row attested"
+                );
+            }
+            other => {
+                bad += 1;
+                let detail = match other {
+                    Ok(r) => format!("persist error on seq {}: {:?}", r.seq, r.persist_error),
+                    Err(e) => e.to_string(),
+                };
+                tracing::error!(
+                    op = "billing.ledger",
+                    entry_id = %e.id,
+                    detail = %detail,
+                    "contract: canonical ledger row NOT attested (will retry)"
+                );
+            }
+        }
+    }
+    save_cursor(&cursor);
+    (ok, bad)
 }

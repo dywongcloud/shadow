@@ -401,7 +401,7 @@ pub struct SkuMargin {
 }
 
 /// Cumulative usage counters for a tenant (as measured from live metrics).
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageTotals {
     pub active_cpu_ms: u64,
     /// Provisioned memory GB-hours ×1000 (milli, to keep it an integer).
@@ -865,8 +865,44 @@ impl BillingStore {
                 self.usage_cost_cents_since(tenant, acc.period_start_ms),
                 "paid",
             );
-            closing.ledger_checkpoint =
-                Some(self.compute_ledger_checkpoint(tenant, acc.period_start_ms, now));
+            let cp = self.compute_ledger_checkpoint(tenant, acc.period_start_ms, now);
+            // Anchor the platform's own unsigned SHA-256 ledger hash-chain under the signed
+            // contract log, including the raw row count. Pruning the raw rows afterwards can no
+            // longer erase the period: the commitment and count are in an attested entry.
+            let cp_payload = std::collections::BTreeMap::from([
+                ("tenant_tag".to_string(), tenant.to_string()),
+                ("period_start_ms".to_string(), cp.period_start_ms.to_string()),
+                ("period_end_ms".to_string(), cp.period_end_ms.to_string()),
+                ("entry_count".to_string(), cp.entry_count.to_string()),
+                ("commitment".to_string(), cp.commitment.clone()),
+            ]);
+            // A MEASUREMENT, never a literal Ok(()): the commitment's row count is only an
+            // attestation if the raw rows it claims to cover are actually present right now.
+            let observed = self
+                .ledger
+                .read()
+                .iter()
+                .filter(|row| {
+                    row.tenant == tenant
+                        && row.ts_ms >= cp.period_start_ms
+                        && row.ts_ms < cp.period_end_ms
+                })
+                .count() as u64;
+            let outcome = if observed == cp.entry_count {
+                Ok(())
+            } else {
+                Err(format!(
+                    "ledger checkpoint covers {} rows but {} are present",
+                    cp.entry_count, observed
+                ))
+            };
+            Self::enqueue_billing_op(
+                hive_contract::BILLING_CHECKPOINT,
+                tenant,
+                cp_payload,
+                outcome,
+            );
+            closing.ledger_checkpoint = Some(cp);
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
@@ -1133,6 +1169,52 @@ impl BillingStore {
                 st.frac_cents = cost - whole as f64;
             }
         }
+        // One signed metering event per tick, carrying ALL twelve cumulative SKUs. The outcome is
+        // a READ-BACK of the meter cursor, never a constant: a reading the cursor did not adopt is
+        // recorded as a failed entry with no index mutation.
+        let measured = self
+            .meters
+            .read()
+            .get(tenant)
+            .map(|st| st.last == current)
+            .unwrap_or(false);
+        let outcome = if measured {
+            Ok(())
+        } else {
+            Err("meter cursor did not adopt this cumulative reading".to_string())
+        };
+        let payload = std::collections::BTreeMap::from([
+            ("tenant_tag".to_string(), tenant.to_string()),
+            ("window_end_ms".to_string(), now_ms().to_string()),
+            ("active_cpu_ms".to_string(), current.active_cpu_ms.to_string()),
+            (
+                "mem_gb_hr_milli".to_string(),
+                current.mem_gb_hr_milli.to_string(),
+            ),
+            ("requests".to_string(), current.requests.to_string()),
+            ("blocked".to_string(), current.blocked.to_string()),
+            ("gpu_ms".to_string(), current.gpu_ms.to_string()),
+            (
+                "browser_requests".to_string(),
+                current.browser_requests.to_string(),
+            ),
+            ("db_row_ops".to_string(), current.db_row_ops.to_string()),
+            (
+                "db_storage_byte_ms".to_string(),
+                current.db_storage_byte_ms.to_string(),
+            ),
+            (
+                "object_storage_byte_ms".to_string(),
+                current.object_storage_byte_ms.to_string(),
+            ),
+            ("ingress_bytes".to_string(), current.ingress_bytes.to_string()),
+            ("egress_bytes".to_string(), current.egress_bytes.to_string()),
+            (
+                "workflow_steps".to_string(),
+                current.workflow_steps.to_string(),
+            ),
+        ]);
+        Self::enqueue_billing_op(hive_contract::METER_SAMPLE, tenant, payload, outcome);
         if whole > 0 {
             self.record_usage(tenant, whole, "Compute usage (metered)");
         }
@@ -1185,6 +1267,21 @@ impl BillingStore {
             .unwrap_or_default()
     }
 
+    fn enqueue_billing_op(
+        kind: &'static str,
+        tenant: &str,
+        payload: std::collections::BTreeMap<String, String>,
+        outcome: Result<(), String>,
+    ) {
+        crate::db_contract::enqueue_meter_op(crate::db_contract::MeterOp {
+            kind,
+            tenant: tenant.to_string(),
+            target: tenant.to_string(),
+            payload,
+            outcome,
+        });
+    }
+
     fn ledger_push(
         &self,
         tenant: &str,
@@ -1203,6 +1300,9 @@ impl BillingStore {
             note: note.to_string(),
         };
         self.ledger.write().push(e.clone());
+        // Ledger rows are NOT enqueued here. db_contract::drain_metering mirrors them from
+        // canonical billing state behind a DURABLE cursor, so a restart or a dropped in-memory
+        // queue can never lose a charge. Enqueueing here as well would double-attest every row.
         e
     }
 

@@ -585,7 +585,21 @@ async fn sample_once(cloud: &Arc<CloudState>, state: &mut SampleState) {
 /// Called once at boot from `main.rs`.
 pub fn spawn_saver(cloud: Arc<CloudState>) {
     meter(); // load persisted rows eagerly, before the first sample can overwrite them
+    // The contract mirror is drained here, NOT in sample_once: this is the one bulkhead loop that
+    // runs with CloudState in hand on EVERY node. Billing enqueues events synchronously (from
+    // ledger_push / meter_usage) and never awaits an engine fsync on a request path.
     let Some(interval) = save_interval() else {
+        // Sidecar persistence disabled is not a reason to stop attesting billing: metering and
+        // ledger events are still enqueued by billing.rs, so keep a drain-only loop alive.
+        crate::bulkhead::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10_000)).await;
+                let r = crate::db_contract::drain_metering(&cloud).await;
+                if r.dropped > 0 || r.persist_errors > 0 {
+                    tracing::warn!(?r, "usage_metering: contract mirror drain degraded");
+                }
+            }
+        });
         return;
     };
     crate::bulkhead::spawn(async move {
@@ -593,6 +607,14 @@ pub fn spawn_saver(cloud: Arc<CloudState>) {
         loop {
             tokio::time::sleep(interval).await;
             sample_once(&cloud, &mut state).await;
+            // BEFORE the dirty check: a tick with no meter delta can still hold charges, credits
+            // and finalized checkpoints that must be attested.
+            let mirror = crate::db_contract::drain_metering(&cloud).await;
+            if mirror.dropped > 0 || mirror.persist_errors > 0 || mirror.refused > 0 {
+                tracing::warn!(?mirror, "usage_metering: contract mirror drain degraded");
+            } else if mirror.submitted > 0 {
+                tracing::info!(submitted = mirror.submitted, "contract: metering/billing events attested");
+            }
             let rows = {
                 let mut guard = meter().inner.lock();
                 if !guard.dirty {
