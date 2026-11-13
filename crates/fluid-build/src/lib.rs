@@ -30,8 +30,8 @@ pub use framework::{
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
 pub use rust::{
-    RustApp, RustFunction, RUST_BUILD_COMMAND, RUST_OUTPUT_DIR, SHIM_CARGO_TOML, SHIM_CONFIG,
-    SHIM_DIR, SHIM_LIB_RS,
+    RustApp, RustFunction, RUST_BUILD_COMMAND, RUST_OUTPUT_DIR, RUST_VENDOR_DIR, SHIM_CARGO_TOML,
+    SHIM_CONFIG, SHIM_CONFIG_ISOLATED, SHIM_DIR, SHIM_LIB_RS,
 };
 pub use repository_snapshot::{
     ApplicationSnapshot, BuildSteps, ExactShellCommand, FixedArgv, FrameworkSnapshot,

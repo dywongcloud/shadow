@@ -3554,6 +3554,24 @@ async fn run_build(
         }
     }
     let host_exec_backend = matches!(cloud.gw.backend_name(), "mock" | "litebox");
+    // The isolated executor copies the checkout into its volume AT begin(), before
+    // produce_manifest runs. Stage the embedded shim and the platform-owned cargo config HERE so
+    // the tar stream carries them; the host lane needs no such hoist but is byte-identical either
+    // way (stage_rust_shim is idempotent). Nothing is assumed about cargo being installed: the
+    // live toolchain probe in build_rust_lane still fails closed with BUILD_TOOLCHAIN_MISSING.
+    // produce_manifest returns on image/compose/Dockerfile/fluid.json BEFORE reaching the Rust
+    // branch, so staging must use the same precedence: otherwise a fluid.json deploy that ships a
+    // .cargo/config.toml would be refused by a lane it never enters.
+    let rust_lane_active = rust_app_present
+        && req.image_ref.is_none()
+        && crate::compose::compose_file(&build_dir).is_none()
+        && container_build_file(&build_dir).is_none()
+        && tokio::fs::read_to_string(build_dir.join("fluid.json"))
+            .await
+            .is_err();
+    if rust_lane_active {
+        stage_rust_shim(&build_dir, !host_exec_backend).await?;
+    }
     let mut isolated = if req.image_ref.is_some() {
         None
     } else if host_exec_backend {
@@ -10816,7 +10834,7 @@ async fn adapter_manifest(
 /// Stage the first-party vercel_runtime shim into a Rust checkout. Embedded in the binary via
 /// include_str!, so a fleet node holding only hive-cloud can still build Vercel-shaped handlers
 /// OFFLINE. Every path is platform-templated: no tenant string becomes a host path.
-async fn stage_rust_shim(dir: &Path) -> anyhow::Result<()> {
+async fn stage_rust_shim(dir: &Path, isolated_lane: bool) -> anyhow::Result<()> {
     let shim = dir.join(fluid_build::SHIM_DIR);
     let parent = dir.join(".hive-rust-runtime");
     for path in [&parent, &dir.join(".cargo")] {
@@ -10830,10 +10848,18 @@ async fn stage_rust_shim(dir: &Path) -> anyhow::Result<()> {
     }
     // A tenant-supplied cargo config could inject [patch], rustflags or a rustc-wrapper. Refuse
     // rather than clobber it or merge untrusted TOML: fail closed with an actionable message.
+    // Staging is idempotent: the SAME config written by an earlier call in this build is accepted,
+    // so the shim can be staged BEFORE the isolated executor streams the checkout into its volume.
+    let expected = if isolated_lane {
+        fluid_build::SHIM_CONFIG_ISOLATED
+    } else {
+        fluid_build::SHIM_CONFIG
+    };
     for name in ["config.toml", "config"] {
         let path = dir.join(".cargo").join(name);
+        let existing = tokio::fs::read_to_string(&path).await.unwrap_or_default();
         anyhow::ensure!(
-            tokio::fs::symlink_metadata(&path).await.is_err(),
+            existing.is_empty() || existing == expected,
             "Rust checkout ships .cargo/{name}; the platform owns cargo config for this lane. \
              Remove it (or set an explicit fluid.json with a prebuilt binary) to deploy."
         );
@@ -10844,7 +10870,7 @@ async fn stage_rust_shim(dir: &Path) -> anyhow::Result<()> {
     tokio::fs::write(shim.join("Cargo.toml"), manifest).await?;
     tokio::fs::write(shim.join("src/lib.rs"), fluid_build::SHIM_LIB_RS).await?;
     tokio::fs::create_dir_all(dir.join(".cargo")).await?;
-    tokio::fs::write(dir.join(".cargo/config.toml"), fluid_build::SHIM_CONFIG).await?;
+    tokio::fs::write(dir.join(".cargo/config.toml"), expected).await?;
     Ok(())
 }
 
@@ -10885,7 +10911,10 @@ async fn build_rust_lane(
             available.unwrap_or_default().join(",")
         );
     }
-    stage_rust_shim(dir).await?;
+    // Idempotent re-assert: on the isolated lane the shim was staged before the checkout was
+    // streamed into the build volume (see run_build), so this only verifies our own bytes.
+    let isolated_lane = isolated.as_ref().is_some_and(|session| !session.host_build);
+    stage_rust_shim(dir, isolated_lane).await?;
     log(format!(
         "Detected {} Rust function(s) (Vercel Rust runtime API); building native $PORT binaries offline.",
         app.functions.len()

@@ -415,10 +415,15 @@
             for path in /bin/sh /bin/sleep /bin/tar /usr/bin/awk /usr/bin/env /usr/bin/find /usr/bin/id /usr/bin/realpath /usr/bin/stat /usr/bin/wc; do
               test -x "$path";
             done;
-            for command in curl git node npm corepack bun python3 go buildah; do
+            for command in curl git node npm corepack bun python3 go buildah{% if build_executor_rust_enabled | bool %} cargo rustc{% endif %}; do
               command -v "$command" >/dev/null;
             done;
-            touch /workspace/non-root-write-ok
+            {% if build_executor_rust_enabled | bool %}test "$(rustc --version | awk '{print $2}')" = "{{ build_executor_rust_version }}";
+            test -f {{ build_executor_rust_vendor_dir }}/.hive-vendor-seal;
+            test "$(awk 'NR==1 {print $1}' {{ build_executor_rust_vendor_dir }}/.hive-vendor-seal)" = "{{ build_executor_rust_vendor_sha256 }}";
+            test -f {{ build_executor_rust_cargo_home }}/config.toml;
+            grep -qxF 'offline = true' {{ build_executor_rust_cargo_home }}/config.toml;
+            {% endif %}touch /workspace/non-root-write-ok
       changed_when: false
 
     - name: Prove the named tmpfs workspace byte ceiling

@@ -83,15 +83,29 @@ reimplementation of Vercel's runtime. Deliberately NOT implemented:
 - The shim source is embedded in `hive-cloud` via `include_str!`, so a node holding only the
   binary can materialize it; no source tree is needed at deploy time.
 
-## Deployment prerequisite (operator one-way door)
+## Isolated builder image (code complete, roll is operator-only)
 
-The isolated builder image `ansible/roles/build_executor/templates/Containerfile.j2` currently
-asserts `curl node npm corepack bun python3 go buildah` but NOT `cargo`/`rustc`. Until an
-authorized roll adds a pinned Rust toolchain and a seeded offline crate registry, Rust source
-builds succeed on host-exec lanes (mock/litebox) and fail closed with
-`BUILD_TOOLCHAIN_MISSING` on isolated-executor nodes. **This change is NOT deployed or rolled.**
-A `git push` auto-deploys through the webhook and `git::spawn_git_poll_reconcile`, which is the
-operator's one-way door.
+The `build_executor` role now carries an OPT-IN, fail-closed Rust contract:
+`build_executor_rust_enabled: false` by default leaves every existing node and
+every non-Rust build byte-identical. Enabling it requires a NEW reviewed,
+digest-pinned base image carrying a pinned toolchain and a seeded offline crate
+set, plus an exact `rustc` version and vendor-seal sha256 — all shape-checked by
+`tasks/00-preflight.yml`. The `--network=none` Containerfile ASSERTS those paths
+and digests instead of installing them; `tasks/50-probe.yml` re-asserts them
+inside gVisor. On the isolated lane the platform stages a vendored-source cargo
+config into the checkout BEFORE the executor streams it into the build volume, so
+`cargo --offline` resolves with no network and no `CARGO_HOME` surviving
+`env -i`. This was witnessed locally (`env -i` build + HTTP serve of an
+unmodified Vercel handler).
+
+**The CODE is done; the ROLL is not.** Producing the reviewed base digest and
+running `playbooks/nw-build-executor.yml` is the operator's one-way door (see
+`ansible/roles/build_executor/README.md`). Until that roll, Rust source builds
+succeed on host-exec lanes (mock/litebox) and fail closed with
+`BUILD_TOOLCHAIN_MISSING` on isolated-executor nodes. No version, digest or
+toolchain path was guessed. A `git push` auto-deploys through the webhook and
+`git::spawn_git_poll_reconcile`; that is a separate one-way door the operator
+authorized explicitly.
 
 ## Zero-build alternative
 

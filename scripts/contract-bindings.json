@@ -197,6 +197,27 @@
       "path": "crates/fluid-build/src/rust.rs"
     },
     {
+      "assertion": "cargo build --release --offline --bins",
+      "canonical_sha256": "c05834c200454285424cc8e060c3bf295ed3bf7aa1f1247601940bcf86cb6e60",
+      "id": "system.rust.shim_config_isolated",
+      "layer": "system",
+      "path": "crates/fluid-build/src/rust.rs"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "7438165dace47ac8c046505f73846f5233678b1fc88c175544c30b661a333025",
+      "id": "system.builder.rust_enabled",
+      "layer": "system",
+      "path": "ansible/roles/build_executor/defaults/main.yml"
+    },
+    {
+      "assertion": "cargo test --workspace --locked --verbose",
+      "canonical_sha256": "52e63b578a00a8f9daace8d702deeb535b479d471c3447346d1f2782721f8a83",
+      "id": "system.builder.rust_preflight",
+      "layer": "system",
+      "path": "ansible/roles/build_executor/tasks/00-preflight.yml"
+    },
+    {
       "assertion": "cargo test --workspace --locked --verbose",
       "canonical_sha256": "e6232e2219572b628e40f71c8d50469be64d381ded405b7b6be4ecead33fb785",
       "id": "system.rust.capability",
@@ -230,7 +251,7 @@
       "step": "npm audit (dashboard)"
     }
   ],
-  "gate_sha256": "fb91e6305c9a21801be30ab8448964fe33c47f6831f27ac3037059d6eca163c1",
+  "gate_sha256": "7e6799b69191657757e4a785bb136cfa248a8406f78a7eb2e231093c3d61cc95",
   "gates": [
     {
       "command": "cargo test --workspace --locked --verbose",

@@ -76,6 +76,40 @@ the image to default to the configured numeric non-root uid:gid, declare no OCI
 volumes, carry the v1 protocol label, and expose every exact tool path exercised
 by the executor.
 
+### Native Rust builds (opt-in, operator only)
+
+`build_executor_rust_enabled` defaults to `false`. With it off the Containerfile,
+preflight and live probe are byte-identical to the pre-Rust role, and native Rust
+source builds stay fail-closed on this node (`BUILD_TOOLCHAIN_MISSING`). Enabling
+it is an OPERATOR one-way door, not a code change:
+
+1. Produce a NEW reviewed, digest-pinned base image that ALREADY contains a
+   pinned `cargo`/`rustc` at `/opt/hive-rust/bin`, a vendored offline crate set at
+   `/opt/hive-rust/vendor`, a `CARGO_HOME` config at
+   `/opt/hive-rust/cargo-home/config.toml` declaring `[net] offline = true`, and
+   `/opt/hive-rust/vendor/.hive-vendor-seal` whose first field is the sha256 of
+   the vendor tree. The image build is `--pull=never --network=none`: the
+   Containerfile ASSERTS these paths, the pinned `rustc` version and the seal
+   digest; it never installs anything. A floating rustup download, a mutable
+   package repository or an unpinned toolchain is refused.
+2. Set `build_executor_builder_base_image` to that new digest, set
+   `build_executor_rust_enabled: true`, `build_executor_rust_version` to the exact
+   pinned `X.Y.Z`, and `build_executor_rust_vendor_sha256` to the seal digest.
+   `00-preflight.yml` rejects an empty/guessed version or digest, so no supply
+   chain input is inferred.
+3. Run `playbooks/nw-build-executor.yml`. The live probe re-asserts the version,
+   seal and offline config INSIDE gVisor, so a base that only fakes the image
+   layer cannot publish the capability.
+
+The platform stages a `[source.crates-io] replace-with = "vendored-sources"`
+config plus the first-party `vercel_runtime` patch into the checkout BEFORE the
+executor streams it into the build volume; cargo resolves that config from the
+checkout even under the executor's `env -i` wrapper, so no `CARGO_HOME` has to
+survive `env_clear()`. The host-exec lane (mock/litebox) keeps the patch-only
+config and uses its own cargo cache; nothing about it changes. A tenant crate
+outside the seeded vendor set fails the build loudly. See
+`docs/rust-functions.md`.
+
 ## Runtime and Podman policy
 
 The role installs gVisor as ONE atomic whole-bundle release, never a

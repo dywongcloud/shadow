@@ -49,11 +49,11 @@ verified+trusted signer`). Admin JWTs are HS256 on `HIVE_JWT_SECRET`, minted ON 
 proxy and owner-forward asks `CloudState::leader_forward_target()`.
 - **Every leader-only loop asks one question, `leadership::may_act(cloud, Job)`**: owner AND fresh view AND not isolated AND (backup
 owner only) fresh DIRECT contact with a strict majority of `HIVE_CP_VOTERS`, held for `Job::min_tenure()` (30 s, 600 s for
-NodeDeathRelocate); take-over keys on the ownership TERM (`TERM_LAPSE`, 30 s). An owner present but unable to act is still owner
+NodeDeathRelocate); take-over keys on the ownership TERM (`TERM_LAPSE`, 30 s). An owner unable to act is still owner
 everywhere, so every job HOLDS fleet-wide: restore transport/voters, never weaken the gate. Node-death self-heal is OFF unless
 `HIVE_NODE_DEATH_SELF_HEAL=1`.
 - `RATE_CARD` > `COST_CARD` (>=6000 bps, `assert_profitable()`); ONE `may_act(BillingMeter)` writer;
-charging OFF until `HIVE_BILLING_METER_RESOURCES=1`.
+charging OFF till `HIVE_BILLING_METER_RESOURCES=1`.
 
 ## State: replication, routing, relational mirror
 
@@ -84,8 +84,8 @@ needs the operator word.
 
 ## Mesh transport, discovery, watchdogs
 
-- `PeerPool` keys trunks by ENDPOINT ID, never the caller's label. **Every inbound accept is bounded, budgeted by its
-NEGOTIATED ALPN, and never evicts an established trunk**: `HIVE_P2P_ACCEPT_DEADLINE_MS` (40 s); the ClientHello picks
+- `PeerPool` keys trunks by ENDPOINT ID, not the label. **Every inbound accept is bounded, budgeted by its
+NEGOTIATED ALPN, and never evicts an established trunk**: `HIVE_P2P_ACCEPT_DEADLINE_MS` (40 s); ClientHello picks
 the budget; `establish_stats` is operator-only `GET /v1/mesh/establish`, never `/v1/mesh`.
 - `vendor/iroh` keeps two patches across pin bumps (relay "read before send", `PendingRebind`); a dialable
 address needs `HIVE_PUBLIC_IP` AND `HIVE_IROH_PORT`.
@@ -116,7 +116,7 @@ a missing runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
 space; seccomp-bpf is the only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes on that host with
 the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the flag alone, never macOS.
 `litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`, so ANY change rebuilds every artifact.
-- A sandbox's live cell is on ONE node (`SandboxRecord::owner_node`); leader only routes.
+- A sandbox's live cell is on ONE node (`SandboxRecord::owner_node`); leader routes.
 
 ## Runtime discipline (the serving runtime never stalls)
 
@@ -132,7 +132,7 @@ drained only through `hive_core::logcap::read_capped_line`, never `BufReader::li
 
 ## Builds & deploys
 
-- `git push` auto-deploys through TWO triggers deduping on the commit SHA (`CloudState::git_poll_seen`): the webhook
+- `git push` auto-deploys through TWO triggers deduping on the SHA (`CloudState::git_poll_seen`): the webhook
 and `git::spawn_git_poll_reconcile`. **A single unreachable node never fails a deploy**: on `FanoutOutcome::nothing_ran()`
 `run_build` walks `schedule::dispatch_fallbacks` one candidate at a time with `place`'s `capable` + `reachable`
 predicates, bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3).
@@ -142,17 +142,18 @@ repository-build placement.
 - Rust: `crates/vercel-runtime` shim = Vercel public handler API on `$PORT` (NOT IPC/`.func`/axum 0.8); `Cargo.toml`
 `[[bin]]`->`api/*.rs` builds `--offline` via a platform-owned `.cargo/config.toml` into `Runtime::Command` binaries.
 `cargo`+`rustc` PROBED (bit `1<<7`, last free exit bit; `None`=NOT CAPABLE, no npm substitute), gates placement.
-Builder image needs the toolchain: operator roll, NOT done. `docs/rust-functions.md`.
+Builder contract OPT-IN: stage shim+vendored config BEFORE the executor streams the checkout; reviewed base
+(pinned toolchain+vendor seal) and roll are operator-only. `docs/rust-functions.md`.
 - Checkouts live in `git::deploy_root()`; prefix scanners cover BOTH roots, BOTH name forms and a renamed project's old names
 (`git::checkout_prefixes`); a missing direct entry fails the BUILD (`git::preflight_direct_entries`), never the launch.
 - The default `GET /v1/gitops/projects?view=summary` stays byte-identical; `project_redeploy` alone rebuilds
 from `last_build`. Legacy env scope `""` matches build AND runtime (`env_scope_matches`); build-inlined `NEXT_PUBLIC_*`
 needs `$HIVE_DATA/build-cache/*.tar` cleared before a redeploy of unchanged source: verify the SERVED bundle.
-- **The host build lane's package registry is part of node health**: it inherits the host `/root/.npmrc`, so a dead
+- **The host build lane's package registry is part of node health**: it inherits `/root/.npmrc`, so a dead
 mirror fails every uncached install; `build_registry::assess` swaps in a 0600 `npm_config_userconfig` with the public
 registry, only for a dark KNOWN public mirror while registry.npmjs.org answers.
-- **Credentials resolve SERVER-SIDE**: the GitHub connection rides in an ENCRYPTED host-only browser cookie, NOT persisted
-server-side and cannot cross devices; build/deploy credentials resolve on the node (`git.rs::resolve_clone_credentials`).
+- **Credentials resolve SERVER-SIDE**: the GitHub connection rides in an ENCRYPTED host-only browser cookie, NOT
+persisted and cannot cross devices; build/deploy credentials resolve on the node (`git.rs::resolve_clone_credentials`).
 
 ## Placement & capacity
 
@@ -183,7 +184,7 @@ refuses NEW placement; stranded databases are reported, never re-hosted (re-prov
 AUTHENTICATION (`AuthProof`: Postgres `AuthenticationOk`, Redis `+OK`; `-NOAUTH`/`+RESET` prove nothing) within
 `HIVE_DB_GATEWAY_ACCEPT_DEADLINE_MS` before the backend and `HIVE_DB_GATEWAY_AUTH_DEADLINE_MS` (30 s absolute) after;
 a full `PendingTable` EVICTS the oldest stuck connection; `splice` copies each direction itself, never
-`copy_bidirectional` or a `select!`.
+`copy_bidirectional`/`select!`.
 
 ## Contract and execution transparency (managed-db)
 
@@ -198,9 +199,9 @@ unopenable log: NO entry; later persist fault: `persist_error`. Docs: `docs/cont
 folds `Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical());
 it cannot cover the ack, since `ack.log_head` IS that hash). No PINNED identity = Inadmissible, never Dishonest.
 Checkpoint close defers to the drain; `submit` starts it, `wrote` awaits `submit`, not the close; `Store::append`
-closes inline past 1 deferred close, rebuild repair inline. Read EVERY segment a window spans.
-- **Vitra has no consensus**: honesty by REPLAY (`replicate.rs`, `audit.rs`), not agreement; **NO bond or incentive
-model**. Inclusion/append-only proofs show an entry WAS published, not freshness.
+closes inline past 1 deferred close, rebuild inline. Read EVERY segment a window spans.
+- **Vitra has no consensus**: honesty by REPLAY (`replicate.rs`, `audit.rs`), not agreement; **NO bond model**.
+Inclusion/append-only proofs show an entry WAS published, not freshness.
 
 ## Account 2FA (optional per-account TOTP)
 
@@ -208,19 +209,19 @@ model**. Inclusion/append-only proofs show an entry WAS published, not freshness
 request from BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from
 leader forwarding, `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local
 check or node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in
-`ui/lib/team-role.ts`. Docs: `docs/account-2fa.md`.
+`ui/lib/team-role.ts`. `docs/account-2fa.md`.
 - State is per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` behind `serde(default)`.
 Secret: `secrets::encrypt` (FAILS OPEN, assert `is_encrypted`), read ONLY `secrets::try_decrypt`, compared
 `admin::ct_eq`. The signed `otp_at` claim sits INSIDE the HS256 payload, read only from a verified token, fails
 closed if absent. Carve out machines before any OTP demand: `is_fleet_service`, `is_queue_client`,
 `key:`/`__untagged__`/empty subs, or all 20 fleet delegations and API keys break. Dev nodes, GET/HEAD/OPTIONS
-never gated. Single-use challenge, `step > last_used_step`, per-sub rate limit charged on wrong codes, Drop
-guard. Already-issued JWTs are NOT revoked; never rotate `HIVE_JWT_SECRET` to invalidate them.
+never gated. Single-use challenge, `step > last_used_step`, per-sub rate limit on wrong codes, Drop guard.
+Already-issued JWTs are NOT revoked; never rotate `HIVE_JWT_SECRET` to invalidate them.
 
 ## Browser lane
 
 - `fluid_core::browser_policy_digest` and `policyDigest` in `artifact-policy.js` are ONE contract with TWO
-implementations (also `MESH_SIG_DOMAIN`/`peer-mesh.js`: drift rejects every handshake).
+implementations (also `MESH_SIG_DOMAIN`/`peer-mesh.js`: drift rejects a handshake).
 
 ## DNS: Seer, cutovers/ACME, custom domains
 
@@ -262,10 +263,10 @@ evidence only for an untagged row), so a read keyed by a DEPLOYMENT ID asks ONE 
 (`record_tenant` takes a stored tag). A claim never takes a project (`ProjectStore::claim_team` is a CAS);
 deployments follow the row (`Gateway::retag_project`, `tenancy_reconcile::retag_deployments_to_rows`
 every host: `HIVE_DEPLOYMENT_RETAG_SECS` 15, `=0` disables). A move needs a destination the caller
-administers (`caller_administers`) or the operator.
+administers (`caller_administers`) or operator.
 - Every roster change goes through `TeamStore::set_member_role`/`remove_member_as` (`check_roster_change`:
 nobody changes, removes or grants above their own role; the last Owner stays), and `remove_checked` authorises
-EVERY row a removal deletes (`check_roster_removal`), so a ghost row cannot carry the Owner away. A directory
+EVERY row a removal deletes (`check_roster_removal`), so a ghost row cannot carry the Owner away. Directory
 sync only adds (`add_member_if_absent`) or removes a plain member (`remove_plain_member`).
 - Only the dashboard SERVER writes the identity mirror (`identity_sync` under `mint_allowed`): it feeds `team_create` and
 `caller_administers`, so a browser-originated sync records nothing.

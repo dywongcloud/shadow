@@ -43,6 +43,18 @@ pub const SHIM_DIR: &str = ".hive-rust-runtime/vercel-runtime";
 /// parent), so no absolute host path is embedded and no tenant string reaches a host path.
 pub const SHIM_CONFIG: &str = "[patch.crates-io]\nvercel_runtime = { path = \".hive-rust-runtime/vercel-runtime\" }\n";
 
+/// Path of the reviewed, seeded offline crate set inside the isolated builder image. Platform-
+/// templated and absolute: never derived from a tenant string, never a host path on the host lane.
+pub const RUST_VENDOR_DIR: &str = "/opt/hive-rust/vendor";
+
+/// Config for the ISOLATED (gVisor BuildExecutor) lane. The image is built --network=none, so the
+/// reviewed base must already carry a vendored crate set; this config makes cargo resolve against
+/// it with NO network and NO mutable registry. The shim stays a [patch], which cargo applies on top
+/// of a replaced source. A tenant crate outside the seeded set fails the build loudly. cargo reads
+/// this from the checkout's .cargo/config.toml even under the executor's `env -i` wrapper, so no
+/// CARGO_HOME needs to survive env_clear(). Witness: offline build + HTTP serve under `env -i`.
+pub const SHIM_CONFIG_ISOLATED: &str = "[patch.crates-io]\nvercel_runtime = { path = \".hive-rust-runtime/vercel-runtime\" }\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.vendored-sources]\ndirectory = \"/opt/hive-rust/vendor\"\n\n[net]\noffline = true\n";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RustFunction {
     /// Validated `[[bin]]` name; also the `target/release/<name>` binary and the route label.

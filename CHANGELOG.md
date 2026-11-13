@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-11-12 - ops: isolated builder image contract for native Rust (opt-in)
+
+Pushed `ee18d735cb` (5 commits) to `origin/main`; GitHub confirms the remote head
+matches. A `git push` auto-deploys through the webhook and `git_poll_reconcile`.
+That SHA's `build + unit tests (macos-15-intel)` leg exposed three pre-existing
+`fluid-gateway` 404 failures (first CI run ever on that runner); re-run started,
+see the honest note below.
+
+The Rust lane previously failed closed on isolated-executor nodes with
+`BUILD_TOOLCHAIN_MISSING`. This change makes the ROLE able to carry a pinned Rust
+toolchain, without weakening any supply-chain gate:
+
+- `ansible/roles/build_executor/defaults/main.yml`: `build_executor_rust_enabled`
+  (default `false`), plus pinned `rust_version`, vendor-seal sha256, cargo-home and
+  vendor-dir paths. Default off leaves every existing node byte-identical.
+- `tasks/00-preflight.yml`: enabling REQUIRES an exact `X.Y.Z` version and a
+  64-lowercase-hex vendor digest; no version or digest is inferred.
+- `templates/Containerfile.j2`: when enabled, ASSERTS `cargo`/`rustc`, the pinned
+  `rustc --version`, the vendor directory, its seal digest, and an offline
+  `CARGO_HOME` config. Built `--pull=never --network=none`, so it NEVER installs:
+  no floating rustup, no mutable package repository, no unpinned toolchain.
+- `tasks/50-probe.yml`: re-asserts the same facts INSIDE the gVisor sandbox
+  before publishing the capability.
+- `crates/hive-cloud/src/build_executor.rs`: `BASE_PATH` gains `/opt/hive-rust/bin`
+  (last, so no checkout path can shadow the pinned compiler).
+- `crates/fluid-build/src/rust.rs`: `SHIM_CONFIG_ISOLATED` carries
+  `[source.crates-io] replace-with = "vendored-sources"` + `[net] offline = true`
+  alongside the shim patch. Witnessed locally: `env -i` with no CARGO_HOME,
+  `cargo build --offline --bins` succeeds and serves `{"message":"Hello, world!"}`
+  and `/_vercel/ping`, using a 51-crate vendored set.
+- `crates/hive-cloud/src/git.rs`: `stage_rust_shim` is now idempotent and
+  lane-aware, and is hoisted BEFORE `IsolatedBuild::begin()` so the embedded shim
+  and platform-owned cargo config are inside the tar stream on the isolated lane.
+  The hoist respects `produce_manifest`'s branch precedence, so a `fluid.json`
+  deploy is unaffected. The host-exec lane keeps the patch-only config.
+- CI: 3 new contract bindings (33 total); both Jinja flag states render to valid
+  YAML and a valid Containerfile.
+
+**CODE COMPLETE; ROLL NOT DONE.** Producing a NEW reviewed, digest-pinned base
+image with the pinned toolchain + seeded vendor tree and running
+`playbooks/nw-build-executor.yml` is the operator's one-way door. Until then Rust
+source builds still fail closed on isolated nodes. No supply-chain digest was
+invented. See `ansible/roles/build_executor/README.md` and `docs/rust-functions.md`.
+
 ## 2026-11-12 - feat: native Rust functions (Vercel Rust runtime source compatibility)
 
 Adds a first-party, source-compatible `vercel_runtime` shim and a dedicated native Rust build

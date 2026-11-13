@@ -80,6 +80,17 @@ build_executor_network_gateway: ""
 # Aardvark is the only resolver visible in the container and forwards to this reviewed public set; empty fails preflight.
 build_executor_dns_upstream_ipv4: []
 
+# Native Rust source builds are OPT-IN. The reviewed, digest-pinned base must ALREADY carry a
+# pinned toolchain and a vendored offline crate set: the Containerfile is built --network=none and
+# never installs anything. No version, digest or path is guessed: enabling requires all inputs
+# below and 00-preflight.yml shape-checks them. Default off leaves every existing node and every
+# non-Rust build byte-identical; Rust builds stay fail-closed on isolated nodes.
+build_executor_rust_enabled: false
+build_executor_rust_version: ""
+build_executor_rust_vendor_sha256: ""
+build_executor_rust_cargo_home: /opt/hive-rust/cargo-home
+build_executor_rust_vendor_dir: /opt/hive-rust/vendor
+
 # Derived from the checked-in inventory so a new fleet node expands the deny set; override only for a different
 # authoritative inventory.
 build_executor_fleet_public_ipv4: >-

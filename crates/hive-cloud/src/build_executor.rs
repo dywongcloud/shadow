@@ -70,7 +70,11 @@ const SOURCE_ROOT: &str = "/workspace/source";
 const OUTPUT_ROOT: &str = "/artifact";
 const ADMIN_OUTPUT_CAP: usize = 2 * 1024 * 1024;
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
-const BASE_PATH: &str = "/workspace/source/node_modules/.bin:/usr/local/bin:/usr/bin:/bin";
+// /opt/hive-rust/bin carries the PINNED toolchain in a Rust-enabled reviewed builder base. It is
+// appended last so no tenant-controlled checkout path can shadow cargo/rustc, and is inert on
+// bases without Rust (a missing PATH entry is ignored). Must match RUST_VENDOR_DIR's install root.
+const BASE_PATH: &str =
+    "/workspace/source/node_modules/.bin:/usr/local/bin:/usr/bin:/bin:/opt/hive-rust/bin";
 /// The exact runsc wrapper flags the installed declaration must carry; any other set is a
 /// `CapabilityMismatch`. `directfs` is deliberately absent, so runsc's own default (true) applies:
 /// forcing `directfs=false` makes gVisor fall back to the gofer-only filesystem path, whose
