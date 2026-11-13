@@ -206,6 +206,15 @@ impl InclusionProof {
     ) -> Result<(), InclusionError> {
         let entry = &self.signed.entry;
         let seq = entry.op.seq;
+        // The artefact's own top-level contract id is a CLAIM too. It used to be documented as
+        // checked and never read: a proof serialized with a foreign contract_id still returned
+        // Ok(()), so the field bound nothing. Check it against the contract being audited.
+        if self.contract_id != contract.id {
+            return Err(InclusionError::ContractMismatch {
+                published: self.contract_id.clone(),
+                expected: contract.id.clone(),
+            });
+        }
         if entry.op.contract != contract.id {
             return Err(InclusionError::ContractMismatch {
                 published: entry.op.contract.clone(),
@@ -239,6 +248,15 @@ impl InclusionProof {
             }
         }
         if let Some(w) = &self.window {
+            // Under an UNPINNED verification the checkpoint's own contract binding is skipped by
+            // SignedCheckpoint::verify(None). Bind it here so a foreign contract's signed window
+            // cannot be attached even in the structural-only mode.
+            if w.checkpoint.checkpoint.contract_id != contract.id {
+                return Err(InclusionError::ContractMismatch {
+                    published: w.checkpoint.checkpoint.contract_id.clone(),
+                    expected: contract.id.clone(),
+                });
+            }
             let trust = trusted_public_key_hex.map(|k| TrustedCheckpoint {
                 public_key_hex: k,
                 contract_id: &contract.id,
