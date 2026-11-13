@@ -135,7 +135,7 @@ async fn main() {
                 Caller {
                     tenant: format!("team-{:02}", i % 3),
                     actor: "witness".to_string(),
-                    owns_target: true,
+                    owns_target: true, platform_attested: false,
                 },
                 kind,
                 pl,

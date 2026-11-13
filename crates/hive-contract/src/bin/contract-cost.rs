@@ -103,7 +103,7 @@ async fn bench(engine: &Engine, ops: usize, window: usize) -> Vec<u128> {
                 hive_contract::Caller {
                     tenant: tenant.clone(),
                     actor: "cost-harness".to_string(),
-                    owns_target: true,
+                    owns_target: true, platform_attested: false,
                 },
                 kind,
                 payload,

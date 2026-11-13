@@ -47,6 +47,13 @@ pub enum AuthPolicy {
     /// Open PARTICIPATION: any node may propose, relay or attest without operator allowlisting.
     /// This is the only sense in which this layer is "permissionless" -- see [`Effect`].
     OpenParticipation,
+    /// A PLATFORM-MEASURED event: metering samples and billing-ledger rows. The emitter is platform
+    /// code that already performed the measurement, never a tenant request and never an anonymous
+    /// proposer. `StateWrite` is admissible here (the forbidden pair is
+    /// `OpenParticipation` + `StateWrite` only), but [`validate`] requires the caller to carry
+    /// `Caller::platform_attested` AND a server-derived tenant. Extending AuthPolicy is the honest
+    /// way to admit these ops: giving them OpenParticipation would let any node mint a charge.
+    PlatformAttested,
 }
 
 /// Whether an operation may change contract state.
@@ -63,8 +70,11 @@ pub enum Effect {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ContractError {
     /// `OpenParticipation` + `StateWrite` -- the one combination that would let an unauthenticated
-    /// proposer mutate tenant data. Unrepresentable by construction, never merely rejected later.
+    /// proposer mutate tenant data. Refused at RUNTIME by `declare` and rechecked on every USE.
     OpenParticipationMayNotWrite,
+    /// A contract reached the executor through a route that skipped `declare` (public fields or
+    /// `Deserialize`) and carries a row that would never have been admitted.
+    Inadmissible { kind: String, reason: String },
     DuplicateOpKind(String),
     EmptyOpKind,
     /// `target_key` is not one of the kind's declared payload keys: the op could never be validated,
@@ -78,6 +88,9 @@ impl std::fmt::Display for ContractError {
             ContractError::OpenParticipationMayNotWrite => f.write_str(
                 "open-participation ops are log-only: an unauthenticated proposer may never mutate state",
             ),
+            ContractError::Inadmissible { kind, reason } => {
+                write!(f, "contract op kind {kind} is inadmissible: {reason}")
+            }
             ContractError::DuplicateOpKind(k) => write!(f, "duplicate op kind {k}"),
             ContractError::EmptyOpKind => f.write_str("op kind must be non-empty"),
             ContractError::TargetKeyNotDeclared { kind, key } => write!(
@@ -162,6 +175,39 @@ impl Contract {
     pub fn spec(&self, kind: &str) -> Option<&OpSpec> {
         self.ops.get(kind)
     }
+
+    /// The first declared op kind that makes this contract INADMISSIBLE, if any.
+    ///
+    /// Two terms are checked, both enforced by `declare` and skippable by a deserialized or
+    /// public-field-constructed `Contract`: an `OpenParticipation` op must not be a
+    /// `StateWrite`, and a `target_key` must be one of the declared payload keys (otherwise the
+    /// target binding in [`validate`] is vacuous).
+    pub fn inadmissible_kind(&self) -> Option<(&str, &'static str)> {
+        for (kind, spec) in &self.ops {
+            if spec.auth == AuthPolicy::OpenParticipation && spec.effect == Effect::StateWrite {
+                return Some((kind, "open participation may not write state"));
+            }
+            if !spec.payload_keys.contains(&spec.target_key) {
+                return Some((kind, "target_key is not a declared payload key"));
+            }
+        }
+        None
+    }
+
+    /// The ONE admissibility predicate. `declare` refuses an inadmissible ROW before inserting it;
+    /// every USE of a contract calls this again, because `Contract` and `OpSpec` have public
+    /// fields and derive `Deserialize`: `serde_json::from_str::<Contract>` never goes through
+    /// `declare`. A contract reaching `validate`, `Executor::commit` or `Engine::submit` from
+    /// another construction route is refused before any state mutation.
+    pub fn assert_admissible(&self) -> Result<(), ContractError> {
+        match self.inadmissible_kind() {
+            Some((kind, reason)) => Err(ContractError::Inadmissible {
+                kind: kind.to_string(),
+                reason: reason.to_string(),
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Why an operation was refused.
@@ -181,6 +227,10 @@ pub enum OpError {
     /// recorded under the submitted one: otherwise the op the contract authorized and the state the
     /// op moves are two different databases.
     TargetMismatch { target: String, expected: String },
+    /// The contract itself is inadmissible (a crafted `Deserialize` or public-field build).
+    InadmissibleContract(String),
+    /// A `PlatformAttested` op arrived without the platform's measurement attestation.
+    PlatformAttestationMissing,
     /// The operation could not be RECORDED: the durable log would not open, because a stored
     /// checkpoint failed to verify or the log directory is unwritable.
     ///
@@ -193,6 +243,10 @@ pub enum OpError {
 impl std::fmt::Display for OpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            OpError::InadmissibleContract(d) => write!(f, "contract is inadmissible: {d}"),
+            OpError::PlatformAttestationMissing => f.write_str(
+                "platform-attested op carries no platform measurement attestation",
+            ),
             OpError::UndeclaredKind(k) => write!(f, "op kind {k} is not declared by this contract"),
             OpError::BadPayload {
                 kind,
@@ -225,6 +279,11 @@ pub struct Caller {
     pub tenant: String,
     pub actor: String,
     pub owns_target: bool,
+    /// TRUE only when platform code measured this event itself (a meter sample or a billing-ledger
+    /// row), never for a request-derived caller. Required by `AuthPolicy::PlatformAttested`.
+    /// This is a verdict supplied by the platform seam, exactly like `owns_target`: the contract
+    /// consumes it and fails closed without it; it never computes either one.
+    pub platform_attested: bool,
 }
 
 /// Validate `op` against `contract` for `caller`, acting on `target`.
@@ -245,7 +304,17 @@ pub fn validate<'a>(
     payload: &BTreeMap<String, String>,
     target: &str,
 ) -> Result<&'a OpSpec, OpError> {
+    // Recheck the WHOLE contract, not just this row: a deserialized Contract skipped declare.
+    contract
+        .assert_admissible()
+        .map_err(|e| OpError::InadmissibleContract(e.to_string()))?;
     let spec = contract.spec(kind).ok_or_else(|| OpError::UndeclaredKind(kind.to_string()))?;
+    // Defense in depth on the exact row being used.
+    if spec.auth == AuthPolicy::OpenParticipation && spec.effect == Effect::StateWrite {
+        return Err(OpError::InadmissibleContract(format!(
+            "op kind {kind} lets open participation write state"
+        )));
+    }
 
     let mut missing = Vec::new();
     for k in &spec.payload_keys {
@@ -291,9 +360,24 @@ pub fn validate<'a>(
                 return Err(OpError::TenantMismatch);
             }
         }
-        // Open participation is admitted on identity alone: it is only reachable for LogOnly ops,
-        // which `Contract::declare` guarantees, so admitting it here cannot reach tenant state.
+        // Open participation admits LogOnly ops only. The pair was rechecked above and by
+        // assert_admissible: a crafted Contract cannot reach tenant state through this arm.
         AuthPolicy::OpenParticipation => {}
+        // Platform-measured metering and billing ops. NOT OpenParticipation + StateWrite: the
+        // emitter must be platform code that already measured the event, and the tenant must be
+        // server-derived. An untagged or unattributed tenant is refused, never collapsed to a
+        // billable namespace.
+        AuthPolicy::PlatformAttested => {
+            if !caller.platform_attested {
+                return Err(OpError::PlatformAttestationMissing);
+            }
+            if caller.tenant.trim().is_empty() || caller.tenant == UNTAGGED_TENANT {
+                return Err(OpError::UntaggedTenant);
+            }
+            if !caller.owns_target {
+                return Err(OpError::TenantMismatch);
+            }
+        }
     }
     Ok(spec)
 }

@@ -73,7 +73,7 @@ fn owner(tenant: &str) -> Caller {
     Caller {
         tenant: tenant.to_string(),
         actor: "platform:require_project".to_string(),
-        owns_target: true,
+        owns_target: true, platform_attested: false,
     }
 }
 
@@ -165,7 +165,7 @@ async fn main() {
             Caller {
                 tenant: UNTAGGED_TENANT.to_string(),
                 actor: "anon".into(),
-                owns_target: true,
+                owns_target: true, platform_attested: false,
             },
             "db.write",
             payload(&[
@@ -179,7 +179,7 @@ async fn main() {
             Caller {
                 tenant: probe_team.clone(),
                 actor: "other".into(),
-                owns_target: false,
+                owns_target: false, platform_attested: false,
             },
             "db.write",
             payload(&[
@@ -225,7 +225,7 @@ async fn main() {
     let anon = Caller {
         tenant: UNTAGGED_TENANT.to_string(),
         actor: "untrusted-node".into(),
-        owns_target: false,
+        owns_target: false, platform_attested: false,
     };
     let r = engine
         .submit(
@@ -269,7 +269,7 @@ async fn main() {
                     Caller {
                         tenant: team.clone(),
                         actor: "untagged".into(),
-                        owns_target: false,
+                        owns_target: false, platform_attested: false,
                     }
                 } else {
                     owner(&team)
@@ -404,7 +404,7 @@ async fn main() {
                         Caller {
                             tenant: team.clone(),
                             actor: "untagged".into(),
-                            owns_target: false,
+                            owns_target: false, platform_attested: false,
                         }
                     } else {
                         owner(&team)
@@ -478,7 +478,7 @@ the scaling curve -- a contract is one writer by design. P11 is the scaling test
                         Caller {
                             tenant: team.clone(),
                             actor: "untagged".into(),
-                            owns_target: false,
+                            owns_target: false, platform_attested: false,
                         }
                     } else {
                         owner(&team)

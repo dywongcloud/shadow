@@ -291,6 +291,11 @@ impl Engine {
         contract: &Contract,
         shard: &mut BTreeMap<String, Executor>,
     ) -> Result<(), StoreError> {
+        // Public fields and Deserialize bypass `declare`. Recheck on EVERY submit (including one
+        // that finds an executor already present) and on every explicit `register`.
+        contract
+            .assert_admissible()
+            .map_err(|e| StoreError::InadmissibleContract(e.to_string()))?;
         if shard.contains_key(&contract.id) {
             return Ok(());
         }
@@ -477,6 +482,11 @@ impl Engine {
         ts_ms: u64,
         outcome: Result<(), String>,
     ) -> Result<SubmitResult, OpError> {
+        // A crafted `Contract` is refused before an Op is even built, so no executor, log entry
+        // or index mutation can be produced for it. Typed, never a panic and never a silent skip.
+        contract
+            .assert_admissible()
+            .map_err(|e| OpError::InadmissibleContract(e.to_string()))?;
         // The window close this op may complete is not done here; make sure something exists to do
         // it. Idempotent, and a no-op once the drain is running.
         self.start_drain();

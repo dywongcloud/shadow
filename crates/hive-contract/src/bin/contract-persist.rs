@@ -134,7 +134,7 @@ async fn run_ops(
                 Caller {
                     tenant,
                     actor: "witness".to_string(),
-                    owns_target: true,
+                    owns_target: true, platform_attested: false,
                 },
                 kind,
                 payload,

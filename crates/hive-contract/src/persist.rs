@@ -139,6 +139,9 @@ pub struct AppendStep {
 /// Why persistence failed. Every variant is a refusal to continue silently.
 #[derive(Clone, Debug)]
 pub enum StoreError {
+    /// A contract reaching `Store::open` did not come from `Contract::declare` and carries an
+    /// inadmissible row. Refused before any durable log is opened for it.
+    InadmissibleContract(String),
     /// No signing identity was configured.
     NoSigner,
     /// The signer refused or failed.
@@ -160,6 +163,9 @@ pub enum StoreError {
 impl std::fmt::Display for StoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            StoreError::InadmissibleContract(d) => {
+                write!(f, "contract is inadmissible: {d}")
+            }
             StoreError::NoSigner => f.write_str(
                 "no checkpoint signer configured: refusing to persist unsigned checkpoints",
             ),

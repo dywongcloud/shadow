@@ -45,9 +45,16 @@ pub use checkpoint::{
     CHECKPOINT_DOMAIN,
 };
 pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
+pub use contracts::billing_meter::{
+    billing_meter_contract, BILLING_CHECKPOINT, BILLING_LEDGER, CONTRACT_ID as BILLING_CONTRACT_ID,
+    DECLARED_OPS as BILLING_DECLARED_OPS, METER_SAMPLE, METER_SKUS, TENANT_TAG,
+};
 pub use contracts::managed_db_contract;
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
-pub use exec::{apply, index_hash, ExecError, Executor, Index, Mutation};
+pub use exec::{
+    apply, canonical_index_value, index_hash, ledger_checkpoint_value, ledger_row_value,
+    ExecError, Executor, Index, Mutation,
+};
 pub use fraud::{
     adjudicate_equivocation, adjudicate_fraud, sign_entry, Equivocation, FraudProof, SignedEntry,
 };

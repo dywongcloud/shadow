@@ -96,7 +96,7 @@ async fn run_plan(
                 Caller {
                     tenant: p.tenant.clone(),
                     actor: p.actor.to_string(),
-                    owns_target: p.owns,
+                    owns_target: p.owns, platform_attested: false,
                 },
                 p.kind,
                 p.payload.clone(),

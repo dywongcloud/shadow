@@ -94,7 +94,7 @@ fn admitted(tenant: &str) -> Caller {
     Caller {
         tenant: tenant.to_string(),
         actor: "reconcile-harness".to_string(),
-        owns_target: true,
+        owns_target: true, platform_attested: false,
     }
 }
 
@@ -346,7 +346,7 @@ async fn main() {
     let no_owner = engine
         .submit(
             &contract,
-            Caller { tenant: tenant0.clone(), actor: "p8".into(), owns_target: false },
+            Caller { tenant: tenant0.clone(), actor: "p8".into(), owns_target: false, platform_attested: false},
             "db.delete",
             payload(&[("db_id", &snap.databases[0].id), ("project", &snap.databases[0].project)]),
             &snap.databases[0].id,
@@ -363,7 +363,7 @@ async fn main() {
     let untagged = engine
         .submit(
             &contract,
-            Caller { tenant: UNTAGGED_TENANT.to_string(), actor: "p8".into(), owns_target: true },
+            Caller { tenant: UNTAGGED_TENANT.to_string(), actor: "p8".into(), owns_target: true, platform_attested: false},
             "db.create",
             payload(&[("db_id", "db_x"), ("kind", "redis"), ("project", "p")]),
             "db_x",
@@ -393,7 +393,7 @@ async fn main() {
     let open = engine
         .submit(
             &contract,
-            Caller { tenant: "anyone".into(), actor: "relay".into(), owns_target: false },
+            Caller { tenant: "anyone".into(), actor: "relay".into(), owns_target: false, platform_attested: false},
             "db.propose",
             payload(&[("db_id", &snap.databases[0].id), ("note", "observed")]),
             &snap.databases[0].id,

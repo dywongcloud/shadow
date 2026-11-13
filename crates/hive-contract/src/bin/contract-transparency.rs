@@ -121,7 +121,7 @@ async fn main() {
                 Caller {
                     tenant: "team-00".to_string(),
                     actor: "witness".to_string(),
-                    owns_target: true,
+                    owns_target: true, platform_attested: false,
                 },
                 "db.write",
                 payload,

@@ -9,8 +9,11 @@
 //! [`Ack`](crate::oplog::Ack) around it, exactly as Vitra puts `ts` in the ack rather than in the
 //! apply arguments (whitepaper 3.3, vm-runtime "Restricted Mode").
 
-use crate::contract::{Contract, Effect};
-use crate::oplog::{canonical_map, Ack, LogEntry, Op, OpLog, INDEX_DOMAIN};
+use crate::contract::{AuthPolicy, Contract, Effect};
+use crate::contracts::billing_meter::{
+    BILLING_CHECKPOINT, BILLING_LEDGER, METER_SAMPLE, METER_SKUS,
+};
+use crate::oplog::{canonical_fields, canonical_map, Ack, LogEntry, Op, OpLog, INDEX_DOMAIN};
 use std::collections::BTreeMap;
 
 /// The contract's current state: a sorted key -> value map, the Vitra "index".
@@ -85,6 +88,18 @@ pub fn apply(index: &Index, op: &Op) -> Vec<Mutation> {
             }
             out
         }
+        METER_SAMPLE => meter_sample_mutations(&ns, op),
+        BILLING_LEDGER => vec![Mutation::Put {
+            key: format!("{ns}/ledger/{}", escape_component(&field(op, "entry_id"))),
+            value: ledger_row_value(op),
+        }],
+        BILLING_CHECKPOINT => vec![Mutation::Put {
+            key: format!(
+                "{ns}/checkpoint/{}",
+                escape_component(&field(op, "period_start_ms"))
+            ),
+            value: ledger_checkpoint_value(op),
+        }],
         // LogOnly: admitted to the log, produces no state change. Enforced again after the fact by
         // [`Executor::commit`], so a bug in this table cannot turn a proposal into a write.
         _ => Vec::new(),
@@ -97,9 +112,70 @@ pub fn index_hash(index: &Index) -> String {
     fluid_core::content_hash(INDEX_DOMAIN, &canonical_map(index))
 }
 
+/// The value one metering/billing index key holds: LENGTH-PREFIXED canonical fields, so a
+/// replaying monitor can rebuild the exact bytes from the log's payload and compare them against
+/// the row it sees in the billing ledger. A bare join is not injective and would let a rewritten
+/// charge travel under the original encoding.
+pub fn canonical_index_value(fields: &[&str]) -> String {
+    String::from_utf8_lossy(&canonical_fields(fields)).into_owned()
+}
+
+fn field(op: &Op, key: &str) -> String {
+    op.payload.get(key).cloned().unwrap_or_default()
+}
+
+/// One meter sample: the cumulative value of each of the twelve SKUs plus the window it was
+/// measured at. Cumulative values, not deltas, so replay can compare the contract index against
+/// the meter's own persisted row without re-deriving a baseline.
+fn meter_sample_mutations(ns: &str, op: &Op) -> Vec<Mutation> {
+    let mut out = vec![Mutation::Put {
+        key: format!("{ns}/usage/window_end_ms"),
+        value: field(op, "window_end_ms"),
+    }];
+    for sku in METER_SKUS {
+        out.push(Mutation::Put {
+            key: format!("{ns}/usage/{sku}"),
+            value: field(op, sku),
+        });
+    }
+    out
+}
+
+/// Canonical bytes of ONE ledger row. The charge's amount, balance, kind, timestamp, tenant and a
+/// BLAKE3 digest of its note are all in the signed log payload, so a rewritten charge is detected
+/// by recomputing this value from the log and comparing it with the row canonical state holds.
+pub fn ledger_row_value(op: &Op) -> String {
+    canonical_index_value(&[
+        &field(op, "tenant_tag"),
+        &field(op, "entry_id"),
+        &field(op, "entry_ts_ms"),
+        &field(op, "entry_kind"),
+        &field(op, "amount_cents"),
+        &field(op, "balance_after_cents"),
+        &field(op, "note_hash"),
+        &field(op, "note"),
+    ])
+}
+
+/// Canonical bytes of one finalized `LedgerCheckpoint`. Anchors the platform's own SHA-256
+/// ledger hash-chain under this log's Ed25519 signature, including the period and the raw row
+/// count, so omitting a whole period's charges is detectable too.
+pub fn ledger_checkpoint_value(op: &Op) -> String {
+    canonical_index_value(&[
+        &field(op, "tenant_tag"),
+        &field(op, "period_start_ms"),
+        &field(op, "period_end_ms"),
+        &field(op, "entry_count"),
+        &field(op, "commitment"),
+    ])
+}
+
 /// Why the executor refused to commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExecError {
+    /// A contract that skipped `declare` (public fields or `Deserialize`) carries an inadmissible
+    /// row. Refused before ANY index mutation, not merely logged afterwards.
+    InadmissibleContract(String),
     /// A LogOnly op produced mutations: the contract's effect declaration and `apply` disagree.
     EffectViolation { kind: String, produced: usize },
     /// The op's kind is not one this contract declares. Returned, never panicked: `Executor` is
@@ -117,6 +193,9 @@ pub enum ExecError {
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ExecError::InadmissibleContract(d) => {
+                write!(f, "contract is inadmissible: {d}")
+            }
             ExecError::EffectViolation { kind, produced } => write!(
                 f,
                 "op kind {kind} is declared log-only but apply produced {produced} mutation(s)"
@@ -222,12 +301,24 @@ impl Executor {
         ts_ms: u64,
         outcome: Result<(), String>,
     ) -> Result<Ack, ExecError> {
+        // Recheck the whole contract at the point of use: `Contract` has public fields and
+        // derives `Deserialize`, so `declare` is not the only construction route.
+        self.contract
+            .assert_admissible()
+            .map_err(|e| ExecError::InadmissibleContract(e.to_string()))?;
         let spec = self
             .contract
             .spec(&op.kind)
             .ok_or_else(|| ExecError::UndeclaredKind {
                 kind: op.kind.clone(),
             })?;
+        // The exact pair, again, on the row being committed.
+        if spec.auth == AuthPolicy::OpenParticipation && spec.effect == Effect::StateWrite {
+            return Err(ExecError::InadmissibleContract(format!(
+                "op kind {} lets open participation write state",
+                op.kind
+            )));
+        }
         // Every key this op writes is namespaced on `op.target`, so the target must be the identity
         // the payload itself names. `contract::validate` refuses this at the gate; refusing it here
         // too keeps the binding true for a caller that reaches the executor directly.
