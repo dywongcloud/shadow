@@ -433,6 +433,19 @@ static PENDING: parking_lot::Mutex<VecDeque<MeterOp>> =
     parking_lot::Mutex::new(VecDeque::new());
 static METER_OPS_DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// Journal rows attested per drain tick. A large restored `billing_ledger` must never turn one
+/// bulkhead tick into tens of thousands of fsyncs; the remaining rows are picked up by later ticks.
+const MAX_JOURNAL_ROWS_PER_TICK: usize = 32;
+/// Counts EVERY journal write attempt, including refusals. A refused entry is a RECORD, and the
+/// count is what makes an unattested attempt visible instead of silent.
+static JOURNAL_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Reconciliation/retention evaluation is hourly, on the bulkhead, never on a serving worker.
+static LAST_JOURNAL_AUDIT_MS: AtomicU64 = AtomicU64::new(0);
+const JOURNAL_AUDIT_INTERVAL_MS: u64 = 60 * 60 * 1000;
+static JOURNAL: tokio::sync::OnceCell<parking_lot::RwLock<hive_contract::Journal>> =
+    tokio::sync::OnceCell::const_new();
+static JOURNAL_CONTRACT: OnceLock<hive_contract::Contract> = OnceLock::new();
+
 /// One measured platform event, with the exact payload the contract declared.
 #[derive(Clone)]
 pub struct MeterOp {
@@ -657,6 +670,7 @@ async fn mirror_ledger_rows(
     pending.truncate(MAX_DRAIN_PER_TICK);
     let mut ok = 0usize;
     let mut bad = 0usize;
+    let mut journal_budget = MAX_JOURNAL_ROWS_PER_TICK;
     for e in pending {
         let caller = hive_contract::Caller {
             tenant: e.tenant.clone(),
@@ -684,6 +698,26 @@ async fn mirror_ledger_rows(
             .await
         {
             Ok(r) if r.persist_error.is_none() => {
+                if journal_budget == 0 {
+                    // Do NOT advance the cursor: the row still needs its journal entry, and a
+                    // later tick re-attests this idempotent billing.ledger index PUT first.
+                    tracing::debug!(
+                        entry_id = %e.id,
+                        "contract: journal batch budget reached; row stays pending"
+                    );
+                    continue;
+                }
+                journal_budget -= 1;
+                let journal_outcome = record_journal_for_row(c, &e).await;
+                if !journal_outcome.recorded {
+                    bad += 1;
+                    tracing::error!(
+                        entry_id = %e.id,
+                        detail = %journal_outcome.detail,
+                        "contract: journal row NOT attested (will retry)"
+                    );
+                    continue;
+                }
                 cursor.insert(e.id.clone());
                 ok += 1;
                 tracing::info!(
@@ -693,6 +727,7 @@ async fn mirror_ledger_rows(
                     seq = r.seq,
                     committed = r.committed,
                     proof = r.proof.is_some(),
+                    journal_refusal = journal_outcome.refusal.is_some(),
                     "contract: canonical ledger row attested"
                 );
             }
@@ -713,4 +748,271 @@ async fn mirror_ledger_rows(
     }
     save_cursor(&cursor);
     (ok, bad)
+}
+
+// ---- balanced double-entry journal, through this SAME ONE seam ------------------------------------
+// The journal's canonical state is the signed, node-local contract oplog shard
+// `hive.billing-journal.v1`, NEVER `state.json` and NEVER the two-element `billing.snapshot()`
+// tuple that `store_sync::REGISTRY` wholesale-replaces. Nothing here adds a persisted field, so a
+// mixed-version fleet cannot lose canonical state to this change. The legacy single-entry ledger
+// row is MUTATED FIRST (it already exists); the journal entry is recorded AFTERWARD. A REFUSED
+// invariant is a RECORD, not a prevention, and it is counted like every other write attempt.
+
+/// Platform-internal tag for journal-wide audit ops. It is a constant, not a tenant-controlled
+/// string, and never becomes a host path.
+const JOURNAL_AUDIT_TENANT: &str = "platform";
+
+pub struct JournalRowOutcome {
+    /// The contract op actually landed with no persist error. "Attested" never means "prevented".
+    pub recorded: bool,
+    /// The typed invariant code when the journal engine refused the row.
+    pub refusal: Option<String>,
+    pub detail: String,
+}
+
+/// Lazily rebuild the in-process journal from the durable signed oplog, so a restart does not
+/// restart the sequence space and a row already attested is not posted twice.
+async fn journal_store(c: &Arc<CloudState>) -> &'static parking_lot::RwLock<hive_contract::Journal> {
+    JOURNAL
+        .get_or_init(|| async {
+            let mut j = hive_contract::Journal::default_chart();
+            if let Some(log) = c
+                .contract_engine
+                .snapshot_log(hive_contract::contracts::journal::CONTRACT_ID)
+                .await
+            {
+                if let Ok(replayed) = hive_contract::Journal::replay(log.entries()) {
+                    j = replayed;
+                }
+            }
+            parking_lot::RwLock::new(j)
+        })
+        .await
+}
+
+fn journal_caller(tenant: &str) -> hive_contract::Caller {
+    hive_contract::Caller {
+        tenant: tenant.to_string(),
+        actor: BILLING_METER_ACTOR.to_string(),
+        owns_target: metering_owns(tenant),
+        platform_attested: true,
+    }
+}
+
+/// Submit the typed refusal as a signed `journal.refusal` entry. `outcome` is a MEASUREMENT: the
+/// journal write did NOT land, so the entry carries `success: false` and no index mutation.
+async fn record_journal_refusal(
+    c: &Arc<CloudState>,
+    contract: &hive_contract::Contract,
+    tenant: &str,
+    at_ms: u64,
+    err: &hive_contract::JournalError,
+    idempotency_key: &str,
+    attempt: u64,
+) -> JournalRowOutcome {
+    let payload = hive_contract::contracts::journal::refusal_payload(
+        tenant,
+        &format!("refusal-{attempt}-{}", err.code()),
+        at_ms,
+        err,
+        idempotency_key,
+        attempt,
+    );
+    let outcome = Err(format!("journal invariant refused: {}", err.code()));
+    match c
+        .contract_engine
+        .submit(
+            contract,
+            journal_caller(tenant),
+            hive_contract::JOURNAL_REFUSAL,
+            payload,
+            tenant,
+            at_ms,
+            outcome,
+        )
+        .await
+    {
+        Ok(r) if r.persist_error.is_none() => JournalRowOutcome {
+            recorded: true,
+            refusal: Some(err.code().to_string()),
+            detail: format!("refusal recorded at seq {}", r.seq),
+        },
+        Ok(r) => JournalRowOutcome {
+            recorded: false,
+            refusal: Some(err.code().to_string()),
+            detail: format!("refusal persist error: {:?}", r.persist_error),
+        },
+        Err(e) => JournalRowOutcome {
+            recorded: false,
+            refusal: Some(err.code().to_string()),
+            detail: e.to_string(),
+        },
+    }
+}
+
+/// One legacy `LedgerEntry` becomes ONE balanced two-line journal entry through the same ONE seam.
+/// The platform's single-entry row is never modified by this function.
+async fn record_journal_for_row(
+    c: &Arc<CloudState>,
+    e: &crate::billing::LedgerEntry,
+) -> JournalRowOutcome {
+    let store = journal_store(c).await;
+    let key = format!("ledger:{}", e.id);
+    if store.read().has_idempotency(&key) {
+        return JournalRowOutcome {
+            recorded: true,
+            refusal: None,
+            detail: "row already attested by the signed oplog".to_string(),
+        };
+    }
+    let contract = JOURNAL_CONTRACT.get_or_init(hive_contract::billing_journal_contract);
+    let attempt = JOURNAL_WRITES.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+    let draft = match crate::billing::journal_draft_for_row(e) {
+        Ok(d) => d,
+        Err(err) => {
+            return record_journal_refusal(
+                c,
+                contract,
+                &e.tenant,
+                e.ts_ms,
+                &err,
+                &key,
+                attempt,
+            )
+            .await;
+        }
+    };
+    let posted = store.write().post(draft);
+    match posted {
+        Ok(entry) => {
+            let payload = match hive_contract::contracts::journal::entry_payload(
+                contract,
+                &entry,
+                &e.tenant,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    return record_journal_refusal(
+                        c,
+                        contract,
+                        &e.tenant,
+                        e.ts_ms,
+                        &err,
+                        &key,
+                        attempt,
+                    )
+                    .await;
+                }
+            };
+            // A MEASUREMENT, never a constant Ok(()): the posted entry must read back.
+            let outcome = if store.read().entry(entry.seq).is_some() {
+                Ok(())
+            } else {
+                Err(format!("journal entry {} did not read back", entry.seq))
+            };
+            match c
+                .contract_engine
+                .submit(
+                    contract,
+                    journal_caller(&e.tenant),
+                    hive_contract::JOURNAL_ENTRY,
+                    payload,
+                    &e.tenant,
+                    entry.posted_ms,
+                    outcome,
+                )
+                .await
+            {
+                Ok(r) if r.committed && r.persist_error.is_none() => JournalRowOutcome {
+                    recorded: true,
+                    refusal: None,
+                    detail: format!("journal seq {} / oplog seq {}", entry.seq, r.seq),
+                },
+                Ok(r) => JournalRowOutcome {
+                    recorded: false,
+                    refusal: r.error.clone(),
+                    detail: format!("journal entry not committed: {:?}", r.persist_error),
+                },
+                Err(err) => JournalRowOutcome {
+                    recorded: false,
+                    refusal: None,
+                    detail: err.to_string(),
+                },
+            }
+        }
+        Err(err) => {
+            record_journal_refusal(c, contract, &e.tenant, e.ts_ms, &err, &key, attempt).await
+        }
+    }
+}
+
+/// Hourly reconciliation + retention evaluation, on the bulkhead, published as signed ops and
+/// persisted atomically to a platform-derived path. Journal lines are NEVER pruned; the raw
+/// `billing_ledger` pruning in `main.rs` is attested by the signed oplog before the cursor moves.
+/// RESIDUAL: a raw row pruned BEFORE its signed entry lands has no reconstructed sample.
+pub async fn run_journal_audit(c: &Arc<CloudState>) {
+    let now = hive_core::now_ms();
+    let last = LAST_JOURNAL_AUDIT_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < JOURNAL_AUDIT_INTERVAL_MS {
+        return;
+    }
+    LAST_JOURNAL_AUDIT_MS.store(now, Ordering::Relaxed);
+    let store = journal_store(c).await;
+    let (recon, retention) = {
+        let mut j = store.write();
+        let r = j.reconcile(now);
+        let e = j.evaluate_retention(now, 0);
+        (r, e)
+    };
+    let path = crate::persist::data_dir().join("journal-state.json");
+    if let Err(err) = store.read().save_json(&path) {
+        tracing::warn!(error = %err, "contract: journal state could not be persisted");
+    }
+    let contract = JOURNAL_CONTRACT.get_or_init(hive_contract::billing_journal_contract);
+    let ops = [
+        (
+            hive_contract::JOURNAL_RECONCILIATION,
+            hive_contract::contracts::journal::reconciliation_payload(JOURNAL_AUDIT_TENANT, &recon),
+        ),
+        (
+            hive_contract::JOURNAL_RETENTION,
+            hive_contract::contracts::journal::retention_payload(JOURNAL_AUDIT_TENANT, &retention),
+        ),
+    ];
+    for (kind, payload) in ops {
+        // The measurement: the record/event exists in the journal at the time it is published.
+        let measured = match kind {
+            hive_contract::JOURNAL_RECONCILIATION => store
+                .read()
+                .reconciliations()
+                .last()
+                .is_some_and(|r| r.run_id == recon.run_id && r.record_hash == r.compute_hash()),
+            hive_contract::JOURNAL_RETENTION => store
+                .read()
+                .retention_events()
+                .last()
+                .is_some_and(|r| r.event_id == retention.event_id),
+            _ => false,
+        };
+        let outcome = if measured {
+            Ok(())
+        } else {
+            Err("journal audit record did not read back".to_string())
+        };
+        if let Err(err) = c
+            .contract_engine
+            .submit(
+                contract,
+                journal_caller(JOURNAL_AUDIT_TENANT),
+                kind,
+                payload,
+                JOURNAL_AUDIT_TENANT,
+                now,
+                outcome,
+            )
+            .await
+        {
+            tracing::warn!(op = kind, error = %err, "contract: journal audit event NOT recorded");
+        }
+    }
 }

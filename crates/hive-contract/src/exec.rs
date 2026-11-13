@@ -100,6 +100,17 @@ pub fn apply(index: &Index, op: &Op) -> Vec<Mutation> {
             ),
             value: ledger_checkpoint_value(op),
         }],
+        // Balanced double-entry journal. Every op writes ONE canonical index row whose value is
+        // length-prefixed over its declared key set, so replay can compare a presented journal
+        // line against the signed log byte for byte. Lines are inside the `lines` field in order.
+        crate::journal::JOURNAL_ENTRY
+        | crate::journal::JOURNAL_REFUSAL
+        | crate::journal::JOURNAL_RECONCILIATION
+        | crate::journal::JOURNAL_RETENTION
+        | crate::journal::JOURNAL_CHECKPOINT => vec![Mutation::Put {
+            key: crate::journal::op_index_key(&ns, op),
+            value: crate::journal::op_index_value(op),
+        }],
         // LogOnly: admitted to the log, produces no state change. Enforced again after the fact by
         // [`Executor::commit`], so a bug in this table cannot turn a proposal into a write.
         _ => Vec::new(),

@@ -26,9 +26,11 @@ pub mod checkpoint;
 pub mod contract;
 pub mod contracts;
 pub mod engine;
+pub mod evidence;
 pub mod exec;
 pub mod fraud;
 pub mod inclusion;
+pub mod journal;
 pub mod merkle;
 pub mod oplog;
 pub mod persist;
@@ -49,8 +51,16 @@ pub use contracts::billing_meter::{
     billing_meter_contract, BILLING_CHECKPOINT, BILLING_LEDGER, CONTRACT_ID as BILLING_CONTRACT_ID,
     DECLARED_OPS as BILLING_DECLARED_OPS, METER_SAMPLE, METER_SKUS, TENANT_TAG,
 };
+pub use contracts::journal::billing_journal_contract;
 pub use contracts::managed_db_contract;
 pub use engine::{Engine, SubmitResult, DEFAULT_SHARDS};
+pub use journal::{
+    draft_from_legacy_row, range_commitment, verify_range_commitment, Account, AccountStatus,
+    AccountType, Amount, Direction, Journal, JournalDraft, JournalEntry, JournalError,
+    JournalFence, JournalLine, JournalSnapshot, RangeCommitment, ReconciliationRecord,
+    RetentionEvent, WormChain, WormEvent, JOURNAL_CHECKPOINT, JOURNAL_ENTRY,
+    JOURNAL_RECONCILIATION, JOURNAL_REFUSAL, JOURNAL_RETENTION,
+};
 pub use exec::{
     apply, canonical_index_value, index_hash, ledger_checkpoint_value, ledger_row_value,
     ExecError, Executor, Index, Mutation,

@@ -598,6 +598,9 @@ pub fn spawn_saver(cloud: Arc<CloudState>) {
                 if r.dropped > 0 || r.persist_errors > 0 {
                     tracing::warn!(?r, "usage_metering: contract mirror drain degraded");
                 }
+                // Hourly, gated inside: immutable reconciliation record + retention event, both
+                // published as signed journal ops. Runs on the bulkhead, never a serving worker.
+                crate::db_contract::run_journal_audit(&cloud).await;
             }
         });
         return;
@@ -615,6 +618,8 @@ pub fn spawn_saver(cloud: Arc<CloudState>) {
             } else if mirror.submitted > 0 {
                 tracing::info!(submitted = mirror.submitted, "contract: metering/billing events attested");
             }
+            // BEFORE the dirty `continue`: an idle meter still needs its journal audit records.
+            crate::db_contract::run_journal_audit(&cloud).await;
             let rows = {
                 let mut guard = meter().inner.lock();
                 if !guard.dirty {

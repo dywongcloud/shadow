@@ -2311,3 +2311,44 @@ pub fn verify_webhook_signature(payload: &[u8], sig_header: &str, secret: &str) 
     let expected = crate::admin::hmac_sha256_hex(secret.as_bytes(), &signed);
     v1_sigs.iter().any(|s| crate::admin::ct_eq(s, &expected))
 }
+
+// ---- double-entry compatibility view --------------------------------------------------------------
+// The single-entry running-balance ledger REMAINS exactly as it is: no field is added to
+// `LedgerEntry`, `BillingAccount` or the two-element `snapshot()` tuple that `store_sync::REGISTRY`
+// wholesale-replaces. A legacy row is only READ here and turned into a balanced two-line draft for
+// the journal's own signed oplog (never into `state.json`). A zero-amount row is a typed refusal,
+// not a fabricated one-cent entry; an out-of-range amount is refused before any i64 cast.
+
+/// Build a balanced double-entry draft from ONE existing ledger row. The note is carried only as
+/// its BLAKE3 digest, so a free-text operator note never reaches the signed log.
+pub fn journal_draft_for_row(
+    e: &LedgerEntry,
+) -> Result<hive_contract::JournalDraft, hive_contract::JournalError> {
+    let digest = crate::db_contract::note_hash(&e.note);
+    hive_contract::draft_from_legacy_row(
+        &e.id,
+        e.amount_cents,
+        &digest,
+        e.ts_ms,
+        crate::db_contract::BILLING_METER_ACTOR,
+    )
+}
+
+/// Typed `PlatformSnapshot` round trip. `persist::load` is `unwrap_or_default()` -- a deserialize
+/// error is SILENT TOTAL STATE LOSS -- so this is the check a mixed-version fleet needs before a
+/// roll. It reads ONLY a caller-supplied copy of `state.json`; nothing is written and no secret is
+/// printed. Every field is additive `serde(default)`; no required key was removed or retyped.
+pub fn state_snapshot_round_trip(raw: &str) -> Result<(usize, usize, usize), String> {
+    let snap: crate::persist::PlatformSnapshot =
+        serde_json::from_str(raw).map_err(|e| format!("PlatformSnapshot deserialize failed: {e}"))?;
+    let accounts = snap.billing.len();
+    let rows = snap.billing_ledger.len();
+    let body = serde_json::to_string(&snap)
+        .map_err(|e| format!("PlatformSnapshot serialize failed: {e}"))?;
+    let back: crate::persist::PlatformSnapshot = serde_json::from_str(&body)
+        .map_err(|e| format!("PlatformSnapshot re-deserialize failed: {e}"))?;
+    if back.billing.len() != accounts || back.billing_ledger.len() != rows {
+        return Err("billing accounts or ledger rows were lost in the round trip".to_string());
+    }
+    Ok((body.len(), accounts, rows))
+}
