@@ -198,6 +198,13 @@
     },
     {
       "assertion": "cargo build --release --offline --bins",
+      "canonical_sha256": "17830267cd9c3a04aecb8fd40a8d07097e75eeaaf9586ea2bf91a3550ea65abc",
+      "id": "system.rust.build_command_isolated",
+      "layer": "system",
+      "path": "crates/fluid-build/src/rust.rs"
+    },
+    {
+      "assertion": "cargo build --release --offline --bins",
       "canonical_sha256": "c05834c200454285424cc8e060c3bf295ed3bf7aa1f1247601940bcf86cb6e60",
       "id": "system.rust.shim_config_isolated",
       "layer": "system",
@@ -251,7 +258,7 @@
       "step": "npm audit (dashboard)"
     }
   ],
-  "gate_sha256": "7e6799b69191657757e4a785bb136cfa248a8406f78a7eb2e231093c3d61cc95",
+  "gate_sha256": "90c14dc40bb0669311140127ce035067d7c47800b1d4ca1008635a489c38dcc8",
   "gates": [
     {
       "command": "cargo test --workspace --locked --verbose",

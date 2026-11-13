@@ -10919,11 +10919,17 @@ async fn build_rust_lane(
         "Detected {} Rust function(s) (Vercel Rust runtime API); building native $PORT binaries offline.",
         app.functions.len()
     ));
-    // Unset compiler-injection variables a project env could otherwise supply. cargo still reads
-    // the offline registry from $HOME/.cargo, which env_clear() leaves intact.
+    // Unset compiler-injection variables a project env could otherwise supply. On the isolated
+    // lane use the ABSOLUTE pinned cargo and put its bin dir first: clean_env_wrapper prepends a
+    // tenant-controlled node_modules/.bin, which would otherwise shadow cargo AND rustc.
+    let build_command = if isolated_lane {
+        fluid_build::RUST_BUILD_COMMAND_ISOLATED
+    } else {
+        fluid_build::RUST_BUILD_COMMAND
+    };
     let command = format!(
         "unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WRAPPER RUSTC CARGO_TARGET_DIR || true\n{}",
-        fluid_build::RUST_BUILD_COMMAND
+        build_command
     );
     run_streamed(
         require_build_session(isolated)?,

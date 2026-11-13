@@ -99,7 +99,7 @@ config into the checkout BEFORE the executor streams it into the build volume, s
 unmodified Vercel handler).
 
 **The CODE is done; the ROLL is not.** Producing the reviewed base digest and
-running `playbooks/nw-build-executor.yml` is the operator's one-way door (see
+running `ansible/playbooks/nw-build-executor.yml` is the operator's one-way door (see
 `ansible/roles/build_executor/README.md`). Until that roll, Rust source builds
 succeed on host-exec lanes (mock/litebox) and fail closed with
 `BUILD_TOOLCHAIN_MISSING` on isolated-executor nodes. No version, digest or

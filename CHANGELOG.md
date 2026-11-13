@@ -1,12 +1,37 @@
 # Changelog
 
+## 2026-11-12 - research: decentralized kernel-metric scheduling (adversarial swarm)
+
+Three parent agents, each with its own refuter sub-swarm, analyzed
+`ajitm722/Decentralized-Kernel-Metric-Driven-Scheduling-for-Edge-Faas-Workloads`
+against this codebase. Reconciled finding: adopt the OBSERVATION idea (a probed,
+advertised per-node pressure signal folded into placement ranking), REJECT the
+system design (leaderless gossip, random offload, client-declared admission,
+thermal-as-hard-filter, unauthenticated Docker exec). Our placement has NO live
+CPU/thermal/memory pressure term today; eBPF/thermal source is absent, though
+cgroup/`proc` metrics exist outside placement. `place`/`dispatch_fallbacks` are
+node-local and call no `may_act`, so leaderless scheduling is not automatically
+incompatible, but independent shared-state writes would be. The external repo
+measures only agent co-location overhead, never scheduling benefit, so no claim
+from it can pass our measurement gate. Analysis only: no eBPF, gossip or
+placement change was made. `docs/edge-metric-scheduling-research.md`.
+
 ## 2026-11-12 - ops: isolated builder image contract for native Rust (opt-in)
 
 Pushed `ee18d735cb` (5 commits) to `origin/main`; GitHub confirms the remote head
 matches. A `git push` auto-deploys through the webhook and `git_poll_reconcile`.
-That SHA's `build + unit tests (macos-15-intel)` leg exposed three pre-existing
-`fluid-gateway` 404 failures (first CI run ever on that runner); re-run started,
-see the honest note below.
+CI on that SHA is RED on `build + unit tests (macos-15-intel)`: three
+pre-existing Python-fixture gateway tests (`gateway_handles_concurrent_requests`,
+`max_duration_504_and_error_isolation`, `no_context_leak_...`) return 404 instead
+of 200/504. Reproducible on a full re-run; `macos-15` and `ubuntu-latest` pass.
+The base SHA ran `test` on ubuntu ONLY, so adding both macOS legs in the pushed
+batch exposed tests that had never run there. All three go through
+`Gateway::deploy` -> `sync_deploy_request` (a deployment that never reaches
+`Ready` is filtered by `select`, hence 404); the nine passing tests construct
+`DeployState::Ready` directly. NOT caused by the Rust lane (its CI witness step
+never ran on that leg, and no Rust change touches `fluid-gateway`). Root cause
+needs an Intel macOS runner to diagnose; no gate was weakened and no test file
+was authored. Open operator item.
 
 The Rust lane previously failed closed on isolated-executor nodes with
 `BUILD_TOOLCHAIN_MISSING`. This change makes the ROLE able to carry a pinned Rust
@@ -35,12 +60,12 @@ toolchain, without weakening any supply-chain gate:
   and platform-owned cargo config are inside the tar stream on the isolated lane.
   The hoist respects `produce_manifest`'s branch precedence, so a `fluid.json`
   deploy is unaffected. The host-exec lane keeps the patch-only config.
-- CI: 3 new contract bindings (33 total); both Jinja flag states render to valid
+- CI: 4 new contract bindings (34 total); both Jinja flag states render to valid
   YAML and a valid Containerfile.
 
 **CODE COMPLETE; ROLL NOT DONE.** Producing a NEW reviewed, digest-pinned base
 image with the pinned toolchain + seeded vendor tree and running
-`playbooks/nw-build-executor.yml` is the operator's one-way door. Until then Rust
+`ansible/playbooks/nw-build-executor.yml` is the operator's one-way door. Until then Rust
 source builds still fail closed on isolated nodes. No supply-chain digest was
 invented. See `ansible/roles/build_executor/README.md` and `docs/rust-functions.md`.
 

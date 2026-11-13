@@ -97,7 +97,7 @@ it is an OPERATOR one-way door, not a code change:
    pinned `X.Y.Z`, and `build_executor_rust_vendor_sha256` to the seal digest.
    `00-preflight.yml` rejects an empty/guessed version or digest, so no supply
    chain input is inferred.
-3. Run `playbooks/nw-build-executor.yml`. The live probe re-asserts the version,
+3. Run `ansible/playbooks/nw-build-executor.yml`. The live probe re-asserts the version,
    seal and offline config INSIDE gVisor, so a base that only fakes the image
    layer cannot publish the capability.
 

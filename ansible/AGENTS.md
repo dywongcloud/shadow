@@ -113,7 +113,7 @@ recompile from code, git log and memory; loaded through `ansible/CLAUDE.md`; roo
   `--security-opt=no-new-privileges`; exactly the eleven `BUILDER_CAPABILITIES`). The nft policy loads
   BEFORE the Netavark network and is re-applied every run; `policy_id` is `sha256-<hex>`, never
   `sha256:<hex>` (`validate_identifier` rejects the whole capability). `build_executor` (run by
-  `playbooks/nw-build-executor.yml`) and the opt-in `hive_build_executor` both publish
+  `ansible/playbooks/nw-build-executor.yml`) and the opt-in `hive_build_executor` both publish
   `/var/lib/hive/build-executor.json`: never both on one host; `roles/hive_build_executor/vars/main.yml`
   stays byte-identical to the `REVIEWED_*` constants or the capability goes blank fleet-wide.
 - Rust lane is OPT-IN (`build_executor_rust_enabled`, default off); enabling needs a NEW reviewed

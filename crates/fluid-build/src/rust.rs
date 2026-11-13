@@ -21,6 +21,13 @@ pub const RUST_PRESET_SLUG: &str = "rust";
 // deliberately NOT used for tenant repos: the platform patch changes resolution, so a committed
 // Cargo.lock naming crates.io vercel_runtime cannot stay locked.
 pub const RUST_BUILD_COMMAND: &str = "cargo build --release --offline --bins";
+
+/// Isolated-lane build command. `clean_env_wrapper` prepends the tenant-controlled
+/// `$cwd/node_modules/.bin` to PATH, so bare `cargo` AND the `rustc` it spawns are both
+/// shadowable by a shipped binary. Pin the compiler with an ABSOLUTE path and put the
+/// reviewed toolchain dir first, ahead of every checkout path. --offline + the vendored
+/// source config keep tenant build.rs off the network. Never used on the host lane.
+pub const RUST_BUILD_COMMAND_ISOLATED: &str = "PATH=/opt/hive-rust/bin:$PATH; export PATH; /opt/hive-rust/bin/cargo build --release --offline --bins";
 pub const RUST_OUTPUT_DIR: &str = "target/release";
 pub const MAX_CARGO_TOML_BYTES: u64 = 1024 * 1024;
 pub const MAX_RUST_FUNCTIONS: usize = 64;
