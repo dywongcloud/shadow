@@ -1,5 +1,76 @@
 # Changelog
 
+## 2026-11-12 - feat: signed metering/billing contract and admissibility guard
+
+Verifiable-database smart contracts gained a real end-to-end path for metering:
+a second contract `hive.billing-meter.v1` (AuthPolicy::PlatformAttested,
+StateWrite, all twelve UsageTotals SKUs, closed payload schemas) emits signed,
+attributed, seq-checked entries for meter samples, ledger rows and finalized
+checkpoints. `billing.rs` enqueues them, the bulkhead saver in
+`usage_metering.rs` drains them through the ONE seam `db_contract.rs` into
+`Engine::submit`, behind a durable cursor so a restart re-attests unattested
+rows. Charging stays gated by HIVE_BILLING_METER_RESOURCES and the single
+may_act(BillingMeter) writer; RATE_CARD > COST_CARD is unchanged.
+
+Contract::assert_admissible() rechecks the forbidden OpenParticipation+StateWrite
+pair on EVERY use, closing the deserialize/struct-literal bypass in validate,
+commit and Engine::submit. Inclusion proofs now bind both the artefact's and the
+window checkpoint's contract_id. A ninth witness binary, contract-billing, proves
+rejection of crafted contracts and that a rewritten, omitted, duplicated or
+reordered charge is detected by replay: RESULT PASS probes=11 signed=9 proofs=7.
+It exits 0/1, unlike contract-cost which exits 0 even on RESULT FAIL.
+
+Inclusion proofs and append-only/equivocation fraud proofs were ALREADY in the
+tree (inclusion.rs, fraud.rs, audit.rs, replicate.rs); the older PRD rows claiming
+they were absent describe a state HEAD has outgrown. Vitra has no consensus, no
+bond/incentive model, and no freshness guarantee; a proof shows an entry WAS
+published, not that the log still ends there. No such guarantee is claimed here.
+
+VERIFIED (final tree 62cda773): cargo test --workspace --locked 444 ok / 0 failed;
+scripts/cli-acceptance.sh 35 passed / 0 failed; check-contract-bindings.py --check
+RESULT PASS bindings=34 layers=4 gates=36 fail_open=4 secrets_clean=1;
+git diff --check 0; all nine witness binaries pass. Locally committed, NOT pushed
+or rolled: both are operator one-way doors. CI remains red on macos-15-intel only
+(three pre-existing fluid-gateway Python-fixture 404s); 12/13 jobs green.
+
+## 2026-11-12 - docs: fraud model, SOC controls, Narwhal verdict, dogfood facts
+
+docs/contract-fraud-resistance.md records the honest threat model and 14 named
+open conditions (no external anchor, no freshness, no challenge window or
+consequence, unvalidated checkpoint ts_ms, persist.rs unwrap_or_default on a
+hidden segment, sort_by_key normalising physical reorder, verify(None) being
+structural-only, and more). docs/compliance-controls.md maps SOC 1 S1-1..S1-10
+and SOC 2 CC1-CC9 + A1 + C1 + PI1 to concrete artefacts (5 MET / 15 PARTIAL /
+4 UNMET, design only, no Type 2 row MET) and states plainly that an attestation
+is an independent CPA examination over a period, not a code state: no
+certification is claimed. A held control is not a passed control.
+
+docs/narwhal-consensus-facts.md (facts only, from arxiv 2105.11827 abs + ar5iv
+HTML; the direct PDF fetch was unreadable and is reported as such) and
+docs/narwhal-consensus-verdict.md answer the operator's question AFTER the
+implementation was verified: DO NOT ADOPT Narwhal (a mempool with no ordering
+authority) or Tusk (a consensus log, a third replication substrate the tree
+declines in docs/leaderless-migration.md:728-733). Two disjoint 2-of-3 voter
+majorities are REFUTED by has_majority arithmetic; read divergence behind
+round-robin DNS is VERIFIED; a chain-head/backup dual-writer window is
+CONDITIONAL (bounded_round ends every round at the 8s deadline, so stalled()
+never fires and health::demote flipping healthy cannot matter to
+strict_chain_owner). No gate was weakened; the mitigations are local: epoch-fence
+locally-writing owners, complete the read-path owner proxy, and run an
+operator-authorized fleet partition drill. Those are filed as open rows.
+
+docs/dogfood-dashboard-facts.md maps the CURRENT NodeA-bound path (HIVE_ADMIN
+loopback :8786, /cloud rewrite, node-local GET/HEAD, round-robin DNS,
+persist::load silent state loss). Making DashboardAPI/DashboardUI replicated
+PlatformDeployments with the control plane self-hosted on the data plane is a
+production architecture change and remains HELD, not implemented.
+
+An adversarial multi-swarm of gm agents (3 leads with recursive checker
+sub-swarms, 18 live at peak) refuted the broad "100% complete" claim 2-1 and
+drove the fixes above. Four-layer verification, all witness dispatch ids, the
+measured headroom STOP, and the pool shortfalls are recorded in .gm/witness-log.md
+and .gm/pool/.
+
 ## 2026-11-12 - research: decentralized kernel-metric scheduling (adversarial swarm)
 
 Three parent agents, each with its own refuter sub-swarm, analyzed
