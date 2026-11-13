@@ -1,6 +1,6 @@
 # Contract verification: binaries, on-disk format, and the runbook
 
-Status: **implemented.** Nine binaries under `crates/hive-contract/src/bin/` exercise the real
+Status: **implemented.** Ten binaries under `crates/hive-contract/src/bin/` exercise the real
 `Engine`, real `Store`, real Ed25519 signing and real adjudication against generated keys and a
 real filesystem. They are the verification surface for `docs/verifiable-database.md`. Present
 tense; every claim cites `path:line`. There are NO `[[bin]]` sections in
@@ -8,15 +8,16 @@ tense; every claim cites `path:line`. There are NO `[[bin]]` sections in
 argument parsing is a hand-rolled `fn arg(name, default) -> String` that scans `std::env::args()`
 for `--<name>` and takes the next token. Unknown flags are ignored.
 
-**Correction to a common shorthand:** `--state <real state.json>` is accepted by FIVE of the
-nine binaries (the ninth, `contract-billing`, uses it only to report the state file's size and
-otherwise runs a generated evidence set), and is OPTIONAL in all five. The phrase "`contract-{audit,reconcile,replicate}`
+**Correction to a common shorthand:** `--state <real state.json>` is accepted by SIX of the
+ten binaries (`contract-billing` reports only the state file's size; `contract-double-entry`
+uses a real full `PlatformSnapshot` for its S1 serde round-trip hard gate), and is OPTIONAL in
+all six. The phrase "`contract-{audit,reconcile,replicate}`
 --state <real state.json>" describes a real route but is not the whole surface, and the other four
 binaries do not accept `--state` at all.
 
 ---
 
-## 1. The nine binaries
+## 1. The ten binaries
 
 | bin | parsed args | `--state` | reads | final result line | exit |
 |---|---|---|---|---|---|
@@ -29,13 +30,17 @@ binaries do not accept `--state` at all.
 | `contract-replicate` | `--state` (`bin/contract-replicate.rs:194`) | YES, optional, default `/tmp/vitra-real-state.json` | `Snapshot { databases, database_tombstones }` (`:37-43`); real `Replica::merge` / `adopt_wholesale`; `reconcile::reconcile` | `ALL PROBES PASSED` (`:725`) or `{n} PROBE(S) FAILED` (`:727`); **no `RESULT:` line** | 2 read/parse, 1 no live dbs or failures, 0 pass |
 | `contract-billing` | `--dir`, `--state` (`bin/contract-billing.rs`, `fn arg`); the state path is INFORMATIONAL (byte count only), NOT a pass/fail gate | YES, optional | real `Engine::open`, real `KeyedSigner`, real `Store`; G1-G3 deserialized-contract guard, R1-R6 replay/signature/inclusion/rewrite/omission/chain-tamper probes | `RESULT PASS probes=11 ...` / `RESULT FAIL failed={n} of {n}` (space, no colon) | 0 / 1 via explicit `std::process::exit` |
 | `contract-transparency` | none (`bin/contract-transparency.rs:16` documents a `--dir` that is not parsed; fixed `/private/tmp/hive-contract-transparency-<pid>`, `:64-69`) | no | real `Engine::open`, generated keys, T1-T6 inclusion/fork/availability/breach probes (`:9-14`) | `RESULT: ALL PROBES PASSED` (`:708`) or `RESULT: BREACH -- {n} guarantee(s) did not hold` (`:711`) | 0 / 1 (`:709`, `:712`) |
+| `contract-double-entry` | `--dir`, `--state`, `--report` (`bin/contract-double-entry.rs`, `fn arg`) | YES, optional; **absent = S1 SKIPPED informational PASS**, present = HARD GATE over a real full `PlatformSnapshot` (unparsable/missing required keys => FAIL) | balanced double-entry journal, 17 typed invariant admit/refuse probes, reversal-only correction, 7 line/entry tamper probes, contract+journal replay, signed range commitment, node-local SOC 2 technical evidence, independent verifier, single-vs-group timing | `RESULT PASS probes=27 invariant_probes=17 replay_ok=true signed=11 proofs=8 tamper_detected=7/7 state_round_trip=true commitment_verified=true evidence_verified=true ...` (space, no colon) / `RESULT FAIL failed={n} of {n}` | 0 / 1 via explicit `std::process::exit` |
 
-Only FIVE binaries print a `RESULT:`-prefixed line. `contract-cost` and `contract-billing` print
-`RESULT PASS` / `RESULT FAIL` (space, no colon); unlike `contract-cost`, `contract-billing`
-exits 1 on FAIL. `contract-audit`, `contract-reconcile` and `contract-replicate` print
-`ALL PROBES PASSED` / `PROBE(S) FAILED` without a `RESULT` prefix. A monitor that greps only for
-`RESULT:` silently misses five of nine tools. The documented-but-unimplemented flags are
-tracked in `contract-cli-documented-flags-unimplemented`.
+Only FIVE binaries print a `RESULT:`-prefixed line. `contract-cost`, `contract-billing` and
+`contract-double-entry` print `RESULT PASS` / `RESULT FAIL` (space, no colon); unlike
+`contract-cost`, the latter two exit 1 on FAIL. `contract-audit`, `contract-reconcile` and
+`contract-replicate` print `ALL PROBES PASSED` / `PROBE(S) FAILED` without a `RESULT` prefix.
+A monitor that greps only for `RESULT:` silently misses five of ten tools. `contract-double-entry`'s
+evidence report is NODE-LOCAL technical evidence supporting an assessment, never an attestation,
+never a certification and never a compliance verdict; it emits no verdict word and its
+`evidence.rs` self-guard rejects any unearned `COMPLIANT` element. The documented-but-unimplemented
+flags are tracked in `contract-cli-documented-flags-unimplemented`.
 
 ## 2. What `--state` actually reads
 
