@@ -34,9 +34,11 @@ mirrored in `crates/hive-contract/src/contract.rs:24`.
 `db_contract.rs` is the ONLY path in `hive-cloud` that calls `contract_engine.submit` for a
 mutation: an exhaustive literal scan finds 31 `db_contract::` call sites in `admin.rs`, one in
 `git.rs` (`purged`, `run_build` storage teardown) and one doc-comment reference in `databases.rs`.
-An exhaustive `.submit(` scan in `hive-cloud` finds exactly three hits, of which two are unrelated
-(the job scheduler and a JS `form.submit()` string). No function in `db_contract.rs` is `pub`;
-all are `pub(crate)` or private.
+An exhaustive `.submit(` scan in `hive-cloud` finds the managed-db `record()` and the billing-meter
+`drain_metering()`, BOTH in `db_contract.rs`; the other hits are unrelated (the job scheduler and
+a JS `form.submit()` string). The managed-db helpers are `pub(crate)`; the metering-mirror entry
+points are `pub` because `billing.rs` and `usage_metering.rs` call them, but they are still inside
+the ONE seam.
 
 | function | line | records | can fail the request? |
 |---|---|---|---|
@@ -132,6 +134,82 @@ state, and `contract-replicate --state <state.json>` to exercise peer sync. Both
 `contract_only` and `divergences` of kind `MissingFromContract`, `StaleInContract` or
 `ValueMismatch` (`:373-391`). `reconcile()` is a pure sorted-map diff with no I/O and no auth
 (`:425-480`); it is a monitor against canonical state, not a second replay.
+
+---
+
+## 9. Metering and the billing ledger: the same seam, the same signed log
+
+The managed-db functions above are not the whole seam any more. `db_contract.rs` also owns the
+metering/billing mirror into the SECOND contract, `hive.billing-meter.v1` (declared in
+`crates/hive-contract/src/contracts/billing_meter.rs`). The rule in section 1 is unchanged: **the
+platform mutates FIRST and records AFTER.** `billing::ledger_push` has already appended the row,
+`billing::meter_usage` has already moved the meter cursor, and `account()` has already finalized
+the invoice before any contract event exists. A REFUSED metering entry is a RECORD that a charge
+could not be attested, never a prevention of the charge.
+
+Why a queue: `ledger_push` and `meter_usage` are synchronous and hold `BillingStore` locks, while
+`Engine::submit` is async and fsyncs. Spawning one task per charge would reorder the log and lose
+entries on shutdown. Instead:
+
+1. `enqueue_meter_op(MeterOp)` (`db_contract.rs`) pushes METER SAMPLES and finalized
+   `billing.checkpoint` events onto a bounded process-wide `VecDeque` (4096). Overflow is
+   COUNTED (`METER_OPS_DROPPED`), WARNed with the entry id, and never silent; a transient
+   `submit` failure requeues the event at the FRONT so order is preserved. Ledger rows are NOT
+   enqueued here.
+2. `usage_metering::spawn_saver` (`usage_metering.rs`) drains it through
+   `drain_metering(&cloud)` on the `bulkhead` runtime, in queue order, at most 256 entries per
+   tick. A drain-only loop remains alive even when `HIVE_USAGE_METER_SAVE_MS=0` disables the
+   meter sidecar, because billing still enqueues events.
+3. `mirror_ledger_rows` runs FIRST in every drain: it reads every raw `LedgerEntry` from
+   canonical `BillingStore::snapshot()` and submits any id not yet in a DURABLE node-local
+   cursor (`$HIVE_DATA/contract-billing-cursor.txt`). The cursor is advanced only after an entry
+   with no persist error, so a restart, a crashed drain or a full queue can never permanently
+   lose a charge. This is the completeness anchor, not the volatile queue.
+4. `drain_metering` builds `Caller { platform_attested: true, owns_target: metering_owns(..),
+   tenant: <server-derived>, actor: "platform:meter" }` and calls `contract_engine.submit`.
+   `metering_owns` refuses `ANON_TENANT`, `__untagged__` and `_unattributed`, so an unattributed
+   measurement is recorded as a REFUSAL with no index mutation. It never reads `x-hive-team`.
+   The attestation is a platform-supplied VERDICT, exactly like `owns_target`; it is not a
+   cryptographic proof, and the drain is an OBSERVER that runs on every node (charging itself
+   stays behind the single `may_act(BillingMeter)` writer).
+
+**The outcome is a MEASUREMENT, never a constant.** `mirror_ledger_rows` measures that the row
+is present in the `BillingStore` snapshot it just read; `meter_usage` reads the meter cursor back
+and compares it with the cumulative reading; the invoice rollover counts the raw rows in the
+checkpoint's period and refuses `Ok(())` unless the count equals `cp.entry_count`. An `Err`
+becomes a failed entry with no index mutation. The `billing.ledger` payload now carries the RAW
+note (bounded to 256 chars) as well as its BLAKE3 digest, because
+`compute_ledger_checkpoint` hashes the raw note into its SHA-256 leaf: after raw-row pruning the
+period commitment is recomputable from the signed log.
+
+What each signed entry makes replayable:
+
+| event | carries | detects |
+|---|---|---|
+| `meter.sample` | all 12 cumulative `UsageTotals` SKUs + `window_end_ms` | a rewritten compute/storage/bandwidth/resource reading |
+| `billing.ledger` | entry id, ts, kind, amount, balance, BLAKE3 note digest + raw note | a rewritten, omitted or duplicated charge/credit |
+| `billing.checkpoint` | period bounds, raw row count, SHA-256 chain commitment | an erased period after raw-row pruning |
+
+`exec::apply` stores the LENGTH-PREFIXED canonical bytes of each row in the contract index, and
+`audit::replay` recomputes the index hash at every seq, so a monitor can recompute the exact
+expected row from the signed op and diff it against canonical billing state. Witness:
+`contract-billing` probes R1-R6 (replay, every entry Ed25519-signed, inclusion proofs pinned to
+one identity, rewritten charge, omitted charge, drop/duplicate/reorder).
+
+**HELD / trust limits (do not overstate).** This is evidence, not consensus and not a bond, slash
+or challenge window (Vitra has none). An inclusion proof proves publication, never freshness.
+`persist.rs` `.unwrap_or_default()` on a missing segment, the unvalidated `checkpoint.ts_ms`
+(back-dating), `sort_by_key` normalising physical reorder, and `replicate.rs` not comparing
+`base_prev` mean replay does NOT detect every physical omission/reorder/back-date. The platform
+billing ledger's own `compute_ledger_checkpoint` is an UNSIGNED SHA-256 chain and its raw rows are
+pruned after rollover in `main.rs` WITHOUT checking that the period was contract-attested: an
+OPEN evidence-retention control gap, partially mitigated by the signed `billing.checkpoint` entry
+and the durable mirror cursor. A queued `meter.sample` lost to a restart is re-attested by the
+next cumulative sample; a `billing.checkpoint` lost before its drain is NOT recovered until the
+next period rollover. The platform attestation is a caller-supplied verdict, not a proof. Charging remains OFF until `HIVE_BILLING_METER_RESOURCES=1` and the
+single `leadership::may_act(BillingMeter)` writer is untouched; `RATE_CARD > COST_CARD` is still
+asserted at >=6000 bps. SOC 1/SOC 2 (Type 1 and Type 2) are EXTERNAL ATTESTATIONS over an audit
+period, never a code state: this layer ships control evidence, not certification.
 
 ---
 

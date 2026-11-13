@@ -49,8 +49,12 @@ Four things this layer is explicitly NOT (`crates/hive-contract/src/lib.rs:10-17
 `Contract` is `{ id: String, version: u32, ops: BTreeMap<String, OpSpec> }`
 (`crates/hive-contract/src/contract.rs:107-113`). An `OpSpec` is
 `{ auth: AuthPolicy, effect: Effect, payload_keys: BTreeSet<String>, target_key: String }`
-(`:99-105`). `AuthPolicy` is `TenantAuthorized | OpenParticipation` (`:42-50`);
-`Effect` is `StateWrite | LogOnly` (`:53-60`).
+(`:99-105`). `AuthPolicy` has THREE variants: `TenantAuthorized | OpenParticipation |
+PlatformAttested` (`contract.rs`, enum `AuthPolicy`); `Effect` is `StateWrite | LogOnly`.
+`PlatformAttested` exists so platform-measured metering and billing events can be `StateWrite`
+WITHOUT the forbidden `OpenParticipation` + `StateWrite` pair: `validate` requires
+`Caller::platform_attested`, a server-derived tenant that is not `__untagged__`, and an ownership
+verdict. Giving a charge open participation would let any node mint one.
 
 The instance is one const table, `DECLARED_OPS`
 (`crates/hive-contract/src/contracts/managed_database.rs:60-89`), built by
@@ -70,17 +74,36 @@ The payload key set is a closed schema: `validate` refuses both a missing and an
 target (`:275-283`). `db.propose` is the only permissionless row and is `LogOnly`; the platform
 seam does not emit it.
 
-**The guard is a runtime check, not a type-level guarantee.** `Contract::declare` refuses
-`OpenParticipation` + `StateWrite` with `ContractError::OpenParticipationMayNotWrite`
-(`contract.rs:138-140`). `Contract` and `OpSpec` have all-public fields and derive `Deserialize`,
-so a struct literal or `serde_json::from_str::<Contract>` bypasses `declare`; `validate` does not
-read `Effect` (`:285-297`) and `Executor::commit` only checks `spec.effect == LogOnly`
-(`crates/hive-contract/src/exec.rs:245-250`). The LIVE seam always passes the boot-built
-`&c.managed_db_contract` (`crates/hive-cloud/src/db_contract.rs:129`), so no production request
-path is affected, but a library caller supplying a crafted `Contract` to `Engine::submit` can
-obtain a state mutation without an ownership verdict. Tracked as
-`contract-declare-runtime-guard-bypass`. Do not describe this as "unrepresentable by
-construction".
+**The guard is a runtime check, rechecked at every use.** `Contract::declare` refuses
+`OpenParticipation` + `StateWrite`, and `Contract::assert_admissible()` (one shared predicate
+in `contract.rs`) rechecks the WHOLE contract on every construction route: `validate`,
+`Executor::commit`, `Engine::submit` and `Engine::register`/`ensure` all call it, with a typed
+`OpError` / `ExecError` / `StoreError::InadmissibleContract` refusal and no panic. `validate` and
+`commit` additionally recheck the exact pair on the row being used. `Contract` and `OpSpec` still
+have public fields and derive `Deserialize`, so this is a RUNTIME invariant, never "unrepresentable
+by construction". Witness: `contract-billing` probes G1/G2/G3 deserialize a crafted
+`{"auth":"OpenParticipation","effect":"StateWrite"}` contract and prove all three refusals with
+the index hash unchanged. Do not weaken those rechecks.
+
+### 2b. The second contract: `hive.billing-meter.v1`
+
+`crates/hive-contract/src/contracts/billing_meter.rs` is a second declarative table, built by
+`billing_meter_contract()`. Its three rows:
+
+| kind | AuthPolicy | Effect | payload keys | target key |
+|---|---|---|---|---|
+| `meter.sample` | `PlatformAttested` | `StateWrite` | tenant_tag, window_end_ms + the 12 `UsageTotals` SKUs | tenant_tag |
+| `billing.ledger` | `PlatformAttested` | `StateWrite` | tenant_tag, entry_id, entry_ts_ms, entry_kind, amount_cents, balance_after_cents, note_hash | tenant_tag |
+| `billing.checkpoint` | `PlatformAttested` | `StateWrite` | tenant_tag, period_start_ms, period_end_ms, entry_count, commitment | tenant_tag |
+
+`exec::apply` has pure arms for all three: a sample stores the cumulative value of each compute,
+storage, bandwidth, resource and workflow SKU; a ledger row stores LENGTH-PREFIXED canonical bytes
+of every field that makes a charge what it is; a checkpoint stores the platform's SHA-256 ledger
+chain commitment and raw row count under this log's Ed25519 signature. Because the index mutation
+is a pure function of the signed op, a replay can recompute the exact expected row and compare it
+against canonical billing state: a rewritten amount, a deleted charge, or an erased period is a
+named divergence. See `docs/contract-platform-seam.md` section 9 and the `contract-billing`
+witness (R1-R6).
 
 ## 3. Submit, validate, execute, record
 
@@ -113,6 +136,12 @@ map (`exec.rs:94-98`). The engine DOES do durable disk I/O (`engine.rs:144-148`,
 - The single seam: `crates/hive-cloud/src/db_contract.rs`. An exhaustive scan finds 31
   `db_contract::` call sites in `admin.rs`, one in `git.rs`, and exactly one `contract_engine.submit`
   in the whole of `hive-cloud`. See `docs/contract-platform-seam.md`.
+- Billing-meter wiring: `billing.rs` enqueues one measured event per `ledger_push` (every credit,
+  charge, plan change and renewal), per `meter_usage` tick (all twelve cumulative SKUs), and per
+  finalized `LedgerCheckpoint` at invoice rollover; `usage_metering::spawn_saver` drains them in
+  order through `db_contract::drain_metering` on the bulkhead runtime. Charging itself is STILL
+  off until `HIVE_BILLING_METER_RESOURCES=1`, and the single
+  `leadership::may_act(BillingMeter)` writer is untouched.
 - Wiring evidence: `crates/hive-contract/src/reconcile.rs:100-128` `DECLARED_SCOPE` has 16
   entries, all `wired: true`, and `measure()` (`:178-212`) reads the tree rather than trusting the
   numbers. The older PRD row `contract-unwired-declared-6-wired-0` (and its `declared=6 wired=0`
@@ -130,14 +159,26 @@ map (`exec.rs:94-98`). The engine DOES do durable disk I/O (`engine.rs:144-148`,
 - No consensus. Honesty is enforced by replay and audit, not agreement (`replicate.rs:3-9`).
 - Not an external anchor: a proof is only as good as the pinned identity it is checked against;
   with no pinned key, adjudication returns `Inadmissible`, never `Dishonest` (`audit.rs:321-326`).
+- NOT freshness, NOT a completeness proof over the physical filesystem, NOT a clock. An inclusion
+  proof says the entry WAS published; it does not say the log still ends there
+  (`inclusion.rs`). Three measured residual trust limits, stated rather than papered over:
+  `persist.rs` `.unwrap_or_default()` on a hidden/missing segment can let an omitted SEGMENT pass
+  replay; `checkpoint.rs` signs `ts_ms` but no verifier validates time, so back-dating is not
+  detected by this layer; `persist.rs` `sort_by_key` normalises physical reordering and
+  `replicate.rs` does not compare `base_prev`, so physical reordering of segment files is invisible
+  to a logical replay. The billing ledger's own `compute_ledger_checkpoint` is an UNSIGNED SHA-256
+  chain (`billing.rs`) and raw rows are pruned after a period rollover: retention of the raw rows is
+  a control gap, partially mitigated by the signed `billing.checkpoint` entry. Do NOT claim replay
+  detects every omission, duplication, reorder or back-date.
 
 ## 6. Claims corrected against the tree
 
 An adversarial read of `AGENTS.md:179-198` found these overstatements; `docs/` states the code,
 and `AGENTS.md` has been corrected to match. Full evidence is in the PRD rows named below.
 
-1. "unrepresentable by construction" -> runtime guard, bypassable via public fields/`Deserialize`
-   (`contract-declare-runtime-guard-bypass`).
+1. "unrepresentable by construction" -> runtime guard. NOW rechecked at every use by
+   `Contract::assert_admissible` (validate, commit, submit, register), witnessed by
+   `contract-billing` G1/G2/G3; never describe it as a type-level guarantee.
 2. "seam does NOT mutate" -> `wrote` maintains the canonical write counter via `record_write`
    (`db_contract.rs:273`). It does not perform the tenant's storage write.
 3. "a caller's outcome is a MEASUREMENT, never `Ok(())`" -> true for the `db.write` lanes only; `created`
@@ -155,12 +196,39 @@ and `AGENTS.md` has been corrected to match. Full evidence is in the PRD rows na
 Confirmed as written: no consensus, no bond/incentive model, `Inadmissible` with no pinned
 identity, length-prefixed canonical bytes, and ack binding against signature replay.
 
-## 7. Open rows
+## 7. SOC 1 / SOC 2: control evidence, never a code state
 
-`contract-declare-runtime-guard-bypass`, `contract-checkpoint-domain-unused`,
+SOC 1 (Type 1 and Type 2) and SOC 2 (Type 1 and Type 2) are EXTERNAL ATTESTATIONS performed by
+an independent auditor over a stated examination PERIOD. No code state, signature or test run is
+"100% SOC compliant"; a Type 2 opinion in particular requires operating effectiveness observed
+over time. What this layer SHIPS is control EVIDENCE an auditor can sample, not certification:
+
+- completeness: every `ledger_push` and meter tick enqueues an event; the bounded queue counts and
+  WARNs drops instead of losing them silently; `reconcile::measure` reads the tree for wiring;
+- accuracy: the twelve cumulative SKUs, the charge amount, balance, kind, timestamp and note digest
+  are each length-prefixed into a signed entry; `RATE_CARD.assert_profitable()` gates charging at
+  >=6000 bps gross margin against `COST_CARD`;
+- cutoff: `window_end_ms`, `entry_ts_ms` and `period_start_ms`/`period_end_ms` are in the signed
+  payload, and `billing.checkpoint` anchors the period boundary;
+- authorization: `AuthPolicy::PlatformAttested` + `validate` fail closed without a platform
+  attestation, a server-derived tenant and an ownership verdict; charging stays behind
+  `HIVE_BILLING_METER_RESOURCES` and one `may_act(BillingMeter)` writer;
+- change management and monitoring: contract declarations are a single diffable table; replay,
+  inclusion proofs and fraud adjudication are executable; drain degradation is logged;
+- retention: raw ledger rows are PRUNED after rollover. This is an OPEN evidence-retention gap;
+  the signed `billing.checkpoint` entry preserves the commitment and row count but not every raw
+  row. Retention policy and the auditor's sampling period remain operator decisions.
+
+Residual trust limits above (missing segment, unvalidated clock, physical reorder, unsigned
+platform ledger chain) are part of the control description, not hidden exceptions.
+
+## 8. Open rows
+
+`contract-checkpoint-domain-unused` (domain-tagging the checkpoint signature would invalidate
+every checkpoint already on disk: HELD pending a versioned migration),
 `contract-cli-documented-flags-unimplemented`, `agents-md-contract-section-stale`, plus the
-pre-existing `contract-op-seq-never-validated`, `contract-declared-scope-realtime`,
-`contract-undeclared-op-silent-when-stamped-failed` and `contract-reconcile-harness-panics-on-untagged-row`.
+pre-existing `contract-declared-scope-realtime` and
+`contract-reconcile-harness-panics-on-untagged-row`.
 Several older rows (`contract-fraud-proofs-absent`,
 `contract-inclusion-proof-claimed-not-implemented`, `contract-no-persistence-log-lost-on-restart`,
 `contract-unbounded-log-growth-no-checkpoint`) describe a state the tree has since outgrown; they
