@@ -16,8 +16,9 @@ fix a failure CLASS at the shared primitive. `cargo check` skips `cfg(target_os=
 `--sync`, never in CI. Darwin `mktemp` ignores `TMPDIR`: `/private/tmp`.
 - Cargo/disk traps: keep the user's PATH (Homebrew cargo has no cross std); `hive-cloud` is bin-only; `df` before a build; never
 build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work via
-`refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup name form. `hive_health_interval` > `hive_health_timeout`; an empty reviewed public resolver set fails
-build-executor preflight; raise `deploy_serial_backend` only with quorum-safety evidence.
+`refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup form.
+`hive_health_interval` > `hive_health_timeout`; an empty reviewed resolver set fails build-executor preflight;
+raise `deploy_serial_backend` only with quorum-safety evidence.
 - A roll/deploy is a production change: operator's word first, then `ansible/AGENTS.md` (dashboard: `ui/AGENTS.md`);
 prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never by grepping a Rust format literal;
 never `git_reword` during a roll (rewrites every later SHA).
@@ -86,7 +87,7 @@ needs the operator word.
 
 - `PeerPool` keys trunks by ENDPOINT ID, not the label. **Every inbound accept is bounded, budgeted by its
 NEGOTIATED ALPN, and never evicts an established trunk**: `HIVE_P2P_ACCEPT_DEADLINE_MS` (40 s); ClientHello picks
-the budget; `establish_stats` is operator-only `GET /v1/mesh/establish`, never `/v1/mesh`.
+the budget.
 - `vendor/iroh` keeps two patches across pin bumps (relay "read before send", `PendingRebind`); a dialable
 address needs `HIVE_PUBLIC_IP` AND `HIVE_IROH_PORT`.
 - **A gossip round never waits on a dead peer, and one stale reading never withdraws one.** Rounds end at
@@ -98,9 +99,8 @@ transport-failure writer funnels through `health::demote` (withdraws only after 
 
 ## Containers, podman, process lifecycle
 
-- **`KillMode=process` on hive-node.service is load-bearing** (rootful podman's conmon inherits the caller's cgroup:
-the default SIGTERMs every managed database per roll). CELLS outlive their process, so every boot reaps its own previous
-boot's cells (`hive_backend::reap_orphaned_cells`). Ownership is owner + boot (`hive.owner`, `hive.boot`), never boot alone.
+- **`KillMode=process` on hive-node.service is load-bearing**. CELLS outlive their process: every boot reaps its own
+previous boot's cells (`hive_backend::reap_orphaned_cells`). Ownership is owner + boot (`hive.owner`, `hive.boot`), never boot alone.
 - Every container removal is `rm -f -v` (`container_cli::rm_args`): podman takes one lock from a FIXED pool (2048) per
 container AND per volume; leaks surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume prune`**: reclaim is gated
 on `is_anonymous_volume` (64 ascii-hex) AND `dangling=true`. Podman runs `short-name-mode=enforcing`, so tenant `FROM`
@@ -112,10 +112,10 @@ refs must be qualified.
 (`NodeInfo::wasm_runtime`/`bun_runtime` from `RuntimeCapabilitySource`; `None` = NOT CAPABLE, unlike `disk_free_gb == 0`).
 Placement gates through ONE predicate shared by `place`, lease-stickiness and `dispatch_fallbacks` (`schedule::wasm_capable`);
 a missing runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
-- Litebox (Firecracker -> Litebox -> Mock) is NOT Firecracker/gVisor isolation (guest and enforcement share one address
-space; seccomp-bpf is the only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes on that host with
-the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the flag alone, never macOS.
-`litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`, so ANY change rebuilds every artifact.
+- Litebox (Firecracker -> Litebox -> Mock) is NOT Firecracker/gVisor isolation (guest/enforcement share one address space; seccomp-bpf is
+only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes
+on that host with the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the flag alone, never macOS.
+`litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`: ANY change rebuilds every artifact.
 - A sandbox's live cell is on ONE node (`SandboxRecord::owner_node`); leader routes.
 
 ## Runtime discipline (the serving runtime never stalls)
@@ -132,26 +132,25 @@ drained only through `hive_core::logcap::read_capped_line`, never `BufReader::li
 
 ## Builds & deploys
 
-- `git push` auto-deploys through TWO triggers deduping on the SHA (`CloudState::git_poll_seen`): the webhook
+- `git push` auto-deploys through TWO triggers deduping on the SHA (`CloudState::git_poll_seen`): webhook
 and `git::spawn_git_poll_reconcile`. **A single unreachable node never fails a deploy**: on `FanoutOutcome::nothing_ran()`
-`run_build` walks `schedule::dispatch_fallbacks` one candidate at a time with `place`'s `capable` + `reachable`
-predicates, bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3).
+`run_build` walks `schedule::dispatch_fallbacks` one at a time with `place`'s `capable` + `reachable` predicates,
+bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3).
 - Isolated BuildExecutor: `NodeInfo::build_isolation_protocol` comes from the boot probe
 `build_executor::init_installed()`; a fault logs `BUILD_ISOLATION_UNAVAILABLE`, advertises `None`, drops the node from
 repository-build placement.
-- Rust: `crates/vercel-runtime` shim = Vercel public handler API on `$PORT` (NOT IPC/`.func`/axum 0.8); `Cargo.toml`
-`[[bin]]`->`api/*.rs` builds `--offline` via a platform-owned `.cargo/config.toml` into `Runtime::Command` binaries.
-`cargo`+`rustc` PROBED (bit `1<<7`, last free exit bit; `None`=NOT CAPABLE, no npm substitute), gates placement.
-Builder contract OPT-IN: stage shim+vendored config BEFORE the executor streams the checkout; reviewed base
-(pinned toolchain+vendor seal) and roll are operator-only. `docs/rust-functions.md`.
+- Rust: `crates/vercel-runtime` shim serves the Vercel public handler API on `$PORT`; `Cargo.toml` `[[bin]]` -> `api/*.rs`
+builds `--offline` into `Runtime::Command`. `cargo`+`rustc` PROBED (bit `1<<7`, last free exit bit; `None`=NOT
+CAPABLE, no npm substitute), gates placement. Builder contract OPT-IN, reviewed base + roll operator-only.
+`docs/rust-functions.md`.
 - Checkouts live in `git::deploy_root()`; prefix scanners cover BOTH roots, BOTH name forms and a renamed project's old names
 (`git::checkout_prefixes`); a missing direct entry fails the BUILD (`git::preflight_direct_entries`), never the launch.
 - The default `GET /v1/gitops/projects?view=summary` stays byte-identical; `project_redeploy` alone rebuilds
 from `last_build`. Legacy env scope `""` matches build AND runtime (`env_scope_matches`); build-inlined `NEXT_PUBLIC_*`
 needs `$HIVE_DATA/build-cache/*.tar` cleared before a redeploy of unchanged source: verify the SERVED bundle.
-- **The host build lane's package registry is part of node health**: it inherits `/root/.npmrc`, so a dead
-mirror fails every uncached install; `build_registry::assess` swaps in a 0600 `npm_config_userconfig` with the public
-registry, only for a dark KNOWN public mirror while registry.npmjs.org answers.
+- **The host build lane's registry is part of node health**: inherits `/root/.npmrc`, so a dead mirror fails
+every uncached install; `build_registry::assess` swaps a 0600 `npm_config_userconfig` to the public registry only
+for a dark KNOWN public mirror while registry.npmjs.org answers.
 - **Credentials resolve SERVER-SIDE**: the GitHub connection rides in an ENCRYPTED host-only browser cookie, NOT
 persisted and cannot cross devices; build/deploy credentials resolve on the node (`git.rs::resolve_clone_credentials`).
 
@@ -171,8 +170,8 @@ never instance count.
 ## Managed data lanes
 
 - Managed SQLite (`DbKind::Sqlite`) and `browser_db` share nothing but the word: a file per DATABASE at
-`$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db` vs a cr-sqlite CRR per PROJECT at `$HIVE_DATA/browser-dbs/`. **Never
-point the Hrana handler or musql at a `browser-dbs` file**: a bare `rusqlite` writer bypasses the clock tables the CRR merge reads.
+`$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db` vs a cr-sqlite CRR per PROJECT at `$HIVE_DATA/browser-dbs/`.
+**Never point Hrana/musql at a `browser-dbs` file**: a bare `rusqlite` writer bypasses the CRR clock tables.
 - `browser_db`: grants ride the admission, server-derived and tenant-pinned, re-checked on EVERY request
 (tenant+project+file derived server-side; `db_file` is an identifier, never a path); caps (`max_bytes`,
 `max_value_bytes`) bind with a typed refusal + whole-batch rollback, never truncate/evict; bytes, site ids and
@@ -191,25 +190,32 @@ a full `PendingTable` EVICTS the oldest stuck connection; `splice` copies each d
 - `crates/hive-contract`: a contract is DATA, not code. `Contract::declare` refuses `OpenParticipation` +
 `StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` MUST recheck. `crates/hive-cloud/src/db_contract.rs` is the
 ONLY seam: it does NOT authorize or fail the request — **the caller mutates FIRST and records afterwards**,
-so a REFUSED entry is a RECORD, not a prevention. It counts writes (`record_write`) even on refusal. A
-`db.write` outcome is a MEASUREMENT, not `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass
-`Ok(())`. An unattributed write is a REFUSED `db.write` against `unattributed:<kind>:<tenant>::<name>`;
-unopenable log: NO entry; later persist fault: `persist_error`. Docs: `docs/contract-platform-seam.md`.
+so a REFUSED entry is a RECORD, not a prevention (counts writes even on refusal). A `db.write` outcome is a
+MEASUREMENT, not `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass `Ok(())`.
+Unattributed write =
+REFUSED `unattributed:<kind>:<tenant>::<name>`; unopenable log: NO entry; persist fault: `persist_error`.
+`docs/contract-platform-seam.md`.
 - Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>` (a bare join is NOT injective). `entry_sig_preimage`
 folds `Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical());
 it cannot cover the ack, since `ack.log_head` IS that hash). No PINNED identity = Inadmissible, never Dishonest.
 Checkpoint close defers to the drain; `submit` starts it, `wrote` awaits `submit`, not the close; `Store::append`
 closes inline past 1 deferred close, rebuild inline. Read EVERY segment a window spans.
-- **Vitra has no consensus**: honesty by REPLAY (`replicate.rs`, `audit.rs`), not agreement; **NO bond model**.
-Inclusion/append-only proofs show an entry WAS published, not freshness.
+- **Vitra has no consensus**: honesty by REPLAY, not agreement; **NO bond model**. Proofs show
+publication, not freshness.
+- **Journal** `hive.billing-journal.v1` (`journal.rs`): balanced double-entry, 16 typed invariants;
+state is the NODE-LOCAL signed oplog shard, ZERO `PlatformSnapshot` shape change. Balance is writer
+self-consistency, NOT fraud detection; a second WORM chain is NOT independent. `evidence.rs` = signed
+node-local SOC 2 TECHNICAL EVIDENCE, NEVER an attestation/compliance verdict; AT-1/AT-2 UNMET. BUSL-1.1
+no-grant: concepts only. `docs/double-entry-design.md`, `docs/soc2-evidence-report.md`.
+
 
 ## Account 2FA (optional per-account TOTP)
 
 - The OTP gate sits INSIDE `admin::mint_token` before `auth::issue`; `auth::step_up_ok` re-checks per
-request from BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from
-leader forwarding, `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local
-check or node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in
-`ui/lib/team-role.ts`. `docs/account-2fa.md`.
+request from BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from leader
+forwarding, `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local check or
+node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in `ui/lib/team-role.ts`.
+`docs/account-2fa.md`.
 - State is per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` behind `serde(default)`.
 Secret: `secrets::encrypt` (FAILS OPEN, assert `is_encrypted`), read ONLY `secrets::try_decrypt`, compared
 `admin::ct_eq`. The signed `otp_at` claim sits INSIDE the HS256 payload, read only from a verified token, fails

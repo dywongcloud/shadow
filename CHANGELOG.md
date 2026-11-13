@@ -1,5 +1,81 @@
 # Changelog
 
+## 2026-11-13 - feat: balanced double-entry journal and SOC 2 evidence
+
+Concept-level reimplementation from `VectorGuard-Labs/VectorLedger` (Rust, BUSL-1.1
+with "Additional Use Grant: None"). NO code or file from that repository is vendored;
+its test apparatus (#[cfg(test)], proptest) is not portable under our no-test-files
+rule. Its `report.rs::is_compliant()` "COMPLIANT" verdict and its mostly-existence
+SOC 2 checks are deliberately NOT ported. Facts, license boundary, portability
+matrix and trust limits: `docs/vectorledger-reference.md`.
+
+A balanced double-entry journal (`crates/hive-contract/src/journal.rs`, 1652 lines)
+enforces 16 domain-adapted invariants with typed `JournalError` variants: >=2 lines,
+debits == credits accumulated in i128, non-zero integer minor units (cents) only,
+unknown/closed accounts, USD currency match and precision, non-negative Asset balance,
+exposure limits, legal holds, four-eyes, reversal-of-posted-only, one reversal per
+entry, correction-without-reversal, strictly monotonic sequence, BLAKE3 chain,
+idempotency, suspense clearing and the Global Ledger Equation. Corrections are a NEW
+reversal entry then a NEW correction entry; the original is never modified. No
+unwrap/expect/panic on a request path; amounts use checked arithmetic. The journal's
+canonical state is the signed, NODE-LOCAL contract oplog shard
+`hive.billing-journal.v1`, rebuilt by replay - ZERO fields added to
+PlatformSnapshot, LedgerEntry, BillingAccount or the billing.snapshot() 2-tuple, so
+a mixed-version fleet cannot lose state to this change. The existing single-entry
+running-balance ledger stays as a compatibility view.
+
+The ONE seam `crates/hive-cloud/src/db_contract.rs` gains a journal-budget drain
+that refuses to advance its durable cursor when a row is not attested, closing the
+prune-before-attestation gap. The caller still MUTATES FIRST and RECORDS AFTERWARDS:
+a REFUSED entry is a RECORD, not a prevention. Charging stays OFF until
+HIVE_BILLING_METER_RESOURCES=1; ONE may_act(BillingMeter) writer and
+RATE_CARD > COST_CARD are unchanged.
+
+Efficiencies: group/batched bulkhead drain, snapshot read fence, O(log n) point
+lookups, immutable reconciliation records, retention-evaluation events, and a
+second WORM BLAKE3 audit chain with an HONEST trust label ("a second tamper-evident
+log", NOT independent verification - same process, same key, no external anchor).
+Signed Merkle range commitments REUSE the existing merkle_root/merkle_prove/
+SignedCheckpoint::covers/verify_inclusion primitives; they were not rebuilt.
+
+Automated SOC 2 evidence generation (`crates/hive-contract/src/evidence.rs`):
+machine-derived technical evidence from LIVE journal state, filtered by the
+report's OWN operating-period range, with CC1-CC9 + A1/C1/PI1, Type 1 design vs
+Type 2 period fields, Ed25519-signed Merkle commitment, WORM tip, reconciliation
+history, invariant/retention events and an exception log. An independent verifier
+reproduces the commitment. The report is NODE-LOCAL, states it is TECHNICAL EVIDENCE
+SUPPORTING AN ASSESSMENT, NOT AN ATTESTATION, NOT A CERTIFICATION and NOT A
+COMPLIANCE CLAIM, emits NO verdict word, and its self-guard rejects any unearned
+"COMPLIANT" element. AT-1/AT-2 remain UNMET. docs/compliance-controls.md's
+24-row matrix (5 MET / 15 PARTIAL / 4 UNMET, no Type 2 row MET) is unchanged.
+
+A tenth witness binary, `contract-double-entry`, admits valid entries, REFUSES each
+invariant violation with its typed error, proves reversal-only correction, detects
+7 rewritten/omitted/duplicated/reordered line/entry tamper cases by replay,
+round-trips a real 18.9 MB PlatformSnapshot (42 keys, 152 accounts, 60,684 ledger
+rows, required_keys_intact=true), and generates + independently verifies a SOC 2
+evidence report and a signed range commitment. Its --state argument is OPTIONAL:
+absent => S1 SKIPPED informational PASS; present but unparsable => hard FAIL exit 1.
+
+VERIFIED on the final tree: cargo test --workspace --locked 444 ok / 0 failed;
+scripts/cli-acceptance.sh 35 passed / 0 failed; check-contract-bindings.py --check
+RESULT PASS bindings=34 layers=4 gates=36 fail_open=4 secrets_clean=1;
+git diff --check 0; cargo check -p hive-cloud --offline --bin hive-cloud exit 0;
+all TEN witness bins pass (the three --state bins require an explicit path by
+design). No test files, no new Cargo deps (Cargo.lock unchanged).
+
+An adversarial recursive gm swarm (3 leads + checker/refuter descendants across 3
+generations, 12 live at peak) KILLED three broad claims: one-for-one portability of
+the standards, "balance + a second chain = fraud detection/independent
+verification", and "a generated report = compliance". Findings:
+docs/vectorledger-adversarial-findings.md (12 findings, 4 CRITICAL / 5 HIGH /
+3 MEDIUM). One research lead died on a server-side API error; the orchestrator
+absorbed its unit and wrote the reference doc from its own witnesses. Headroom was
+a measured STOP (0% CPU idle, 62-178 MB free, 9.5 -> 7.0 Gi disk), so the swarm
+was bounded and no heavy parallel builds were run. Locally committed, NOT pushed
+or rolled: both are operator one-way doors for this task.
+
+
 ## 2026-11-12 - feat: signed metering/billing contract and admissibility guard
 
 Verifiable-database smart contracts gained a real end-to-end path for metering:
