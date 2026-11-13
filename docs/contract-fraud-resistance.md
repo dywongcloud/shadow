@@ -158,7 +158,7 @@ refutations kill a claim, a checker that errors casts no vote.
 |---|---|---|
 | A FORGERY | **1 valid refutation / 0 errors / 1 no-vote** (strict `Verdict::Dishonest` reading: 0 valid / 0 errors / 2 no-votes) | **CLAIM SURVIVES** -- fewer than two valid refutations leave it UNVERIFIED, not killed. No path from a copied sig / rewritten ack / spliced log / unpinned or foreign key to `Verdict::Dishonest`. The one valid refutation reaches `Withheld::TailTruncated` / `Err(DivergentAck)`, i.e. an unpinned VERIFICATION finding, not an adjudication; `docs/verifiable-database.md:121` already records that distinction. Witnesses: `1794544131108-7839-2999e2a124e54387`, `1794544222532-7894-d4773cebea08f039`, `1794542291862-6368-daa9fdecfccd18d1`, `1794542392236-6498-e7f3bcef0e3f14f0` |
 | B OMISSION / REPLAY | **2 valid refutations / 0 errors / 0 no-votes** | **CLAIM KILLED** |
-| C COMPLIANCE THEATER | see run receipt | pending at time of writing |
+| C COMPLIANCE THEATER | **0 errors, 0 abstentions**; per claim: C1 1 valid/1 no-vote; C2 1/1; **C3 2/0**; C4 1/1; C5 1/1; C6 1/1; C7 0/2; **C8 2/0**; **C9 2/0** | **3 claims KILLED**: (C3) `db_contract.rs:28-30` "a caller's `outcome` is a measurement ... never a constant" vs `:373`/`:396` literal `Ok(())`; (C8) `docs/verifiable-database.md:155-156` "so a restart loses nothing" and `docs/contract-verification.md:82` "durability is still on" vs `persist.rs:800-801` no fsync when `sync=false` and `state.rs:894-896` default off; (C9) `docs/contract-verification.md:31` "Only FIVE binaries print a `RESULT:`-prefixed line" vs exactly FOUR (`1794548416933-9292-382aadd9173b7849`: 8 lines / 4 files, exhaustive:true). C1/C2/C4/C5/C6 are UNVERIFIED (1/1 split is a convention difference, not a disagreement: both refuters agree no overstatement survives in the five named docs). C7 = 0/2: honestly documented tooling limit, NOT compliance theater. |
 
 Lens B killed the universal claim "no metering or billing event can be dropped,
 duplicated, reordered or back-dated without replay detecting it". Witnesses:
@@ -174,61 +174,113 @@ overlapping retained windows (`bin/contract-replicate.rs:370`).
 
 ---
 
-## 5. Metering/billing: baseline finding, in-flight change, gated status
+## 5. Metering/billing: baseline gap, wired path, verified witness, remaining limits
 
-**BASELINE FINDING (KILLED CLAIM; still TRUE of the live request path).** The
-billing ledger is NOT tied to the signed contract oplog, and replay cannot see a
-metering or billing event. `billing.rs` (2213 lines) had ZERO hits for
-`db_contract::`, `contract_engine`, `hive_contract`
-(exhaustive literal, `1794542391190-6496-b93ef56ab038ef18`,
-`1794542397507-6506-22b713e98ec66aa0`, `1794542404680-6517-4b8ef0c161359cdc`);
-`crates/hive-contract` had ZERO `LedgerEntry` hits
-(`1794542457866-6578-bc177ddc8168e90a`); the only contract submit site in
-`crates/hive-cloud` was `db_contract.rs:127-128` (`.submit(` exhaustive: 3 hits,
-two unrelated, `1794542809230-6962-9b607b664382876d`). The billing ledger instead
-had its OWN SHA-256 hash-chain commitment `compute_ledger_checkpoint`
-(`billing.rs:932-993`), pruned raw rows (`billing.rs:1001`, `main.rs:4900`), and
-`contracts/managed_database.rs:60-89` declared only `db.create`, `db.delete`,
-`db.write`, `db.propose`. The replayed op set contained no metering event.
+This section is a TIMELINE because the tree changed three times during the audit. Every
+stage carries its own dispatch ids; do not collapse them into one present-tense claim.
 
-**A DECLARATIVE CONTRACT HAS BEEN AUTHORED BUT IS UNWIRED AND UNVERIFIED.**
-Observed at `1794543726411-7604-985cc250ea14769b`: HEAD moved to
-`5ca47f85b0d3e7528b19a985f8dc6cb8b2685886` and `git_status` showed 17 dirty
-paths including a NEW untracked `crates/hive-contract/src/contracts/billing_meter.rs`
-(136 lines, 5038 bytes, `1794543802889-7654-756d6c1d44f479b1`). It declares a
-second contract `hive.billing-meter.v1` (`:28`), three op kinds `meter.sample` /
+**STAGE 1 — BASELINE (killed claim).** Before commit `458f1e24`, the billing ledger
+was NOT tied to the signed contract oplog and replay could not see a metering or
+billing event. `billing.rs` (2213 lines) had ZERO hits for `db_contract::`,
+`contract_engine`, `hive_contract` (exhaustive literal,
+`1794542391190-6496-b93ef56ab038ef18`,
+`1794542397507-6506-22b713e98ec66aa0`,
+`1794542404680-6517-4b8ef0c161359cdc`); `crates/hive-contract` had ZERO
+`LedgerEntry` hits (`1794542457866-6578-bc177ddc8168e90a`); the only contract
+submit site in `crates/hive-cloud` was `db_contract.rs:127-128` (`.submit(`
+exhaustive: 3 hits, two unrelated, `1794542809230-6962-9b607b664382876d`).
+The billing ledger instead had its OWN SHA-256 hash-chain commitment
+`compute_ledger_checkpoint` (`billing.rs:940-993`), pruned raw rows
+(`billing.rs:1001`, `main.rs:4900`), and `contracts/managed_database.rs:60-89`
+declared only `db.create`, `db.delete`, `db.write`, `db.propose`. Lens B killed
+both "the billing ledger is tied to the oplog" and "replay detects every
+omission/duplication/reorder/back-date". That verdict is about the BASELINE tree.
+
+**STAGE 2 — DECLARATIVE CONTRACT, UNWIRED (transient).** At
+`1794543726411-7604-985cc250ea14769b` a NEW untracked
+`crates/hive-contract/src/contracts/billing_meter.rs` existed (136 lines, 5038
+bytes, `1794543802889-7654-756d6c1d44f479b1`) declaring a second contract
+`hive.billing-meter.v1` (`:28`), three op kinds `meter.sample` /
 `billing.ledger` / `billing.checkpoint` (`:31-33`), `AuthPolicy::PlatformAttested`
 + `Effect::StateWrite` for all three (`:100-123`), all 12 `UsageTotals` SKUs in a
-closed payload schema (`:39-52`, `:61-76`), and the builder goes through
-`Contract::declare` (`:127-136`). `contract.rs:56` gained `PlatformAttested`,
-`contract.rs:202` `assert_admissible`, `contract.rs:370` the `validate` arm;
-`engine.rs:297`, `:488` call `assert_admissible`; `db_contract.rs:124` now sets
-`platform_attested: false` for managed-db callers
-(`1794543877531-7706-14106c124e1f5a12`).
+closed payload schema (`:39-52`, `:61-76`). At that moment `crates/hive-cloud/src`
+had ZERO hits for `meter.sample`, `billing_meter::`, `billing_meter_contract`
+(`1794543824103-7667-7e6f29772cd1cc2`,
+`1794543837473-7681-88f8febb82bd355c`,
+`1794543844577-7689-8cd5df087d9448ff`). Treating the 14 pre-existing
+`billing_meter` hits (`HIVE_BILLING_METER_RESOURCES`, `spawn_billing_meter_loop`,
+`billing_meters` snapshot/mirror) as wiring evidence is a FALSE INFERENCE. A
+declared contract is not an evidentiary path. This stage is recorded because the
+orchestrator's mid-audit ruling ("UNWIRED, requirement NOT MET") was correct FOR
+THIS STAGE; do not quote it as current.
 
-**THE REQUIREMENT IS NOT MET YET.** Those edits are UNCOMMITTED and NOT compiled
-or witnessed. Nothing emits the new op kinds: `crates/hive-cloud/src` has ZERO
-hits for `billing_meter::`, `billing_meter_contract`, `meter.sample`,
-`billing.checkpoint` (exhaustive, `1794543837473-7681-88f8febb82bd355c` /
-`1794543844577-7689-8cd5df087d9448ff` /
-`1794543824103-7667-7e6f29772cd1cc2` /
-`1794543833044-7676-f41fff22b72b68ed`); literal `hive.billing-meter.v1` occurs
-ONCE in the whole tree, in its own definition (`1794543799864-7653-3335ea7387f878d6`);
-`git_status` shows NO edit to `main.rs` or `billing.rs`. The 14 `billing_meter`
-hits in `hive-cloud` at `1794543875063-7704-9348a8dee4146cad` are ALL pre-existing
-names (`HIVE_BILLING_METER_RESOURCES`, `spawn_billing_meter_loop`,
-`billing_meters` snapshot/mirror, `usage_metering` docs) and NONE reference the
-new contract -- treating those as wiring evidence is a false inference. A declared
-contract is not an evidentiary path. The gap `OC-11` stays OPEN until the writer
-lands a real emit site on the metering and ledger paths with a compile + live
-`--state` witness receipt. Do not describe "billing tied to our smart contracts"
-as implemented, in progress toward a verified state, or gated-on-witness only;
-state plainly that it is UNWIRED.
+**STAGE 3 — WIRED AND WITNESSED (current HEAD `c19e4526`).** Commits
+`458f1e24` ("feat: signed metering/billing contract and guard") and `121899e1`
+("feat: wire metering and ledger into contract oplog") landed the emit sites:
+`billing.rs:1197` `Self::enqueue_billing_op(hive_contract::METER_SAMPLE, ...)`,
+`:1304` `BILLING_LEDGER`, `:870-887` a `billing.checkpoint` payload carrying the
+period commitment + `entry_count`, `:1250-1264` `enqueue_billing_op` forwarding
+into `db_contract::enqueue_meter_op`; `db_contract.rs:402-524` a bounded
+process-wide queue (`MAX_PENDING_METER_OPS = 4096`, drops COUNTED and WARNed),
+`:486-524` `drain_metering` submitting through the ONE seam with
+`Caller::platform_attested = true` and `get_or_init(billing_meter_contract)`;
+`usage_metering.rs:597` and `:612` actually call `drain_metering` on the
+bulkhead loop (`1794546790952-8850-97fd83c1410ea94e`,
+`1794546567293-8810-5ec034bf647c4871`,
+`1794546586714-8814-4bf883b8d6d4d314`,
+`1794547852310-9184-9997d8bbbbf43610`). A 9th witness binary
+`crates/hive-contract/src/bin/contract-billing.rs` (332 lines) replays meter
+samples, credits, charges, plan changes, renewals and a finalized checkpoint and
+measures that a rewritten, omitted, duplicated or reordered charge is DETECTED
+(`:1-14`, `:325-331`). Witness receipts in `.gm/witness-log.md` include
+`contract-billing --state /tmp/hive-real-state-full.json exit=0 "RESULT PASS
+probes=11 replay_ok=true signed=9 proofs=7 rewritten_detected=true
+omitted_detected=true chain_tamper_detected=true"` and a four-layer gate
+(`cargo test --workspace --locked` 60 result lines / 444 ok / 0 failed,
+`cli-acceptance.sh` 35 passed 0 failed, `check-contract-bindings.py --check`
+RESULT PASS, `git diff --check` exit 0). `Contract::assert_admissible()`
+(`contract.rs:202`, called at `contract.rs:309`, `exec.rs:306`,
+`engine.rs:297`, `:488`) now rechecks the forbidden pair on every use, closing
+the deserialize bypass (`1794546397184-8753-7a62fdba0d8561a3`,
+`1794546421182-8760-b284da6077a06e3e3`, `1794546464447-8775-70a96542f67a824d`).
 
-Adding op kinds would NOT, by itself, solve the four replay limits below. A
-`PlatformAttested` row is still a claim the platform makes about its own
-measurement (`billing_meter.rs:10-23`), recorded after the fact, with no
-independent observer.
+**What is therefore MET:** metering, ledger and checkpoint events now become
+signed, attributed, seq-checked entries in the same hash-chained oplog, and a
+live binary witnesses replay, inclusion signatures and tamper detection. The
+user's "billing ledger tied to our smart contracts" is no longer absent.
+
+**What is still NOT MET ("100% complete and working" is not established):**
+
+- Charging is OFF until `HIVE_BILLING_METER_RESOURCES=1` AND every SKU clears
+  the margin floor (`billing.rs:523-534`, `resource_charging_enabled` at `:526`,
+  refreshed witness `1794548468241-9305-7bb2371ed1e24856`). Shadow mode measures,
+  nobody is charged, so the charge-to-invoice control has not operated on real
+  money.
+- The witness is one run against a snapshot, not operating effectiveness over a
+  period (no SOC Type 2 evidence). No external anchor, no consensus, no
+  freshness, no economic consequence: OC-01/02/03 remain.
+- All four replay limits below remain: OC-04 `persist.rs:620
+  .unwrap_or_default()` still swallows a hidden segment
+  (`1794548241985-9252-42c5a231b5cda35d`, 1 match, exhaustive:true); OC-05
+  `audit.rs` has ZERO `ts_ms` hits
+  (`1794548258054-9259-30c8a4449dc13ac`, exhaustive:true); OC-06 `sort_by_key`
+  at `persist.rs:362`, `:417`, `:499` still normalises physical reorder
+  (`1794548298222-9268-aa22435e375f79a5`, 3 matches, exhaustive:true); OC-07
+  `replicate.rs` still has ZERO `base_prev`
+  (`1794548375939-9282-39f6a70682c15632`, exhaustive:true). New op kinds do not
+  change the replay primitive. These were re-read with `refresh:true` disk walks
+  on HEAD `c19e4526`, because a cached `codesearch` is unreliable during a
+  concurrent rewrite.
+- The bounded queue can DROP an event when 4096 are pending
+  (`db_contract.rs:427`, `:452`, `:555`, refreshed witness
+  `1794548510145-9308-a93449cb6ce0083e`); the drop is counted and WARNed, not made
+  impossible. Completeness is therefore an availability property, not a proof.
+- Adding `PlatformAttested` rows is still a claim the platform makes about its
+  own measurement, recorded after the fact, with no independent observer.
+
+Do not describe the requirement as fully met, and do not describe it as
+UNWIRED. State: wired and witnessed at HEAD `c19e4526`, with the named
+residuals open and charging still off.
 
 ---
 
@@ -247,10 +299,10 @@ Each residual is a stated open condition, not a TODO stub and not a hidden claim
 | `OC-07` **compacted-prefix-blind** | `replicate.rs` has ZERO `base_prev` occurrences; merge compares only the OVERLAPPING retained window, so two compacted logs with different attested prefixes compare equal. `replay_from(Some(cp))` skips entries INSIDE an attested window. | `replicate.rs:86-151`, `:519-532`; `audit.rs:139-179`; `1794542311564-6399-e9708321aff833b6` |
 | `OC-08` **unopenable-log-silence** | On a `submit` error `record` returns `None`, logs "contract: managed-db op NOT recorded", and the platform's mutation stands. A later persist fault sets `SubmitResult.persist_error`, but `Receipt` omits the field and the seam logs "op recorded". After restart the head is recomputed from `entries.last()`, so a shorter, perfectly consistent log replays `Ok`. | `db_contract.rs:31-33`, `:140-181`; `engine.rs:399-414`, `:493-498`, `:713-726`; `oplog.rs:339-354` |
 | `OC-09` **refusal-inventory-gap** | An unattributed REFUSED write is recorded in the oplog but deliberately leaves the canonical write plane untouched, so reconciliation has no INDEPENDENT event for that lane. | `db_contract.rs:311-313`, `:324`; `docs/contract-platform-seam.md:57-90` |
-| `OC-10` **tool-result-line-inconsistency** | Only FOUR of eight witness binaries print a `RESULT:`-prefixed line (adversary `:526,:529`; forge `:971,:973`; persist `:586,:588`; transparency `:708,:711`; exhaustive literal scan `1794544334463-7956`: 8 lines / 4 files). `contract-cost` prints `RESULT PASS`/`RESULT FAIL` with no colon and exits 0 even on FAIL; `contract-audit`/`contract-reconcile`/`contract-replicate` print `ALL PROBES PASSED`/`PROBE(S) FAILED` without the prefix. A monitor grepping only `RESULT:` misses four of eight. `docs/contract-verification.md:31` says "FIVE" by counting cost's colon-less line, which contradicts its own table (`:20-29`) -- a miscount, not a concealment. This is an HONESTLY DOCUMENTED tooling limit; it is a real evidence-completeness weakness for a naive monitor. | `docs/contract-verification.md:20-34`, `:116-117`; `bin/contract-cost.rs:222-224` (0 `process::exit` in 225 lines, exhaustive) |
-| `OC-11` **billing-evidence-UNWIRED** | Baseline replay could not see any metering/billing event; a second declarative contract `hive.billing-meter.v1` EXISTS in the working tree but has ZERO emit sites in `hive-cloud`, no edit to `main.rs`/`billing.rs`, and is uncompiled/unwitnessed. The requirement "billing ledger tied to our smart contracts" is NOT MET. Gap OPEN until a real emit site lands with compile + live-witness receipts. | §5 above; `1794543820405-7662-f32bc00e8ab8f836`, `1794543875063-7704-9348a8dee4146cad` |
+| `OC-10` **tool-result-line-inconsistency** | Only FOUR of NINE witness binaries print a `RESULT:`-prefixed line (adversary `:526,:529`; forge `:971,:973`; persist `:586,:588`; transparency `:708,:711`; refreshed exhaustive scan `1794548416933-9292-382aadd9173b7849`: 8 lines / 4 files). `contract-cost` prints `RESULT PASS`/`RESULT FAIL` with no colon and exits 0 even on FAIL; the 9th bin `contract-billing` prints `RESULT PASS` with no colon but DOES `std::process::exit(1)` on FAIL (`bin/contract-billing.rs:325-331`); `contract-audit`/`contract-reconcile`/`contract-replicate` print `ALL PROBES PASSED`/`PROBE(S) FAILED` without the prefix but exit 1 on failure. A monitor grepping only `RESULT:` misses five of nine. `docs/contract-verification.md:31` says "FIVE" by counting cost's colon-less line, which contradicts its own table (`:20-29`) -- a miscount, not a concealment. This is an HONESTLY DOCUMENTED tooling limit; it is a real evidence-completeness weakness for a naive monitor. | `docs/contract-verification.md:20-34`, `:116-117`; `bin/contract-cost.rs:222-224`; `bin/contract-billing.rs:325-331` |
+| `OC-11` **billing-evidence-wired-but-unproven-in-production** | BASELINE: replay could not see ANY metering/billing event and the ledger was UNTIED (§5 stage 1). At HEAD `c19e4526` the emit sites, drain and a 9th witness binary ARE wired and witnessed (§5 stage 3). The requirement "billing ledger tied to our smart contracts" is therefore MET at the code/evidence level, but NOT "100% complete and working": charging is OFF until `HIVE_BILLING_METER_RESOURCES=1`, the witness is one snapshot run rather than operating effectiveness over a period, the bounded queue can drop an event, and OC-01/02/03/04/05/06/07 remain. Gap OPEN on production verification, not on wiring. | §5; `1794546790952-8850-97fd83c1410ea94e`, `1794547852310-9184-9997d8bbbbf43610`, `.gm/witness-log.md` contract-billing RESULT PASS probes=11 |
 | `OC-12` **no-breach-notice-delivery** | No route or gossip disseminates a `Dishonest` verdict to affected participants; upstream §2.3 monitors "warn participants", which is mapped here as not implemented. | `docs/verifiable-database.md:198`, `:217` |
-| `OC-13` **runtime-deserialize-bypass** | `Contract::declare` is a RUNTIME guard; public fields + `Deserialize` let a library caller bypass it. The live seam always passes the boot-built contract, so no production request path is affected, but a crafted `Contract` to `Engine::submit` can obtain a state mutation without an ownership verdict. The in-flight `assert_admissible()` targets this class. | `docs/smart-contracts.md:73-83`; `contract.rs:138-140`, `:202` |
+| `OC-13` **runtime-deserialize-bypass (CLOSED)** | `Contract::declare` is a RUNTIME guard; public fields + `Deserialize` let a library caller bypass it via a crafted `Contract`. At HEAD `c19e4526` this is CLOSED by `Contract::assert_admissible()` (`contract.rs:202`), rechecked on every use (`contract.rs:309` `validate`, `exec.rs:306` `commit`, `engine.rs:297`, `:488` `submit`/`ensure`); `contract.rs:73` now says "Refused at RUNTIME by `declare` and rechecked on every USE". A 9th witness binary deserializes a crafted `OpenParticipation` + `StateWrite` contract and proves all three refuse it with the index unchanged (`bin/contract-billing.rs:1-14`). `docs/smart-contracts.md:73-83` and `CHANGELOG.md:664-670` are now STALE (they still describe bypassability) and belong to the code writer's doc surface, not this one. | `contract.rs:73`, `:202`, `:309`; `engine.rs:297`, `:488`; `exec.rs:306`; `1794546397184-8753-7a62fdba0d8561a3`, `1794546464447-8775-70a96542f67a824d` |
 | `OC-14` **disk-entry-re-signed-unverified** | `Engine::inclusion_proof` (`engine.rs:599-641`) reads a compacted entry from disk with `public_key: None` (`engine.rs:619`, `:632`), so `verify_line` early-returns without checking its signature (`persist.rs:421-428`); `inclusion::prove` then RE-SIGNS that entry with the node's real key (`engine.rs:625`, `inclusion.rs:288-306` `sign_entry`), despite `persist.rs:386` saying the "signature is re-read, never re-signed". `InclusionProof::verify` checks only `hash_is_self_consistent` (`inclusion.rs:217`), the signature and the key, so a locally tampered segment line can be laundered into a genuine node-signed `SignedEntry`. Precondition: local write access to the node's data dir, not a remote forgery. Raised by Lens A; verified live at `1794544563401-8051-1e3708b98a7ddcd0`, `1794544591499-8061-dc13470279ce9570`, `1794544617117-8071-89458bb3a043ca8`, `1794544631767-8087-d4fa64d04ee56030`, `1794544634578-8091-322042b8dacb66c4`. | `engine.rs:619`, `:625`, `:632`; `persist.rs:386`, `:421-428`; `inclusion.rs:217`, `:288-306` |
 
 ---
@@ -259,10 +311,15 @@ Each residual is a stated open condition, not a TODO stub and not a hidden claim
 
 Fraud resistance here means: **a divergence between two artefacts, once both are
 in an auditor's hands and the auditor has pinned the identity, is reproducible and
-attributable.** It does not mean a dishonest writer is prevented, caught in real
-time, punished, or unable to withhold the evidence an audit would need. Nothing in
-this document asserts consensus, finality, freshness, certification, or that
-charging is enabled. Charging stays OFF until `HIVE_BILLING_METER_RESOURCES=1`
+attributable.** At HEAD `c19e4526` the metering/billing path is WIRED into that
+same signed oplog and witnessed by `contract-billing`; it is not "UNWIRED", and
+it is not "100% complete and working" either. It does not mean a dishonest writer
+is prevented, caught in real time, punished, or unable to withhold the evidence
+an audit would need. Nothing in this document asserts consensus, finality,
+freshness, certification, or that charging is enabled. Charging stays OFF until
+`HIVE_BILLING_METER_RESOURCES=1`
 (`billing.rs:523-534`, `resource_charging_enabled` at `:526`) AND every SKU clears
 `MIN_GROSS_MARGIN_BPS` (`billing.rs:392`, `:507-518`); a control that HOLDS
-(`leadership.rs:416` `may_act`) is not a control that passed.
+(`leadership.rs:416` `may_act`) is not a control that passed. OC-01..OC-12 and
+OC-14 remain OPEN; OC-13 is CLOSED by `assert_admissible()`; OC-11 is now a
+production-verification gap rather than a wiring gap.

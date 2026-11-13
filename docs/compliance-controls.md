@@ -66,7 +66,14 @@ Callers are `billing.rs:869` and `main.rs:4867`; the struct is at `:564-579`.
   contract oplog: `persist.rs:215-221` `entry_sig_preimage` folds the ack into
   Ed25519-signed bytes, `fraud.rs:68-76` `SignedEntry::verify` recomputes them,
   and `admin.rs:3152-3153` `integrity_signer.sign_chain_head` signs a chain head.
-  The billing commitment has none of that.
+  The billing commitment has none of that. **Update at HEAD `c19e4526`: the
+  commitment is now PUBLISHED INSIDE a signed oplog entry.** `billing.rs:870-887`
+  builds a `billing.checkpoint` payload with `period_start_ms`, `period_end_ms`,
+  `entry_count` and `commitment`, and `db_contract.rs:486-524` `drain_metering`
+  submits it with `Caller::platform_attested = true`. That upgrades the
+  commitment from an unattributed local hash to an attested entry; it does NOT
+  turn the SHA-256 chain itself into a signature, does not add an external
+  anchor, and does not supply a Type 2 examination period.
 - **Retention is the real SOC issue.** `billing.rs:1001` `prune_ledger_range`
   removes raw entries from the in-memory ledger, `relational::prune_billing_ledger`
   removes them from the relational mirror, and `main.rs:4900` logs
