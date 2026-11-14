@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-11-14 - admin contract log explorer: node-local oplog and recorded execution
+
+The admin ops console has no way to observe smart-contract operations or the append-only log
+behind them. `GET /v1/admin/contract/explorer` is now a NODE-LOCAL, operator-only read of ONE
+contract's RETAINED oplog window, and `ui/app/admin/explorer/` renders it. `admin_ingress` serves
+GET/HEAD locally and public hosts are round-robin DNS, so there is deliberately no owner proxy,
+no `?node=` hop and no `gossip::dispatch` arm: one node's signed shard is never presented under
+another node's name. The response names `responding_node`.
+
+`require_auth_read` (401 anonymous on an enforced node), an ADMIN `roles::RULES` row mirrored in
+`ui/lib/team-role.ts`, and `require_operator` gate the route: raw entries carry tenant tags,
+actors and refusal reasons, so a viewer floor would leak other tenants' rows. The page prefetches
+server-side with `fetchOpsResult` and has no client poller, because a browser `/ops` hop carries
+only the tenant cookie. Bounded window, payload and replay run on `spawn_blocking`.
+
+Every verdict is RECOMPUTED, never a stored "verified" flag: `OpLog::verify_chain()` from the
+attested `base_prev`, per-entry `expected_hash()` and prev-link checks, and `audit::verify` index
+replay only from genesis (after compaction the page reports that a signed checkpoint is needed,
+rather than a false divergence). Canonical bytes are LENGTH-PREFIXED and are never shown as a
+preimage. No per-entry signature is verified by this view and `pin_required` is true. The view
+proves publication, chain integrity and deterministic replay; it does NOT prove freshness,
+consensus, finality, fraud detection or an attestation. Honesty is by REPLAY, not agreement;
+there is no bond model. A REFUSED entry is a RECORD of a write that already happened, not a
+prevention, and `db.write` outcomes are MEASUREMENTS, not `Ok(())`; an empty window is unknown,
+not clean.
+
+The page is titled "Contract log explorer", not "block explorer": the platform has no blocks, no
+height, no confirmations and no finality. `docs/explorer.md` carries the full boundary.
+
+An adversarial swarm of ten read-only agents (four scouts, three design refuters, one epistemic
+refuter, one CI/caps scout, one ops-path scout) refuted the initial "block explorer" framing,
+the viewer-floor gate, unbounded replay, raw payload display and "verified" wording; the change
+adopts those constraints. It also fixes a shared GET-cache defect: an `x-hive-anon: 1` 200 left
+a RESOLVED Promise in `getCache`, so every later call (including `fresh: true`) replayed the
+anonymous body forever; `apiGet` and `opsGet` now delete the slot. Adding the RULES and
+TEAM_ACTIONS rows re-pins the two contract-binding spans via a LOCAL `--sync` (never in CI).
+
+A roll/deploy is a production change requiring the operator's word, which this request does not
+contain; no roll is claimed here.
+
 ## 2026-11-13 - 2FA: one OTP per bounded login session, not per mint/team/5 minutes
 
 An enrolled account runs a 2FA challenge on every mint, on every team switch and on the keeper's

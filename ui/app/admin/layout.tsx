@@ -12,6 +12,7 @@ import {
   ScrollText,
   ArrowLeft,
   Table2,
+  ListTree,
   Menu,
   X,
 } from "lucide-react";
@@ -26,6 +27,7 @@ const nav = [
   { href: "/admin/data", label: "Data Browser", icon: Table2 },
   { href: "/admin/nodes", label: "Infrastructure", icon: Server },
   { href: "/admin/audit", label: "Audit log", icon: ScrollText },
+  { href: "/admin/explorer", label: "Contract explorer", icon: ListTree },
 ];
 
 function NavList({ pathname, onNavigate }: { pathname: string; onNavigate?: () => void }) {

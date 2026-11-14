@@ -48,6 +48,13 @@ const MESH_FORWARD_TIMEOUT_SECS: u64 = 20;
 /// unbounded walk of the journal on a serving path.
 const SOC2_EVIDENCE_DEFAULT_PERIOD_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const SOC2_EVIDENCE_MAX_PERIOD_MS: u64 = 366 * 24 * 60 * 60 * 1000;
+/// The admin oplog explorer serves ONE bounded window per GET. The retained log is already bounded
+/// by compaction, but the replay bound is explicit so a request can never ask for an unbounded walk.
+const CONTRACT_EXPLORER_DEFAULT_LIMIT: usize = 50;
+const CONTRACT_EXPLORER_MAX_LIMIT: usize = 100;
+const CONTRACT_EXPLORER_MAX_REPLAY_ENTRIES: usize = 4096;
+const CONTRACT_EXPLORER_MAX_PAYLOAD_KEYS: usize = 24;
+const CONTRACT_EXPLORER_MAX_VALUE_CHARS: usize = 160;
 const PROJECT_DELETE_QUICK_PASS_PEER_BUDGET: Duration = Duration::from_secs(28);
 const FRAMEWORK_OUTPUT_DIRS: [&str; 6] = [
     ".vercel/output/static",
@@ -88,6 +95,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/admin/runtime", get(admin_runtime))
         .route("/v1/admin/content-hash", get(admin_content_hash))
         .route("/v1/admin/soc2/evidence", get(soc2_evidence_public))
+        .route("/v1/admin/contract/explorer", get(contract_explorer_public))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -3908,6 +3916,334 @@ struct Soc2EvidenceQuery {
     period_start_ms: Option<u64>,
     #[serde(default)]
     period_end_ms: Option<u64>,
+}
+
+/// The admin oplog explorer. `admin_ingress` serves GET/HEAD LOCALLY and public hosts are
+/// round-robin DNS, so this is deliberately NODE-LOCAL: one contract's RETAINED oplog window on
+/// the responding node. There is NO owner proxy, NO `?node=` hop and NO `gossip::dispatch` arm:
+/// presenting one node's signed shard under another node's name would misattribute the evidence,
+/// and an unknown gossip path answers an EMPTY body. The response names the responding node and
+/// its own signing key; a verifier that wants a different node addresses that node directly.
+///
+/// Auth is `require_auth_read` (401 for an anonymous GET on an enforced node, so the dashboard's
+/// cookie re-mint fires) PLUS an operator assertion: the raw entries carry tenant tags, actors and
+/// refusal reasons, so a viewer-floor read would leak other tenants' rows. `roles::RULES` lists the
+/// route at ADMIN and `roles::gate` decides the role once; `platform_admin` short-circuits that gate.
+/// Heavy work (chain verification, index replay, per-entry hash recomputation) runs on
+/// `spawn_blocking`, never on a serving tokio worker, and is bounded by a retained-window budget.
+#[derive(Debug, Deserialize)]
+struct ContractExplorerQuery {
+    #[serde(default)]
+    contract: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    before_seq: Option<u64>,
+}
+
+/// An allowlist, never a path: a caller-controlled string never reaches the filesystem or a URL.
+fn explorer_contract(id: &str) -> Option<(hive_contract::Contract, u32)> {
+    match id {
+        hive_contract::contracts::managed_database::CONTRACT_ID => Some((
+            hive_contract::managed_db_contract(),
+            hive_contract::contracts::managed_database::CONTRACT_VERSION,
+        )),
+        hive_contract::contracts::journal::CONTRACT_ID => Some((
+            hive_contract::billing_journal_contract(),
+            hive_contract::contracts::journal::CONTRACT_VERSION,
+        )),
+        hive_contract::contracts::billing_meter::CONTRACT_ID => Some((
+            hive_contract::billing_meter_contract(),
+            hive_contract::contracts::billing_meter::CONTRACT_VERSION,
+        )),
+        _ => None,
+    }
+}
+
+fn explorer_bound(value: &str) -> (String, bool) {
+    let mut out: String = value.chars().take(CONTRACT_EXPLORER_MAX_VALUE_CHARS).collect();
+    let truncated = value.chars().count() > CONTRACT_EXPLORER_MAX_VALUE_CHARS;
+    if truncated {
+        out.push_str(" ... [truncated]");
+    }
+    (out, truncated)
+}
+
+/// Bounded DISPLAY of one op's payload. This is never a canonical preimage: canonical bytes are
+/// LENGTH-PREFIXED `<len>:<bytes>` and are only ever rebuilt by the crate's own hashing code.
+fn explorer_payload(op: &hive_contract::Op) -> (Value, usize, bool) {
+    let mut out = serde_json::Map::new();
+    let mut truncated = false;
+    let total = op.payload.len();
+    for (k, v) in op.payload.iter().take(CONTRACT_EXPLORER_MAX_PAYLOAD_KEYS) {
+        let lower = k.to_ascii_lowercase();
+        let sensitive = [
+            "secret", "token", "password", "credential", "cookie", "authorization", "private",
+        ]
+        .iter()
+        .any(|s| lower.contains(s));
+        let (key, _) = explorer_bound(k);
+        let (shown, cut) = explorer_bound(v);
+        truncated |= cut;
+        out.insert(
+            key,
+            Value::String(if sensitive { "[redacted]".to_string() } else { shown }),
+        );
+    }
+    let shown_keys = out.len();
+    (
+        Value::Object(out),
+        total.saturating_sub(shown_keys),
+        truncated,
+    )
+}
+
+fn explorer_effect(contract: &hive_contract::Contract, kind: &str) -> &'static str {
+    match contract.spec(kind).map(|s| s.effect) {
+        Some(hive_contract::Effect::StateWrite) => "StateWrite",
+        Some(hive_contract::Effect::LogOnly) => "LogOnly",
+        None => "undeclared",
+    }
+}
+
+/// Build the whole view off the serving runtime. Every claim here is RECOMPUTED from this node's
+/// retained window, never copied from a stored "verified" flag.
+fn explorer_view(
+    contract: &hive_contract::Contract,
+    version: u32,
+    log: &hive_contract::OpLog,
+    node: &str,
+    public_key_hex: &str,
+    limit: usize,
+    before_seq: u64,
+) -> Value {
+    let base = log.base();
+    let next_seq = log.next_seq();
+    let retained = log.len();
+    let entries = log.entries();
+
+    let within_budget = retained <= CONTRACT_EXPLORER_MAX_REPLAY_ENTRIES;
+    let chain = if !within_budget {
+        json!({
+            "ok": Value::Null,
+            "entries_walked": 0,
+            "reason": "retained window exceeds the bounded replay budget; chain was NOT walked",
+        })
+    } else if retained == 0 {
+        // verify_chain() on an empty window returns Ok vacuously. An empty RETAINED window is
+        // UNKNOWN, not clean: compaction, a durable-store fault or a rejected segment can all
+        // produce it. Say so instead of reporting a reassuring green "consistent".
+        json!({
+            "ok": Value::Null,
+            "entries_walked": 0,
+            "reason": "no retained entries to walk; an empty retained window is UNKNOWN, not clean",
+        })
+    } else {
+        match log.verify_chain() {
+            Ok(()) => json!({ "ok": true, "entries_walked": retained, "break": Value::Null }),
+            Err(b) => json!({
+                "ok": false,
+                "entries_walked": retained,
+                "break": { "seq": b.seq, "expected": b.expected, "stored": b.stored },
+            }),
+        }
+    };
+
+    // Replaying into an empty index is only sound from genesis. After compaction the retained
+    // window starts at a signed checkpoint, so a divergence would be an artefact of the missing
+    // checkpoint, NOT evidence of tampering. Report that honestly instead of a false alarm.
+    let index_replay = if !within_budget {
+        json!({
+            "available": false,
+            "reason": "retained window exceeds the bounded replay budget",
+        })
+    } else if base != 0 {
+        json!({
+            "available": false,
+            "reason": "retained window starts at a signed checkpoint; resuming the index needs that checkpoint",
+        })
+    } else {
+        let published = entries
+            .last()
+            .map(|e| e.ack.index_hash.clone())
+            .unwrap_or_else(|| hive_contract::index_hash(&hive_contract::Index::new()));
+        match hive_contract::verify(contract, log, &published) {
+            Ok(h) => json!({
+                "available": true, "ok": true,
+                "recomputed_index_hash": h, "published_index_hash": published,
+            }),
+            Err(b) => json!({
+                "available": true, "ok": false,
+                "breach": b.to_string(), "published_index_hash": published,
+            }),
+        }
+    };
+
+    let end_idx = before_seq
+        .min(next_seq)
+        .saturating_sub(base)
+        .min(entries.len() as u64) as usize;
+    let start_idx = end_idx.saturating_sub(limit);
+    let has_more = start_idx > 0;
+    let next_before_seq = has_more.then_some(base + start_idx as u64);
+
+    let mut rows: Vec<Value> = Vec::new();
+    for offset in (start_idx..end_idx).rev() {
+        let e = &entries[offset];
+        let seq = base + offset as u64;
+        let expected_prev = if offset == 0 {
+            log.base_prev()
+        } else {
+            entries[offset - 1].entry_hash.as_str()
+        };
+        let (payload, omitted_keys, payload_truncated) = explorer_payload(&e.op);
+        let (tenant, _) = explorer_bound(&e.op.tenant);
+        let (actor, _) = explorer_bound(&e.op.actor);
+        let (target, _) = explorer_bound(&e.op.target);
+        let (contract_label, _) = explorer_bound(&e.op.contract);
+        let (kind_label, _) = explorer_bound(&e.op.kind);
+        rows.push(json!({
+            "seq": seq,
+            "kind": kind_label,
+            "contract": contract_label,
+            "tenant": tenant,
+            "actor": actor,
+            "target": target,
+            "payload": payload,
+            "payload_omitted_keys": omitted_keys,
+            "payload_truncated": payload_truncated,
+            "declared_effect": explorer_effect(contract, &e.op.kind),
+            "execution": {
+                "recorded_success": e.ack.success,
+                "recorded_error": e.ack.error.as_deref().map(|s| explorer_bound(s).0),
+                "index_hash": e.ack.index_hash,
+                "log_head": e.ack.log_head,
+                "ts_ms": e.ack.ts_ms,
+                "recording": "the ack is a MEASUREMENT, not Ok(()); a REFUSED entry is a RECORD of a write that already happened, not a prevention",
+            },
+            "entry_hash": e.entry_hash,
+            "prev_hash": e.prev_hash,
+            "recomputed_entry_hash": e.expected_hash(),
+            "hash_ok": e.hash_is_self_consistent(),
+            "prev_link_ok": e.prev_hash == expected_prev,
+            "log_head_ok": e.ack.log_head == e.entry_hash,
+        }));
+    }
+
+    let returned = rows.len();
+    let declared: Vec<Value> = contract
+        .ops
+        .iter()
+        .map(|(kind, spec)| {
+            json!({
+                "kind": kind,
+                "effect": match spec.effect {
+                    hive_contract::Effect::StateWrite => "StateWrite",
+                    hive_contract::Effect::LogOnly => "LogOnly",
+                },
+            })
+        })
+        .collect();
+
+    json!({
+        "responding_node": node,
+        "scope": "node-local RETAINED WINDOW of ONE contract's append-only oplog on the responding node; public hosts are round-robin DNS, so a later read may reach a different node with a different shard",
+        "seq_note": "seq is a per-contract sequence number in THIS node's own shard; it is NOT a block height, and seqs from different nodes are not comparable",
+        "canonical_note": "canonical bytes are LENGTH-PREFIXED <len>:<bytes>; entry_hash = fluid_core::content_hash(OP_DOMAIN, prev || 0x1c || op.canonical()). No string in this view is a canonical preimage.",
+        "public_key_hex": public_key_hex,
+        "pin_required": true,
+        "contract": {
+            "id": contract.id,
+            "version": version,
+            "declared_kinds": declared,
+        },
+        "shard": {
+            "base": base,
+            "base_prev": log.base_prev(),
+            "next_seq": next_seq,
+            "head": log.head(),
+            "retained": retained,
+            "compacted_prefix": base != 0,
+            "full_history": false,
+            "compaction_note": "entries before base were compacted away under a signed checkpoint; this is the RETAINED WINDOW, not the whole history",
+        },
+        "window": {
+            "returned": returned,
+            "limit": limit,
+            "from_seq": if returned == 0 { Value::Null } else { json!(base + end_idx.saturating_sub(1) as u64) },
+            "to_seq": if returned == 0 { Value::Null } else { json!(base + start_idx as u64) },
+            "has_more": has_more,
+            "next_before_seq": next_before_seq,
+        },
+        "verification": {
+            "kind": "structural self-check by REPLAY of this node's own retained window under this node's own key",
+            "chain": chain,
+            "index_replay": index_replay,
+            "entry_signature": {
+                "verified": false,
+                "reason": "the retained in-memory window carries no per-entry signature; signed segments are verified by contract-audit / contract-transparency with a PINNED key",
+            },
+            "proves": ["publication", "hash-chain integrity", "deterministic index replay from genesis"],
+            "does_not_prove": ["consensus", "finality", "freshness", "fraud detection", "an attestation or compliance verdict"],
+            "trust_limit": "reproducing hashes and the index under the writer's own key is NOT fraud detection; no pinned independent identity is supplied, so a publisher is NOT named",
+        },
+        "entries": rows,
+        "labels": {
+            "entry": "one hash-chained oplog entry at a seq; NOT a block, with NO confirmations",
+            "success": "the executor's recorded OUTCOME (a measurement), not a guarantee the mutation was prevented",
+            "refused": "a REFUSED entry is a RECORD, not a prevention: the caller mutates FIRST and records afterwards",
+            "absent": "no entry is NOT success: an engine or durable-store fault can leave NO entry at all (persist_error), so an empty window is unknown, not clean",
+            "replay": "honesty by REPLAY, not agreement; there is NO consensus and NO bond model; proofs show publication, not freshness",
+        },
+    })
+}
+
+async fn contract_explorer_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: Query<ContractExplorerQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    require_operator(cl)?;
+    let contract_id = q
+        .contract
+        .as_deref()
+        .unwrap_or(hive_contract::contracts::journal::CONTRACT_ID);
+    let Some((contract, version)) = explorer_contract(contract_id) else {
+        return Err((StatusCode::BAD_REQUEST, "unknown contract id".into()));
+    };
+    let limit = q
+        .limit
+        .unwrap_or(CONTRACT_EXPLORER_DEFAULT_LIMIT)
+        .clamp(1, CONTRACT_EXPLORER_MAX_LIMIT);
+    let before_seq = q.before_seq.unwrap_or(u64::MAX);
+    let log = c
+        .contract_engine
+        .snapshot_log(&contract.id)
+        .await
+        .unwrap_or_default();
+    let node = c.node_name.clone();
+    let public_key_hex = c.integrity_signer.public_key_hex().to_string();
+    let view = tokio::task::spawn_blocking(move || {
+        explorer_view(
+            &contract,
+            version,
+            &log,
+            &node,
+            &public_key_hex,
+            limit,
+            before_seq,
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oplog replay failed".into(),
+        )
+    })?;
+    Ok(Json(view))
 }
 
 /// Public mount for [`anycast_table`]: the dashboard Network page reads it, so it takes the

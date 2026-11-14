@@ -99,8 +99,9 @@ transport-failure writer funnels through `health::demote` (withdraws only after 
 
 ## Containers, podman, process lifecycle
 
-- **`KillMode=process` on hive-node.service is load-bearing**. CELLS outlive their process: every boot reaps its own
-previous boot's cells (`hive_backend::reap_orphaned_cells`). Ownership is owner + boot (`hive.owner`, `hive.boot`), never boot alone.
+- **`KillMode=process` on hive-node.service is load-bearing**. CELLS outlive their process: every boot reaps its
+own previous boot's cells (`hive_backend::reap_orphaned_cells`). Ownership is owner + boot (`hive.owner`,
+`hive.boot`), never boot alone.
 - Every container removal is `rm -f -v` (`container_cli::rm_args`): podman takes one lock from a FIXED pool (2048) per
 container AND per volume; leaks surface as 503 `CAPACITY_EXHAUSTED`. **Never `podman volume prune`**: reclaim is gated
 on `is_anonymous_volume` (64 ascii-hex) AND `dangling=true`. Podman runs `short-name-mode=enforcing`, so tenant `FROM`
@@ -112,10 +113,11 @@ refs must be qualified.
 (`NodeInfo::wasm_runtime`/`bun_runtime` from `RuntimeCapabilitySource`; `None` = NOT CAPABLE, unlike `disk_free_gb == 0`).
 Placement gates through ONE predicate shared by `place`, lease-stickiness and `dispatch_fallbacks` (`schedule::wasm_capable`);
 a missing runtime is a NODE fault (`fault::NODE_RUNTIME_MISSING`).
-- Litebox (Firecracker -> Litebox -> Mock) is NOT Firecracker/gVisor isolation (guest/enforcement share one address space; seccomp-bpf is
-only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes
-on that host with the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the flag alone, never macOS.
-`litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`: ANY change rebuilds every artifact.
+- Litebox (Firecracker -> Litebox -> Mock) is NOT Firecracker/gVisor isolation (guest/enforcement share one
+address space; seccomp-bpf is only backstop): a node is Litebox only after `hive-cloud --litebox-probe` passes
+on that host with the exact staged runner AND `litebox_verified=true` on its `hosts.ini` line, never the
+flag alone, never macOS. `litebox-bind-shim.js` and guest `/etc` feed `runtime_source_sha256`: ANY change
+rebuilds every artifact.
 - A sandbox's live cell is on ONE node (`SandboxRecord::owner_node`); leader routes.
 
 ## Runtime discipline (the serving runtime never stalls)
@@ -188,16 +190,17 @@ a full `PendingTable` EVICTS the oldest stuck connection; `splice` copies each d
 ## Contract and execution transparency (managed-db)
 
 - `crates/hive-contract`: a contract is DATA, not code. `Contract::declare` refuses `OpenParticipation` +
-`StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` MUST recheck. `crates/hive-cloud/src/db_contract.rs` is the
-ONLY seam: it does NOT authorize or fail the request — **the caller mutates FIRST and records afterwards**,
-so a REFUSED entry is a RECORD, not a prevention (counts writes even on refusal). A `db.write` outcome is a
-MEASUREMENT, not `Ok(())`; `created` forwards its outcome, `purged`/`deleted` pass `Ok(())`.
-Unattributed write =
-REFUSED `unattributed:<kind>:<tenant>::<name>`; unopenable log: NO entry; persist fault: `persist_error`.
-`docs/contract-platform-seam.md`.
+`StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` MUST recheck.
+`crates/hive-cloud/src/db_contract.rs` is the ONLY seam: it does NOT authorize or fail the request —
+**the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD, not a prevention (counts writes even on refusal).
+A `db.write` outcome is a MEASUREMENT, not `Ok(())`; `created` forwards its outcome, `purged`/`deleted`
+pass `Ok(())`. Unattributed = REFUSED `unattributed:<kind>:<tenant>::<name>`; unopenable log: NO entry;
+persist fault: `persist_error`. `docs/contract-platform-seam.md`.
+- `/v1/admin/contract/explorer` is NODE-LOCAL, ADMIN `RULES` + `require_operator`, bounded replay
+ONLY. `docs/explorer.md`.
 - Canonical bytes are LENGTH-PREFIXED `<len>:<bytes>` (a bare join is NOT injective). `entry_sig_preimage`
 folds `Ack::canonical` into the signed preimage (`entry_hash` = BLAKE3(OP_DOMAIN||prev||0x1c||op.canonical());
-it cannot cover the ack, since `ack.log_head` IS that hash). No PINNED identity = Inadmissible, never Dishonest.
+`ack.log_head` IS that hash, so it cannot cover the ack). No PINNED identity = Inadmissible, never Dishonest.
 Checkpoint close defers to the drain; `submit` starts it, `wrote` awaits `submit`, not the close; `Store::append`
 closes inline past 1 deferred close, rebuild inline. Read EVERY segment a window spans.
 - **Vitra has no consensus**: honesty by REPLAY, not agreement; **NO bond model**. Proofs show
@@ -207,22 +210,19 @@ state is the NODE-LOCAL signed oplog shard, ZERO `PlatformSnapshot` shape change
 self-consistency, NOT fraud detection; a second WORM chain is NOT independent. `evidence.rs` = signed
 node-local SOC 2 TECHNICAL EVIDENCE, NEVER an attestation/compliance verdict; AT-1/AT-2 UNMET. BUSL-1.1
 no-grant: concepts only. `docs/double-entry-design.md`, `docs/soc2-evidence-report.md`.
-
-
 ## Account 2FA (optional per-account TOTP)
 
 - OTP gate INSIDE `admin::mint_token` before `auth::issue`; `step_up_ok` re-checks per request from
-BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from leader
-forwarding; `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local
-check or node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in
-`ui/lib/team-role.ts`. Dev/GET/HEAD/OPTIONS never gated. `docs/account-2fa.md`.
+BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, no leader hop; `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local
+check or node-local store is a bypass. Dev/GET/HEAD/OPTIONS never gated. `docs/account-2fa.md`.
 - ONE OTP per bounded LOGIN SESSION (`totp::session_step_up_secs` 8 h, `HIVE_2FA_SESSION_SECS`), NOT
-per mint/team/5 min: ORIGINAL signed `otp_at` carries forward ONLY from a VERIFIED prior token (`auth::verified_session_otp_at`); forged/foreign/garbage fail closed. `force_otp` demands
-a fresh code to disable; a stolen cookie keeps 8 h. `/api/token` reads `prior_token` SERVER-SIDE
-from the httpOnly cookie, NEVER a client body field; QR label account-scoped. A challenge DETACHED
-from `mintInFlight` + module-scope OTP form: no read waits on a human or spends the failure budget.
-- State per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` (`serde(default)`).
-Secrets/carve-outs/replay/tombstones/residual: `docs/account-2fa.md`.
+per mint/team/5 min: ORIGINAL signed `otp_at` carries forward ONLY from a VERIFIED prior token
+(`auth::verified_session_otp_at`); forged/foreign/garbage fail closed. `force_otp` demands a fresh
+code to disable; a stolen cookie keeps 8 h. `/api/token` reads `prior_token` from the httpOnly cookie
+SERVER-SIDE, NEVER a client body field; QR label account-scoped. A challenge DETACHED from
+`mintInFlight` + module-scope OTP form: no read waits on a human or spends the failure budget.
+- State per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` (`serde(default)`);
+secrets/carve-outs/replay/tombstones/residual: `docs/account-2fa.md`.
 
 ## Browser lane
 
@@ -239,12 +239,14 @@ restore-on-failure transaction in `vercel_dns::plan_writes` (creates before dele
 - **Advertise only what peers have PROVEN**: `NodeInfo::dns_ns` needs `dns_bind_reaches_internet` (necessary,
 never sufficient); `dns_probe` proves reachability and `validate_nameservers` admits a node attested from TWO distinct
 REGIONS, never self-attested.
-- A platform-wide public-DNS question (`www` SAN, `_hive-verify` TXT) is asked of `dns_quorum::VANTAGES` and admitted
-by `Tally::admits`: a resolver that errors ABSTAINS (never a "no"), a MAJORITY of ANSWERING operators with a floor of 2.
-- Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s `aliases_full`) before any first-label/wildcard lookup.
-Attachment needs observed DNS proof through ONE helper (`mark_domain_verified`); only a VERIFIED record locks to its tenant;
-detach/activate require `require_domain_owner_if_exists` AND a stored challenge whose project matches the path. Reserved
-proof names (`_acme-challenge`, `_hive-verify`) are rejected in add/import/zone-parse.
+- A platform-wide public-DNS question (`www` SAN, `_hive-verify` TXT) is asked of `dns_quorum::VANTAGES`
+and admitted by `Tally::admits`: an erroring resolver ABSTAINS (never "no"), a MAJORITY of ANSWERING
+operators with a floor of 2.
+- Custom domains: routing keys are FULL hostnames (`fluid_gateway`'s `aliases_full`) before any
+first-label/wildcard lookup. Attachment needs observed DNS proof via ONE helper (`mark_domain_verified`);
+only a VERIFIED record locks to its tenant; detach/activate require `require_domain_owner_if_exists`
+AND a stored challenge whose project matches the path. Reserved proof names (`_acme-challenge`,
+`_hive-verify`) are rejected in add/import/zone-parse.
 
 ## Security gates (never weaken)
 
@@ -274,8 +276,8 @@ administers (`caller_administers`) or operator.
 nobody changes, removes or grants above their own role; the last Owner stays), and `remove_checked` authorises
 EVERY row a removal deletes (`check_roster_removal`), so a ghost row cannot carry the Owner away. Directory
 sync only adds (`add_member_if_absent`) or removes a plain member (`remove_plain_member`).
-- Only the dashboard SERVER writes the identity mirror (`identity_sync` under `mint_allowed`): it feeds `team_create` and
-`caller_administers`, so a browser-originated sync records nothing.
+- Only the dashboard SERVER writes the identity mirror (`identity_sync` under `mint_allowed`): it feeds
+`team_create`/`caller_administers`, so a browser-originated sync records nothing.
 - `POST /v1/token` checks the internal token FIRST: only a failing request spends the per-peer guess budget
 (`mint_rate_limiter`, 20/min); a legitimate mint spends `HIVE_MINT_USER_PER_MIN` (30) and `HIVE_MINT_BACKSTOP_PER_MIN`
 (600: the dashboard is one peer per user). A token carries its role for its whole life: `admin`/`member`/`viewer`
@@ -291,22 +293,22 @@ refuse non-public addresses at connect (no proxy; redirects re-validated per hop
 tenant app, `internal_client` (no redirect) for peers/platform URLs. A tenant-facing failure is one of
 `hive_outbound::describe`'s fixed sentences; `HIVE_OUTBOUND_ALLOW_PRIVATE=1` is a developer-only escape, REFUSED when
 `HIVE_JWT_SECRET` is set.
-- A caller-controlled string never reaches a URL, HTML or a `Location` by interpolation: parse a trusted base, then
-`Url::set_host`/`set_path` (`state::host_scoped_https_url`, `edge::with_request_target`; `//host` is an authority, so `Url::join`
-needs a same-origin check). `edge::password_page` has NO form `action`, shown text passes `edge::html_escape`, a redirect passes
-`auth::same_origin_path`.
+- A caller-controlled string never reaches a URL, HTML or `Location` by interpolation: parse a trusted
+base, then `Url::set_host`/`set_path` (`state::host_scoped_https_url`, `edge::with_request_target`;
+`//host` is an authority, so `Url::join` needs a same-origin check). `edge::password_page` has NO form
+`action`, shown text passes `edge::html_escape`, a redirect passes `auth::same_origin_path`.
 - A tenant never names a loopback address: `world::world_config` accepts one only when it equals the REST URL of one of the project's
 own Redis records on this node (`DatabaseStore::local_redis_rest_urls`).
-- A plan is bought or granted, never self-assigned: `admin::apply_plan_everywhere(.., PlanChange)` refuses a raise
-without `Paid` or an operator; a REQUESTED plan resolves via `billing::known_plan` (never `plan_spec`'s Hobby fallback);
-`BillingStore::confirm_checkout(id, Payment)` completes an unproven payment only where `billing::mock_checkout_allowed()`
-and a Stripe one only when `billing::session_paid`; every cents input is bounded by `billing::MAX_AMOUNT_CENTS` (a `u64
-as i64` goes NEGATIVE).
+- A plan is bought or granted, never self-assigned: `admin::apply_plan_everywhere(.., PlanChange)` refuses
+a raise without `Paid` or an operator; a REQUESTED plan resolves via `billing::known_plan` (never
+`plan_spec`'s Hobby fallback); `BillingStore::confirm_checkout(id, Payment)` completes an unproven
+payment only where `billing::mock_checkout_allowed()`, a Stripe one only when `billing::session_paid`;
+every cents input is bounded by `billing::MAX_AMOUNT_CENTS` (a `u64 as i64` goes NEGATIVE).
 - SAML ACS verifies no assertion signature, so only the path team's owner/admin may post it (`require_team_floor`); SCIM is open at the
 platform gate, managed by an owner/admin and authenticated ONLY by its per-team bearer (`scim_team_for_token` fails closed);
 `zkauth::bootstrap` binds the proof's ring to the project's owner (`local_owning_team`).
-- A route that execs tenant commands checks the ACTIVE backend (`/v1/sandbox` refuses on Mock, which runs on the HOST shell), and its
-per-tenant cap is held by the submitted JOB, never the request's Drop guard.
+- A route that execs tenant commands checks the ACTIVE backend (`/v1/sandbox` refuses on Mock, which runs on
+the HOST shell); its per-tenant cap is held by the submitted JOB, never the request's Drop guard.
 - A cookie, token or stored password that DECIDES access is read with `secrets::try_decrypt`, never the passthrough `decrypt`; the
 password-gate unlock cookie is a server-sealed `v1.<expiry ms>.<HMAC>` over (deployment, expiry, stored hash)
 (`EnterpriseStore::seal_password_cookie`, `HIVE_PW_COOKIE_TTL_SECS`), `Secure` unless plain-http loopback

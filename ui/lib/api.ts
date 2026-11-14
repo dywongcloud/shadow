@@ -476,6 +476,9 @@ function tenantScopedKey(path: string): string {
 /** Per-path GET cache TTL, first match wins: stable data (catalogs, settings, billing) long, live data (logs, workflow
  *  runs, build status) the short default; any mutation clears the whole cache. */
 const PATH_TTL: Array<[RegExp, number]> = [
+  // A node-local oplog read is never cached: another poll may reach a DIFFERENT node's shard
+  // behind round-robin DNS, and a cached answer would misattribute it to the first responder.
+  [/^\/v1\/admin\/contract\/explorer/, 0],
   [/^\/v1\/regions(\/catalog)?$/, 10 * 60_000],
   [/^\/v1\/teams\/?$/, 60_000],
   [/\/settings$/, 30_000],
@@ -531,8 +534,13 @@ export async function apiGet<T>(path: string, opts?: { fresh?: boolean }): Promi
     }
     const data = (await r.json()) as T;
     /** An anonymous-tenant 200 is NOT data: never cache it as this tenant's answer. A returning
-     *  browser whose 2FA form is open must refetch once the human answers (`hive-otp-satisfied`). */
-    if (r.headers.get("x-hive-anon") === "1") return data;
+     *  browser whose 2FA form is open must refetch once the human answers (`hive-otp-satisfied`).
+     *  Delete the in-flight slot too: leaving the RESOLVED promise in `getCache` would make every
+     *  later call (even `fresh: true`) replay the anonymous body forever. */
+    if (r.headers.get("x-hive-anon") === "1") {
+      getCache.delete(key);
+      return data;
+    }
     getCache.set(key, { at: Date.now(), data });
     return data;
   })();
@@ -735,7 +743,11 @@ export async function opsGet<T>(path: string, opts?: { fresh?: boolean }): Promi
     const r = await fetchWithTimeout(`${OPS_BASE}${path}`, { cache: "no-store", headers: teamHeaders() }, 20_000);
     if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
     const data = (await r.json()) as T;
-    if (r.headers.get("x-hive-anon") === "1") return data; // never cache an anonymous ops answer
+    if (r.headers.get("x-hive-anon") === "1") {
+      // Never leave a resolved anonymous Promise in the cache: see apiGet's note.
+      getCache.delete(key);
+      return data;
+    }
     getCache.set(key, { at: Date.now(), data });
     return data;
   })();
