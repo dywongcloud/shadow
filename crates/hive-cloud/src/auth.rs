@@ -152,12 +152,15 @@ pub fn issue_with_secret(
     Ok(token)
 }
 
-/// The ONLY writer of the otp_at claim: admin::mint_token calls this after a verified OTP or
-/// one-use recovery code. The otp_at value is the unix-seconds verification timestamp returned by
-/// TotpStore::verify_login; it is NEVER taken from TokenReq, a header, a cookie or any other
-/// client-supplied string, and it is emitted INSIDE the signed payload (HS256 covers it). Claims
-/// deliberately has no such field: three explicit Claims literals in gossip.rs have no struct
-/// update, and serde ignores the extra claim on decode, so every pre-roll token still verifies.
+/// The ONLY writer of the otp_at claim: admin::mint_token calls this after a verified OTP, a
+/// one-use recovery code, or a signature-verified carry-forward of that SAME instant from the
+/// prior login-session token. The otp_at value is the ORIGINAL unix-seconds verification
+/// timestamp, never `now` and never taken from TokenReq, a header, a cookie or any other
+/// UNVERIFIED client-supplied string; a carried value is read only through
+/// verified_session_otp_at after auth::verify checks the HS256 signature and expiry. It is
+/// emitted INSIDE the signed payload (HS256 covers it). Claims deliberately has no such field:
+/// three explicit Claims literals in gossip.rs have no struct update, and serde ignores the extra
+/// claim on decode, so every pre-roll token still verifies.
 pub fn issue_otp_satisfied(
     sub: &str,
     tenant: &str,
@@ -208,10 +211,11 @@ fn issue_otp_satisfied_with_secret(
     )?)
 }
 
-/// PRIVATE raw JWT payload parse. This is NOT signature verification. The ONLY sanctioned
-/// request-path caller is step_up_claim, which demands a Claims value that principal already
-/// produced from verify_with_secret. Never make this pub; never call it on an unauthenticated
-/// raw token. A hive_ API key and the queue token have no JWT payload and yield None.
+/// PRIVATE raw JWT payload parse. This is NOT signature verification. Its ONLY caller is
+/// step_up_claim, which demands a Claims value that verify / verify_with_secret (principal or
+/// verified_session_otp_at) already produced from a checked signature. Never make this pub; never
+/// call it on an unauthenticated raw token. A hive_ API key and the queue token have no JWT
+/// payload and yield None.
 fn otp_payload_claims(token: &str) -> Option<(String, u64)> {
     let payload = token.split('.').nth(1)?;
     let payload = payload.trim_end_matches('=');
@@ -287,6 +291,21 @@ fn step_up_subject(claims: &Claims) -> Option<&str> {
     Some(&claims.sub)
 }
 
+/// The otp_at of a PRIOR login-session token for the SAME sub, read only AFTER the REAL
+/// HIVE_JWT_SECRET signature and expiry are verified by verify. admin::mint_token uses this for
+/// the bounded session carry-forward (team switch, keeper refresh): it refuses a foreign sub, a
+/// machine identity (the SINGLE step_up_subject carve-out) and any token without a signed otp_at.
+/// FAILS CLOSED on a missing, invalid, expired, foreign or machine token; otp_payload_claims is
+/// never reached with an unverified token, and the returned instant is the ORIGINAL one.
+pub fn verified_session_otp_at(prior: &str, expected_sub: &str) -> Option<u64> {
+    let claims = verify(prior).ok()?;
+    if claims.sub != expected_sub {
+        return None;
+    }
+    step_up_subject(&claims)?;
+    step_up_claim(&claims, Some(prior))
+}
+
 /// Per-request 2FA step-up re-check. Called from BOTH require_auth and main::admin_ingress (both
 /// authenticate through principal), so a leader-forwarded mutation cannot bypass it. An OTP is
 /// demanded ONLY when step_up_subject yields a human sub AND a stored otp_required row exists;
@@ -320,8 +339,11 @@ pub fn step_up_ok(
     let Some(at) = otp_at else {
         return false;
     };
+    // The LOGIN-SESSION window, bounded from the ORIGINAL OTP instant. fresh_step_up alone keeps
+    // STEP_UP_WINDOW_SECS: disabling 2FA still demands a code entered now.
     let now = hive_core::now_ms() / 1000;
-    at <= now.saturating_add(60) && now.saturating_sub(at) <= crate::totp::STEP_UP_WINDOW_SECS
+    at <= now.saturating_add(60)
+        && now.saturating_sub(at) <= crate::totp::session_step_up_secs()
 }
 
 /// Verify a token and return its claims.

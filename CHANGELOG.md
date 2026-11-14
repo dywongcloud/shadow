@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-11-13 - 2FA: one OTP per bounded login session, not per mint/team/5 minutes
+
+An enrolled account runs a 2FA challenge on every mint, on every team switch and on the keeper's
+~70% re-mint, and `step_up_ok` demands an `otp_at` no older than 300 s on every protected request.
+A fresh logged-in browser makes it worse: `ensureSessionMinted()` gates each `/cloud` read on the
+single-flight mint, which blocks on the OTP form for up to five minutes, and a challenge before
+hydration finds no registered form at all, so the mint consumes the failure budget and reads go
+anonymous. The QR label embeds `currentTeam()`, so switching teams shows a different account for
+the same per-account enrollment.
+
+`totp::session_step_up_secs()` (8 h default, `HIVE_2FA_SESSION_SECS` clamped to 300-86400 s) is now
+the `step_up_ok` window; `fresh_step_up` keeps 300 s for disabling the factor. A re-mint carries
+the ORIGINAL signed `otp_at` forward ONLY from a VERIFIED prior token (`auth::verified_session_otp_at`:
+signature, `exp`, subject, single machine carve-out), so a stolen cookie cannot become perpetual;
+forged, foreign-subject and garbage priors fail closed to a new challenge. `force_otp` demands a
+fresh code. `/api/token` derives `prior_token` server-side from the httpOnly cookie (never a client
+body field), the QR label is the verified Clerk user id, and the challenge is detached from
+`mintInFlight` with a module-scope OTP form, so no read waits on a human or spends the failure budget.
+
+Accepted residual: a stolen session cookie keeps 8 h instead of 300 s. `HIVE_JWT_SECRET` is not
+rotated; already-issued JWTs are not revoked. A deployment/CI result is not claimed by this entry.
+
 ## 2026-11-13 - ui: analytics console uses the dashboard's own semantic theme
 
 The project and storage analytics consoles carried a PARALLEL hardcoded palette (`--a-*` /

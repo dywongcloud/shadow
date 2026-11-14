@@ -4,6 +4,25 @@ import { useEffect, useRef, useState } from "react";
 import { Button, Card, Input } from "@/components/ui";
 import { registerOtpPrompt } from "@/lib/api";
 
+/** EAGER, module-scope registration (not in `useEffect`): a fresh logged-in browser's FIRST mint can
+ *  arrive before hydration, and a missing prompt would fail the challenge closed with no form at all.
+ *  Requests are never parked on this human: `ui/lib/api.ts` detaches the flow from the single-flight mint. */
+type PendingChallenge = { error: string; resolve: (code: string | null) => void };
+let sink: ((p: PendingChallenge) => void) | null = null;
+const queued: PendingChallenge[] = [];
+registerOtpPrompt((error) => new Promise<string | null>((resolve) => {
+  const pending: PendingChallenge = { error, resolve };
+  if (sink) { sink(pending); return; }
+  /** Before hydration (or after an HMR unmount) the form cannot answer yet. Bound the wait and fail
+   *  closed, so a queued challenge can never hang a caller indefinitely. */
+  const timer = setTimeout(() => {
+    const i = queued.indexOf(pending);
+    if (i >= 0) queued.splice(i, 1);
+    resolve(null);
+  }, 30_000);
+  queued.push({ error, resolve: (code) => { clearTimeout(timer); resolve(code); } });
+}));
+
 /** The ONLY login-time 2FA form. It appears on the typed `otp_required` refusal from `/api/token`,
  *  holds NO challenge id (that stays in the in-flight mint in `ui/lib/api.ts`), and returns just the
  *  code. A 6-digit TOTP or a one-use recovery code both travel in the `otp` re-POST field. */
@@ -16,17 +35,19 @@ export function LoginOtpChallenge() {
   const resolver = useRef<((value: string | null) => void) | null>(null);
 
   useEffect(() => {
-    registerOtpPrompt((err) => {
-      setError(err);
+    sink = (p) => {
+      setError(p.error);
       setCode("");
       setRecovery("");
       setUseRecovery(false);
       setOpen(true);
-      return new Promise<string | null>((resolve) => { resolver.current = resolve; });
-    });
+      resolver.current = p.resolve;
+    };
+    for (const p of queued.splice(0)) sink(p);
     return () => {
-      registerOtpPrompt(null);
+      sink = null;
       resolver.current?.(null);
+      resolver.current = null;
     };
   }, []);
 

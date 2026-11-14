@@ -107,20 +107,30 @@ function teamHeaders(): Record<string, string> {
 /** The mint running or queued last in this tab: every mint funnels through `mintSessionToken`, ONE at a time per tab. */
 let mintInFlight: Promise<string | null> | null = null;
 
+/** Options for one mint. `forceOtp` refuses the session carry-forward so a FRESH code is demanded
+ *  (the explicit "refresh sign-in" before disabling 2FA); it can only make the gate stricter.
+ *  `awaitOtp` makes that ONE explicit caller wait for the human answer it asked for. */
+export interface MintOptions { forceOtp?: boolean; awaitOtp?: boolean }
+
 /** Re-mints the httpOnly `hive_jwt` cookie for `team` (default: current) and resolves to the tenant the mint actually
- *  granted, or `null` on failure: callers must treat `null` as "no valid session for this tenant". Every automatic and
- *  explicit mint funnels through here, ONE at a time per tab (a mint asked for while another runs waits its turn, so an
- *  explicit one, a team switch or an identity sync, still fires after it); only the automatic ones consult the failure budget. */
-export function mintSessionToken(team?: string): Promise<string | null> {
+ *  granted, or `null`: no valid session, OR a 2FA challenge is being answered by a human (never a transport wait).
+ *  Every mint funnels through here, ONE at a time per tab, but a human-paced challenge releases the single-flight
+ *  AT ONCE, so no `/cloud` request is parked behind a five-minute modal. Only real failures spend the budget. */
+export function mintSessionToken(team?: string, opts: MintOptions = {}): Promise<string | null> {
   if (typeof window === "undefined") return Promise.resolve(null);
+  /** An OTP form is already open (or in its short cooldown): another mint would re-challenge and re-prompt.
+   *  The explicit step-up is the ONE caller allowed through, because it must demand a fresh code. */
+  if (otpBusy() && !opts.forceOtp) return Promise.resolve(null);
   const behind = mintInFlight;
   const run: Promise<string | null> = (async () => {
     if (behind) await behind.catch(() => null);
-    const minted = await mintOnce(team);
-    noteMintOutcome(minted?.tenant ?? null);
-    if (minted) noteMinted(minted.sentAt, minted.lifeMs, minted.tenant);
+    const outcome = await mintOnce(team, opts);
+    if (outcome.kind === "otp") return opts.awaitOtp ? await outcome.flow : null;
+    const session = outcome.kind === "ok" ? outcome.session : null;
+    noteMintOutcome(session?.tenant ?? null);
+    if (session) noteMinted(session.sentAt, session.lifeMs, session.tenant);
     else announceMintFailure();
-    return minted?.tenant ?? null;
+    return session?.tenant ?? null;
   })().finally(() => {
     if (mintInFlight === run) mintInFlight = null;
   });
@@ -165,11 +175,67 @@ function challengeIdOf(d: unknown): string | null {
 }
 
 /** The ONE 6-digit form (mounted in the root layout) registers here. `null` = no form mounted, so a
- *  challenge fails closed instead of silently minting. */
+ *  challenge fails closed instead of silently minting. A challenge that arrives BEFORE hydration waits
+ *  a SHORT bounded time for that registration: a fresh logged-in browser is not refused outright. */
 type OtpPrompt = (error: string) => Promise<string | null>;
 let otpPrompt: OtpPrompt | null = null;
-export function registerOtpPrompt(fn: OtpPrompt | null): void { otpPrompt = fn; }
+const otpPromptWaiters: Array<(fn: OtpPrompt) => void> = [];
+export function registerOtpPrompt(fn: OtpPrompt | null): void {
+  otpPrompt = fn;
+  if (fn) { const waiting = otpPromptWaiters.splice(0); for (const wake of waiting) wake(fn); }
+}
 const OTP_PROMPT_TIMEOUT_MS = 5 * 60_000;
+const OTP_PROMPT_HYDRATE_MS = 4_000;
+
+/** A HUMAN answering 2FA is never a transport failure: the mint that met a challenge resolves at once,
+ *  the challenge runs on its own, and no `/cloud` request is parked behind a five-minute modal. A
+ *  dismissed or expired prompt spends NO failure budget; a short cooldown stops it re-opening per poll. */
+let otpFlowInFlight: Promise<string | null> | null = null;
+let otpPromptOpen = false;
+let otpBackoffUntilMs = 0;
+const OTP_BACKOFF_MS = 30_000;
+function otpBusy(): boolean { return otpPromptOpen || Date.now() < otpBackoffUntilMs; }
+
+/** Wait briefly for the root-layout form to register on a freshly hydrated page, then fail closed. */
+function promptForCode(error: string): Promise<string | null> {
+  if (otpPrompt) return otpPrompt(error);
+  return new Promise((resolve) => {
+    let wake: (fn: OtpPrompt) => void;
+    const timer = setTimeout(() => {
+      const i = otpPromptWaiters.indexOf(wake);
+      if (i >= 0) otpPromptWaiters.splice(i, 1);
+      resolve(null);
+    }, OTP_PROMPT_HYDRATE_MS);
+    wake = (fn: OtpPrompt) => { clearTimeout(timer); fn(error).then(resolve, () => resolve(null)); };
+    otpPromptWaiters.push(wake);
+  });
+}
+
+/** ONE human-paced challenge at a time. On success the session clock and mint state move exactly as a
+ *  normal mint would; on cancel they do not move at all, so reads never enter the failure backoff. */
+function startOtpFlow(team: string, clerkTok: string | null, challengeId: string, forceOtp: boolean): Promise<string | null> {
+  if (otpFlowInFlight) return otpFlowInFlight;
+  otpPromptOpen = true;
+  const run = (async () => {
+    const answered = await resolveOtpChallenge(team, clerkTok, challengeId, forceOtp);
+    if (answered) {
+      noteMintOutcome(answered.tenant);
+      noteMinted(answered.sentAt, answered.lifeMs, answered.tenant);
+      /** Reads sent while the form was open went out anonymous: drop their cached answers and tell
+       *  every poller (including one-shot ones) to fetch again with the now-valid cookie. */
+      invalidateApiCache();
+      window.dispatchEvent(new Event("hive-otp-satisfied"));
+      return answered.tenant;
+    }
+    otpBackoffUntilMs = Date.now() + OTP_BACKOFF_MS;
+    return null;
+  })().finally(() => {
+    otpPromptOpen = false;
+    if (otpFlowInFlight === run) otpFlowInFlight = null;
+  });
+  otpFlowInFlight = run;
+  return run;
+}
 
 /** Answers a typed challenge: prompt, re-POST the SAME body plus `challenge_id` + `otp`, and on a new
  *  challenge (wrong code) prompt again. `otp` carries a 6-digit TOTP OR a one-use recovery code: the
@@ -178,13 +244,13 @@ async function resolveOtpChallenge(
   team: string,
   clerkTok: string | null,
   firstChallengeId: string,
+  forceOtp = false,
 ): Promise<{ tenant: string; sentAt: number; lifeMs: number } | null> {
   let challengeId = firstChallengeId;
   let error = "";
   for (;;) {
-    if (!otpPrompt) return null;
     const code = await Promise.race([
-      otpPrompt(error),
+      promptForCode(error),
       new Promise<null>((resolve) => setTimeout(() => resolve(null), OTP_PROMPT_TIMEOUT_MS)),
     ]);
     if (!code) return null;
@@ -195,7 +261,7 @@ async function resolveOtpChallenge(
       r = await fetch("/api/token", {
         method: "POST",
         headers: { "content-type": "application/json", ...(clerkTok ? { authorization: `Bearer ${clerkTok}` } : {}) },
-        body: JSON.stringify({ team, ...(clerkTok ? { clerk_token: clerkTok } : {}), challenge_id: challengeId, otp: code }),
+        body: JSON.stringify({ team, ...(clerkTok ? { clerk_token: clerkTok } : {}), ...(forceOtp ? { force_otp: true } : {}), challenge_id: challengeId, otp: code }),
         signal: ctrl.signal,
       });
     } catch {
@@ -220,14 +286,19 @@ async function resolveOtpChallenge(
   }
 }
 
-/** Re-run the 2FA login challenge to put a FRESH `otp_at` claim in the httpOnly cookie: the backend's
- *  destructive 2FA routes require a step-up no older than five minutes. Same single-flight mint. */
+/** Re-run the 2FA login challenge to put a FRESH `otp_at` claim in the httpOnly cookie: disabling 2FA
+ *  still demands a code entered NOW. `force_otp` refuses the session carry-forward on the server, and
+ *  this explicit caller awaits the human answer to report an honest result. */
 export function refreshTwoFactorStepUp(): Promise<string | null> {
-  return mintSessionToken();
+  return mintSessionToken(undefined, { forceOtp: true, awaitOtp: true });
 }
 
-/** One mint round trip: the tenant it granted, when it was sent and the lifetime it reported (0 when it did not say), or null when it failed. */
-async function mintOnce(team?: string): Promise<{ tenant: string; sentAt: number; lifeMs: number } | null> {
+type MintedSession = { tenant: string; sentAt: number; lifeMs: number };
+type MintOutcome = { kind: "ok"; session: MintedSession } | { kind: "failed" } | { kind: "otp"; flow: Promise<string | null> };
+
+/** One mint round trip: the session it granted, a genuine transport failure, or a typed 2FA challenge
+ *  handed to the ONE human-paced flow (which is never awaited here). */
+async function mintOnce(team?: string, opts: MintOptions = {}): Promise<MintOutcome> {
   const t = team ?? currentTeam();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), MINT_TIMEOUT_MS);
@@ -240,27 +311,29 @@ async function mintOnce(team?: string): Promise<{ tenant: string; sentAt: number
         "content-type": "application/json",
         ...(clerkTok ? { authorization: `Bearer ${clerkTok}` } : {}),
       },
-      body: JSON.stringify({ team: t, ...(clerkTok ? { clerk_token: clerkTok } : {}) }),
+      body: JSON.stringify({ team: t, ...(clerkTok ? { clerk_token: clerkTok } : {}), ...(opts.forceOtp ? { force_otp: true } : {}) }),
       signal: ctrl.signal,
     });
     const raw = (await r.json().catch(() => null)) as OtpChallengeBody | null;
     const challenge = challengeIdOf(raw);
-    if (challenge) return resolveOtpChallenge(t, clerkTok, challenge);
+    if (challenge) {
+      return { kind: "otp", flow: startOtpFlow(t, clerkTok, challenge, opts.forceOtp === true) };
+    }
     if (!r.ok) {
       console.warn(`hive: session mint failed (${raw?.reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
-      return null;
+      return { kind: "failed" };
     }
     const d = raw;
-    if (!d?.ok) return null;
+    if (!d?.ok) return { kind: "failed" };
     mirrorSession(d);
     const backendUnenforced = d.enforced === false;
-    return {
+    return { kind: "ok", session: {
       tenant: backendUnenforced ? t : (d.tenant ?? t),
       sentAt,
       lifeMs: typeof d.expires_in === "number" && d.expires_in > 0 ? d.expires_in * 1000 : 0,
-    };
+    } };
   } catch {
-    return null;
+    return { kind: "failed" };
   } finally {
     clearTimeout(timer);
   }
@@ -382,6 +455,9 @@ function noteMintOutcome(granted: string | null): void {
  *  Resolves at once while minting is in backoff or `failed`; a failed mint lets a later caller retry. */
 export function ensureSessionMinted(): Promise<void> {
   if (typeof window === "undefined" || !MINT_ON) return Promise.resolve();
+  /** A 2FA form is open (or in its short cooldown): don't mint again — that would create a fresh
+   *  challenge on every read — and NEVER wait on a human. Reads go out at once, anonymous. */
+  if (otpBusy()) return Promise.resolve();
   if (mintState === "ok" && !lapsing(sessionClock(), Date.now())) return Promise.resolve();
   const underway = mintInFlight;
   if (underway) return underway.then(() => undefined);
@@ -454,6 +530,9 @@ export async function apiGet<T>(path: string, opts?: { fresh?: boolean }): Promi
       throw refusal ? new ApiError(403, refusal, ROLE_REFUSED) : new Error(`GET ${path} -> ${r.status}`);
     }
     const data = (await r.json()) as T;
+    /** An anonymous-tenant 200 is NOT data: never cache it as this tenant's answer. A returning
+     *  browser whose 2FA form is open must refetch once the human answers (`hive-otp-satisfied`). */
+    if (r.headers.get("x-hive-anon") === "1") return data;
     getCache.set(key, { at: Date.now(), data });
     return data;
   })();
@@ -624,11 +703,16 @@ function usePollWith<T>(fetcher: Fetcher, path: string, intervalMs: number, acti
       setLoading(true);
       load(true);
     };
+    /** A human just answered 2FA: every read sent while the form was open went out anonymous.
+     *  Refetch even the `active=false` one-shot polls, which have no recurring tick. */
+    const onOtpSatisfied = () => load(true);
     if (typeof window !== "undefined") window.addEventListener("hive-team-changed", onTeam);
+    if (typeof window !== "undefined") window.addEventListener("hive-otp-satisfied", onOtpSatisfied);
     return () => {
       if (id) clearInterval(id);
       if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisible);
       if (typeof window !== "undefined") window.removeEventListener("hive-team-changed", onTeam);
+      if (typeof window !== "undefined") window.removeEventListener("hive-otp-satisfied", onOtpSatisfied);
     };
   }, [load, intervalMs, active]);
 
@@ -651,6 +735,7 @@ export async function opsGet<T>(path: string, opts?: { fresh?: boolean }): Promi
     const r = await fetchWithTimeout(`${OPS_BASE}${path}`, { cache: "no-store", headers: teamHeaders() }, 20_000);
     if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
     const data = (await r.json()) as T;
+    if (r.headers.get("x-hive-anon") === "1") return data; // never cache an anonymous ops answer
     getCache.set(key, { at: Date.now(), data });
     return data;
   })();

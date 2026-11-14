@@ -66,10 +66,22 @@ function otpChallengeResponse(challengeId: string, backendStatus: number) {
  *  `x-hive-internal`. Clerk disabled: `{ ok:false }` and no cookie (the backend is unenforced). */
 export async function POST(req: NextRequest) {
   const incoming = (await req.json().catch(() => null)) as
-    | { team?: unknown; clerk_token?: unknown; challenge_id?: unknown; otp?: unknown }
+    | { team?: unknown; clerk_token?: unknown; challenge_id?: unknown; otp?: unknown; force_otp?: unknown }
     | null;
   const challengeId = typeof incoming?.challenge_id === "string" ? incoming.challenge_id.trim() : "";
   const otp = typeof incoming?.otp === "string" ? incoming.otp.trim() : "";
+  /** The ONLY prior token is the httpOnly cookie this server set on this browser: a client-sent
+   *  `prior_token` is a REQUEST, not a grant, and is never read under that name. The backend re-verifies
+   *  the signature, `exp`, subject and the ORIGINAL signed `otp_at` before carrying a login session forward.
+   *  `getAll` picks the live parent-domain cookie over a legacy host-only one the mint expires below. */
+  const priorToken = req.cookies.getAll("hive_jwt").map((c) => c.value).find((v) => !!v) || "";
+  /** An EXPLICIT destructive step-up (refresh before disabling 2FA) asks for a FRESH code. It can only
+   *  make the gate stricter; the caller never decides whether the gate exists. */
+  const forceOtp = incoming?.force_otp === true;
+  const sessionFields = {
+    ...(priorToken ? { prior_token: priorToken } : {}),
+    ...(forceOtp ? { force_otp: true } : {}),
+  };
   /** The re-POST keeps the SAME server-derived TokenReq and adds only the one-shot challenge answer. */
   const challengeFields = {
     ...(challengeId ? { challenge_id: challengeId } : {}),
@@ -90,7 +102,7 @@ export async function POST(req: NextRequest) {
       const r = await fetch(`${ADMIN}/v1/token`, {
         method: "POST",
         headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-        body: JSON.stringify({ sub: "local-dev", tenant: team, role: devRole, email: primaryOwnerEmail(), ...challengeFields }),
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: devRole, email: primaryOwnerEmail(), ...sessionFields, ...challengeFields }),
         cache: "no-store",
       });
       const d = await r.json().catch(() => null);
@@ -195,7 +207,7 @@ function userIdFromSessionToken(tok: string): Promise<string | null> {
     const r = await fetch(`${ADMIN}/v1/token`, {
       method: "POST",
       headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
-      body: JSON.stringify({ sub: userId, tenant, role, email, ...challengeFields }),
+      body: JSON.stringify({ sub: userId, tenant, role, email, ...sessionFields, ...challengeFields }),
       cache: "no-store",
     });
     const d = await r.json().catch(() => null);

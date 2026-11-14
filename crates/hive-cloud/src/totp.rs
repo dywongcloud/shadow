@@ -52,8 +52,29 @@ const RECOVERY_CODE_COUNT: usize = 10;
 /// Dedicated per-sub verification throttle (the mint limiter alone is not enough).
 const VERIFY_PER_WINDOW: u32 = 30;
 const VERIFY_WINDOW_MS: u64 = 60_000;
-/// How fresh a token otp_at must be for a protected mutation on a 2FA account.
+/// How fresh a token otp_at must be for a FRESH step-up (destructive 2FA self-service: disabling
+/// 2FA still demands a code entered now). This is NEVER the login-session window.
 pub const STEP_UP_WINDOW_SECS: u64 = 300;
+
+/// Operator decision (2026-11-13): 2FA is a bounded LOGIN-SESSION factor, not a per-mint or
+/// per-request re-auth. Once a signed-in human has entered one code, every re-mint inside this
+/// window (team switch, token keeper refresh) carries the SAME original otp_at forward, so no
+/// second code is demanded. Accepted residual: a stolen session cookie / OTP-satisfied JWT keeps
+/// this window instead of 300 s; the instant is bounded from the REAL OTP time and never
+/// re-stamped, so a stolen cookie cannot become perpetual. Already-issued JWTs are not revoked
+/// and HIVE_JWT_SECRET is never rotated for this.
+pub const SESSION_STEP_UP_SECS: u64 = 8 * 60 * 60;
+
+/// Session window for auth::step_up_ok and admin::mint_token's otp_at carry-forward.
+/// HIVE_2FA_SESSION_SECS is clamped to 300..=86400; a missing or unparsable value falls back to
+/// SESSION_STEP_UP_SECS. fresh_step_up deliberately keeps the separate STEP_UP_WINDOW_SECS gate.
+pub fn session_step_up_secs() -> u64 {
+    std::env::var("HIVE_2FA_SESSION_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|secs| secs.clamp(300, 86_400))
+        .unwrap_or(SESSION_STEP_UP_SECS)
+}
 
 /// A server-side one-shot login challenge. nonce is CSPRNG material bound to the id; it is never
 /// returned to a client, logged, or placed in a URL.

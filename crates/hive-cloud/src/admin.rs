@@ -436,6 +436,14 @@ struct TokenReq {
     /// 6-digit TOTP code or a one-use recovery code. NEVER logged, never in a URL.
     #[serde(default)]
     otp: String,
+    /// The CURRENT login-session JWT, sent only in this authenticated JSON body. The ORIGINAL
+    /// signed otp_at is carried forward from it after auth::verify checks the signature. NEVER
+    /// logged, never placed in a URL, Location or argv; empty on the first sign-in.
+    #[serde(default)]
+    prior_token: String,
+    /// A destructive "refresh sign-in" demands a NEW code even with a valid prior_token.
+    #[serde(default)]
+    force_otp: bool,
 }
 fn default_sub() -> String {
     "user".into()
@@ -629,33 +637,55 @@ async fn mint_token(
     // roles::gate short-circuits for platform_admin and fleet tokens, and /v1/token is an open
     // route exempt from leader forwarding, so this gate can live NOWHERE else. Dev (unenforced)
     // mode bypasses 2FA entirely and NEVER reports otp_required as satisfied.
+    // 2FA is a bounded LOGIN-SESSION factor: one verified code covers every re-mint (team switch,
+    // keeper refresh) inside session_step_up_secs, measured from the ORIGINAL otp_at.
     let mut otp_at: Option<u64> = None;
     if crate::auth::enforced() && c.totp.requires_otp(req.sub.as_str()) {
-        if req.challenge_id.trim().is_empty() {
-            return match c.totp.create_challenge(req.sub.as_str(), now) {
-                Ok(id) => {
-                    let mut resp = Json(json!({
-                        "otp_required": true,
-                        "challenge_id": id,
-                        "status": "2fa_required",
-                    }))
-                    .into_response();
-                    *resp.status_mut() = StatusCode::FORBIDDEN;
-                    resp
-                }
-                Err(e) => (e.status(), e.message()).into_response(),
-            };
-        }
-        let code = req.otp.trim();
-        if code.is_empty() {
-            return (StatusCode::BAD_REQUEST, "otp required").into_response();
-        }
-        match c
-            .totp
-            .verify_login(req.sub.as_str(), req.challenge_id.trim(), code, now)
-        {
-            Ok(at) => otp_at = Some(at),
-            Err(e) => return (e.status(), e.message()).into_response(),
+        if !req.challenge_id.trim().is_empty() {
+            // The one-shot challenge answer: the existing verify_login path.
+            let code = req.otp.trim();
+            if code.is_empty() {
+                return (StatusCode::BAD_REQUEST, "otp required").into_response();
+            }
+            match c
+                .totp
+                .verify_login(req.sub.as_str(), req.challenge_id.trim(), code, now)
+            {
+                Ok(at) => otp_at = Some(at),
+                Err(e) => return (e.status(), e.message()).into_response(),
+            }
+        } else {
+            if !req.force_otp && !req.prior_token.trim().is_empty() {
+                // prior_token travels only in this authenticated JSON body: NEVER logged, never in
+                // a URL, Location or argv. verified_session_otp_at checks the HS256 signature,
+                // expiry, sub and machine carve-out before it reads the signed otp_at. The
+                // ORIGINAL instant is carried forward (never re-stamped to now), so a stolen
+                // session cookie expires with the session instead of becoming perpetual.
+                let now_s = now / 1000;
+                let window = crate::totp::session_step_up_secs();
+                otp_at = crate::auth::verified_session_otp_at(
+                    req.prior_token.trim(),
+                    req.sub.as_str(),
+                )
+                .filter(|at| {
+                    *at <= now_s.saturating_add(60) && now_s.saturating_sub(*at) <= window
+                });
+            }
+            if otp_at.is_none() {
+                return match c.totp.create_challenge(req.sub.as_str(), now) {
+                    Ok(id) => {
+                        let mut resp = Json(json!({
+                            "otp_required": true,
+                            "challenge_id": id,
+                            "status": "2fa_required",
+                        }))
+                        .into_response();
+                        *resp.status_mut() = StatusCode::FORBIDDEN;
+                        resp
+                    }
+                    Err(e) => (e.status(), e.message()).into_response(),
+                };
+            }
         }
     }
     // -----------------------------------------------------------------------

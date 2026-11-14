@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, Check, Copy, ShieldCheck, TriangleAlert } from "lucide-react";
 import { Badge, Button, Card, Input, PageHeader } from "@/components/ui";
-import { ApiError, ROLE_REFUSED, apiGet, apiSend, currentTeam, refreshTwoFactorStepUp } from "@/lib/api";
+import { ApiError, ROLE_REFUSED, apiGet, apiSend, refreshTwoFactorStepUp } from "@/lib/api";
 import { reportError } from "@/components/toast";
 import { qrcodegen } from "@/lib/qrcodegen";
 
@@ -25,10 +25,19 @@ interface TwoFactorStatus { otp_required?: boolean; enrolled?: boolean }
 
 const ISSUER = "shadw";
 
+/** ONE enrollment per ACCOUNT (the verified `Claims.sub`), never per team: the mirrored Clerk user id is
+ *  the same identity the backend keys the TOTP row by, so switching teams never shows a different QR
+ *  label for the same secret. It is QR DATA only, never a URL, href or HTML attribute. */
+function accountLabel(): string {
+  if (typeof window === "undefined") return "account";
+  const uid = localStorage.getItem("hive_uid") || "";
+  return /^[A-Za-z0-9_.:-]{1,64}$/.test(uid) && uid !== "local" ? uid : "account";
+}
+
 /** A provisioning payload for the QR encoder ONLY: it is never a navigation URL, an HTML attribute,
  *  a log line, storage or argv. React renders all account-derived text as text, never as HTML. */
 function otpauthFromSecret(secret: string, digits: number, period: number): string {
-  const label = encodeURIComponent(`${ISSUER}:${currentTeam()}`);
+  const label = encodeURIComponent(`${ISSUER}:${accountLabel()}`);
   return `otpauth://totp/${label}?secret=${encodeURIComponent(secret)}&issuer=${encodeURIComponent(ISSUER)}&algorithm=SHA1&digits=${digits}&period=${period}`;
 }
 
@@ -223,7 +232,7 @@ export default function TwoFactorPage() {
       {enabled && !showEnrollment && recoveryCodes === null ? (
         <Card className="mb-6">
           <div className="mb-1 text-sm font-medium text-red-600">Danger Zone</div>
-          <p className="mb-3 text-sm text-secondary">Disabling needs a fresh code from your app (or an unused recovery code). If your sign-in is older than five minutes, refresh it first, then use a NEW code.</p>
+          <p className="mb-3 text-sm text-secondary">Disabling needs a fresh code from your app (or an unused recovery code). Refresh your sign-in once to enter a new code, then use ANOTHER new code to confirm.</p>
           <div className="flex flex-wrap items-center gap-2">
             <Input value={disableCode} onChange={(e) => setDisableCode(e.target.value)} autoComplete="off" placeholder="Code or recovery code" className="w-56 font-mono" />
             <Button variant="danger" onClick={() => void disable()} disabled={busy}>Disable 2FA</Button>

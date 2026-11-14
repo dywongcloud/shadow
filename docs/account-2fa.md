@@ -1,9 +1,59 @@
 # Per-account TOTP 2FA
 
-Status: **implemented (source in the working tree).** No passing test run, browser witness, CI
-result or deployment is claimed here. Present tense; every claim cites `path:line`. Line numbers
-are hints that drift as the tree moves. History lives in `CHANGELOG.md`; this page states only what
-must be true of the code now.
+Present tense; HISTORY lives in `CHANGELOG.md`. Symbols are authoritative; `path:line` hints drift.
+
+## The login-session model (operator decision, 2026-11-13)
+
+An enrolled account answers ONE OTP per bounded LOGIN SESSION, not once per mint, team switch or five
+minutes. `totp::session_step_up_secs()` is 8 h by default (`SESSION_STEP_UP_SECS`), overridable with
+`HIVE_2FA_SESSION_SECS` clamped to `[300, 86400]`. `auth::step_up_ok` uses that window on every
+protected request; `auth::fresh_step_up` KEEPS the separate 300 s window for destructive 2FA
+self-service (disable). The signed `otp_at` claim is the ORIGINAL code-entry instant, never `now`:
+a re-mint carries it forward verbatim, so a stolen cookie cannot become a perpetual session.
+
+Carry-forward is admissible ONLY from a VERIFIED prior token. `auth::verified_session_otp_at` calls
+`auth::verify` (real `HIVE_JWT_SECRET`: signature and `exp`), requires `claims.sub == expected_sub`,
+applies the SINGLE `step_up_subject` machine carve-out, and reads `otp_at` from the verified payload.
+`admin::mint_token` additionally bounds it to `now + 60 s` in the future and `session_step_up_secs()`
+in the past. A forged, foreign-subject, expired or unparsable prior token fails CLOSED to a new typed
+challenge; `force_otp: true` refuses carry-forward outright and demands a fresh code. `TokenReq` gains
+two `#[serde(default)]` fields (`prior_token`, `force_otp`); the prior token travels ONLY in the
+authenticated JSON body carrying `x-hive-internal`, never in a URL, `Location`, log line or argv.
+`/v1/token` stays `is_open_route`, and the gate order (internal token, limiter, `mint_allowed`, then
+OTP) is unchanged.
+
+Residual, accepted explicitly: a stolen session cookie keeps the bounded session window (8 h) instead
+of 300 s. Instant is bounded from the REAL OTP time and never re-stamped. Already-issued JWTs are NOT
+revoked; `HIVE_JWT_SECRET` is never rotated to invalidate them. Disabling 2FA still demands a code
+entered NOW: `totp::disable_handler` re-asserts `fresh_step_up`, and `totp::disable` runs its own
+`create_challenge` + `verify_login` (single-use, `step > last_used_step`).
+
+## Dashboard session flow
+
+`ui/app/api/token/route.ts` derives `prior_token` SERVER-SIDE from the httpOnly `hive_jwt` cookie
+(`req.cookies.getAll("hive_jwt")`, preferring the live parent-domain value over the expired
+host-only one). A client-sent `prior_token` is a REQUEST under that name and is NEVER read; the
+backend re-verifies everything anyway. The route forwards `force_otp` only as a boolean that can make
+the gate stricter. Both mint bodies (Clerk and the `HIVE_AUTH_BYPASS` dev path) carry these fields.
+
+`ui/lib/api.ts` detaches the human-paced challenge from the single-flight mint. A typed
+`otp_required` refusal starts ONE `startOtpFlow` and returns an `otp` outcome immediately: `mintInFlight`
+clears at once, so `ensureSessionMinted()` and every `/cloud` read never wait on a human, and a
+cancelled or expired prompt spends NO failure budget (no backoff, no anonymous-read degradation).
+`registerOtpPrompt` is called at MODULE scope in `ui/components/login-otp-challenge.tsx`, with a
+bounded queue for challenges that arrive before hydration, so a fresh logged-in browser gets the ONE
+form instead of failing closed. `refreshTwoFactorStepUp()` sends `force_otp: true` and awaits the
+human answer, because disable needs a FRESH `otp_at`. A switch of team or a keeper re-mint reads the
+cookie, so it carries the same session forward and does NOT re-challenge.
+
+Enrollment is ONE per ACCOUNT (`Claims.sub`): `status_handler` reads `c.totp.account(&cl.sub)`, and
+the QR label is `shadw:<hive_uid>` (the mirrored verified Clerk user id), NOT `currentTeam()`. A team
+switch therefore never displays a different account to re-scan.
+
+**Reported residual (not changed).** `totp::api_key_blocked` requires `r.tenant == team`, and
+`confirm_handler` revokes keys in `cl.tenant` only. A pre-enrollment `hive_` key in a DIFFERENT team
+stays usable after enrolling in this one. Widening that revocation is a security-sensitive scope
+change requiring the operator's word; this change neither widens nor weakens it.
 
 ## Citation drift
 
@@ -174,8 +224,10 @@ secret, code, or challenge id enters a URL, `Location`, HTML, log line, or argv;
   retries the same mint with `challenge_id` and `otp`, and a successful verification stamps
   `otp_at` into the issued token (`crates/hive-cloud/src/totp.rs:398-475`,
   `crates/hive-cloud/src/auth.rs:161-209`).
-- **Step-up.** Every protected mutation on a 2FA account asks `step_up_ok` on a fresh `otp_at`
-  within `STEP_UP_WINDOW_SECS` (`crates/hive-cloud/src/totp.rs:55-56`,
+- **Step-up.** Every protected mutation on a 2FA account asks `step_up_ok` on the signed `otp_at`
+  within `session_step_up_secs()` (8 h bounded login session); `fresh_step_up` KEEPS its own
+  `STEP_UP_WINDOW_SECS` (300 s) gate for disabling 2FA, so that destructively changing the factor
+  always needs a code entered now (`crates/hive-cloud/src/totp.rs:55-56`,
   `crates/hive-cloud/src/auth.rs:294-325`, `crates/hive-cloud/src/auth.rs:550-552`, `crates/hive-cloud/src/main.rs:2212-2213`). The store lookup is tri-state and fails CLOSED on an
  unreadable store (`crates/hive-cloud/src/totp.rs:247-250`).
 - **Disable.** `POST /v1/account/2fa/disable` re-asserts the step-up gate in the handler itself,
@@ -184,11 +236,12 @@ secret, code, or challenge id enters a URL, `Location`, HTML, log line, or argv;
   `:762-786`).
 
 **Residual.** Already-issued JWTs are not revoked; they keep living until their own expiry, at most
- `MINTED_TOKEN_TTL_SECS = 3600` (`crates/hive-cloud/src/admin.rs:41`, `:585-594`). Rotating
-`HIVE_JWT_SECRET` to invalidate them is explicitly forbidden: `secret()` and `enforced()` read
- that one variable (`crates/hive-cloud/src/auth.rs:104-112`), so a rotation invalidates every fleet
-token and flips enforcement on any node where it is unset. `HIVE_SECRET_KEY` is never rotated here
-either (`crates/hive-cloud/src/totp.rs:19`).
+ `MINTED_TOKEN_TTL_SECS = 3600` (`crates/hive-cloud/src/admin.rs:41`, `:585-594`). A stolen session
+cookie keeps the bounded 8 h login-session window, not 300 s: the accepted cost of one OTP per
+session. Rotating `HIVE_JWT_SECRET` to invalidate them is explicitly forbidden: `secret()` and
+`enforced()` read that one variable (`crates/hive-cloud/src/auth.rs:104-112`), so a rotation
+invalidates every fleet token and flips enforcement on any node where it is unset.
+`HIVE_SECRET_KEY` is never rotated here either (`crates/hive-cloud/src/totp.rs:19`).
 
 ## Non-goals
 
@@ -271,7 +324,9 @@ acceptance surface. Both are run, not authored. The runbook adds no `test/`, `__
 
 - No protection against a stolen session cookie already in hand. `hive_jwt` is an httpOnly cookie
   whose lifetime is the minted `expires_in` less 30 s (`ui/app/api/token/route.ts:24-25`); a
-  bearer holding it is a bearer, and step-up only re-checks on protected mutations.
+  bearer holding it is a bearer, and step-up only re-checks on protected mutations. Re-mints carry
+  the ORIGINAL `otp_at` forward, so the exposure is bounded by `session_step_up_secs()` (8 h),
+  never renewed by the keeper or by a team switch.
 - No revocation of pre-enrollment tokens. Tokens already issued stay valid until their own `exp`,
   at most 3600 s (`crates/hive-cloud/src/admin.rs:41`, `crates/hive-cloud/src/auth.rs:36-38`);
    disable writes a tombstone, not a token blacklist (`crates/hive-cloud/src/totp.rs:481-496`).

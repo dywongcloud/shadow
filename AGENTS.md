@@ -211,18 +211,18 @@ no-grant: concepts only. `docs/double-entry-design.md`, `docs/soc2-evidence-repo
 
 ## Account 2FA (optional per-account TOTP)
 
-- The OTP gate sits INSIDE `admin::mint_token` before `auth::issue`; `auth::step_up_ok` re-checks per
-request from BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from leader
-forwarding, `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local check or
-node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in `ui/lib/team-role.ts`.
-`docs/account-2fa.md`.
-- State is per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` behind `serde(default)`.
-Secret: `secrets::encrypt` (FAILS OPEN, assert `is_encrypted`), read ONLY `secrets::try_decrypt`, compared
-`admin::ct_eq`. The signed `otp_at` claim sits INSIDE the HS256 payload, read only from a verified token, fails
-closed if absent. Carve out machines before any OTP demand: `is_fleet_service`, `is_queue_client`,
-`key:`/`__untagged__`/empty subs, or all 20 fleet delegations and API keys break. Dev nodes, GET/HEAD/OPTIONS
-never gated. Single-use challenge, `step > last_used_step`, per-sub rate limit on wrong codes, Drop guard.
-Already-issued JWTs are NOT revoked; never rotate `HIVE_JWT_SECRET` to invalidate them.
+- OTP gate INSIDE `admin::mint_token` before `auth::issue`; `step_up_ok` re-checks per request from
+BOTH `require_auth` and `admin_ingress` (`/v1/token` is `is_open_route`, exempt from leader
+forwarding; `roles::gate` short-circuits for `platform_admin`/fleet). A RULES row, handler-local
+check or node-local store is a bypass; new routes get viewer `roles::RULES` rows mirrored in
+`ui/lib/team-role.ts`. Dev/GET/HEAD/OPTIONS never gated. `docs/account-2fa.md`.
+- ONE OTP per bounded LOGIN SESSION (`totp::session_step_up_secs` 8 h, `HIVE_2FA_SESSION_SECS`), NOT
+per mint/team/5 min: ORIGINAL signed `otp_at` carries forward ONLY from a VERIFIED prior token (`auth::verified_session_otp_at`); forged/foreign/garbage fail closed. `force_otp` demands
+a fresh code to disable; a stolen cookie keeps 8 h. `/api/token` reads `prior_token` SERVER-SIDE
+from the httpOnly cookie, NEVER a client body field; QR label account-scoped. A challenge DETACHED
+from `mintInFlight` + module-scope OTP form: no read waits on a human or spends the failure budget.
+- State per verified `Claims.sub` in `store_sync::REGISTRY` + `MERGE_STORES` (`serde(default)`).
+Secrets/carve-outs/replay/tombstones/residual: `docs/account-2fa.md`.
 
 ## Browser lane
 
