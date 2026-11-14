@@ -95,18 +95,21 @@ body or an assigned fleet-secret literal instead of printing a warning.
 
 ## macOS runners
 
-Every blocking layer runs on macOS too. `rust-ci.yml` uses `macos-15`
-(arm64) and `macos-15-intel` (x64) alongside `ubuntu-latest`; the npm release
-workflow gates the tagged SHA on the same three runners and builds darwin
-packages on the two Mac labels. `macos-13`/`macos-14` were retired on
-2026-11-02 and are refused by the contract gate.
+Every blocking layer runs on macOS too. `rust-ci.yml` uses `ubuntu-latest`
+and `macos-15` (arm64). The `macos-15-intel` (x64) leg was removed from the
+BLOCKING CI matrix by operator decision on 2026-11-13; see `CHANGELOG.md` for
+the coverage reduction and the three pre-existing `fluid-gateway` fixture 404s
+that leg was reporting. `release-npm-cli.yml` is UNCHANGED and still builds
+and ships darwin x64 release artifacts on `macos-15-intel` - those are release
+artifacts, not a CI gate. `macos-13`/`macos-14` were retired on 2026-11-02 and
+are refused by the contract gate.
 
-`REQUIRED_MACOS_JOBS` in the checker asserts each job's OWN block carries a
-macOS runner (a macOS leg in an unrelated job cannot satisfy a missing one),
-that both arch labels appear in each workflow, and that no retired label
-remains in an executable line. The `cli` job passes `HIVE_CI_PLATFORM` and the
-harness refuses a mismatch with `uname -s`, so a mislabeled runner cannot
-silently drop the Mac leg.
+`REQUIRED_MACOS_JOBS` asserts each job's OWN block carries a macOS runner (a
+macOS leg in an unrelated job cannot satisfy a missing one). `MACOS_LABELS`
+is now `["macos-15"]`, so the checker asserts that one label appears in each
+workflow; retired labels are still refused in an executable line. The `cli`
+job passes `HIVE_CI_PLATFORM` and the harness refuses a mismatch with
+`uname -s`, so a mislabeled runner cannot silently drop the Mac leg.
 
 The real macOS defect was the temp root, not build isolation. `mktemp` on
 Darwin ignores `TMPDIR` and uses `/var/folders/...`; measured there the
@@ -122,7 +125,7 @@ Linux CI (run 43151853515) is green at 35/35 acceptance and all four jobs.
 
 ## Verified
 
-The Rust lane adds a blocking live witness to the `test` job (all three OSes): an unmodified
+The Rust lane adds a blocking live witness to the `test` job (Linux and macOS arm64): an unmodified
 Vercel Rust handler builds OFFLINE against the first-party shim and curls `/` and `/_vercel/ping`.
 Five bindings pin the shim `$PORT` listener, the clean cargo argv, the platform-owned
 `[patch.crates-io]`, the probed `cargo`/`rustc` capability bit and the `Runtime::Command` label.

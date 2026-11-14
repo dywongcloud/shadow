@@ -790,6 +790,57 @@ async fn journal_store(c: &Arc<CloudState>) -> &'static parking_lot::RwLock<hive
         .await
 }
 
+/// A request-path snapshot of THIS node's signed journal evidence surface. It hands out a CLONE of
+/// the live in-process journal (taken under the read lock, never a guard held across an await) and
+/// a CLONE of the engine's signed oplog entries for the same journal shard. The signer is the
+/// platform's own per-node Ed25519 identity and `public_key_hex` is its hex form. This is the
+/// WRITER's own key, NOT an operator-pinned independent identity: a verifier using it performs a
+/// structural self-check, and the report must say `pin_required`.
+///
+/// No journal is rebuilt on a serving tokio worker: when the bulkhead metering lane has not yet
+/// initialized `JOURNAL`, replay of the signed oplog runs on `spawn_blocking`. A corrupt or
+/// unreadable shard yields `None` rather than a fabricated report; nothing here writes state.
+pub struct JournalEvidenceSnapshot {
+    pub journal: hive_contract::Journal,
+    pub oplog: Vec<hive_contract::LogEntry>,
+    pub signer: Arc<crate::integrity_signer::IntegritySigner>,
+    pub public_key_hex: String,
+}
+
+pub async fn journal_evidence_snapshot(c: &Arc<CloudState>) -> Option<JournalEvidenceSnapshot> {
+    let log = c
+        .contract_engine
+        .snapshot_log(hive_contract::contracts::journal::CONTRACT_ID)
+        .await;
+    let oplog = log
+        .as_ref()
+        .map(|l| l.entries().to_vec())
+        .unwrap_or_default();
+    let journal = match JOURNAL.get() {
+        Some(store) => {
+            let guard = store.read();
+            (*guard).clone()
+        }
+        None => {
+            let entries = oplog.clone();
+            let replayed = tokio::task::spawn_blocking(move || {
+                hive_contract::Journal::replay(&entries).map_err(|e| e.to_string())
+            })
+            .await
+            .ok()?;
+            replayed.ok()?
+        }
+    };
+    let signer = c.integrity_signer.clone();
+    let public_key_hex = signer.public_key_hex().to_string();
+    Some(JournalEvidenceSnapshot {
+        journal,
+        oplog,
+        signer,
+        public_key_hex,
+    })
+}
+
 fn journal_caller(tenant: &str) -> hive_contract::Caller {
     hive_contract::Caller {
         tenant: tenant.to_string(),

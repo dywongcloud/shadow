@@ -3,6 +3,15 @@
 import { use, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Badge, Button, Card } from "@/components/ui";
+import {
+  ANALYTICS_CARD_CLASS,
+  ANALYTICS_PILL_CLASS,
+  ANALYTICS_ROOT_CLASS,
+  ANALYTICS_TAB_CLASS,
+  ANALYTICS_TEXT,
+  ANALYTICS_THEME_CSS,
+  ANALYTICS_TOKENS,
+} from "@/components/analytics-theme";
 import { usePoll, type MetricBucket, type Metrics } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { AnalyticsMetricCard, type MetricDeltaTone } from "@/components/analytics-metric-card";
@@ -18,31 +27,16 @@ const WINDOWS = {
 type WindowKey = keyof typeof WINDOWS;
 const WINDOW_KEYS: WindowKey[] = ["60m", "24h", "7d"];
 
-const PALETTE_CSS = [
-  ".hive-analytics {",
-  "  --a-indigo: #4239c2; --a-rose: #9d1239; --a-amber: #826001;",
-  "  --a-emerald: #0c8d63; --a-cyan: #1296aa; --a-violet: #896cd8;",
-  "  --a-indigo-lit: #6366f1; --a-cyan-lit: #22d3ee; --a-emerald-lit: #34d399;",
-  "  --a-amber-lit: #fbbf24; --a-rose-lit: #fb7185; --a-violet-lit: #a78bfa;",
-  "}",
-  ".dark .hive-analytics {",
-  "  --a-indigo: #4d4ad3; --a-rose: #ae2846; --a-amber: #8c6800;",
-  "  --a-emerald: #07976a; --a-cyan: #149db2; --a-violet: #8163ce;",
-  "}",
-  "@media (forced-colors: active) {",
-  "  .hive-analytics .ha-fill { background-image: repeating-linear-gradient(45deg, CanvasText 0 1px, transparent 1px 6px) !important; }",
-  "}",
-].join(String.fromCharCode(10));
-
+const ROLE = { color: ANALYTICS_TOKENS.accent, lit: ANALYTICS_TOKENS.accentSoft };
 const ROLES = {
-  indigo: { color: "var(--a-indigo)", lit: "var(--a-indigo-lit)" },
-  cyan: { color: "var(--a-cyan)", lit: "var(--a-cyan-lit)" },
-  emerald: { color: "var(--a-emerald)", lit: "var(--a-emerald-lit)" },
-  amber: { color: "var(--a-amber)", lit: "var(--a-amber-lit)" },
-  rose: { color: "var(--a-rose)", lit: "var(--a-rose-lit)" },
-  violet: { color: "var(--a-violet)", lit: "var(--a-violet-lit)" },
+  indigo: ROLE,
+  cyan: ROLE,
+  emerald: ROLE,
+  amber: ROLE,
+  rose: ROLE,
+  violet: ROLE,
 };
-const BAR_ROLES = [ROLES.indigo, ROLES.cyan, ROLES.emerald, ROLES.amber, ROLES.rose, ROLES.violet];
+const BAR_ROLES = [ROLE];
 const EMPTY_BUCKETS: MetricBucket[] = [];
 const EMPTY_PATHS: { path: string; count: number }[] = [];
 const EMPTY_STATUS: Record<string, number> = {};
@@ -137,6 +131,7 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
   const name = decodeURIComponent(params.project);
   const [rangeKey, setRangeKey] = useState<WindowKey>("60m");
   const [activeKeys, setActiveKeys] = useState<string[]>(SERIES_META.map((item) => item.key));
+  const [selectedMetric, setSelectedMetric] = useState<string>(SERIES_META[0].key);
   const win = WINDOWS[rangeKey];
   const metricsPath = "/v1/metrics?project=" + encodeURIComponent(name) + "&minutes=" + win.minutes + "&gran=" + win.gran;
   const { data, error, loading, refresh } = usePoll<Metrics>(metricsPath, 8000);
@@ -153,6 +148,15 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
       if (previous.includes(key)) return previous.length === 1 ? previous : previous.filter((item) => item !== key);
       return SERIES_META.filter((item) => previous.includes(item.key) || item.key === key).map((item) => item.key);
     });
+  }
+
+  function selectMetric(key: string) {
+    setSelectedMetric(key);
+    setActiveKeys((previous) =>
+      previous.includes(key)
+        ? previous
+        : SERIES_META.filter((item) => previous.includes(item.key) || item.key === key).map((item) => item.key),
+    );
   }
 
   const chartData = useMemo(() => {
@@ -246,18 +250,17 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
   ];
 
   return (
-    <div className="hive-analytics min-w-0 w-full max-w-full px-4 py-5 sm:px-6">
-      <style>{PALETTE_CSS}</style>
+    <div className={ANALYTICS_ROOT_CLASS + " min-w-0 w-full max-w-full px-4 py-5 sm:px-6"}>
+      <style>{ANALYTICS_THEME_CSS}</style>
       <header className="mb-4 flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <div className="min-w-0 break-words text-xs font-medium uppercase tracking-wide text-muted">Project analytics</div>
-          <h1 className="mt-1 min-w-0 break-words text-xl font-semibold text-fg sm:text-2xl">{name}</h1>
+          <div className={ANALYTICS_TEXT.eyebrow}>Project analytics</div>
+          <h1 className={ANALYTICS_TEXT.heading}>{name}</h1>
           <p className="mt-1 min-w-0 break-words text-sm text-secondary">Measured request series, status classes and top paths. The dashed trailing segment is a projection from the current partial bucket, not a measurement.</p>
         </div>
         <Link
           href={"/projects/" + encodeURIComponent(name)}
-          className="inline-flex min-h-[44px] min-w-0 max-w-full items-center rounded-md border border-border px-3 text-sm font-medium text-fg hover:bg-subtle"
-          style={{ borderColor: "var(--a-indigo)" }}
+          className={ANALYTICS_PILL_CLASS}
         >
           <span className="min-w-0 break-words">Project overview</span>
         </Link>
@@ -269,10 +272,10 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
           return (
             <Button
               key={key}
-              variant={isActive ? "default" : "outline"}
+              variant="ghost"
               aria-pressed={isActive}
-              className="min-h-[44px] min-w-0 px-3"
-              style={isActive ? { background: "linear-gradient(90deg, var(--a-indigo), var(--a-cyan))", color: "#ffffff", borderColor: "transparent" } : undefined}
+              className={ANALYTICS_TAB_CLASS + (isActive ? " font-medium text-fg" : " text-secondary")}
+              style={isActive ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
               onClick={() => setRangeKey(key)}
             >
               {WINDOWS[key].label}
@@ -282,13 +285,12 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
         <Button
           variant="outline"
           aria-label="Refresh measured metrics"
-          className="min-h-[44px] min-w-0"
-          style={{ borderColor: "var(--a-violet)" }}
+          className={ANALYTICS_PILL_CLASS}
           onClick={() => refresh()}
         >
           Refresh
         </Button>
-        <Badge tone="purple" className="min-w-0 max-w-full">
+        <Badge tone="default" className="min-w-0 max-w-full">
           <span className="min-w-0 break-words">{updated}</span>
         </Badge>
       </div>
@@ -299,21 +301,21 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
         </div>
       ) : null}
       {!data && loading ? (
-        <Card className="min-w-0 w-full max-w-full p-5">
+        <Card className={ANALYTICS_CARD_CLASS + " p-5"}>
           <p className="min-w-0 break-words text-sm text-secondary">Waiting for the metrics response.</p>
         </Card>
       ) : !data ? (
-        <Card className="min-w-0 w-full max-w-full p-5">
+        <Card className={ANALYTICS_CARD_CLASS + " p-5"}>
           <p className="min-w-0 break-words text-sm text-secondary">The metrics request has not returned data.</p>
         </Card>
       ) : series.length === 0 ? (
-        <Card className="relative min-w-0 w-full max-w-full overflow-hidden p-5">
-          <span className="absolute inset-y-0 left-0 w-1.5" style={{ background: "linear-gradient(180deg, var(--a-indigo-lit), var(--a-emerald))" }} aria-hidden="true" />
+        <Card className={ANALYTICS_CARD_CLASS + " relative overflow-hidden p-5"}>
+          <span className="absolute inset-y-0 left-0 w-px bg-border" aria-hidden="true" />
           <p className="min-w-0 break-words text-sm text-secondary">No measured buckets are returned for this window.</p>
         </Card>
       ) : (
         <div aria-busy={loading} className={loading ? "min-w-0 w-full max-w-full opacity-80" : "min-w-0 w-full max-w-full"}>
-          <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <div role="tablist" aria-label="Project metrics" className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {metricCards.map((card) => (
               <AnalyticsMetricCard
                 key={card.key}
@@ -324,8 +326,8 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
                 deltaTone={card.deltaTone}
                 deltaHint={card.deltaHint}
                 deltaAria={card.deltaAria}
-                color={card.color}
-                lit={card.lit}
+                selected={card.key === selectedMetric}
+                onSelect={() => selectMetric(card.key)}
               />
             ))}
           </div>
@@ -340,15 +342,15 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
               windowLabel={win.label}
             />
           </div>
-          <Card className="mt-4 min-w-0 w-full max-w-full p-4 sm:p-5">
+          <Card className={ANALYTICS_CARD_CLASS + " mt-4 p-4 sm:p-5"}>
             <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-              <h2 className="min-w-0 break-words text-sm font-semibold text-fg">Status</h2>
-              <Badge tone="blue" className="shrink-0 tabular-nums">{statusRows.length + " rows"}</Badge>
+              <h2 className={ANALYTICS_TEXT.title}>Status</h2>
+              <Badge tone="default" className="shrink-0 tabular-nums">{statusRows.length + " rows"}</Badge>
             </div>
-            <p className="mb-3 min-w-0 break-words text-xs text-secondary">Status classes returned for this tenant.</p>
+            <p className={"mb-3 " + ANALYTICS_TEXT.caption}>Status classes returned for this tenant.</p>
             {statusRows.length === 0 ? (
               <div className="flex min-h-[44px] min-w-0 items-center gap-3 rounded-md border border-dashed border-border p-3">
-                <span className="h-8 w-1.5 shrink-0 rounded-full" style={{ background: "linear-gradient(180deg, var(--a-rose-lit), var(--a-violet))" }} aria-hidden="true" />
+                <span className="h-8 w-px shrink-0 bg-border" aria-hidden="true" />
                 <span className="min-w-0 break-words text-sm text-secondary">No status classes are returned.</span>
               </div>
             ) : (
@@ -359,8 +361,8 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
                   return (
                     <div key={row.id} className="relative min-w-0 overflow-hidden rounded-md border border-border p-3">
                       <span
-                        className="ha-fill pointer-events-none absolute inset-y-1 left-0 rounded-r-full"
-                        style={{ width: width + "%", background: "linear-gradient(90deg, " + row.lit + ", " + row.color + ")", opacity: 0.24 }}
+                        className="analytics-bar pointer-events-none absolute inset-y-1 left-0 rounded-md"
+                        style={{ width: width + "%", background: ANALYTICS_TOKENS.bar }}
                         role="meter"
                         aria-label={row.label + " Requests"}
                         aria-valuemin={0}
@@ -382,7 +384,7 @@ export function AnalyticsPageClient({ paramsPromise }: { paramsPromise: Promise<
             <AnalyticsBreakdown title="Pages" tabs={leftTabs} labelHeading="Page" countLabel="Requests" />
             <AnalyticsBreakdown title="Referrers and UTM parameters" tabs={rightTabs} labelHeading="Dimension" countLabel="Requests" />
           </div>
-          <p className="mt-4 min-w-0 break-words text-xs text-secondary">
+          <p className={"mt-4 " + ANALYTICS_TEXT.caption}>
             Project-filtered buckets carry request counts; the backend does not return per-project error, blocked, or cache counters in this endpoint.
           </p>
         </div>

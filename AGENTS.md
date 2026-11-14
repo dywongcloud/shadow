@@ -10,7 +10,7 @@ keep load-bearing, drop absorbed. Nested:
 grep/find; git only via `git_*` verbs (`git_commit paths:[...]` stages EVERY dirty hunk of a named file: `git_status` first).
 Attribution is dywongcloud ONLY: no `Co-Authored-By`, no Claude/Anthropic trailer.
 - **No test files, ever** (no `test/`, `__tests__/`, `spec/`, `#[cfg(test)]`, mocking libraries): CI RUNS 4 layers on
-Linux AND macOS (`macos-15`/`-intel`): `cargo test --workspace --locked` + `scripts/cli-acceptance.sh` + live execution;
+Linux + macOS (`macos-15`; `-intel` gate off, operator 2026-11-13): `cargo test --workspace --locked` + `scripts/cli-acceptance.sh` + live execution;
 fix a failure CLASS at the shared primitive. `cargo check` skips `cfg(target_os="linux")` AND test targets, so run, not
 `--no-run`; a dep change ships `Cargo.lock` (`--locked`). `check-contract-bindings.py --check` gates CI; drift names
 `--sync`, never in CI. Darwin `mktemp` ignores `TMPDIR`: `/private/tmp`.

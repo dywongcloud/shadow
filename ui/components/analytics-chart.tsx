@@ -2,6 +2,15 @@
 
 import { useId, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button, Card } from "@/components/ui";
+import {
+  ANALYTICS_CARD_CLASS,
+  ANALYTICS_MARK,
+  ANALYTICS_PILL_CLASS,
+  ANALYTICS_TAB_CLASS,
+  ANALYTICS_TEXT,
+  ANALYTICS_TOKENS,
+  analyticsSeriesDash,
+} from "@/components/analytics-theme";
 
 export interface ChartSeries {
   key: string;
@@ -88,7 +97,6 @@ export function AnalyticsChart({
     ? [0, Math.floor(lastSolid / 2), lastSolid, projectionIndex]
     : [0, Math.floor((columns.length - 1) / 2), columns.length - 1];
   const xLabelIdxs = Array.from(new Set(labelCandidates.filter((index) => index >= 0 && index < columns.length)));
-  const gradientId = (key: string) => uid + "-fill-" + key;
   const hoverColumn = hover !== null && hover >= 0 && hover < columns.length ? columns[hover] : null;
 
   function nearestIndex(clientX: number, rect: DOMRect): number {
@@ -121,25 +129,35 @@ export function AnalyticsChart({
   }
 
   return (
-    <Card className="min-w-0 w-full max-w-full p-0" aria-label={windowLabel + " measured series"}>
+    <Card className={ANALYTICS_CARD_CLASS} aria-label={windowLabel + " measured series"}>
       <div className="flex min-w-0 flex-col gap-3 border-b border-border p-4 sm:p-5 lg:flex-row lg:items-center lg:justify-between">
         <div className="min-w-0">
-          <h2 className="min-w-0 break-words text-sm font-semibold text-fg">Measured series</h2>
-          <p className="mt-1 min-w-0 break-words text-xs text-secondary">Percent of each series measured peak</p>
+          <h2 className={ANALYTICS_TEXT.title}>Measured series</h2>
+          <p className={"mt-1 " + ANALYTICS_TEXT.caption}>Percent of each series measured peak</p>
         </div>
         <div aria-label="Series legend" className="flex min-w-0 flex-wrap gap-2">
-          {series.map((item) => {
+          {series.map((item, seriesIndex) => {
             const isActive = activeKeys.includes(item.key);
             return (
               <Button
                 key={item.key}
-                variant={isActive ? "default" : "outline"}
+                variant="ghost"
                 aria-pressed={isActive}
-                className="min-h-[44px] min-w-0 gap-2 px-3 text-xs"
-                style={isActive ? { background: "linear-gradient(90deg, " + item.lit + ", " + item.color + ")", color: "#ffffff", borderColor: "transparent" } : { borderColor: item.color }}
+                className={ANALYTICS_TAB_CLASS + (isActive ? " gap-2 font-medium text-fg" : " gap-2 text-secondary")}
+                style={isActive ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
                 onClick={() => onToggle(item.key)}
               >
-                <span className="h-0.5 w-5 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+                <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
+                  <line
+                    x1="0"
+                    y1="4"
+                    x2="20"
+                    y2="4"
+                    stroke={ANALYTICS_TOKENS.accent}
+                    strokeWidth={ANALYTICS_MARK.lineWidth}
+                    strokeDasharray={analyticsSeriesDash(seriesIndex)}
+                  />
+                </svg>
                 <span className="min-w-0 break-words">{item.label}</span>
               </Button>
             );
@@ -148,15 +166,15 @@ export function AnalyticsChart({
       </div>
       {!hasColumns ? (
         <div className="flex min-h-[220px] min-w-0 items-center gap-3 p-5">
-          <span className="h-16 w-1.5 shrink-0 rounded-full" style={{ background: "linear-gradient(180deg, var(--a-indigo-lit), var(--a-emerald))" }} aria-hidden="true" />
-          <p className="min-w-0 break-words text-sm text-secondary">
+          <span className="h-12 w-px shrink-0 bg-border" aria-hidden="true" />
+          <p className={ANALYTICS_TEXT.caption}>
             {columns.length === 0 ? "No measured buckets are returned for this window." : "Select at least one metric."}
           </p>
         </div>
       ) : (
         <>
           <div
-            className="relative h-[300px] min-w-0 w-full max-w-full overflow-hidden rounded-lg border border-border bg-card sm:h-[360px]"
+            className="relative h-[300px] min-w-0 w-full max-w-full overflow-hidden bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border sm:h-[360px]"
             role="group"
             tabIndex={0}
             aria-label={windowLabel + " chart. Use arrow keys to inspect measured buckets."}
@@ -168,18 +186,10 @@ export function AnalyticsChart({
             onBlur={() => setHover(null)}
             onKeyDown={onChartKeyDown}
           >
-            <div className="pointer-events-none absolute left-2 top-[18px] bottom-[38px] z-10 flex flex-col justify-between text-[10px] tabular-nums text-muted">
+            <div className={"pointer-events-none absolute left-2 top-[18px] bottom-[38px] z-10 flex flex-col justify-between " + ANALYTICS_TEXT.axis}>
               {TICKS.map((tick) => <span key={tick}>{tick + "%"}</span>)}
             </div>
             <svg viewBox="0 0 1000 320" preserveAspectRatio="none" className="absolute inset-0 h-full w-full" aria-hidden="true">
-              <defs>
-                {active.map((item) => (
-                  <linearGradient key={item.key} id={gradientId(item.key)} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" style={{ stopColor: item.lit, stopOpacity: 0.34 }} />
-                    <stop offset="100%" style={{ stopColor: item.color, stopOpacity: 0.02 }} />
-                  </linearGradient>
-                ))}
-              </defs>
               {TICKS.map((tick) => (
                 <line
                   key={"y-" + tick}
@@ -187,42 +197,46 @@ export function AnalyticsChart({
                   x2={W - RIGHT}
                   y1={yFor(tick)}
                   y2={yFor(tick)}
-                  stroke="hsl(var(--border))"
-                  strokeWidth="1"
-                  strokeDasharray={tick === 0 ? undefined : "2 7"}
+                  stroke={ANALYTICS_TOKENS.grid}
+                  strokeWidth={ANALYTICS_MARK.gridWidth}
                   vectorEffect="non-scaling-stroke"
                 />
               ))}
-              {xLabelIdxs.map((index) => (
-                <line
-                  key={"x-" + index}
-                  x1={xFor(columns[index].t_ms)}
-                  x2={xFor(columns[index].t_ms)}
-                  y1={TOP}
-                  y2={H - BOTTOM}
-                  stroke="hsl(var(--border))"
-                  strokeWidth="1"
-                  strokeDasharray="2 9"
-                  vectorEffect="non-scaling-stroke"
-                />
-              ))}
-              {active.map((item) => {
+              {active.map((item, seriesIndex) => {
                 const line = pathFor(solidIdxs, item.key);
                 const area = solidIdxs.length > 1
                   ? line + " L " + xFor(columns[lastSolid].t_ms).toFixed(2) + " " + yFor(0) + " L " + xFor(columns[solidIdxs[0]].t_ms).toFixed(2) + " " + yFor(0) + " Z"
                   : "";
                 return (
                   <g key={"area-" + item.key}>
-                    {area ? <path d={area} fill={"url(#" + gradientId(item.key) + ")"} /> : null}
-                    <path d={line} fill="none" style={{ stroke: item.lit }} strokeOpacity="0.16" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-                    <path d={line} fill="none" style={{ stroke: item.color }} strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+                    {area ? <path d={area} fill={ANALYTICS_TOKENS.accentSoft} /> : null}
+                    <path
+                      d={line}
+                      fill="none"
+                      stroke={ANALYTICS_TOKENS.accent}
+                      strokeWidth={ANALYTICS_MARK.lineWidth}
+                      strokeDasharray={analyticsSeriesDash(seriesIndex)}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      vectorEffect="non-scaling-stroke"
+                    />
                   </g>
                 );
               })}
-              {active.map((item) => {
+              {active.map((item, seriesIndex) => {
                 const line = dashedIdxs.length > 1 ? pathFor(dashedIdxs, item.key) : "";
                 return line
-                  ? <path key={"projection-" + item.key} d={line} fill="none" style={{ stroke: item.color }} strokeWidth="2.25" strokeDasharray="7 7" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+                  ? <path
+                      key={"projection-" + item.key}
+                      d={line}
+                      fill="none"
+                      stroke={ANALYTICS_TOKENS.accent}
+                      strokeWidth={ANALYTICS_MARK.lineWidth}
+                      strokeDasharray={ANALYTICS_MARK.tailDash}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      vectorEffect="non-scaling-stroke"
+                    />
                   : null;
               })}
               {partialIndex >= 0 && partialIndex < columns.length && active.map((item) => (
@@ -230,9 +244,10 @@ export function AnalyticsChart({
                   key={"partial-" + item.key}
                   cx={xFor(columns[partialIndex].t_ms)}
                   cy={yFor(norm(columns[partialIndex], item.key))}
-                  r="4"
-                  style={{ fill: item.color, stroke: "hsl(var(--card))" }}
-                  strokeWidth="2"
+                  r={ANALYTICS_MARK.markerRadius}
+                  fill={ANALYTICS_TOKENS.accent}
+                  stroke={ANALYTICS_TOKENS.surface}
+                  strokeWidth={ANALYTICS_MARK.lineWidth}
                   vectorEffect="non-scaling-stroke"
                 />
               ))}
@@ -241,9 +256,10 @@ export function AnalyticsChart({
                   key={"projected-" + item.key}
                   cx={xFor(columns[projectionIndex].t_ms)}
                   cy={yFor(norm(columns[projectionIndex], item.key))}
-                  r="4.5"
-                  style={{ fill: "hsl(var(--card))", stroke: item.color }}
-                  strokeWidth="2"
+                  r={ANALYTICS_MARK.markerRadius}
+                  fill={ANALYTICS_TOKENS.surface}
+                  stroke={ANALYTICS_TOKENS.accent}
+                  strokeWidth={ANALYTICS_MARK.lineWidth}
                   vectorEffect="non-scaling-stroke"
                 />
               ))}
@@ -252,37 +268,47 @@ export function AnalyticsChart({
                 const labelX = Math.min(xFor(column.t_ms) + 10, W - RIGHT - 150);
                 const labelY = Math.max(TOP + 10, Math.min(H - BOTTOM - 8, yFor(norm(column, item.key)) + (index - (active.length - 1) / 2) * 14));
                 return (
-                  <g key={"label-" + item.key} transform={"translate(" + labelX.toFixed(2) + "," + labelY.toFixed(2) + ")"} className="text-fg">
-                    <line x1="0" y1="0" x2="16" y2="0" style={{ stroke: item.color }} strokeWidth="2" vectorEffect="non-scaling-stroke" />
-                    <text x="20" y="4" fontSize="11" fill="currentColor">{item.label}</text>
+                  <g key={"label-" + item.key} transform={"translate(" + labelX.toFixed(2) + "," + labelY.toFixed(2) + ")"}>
+                    <line x1="0" y1="0" x2="16" y2="0" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} vectorEffect="non-scaling-stroke" />
+                    <text x="20" y="4" fontSize="11" fill={ANALYTICS_TOKENS.text}>{item.label}</text>
                   </g>
                 );
               })}
               {hover !== null && hoverColumn ? (
                 <g>
-                  <line x1={xFor(hoverColumn.t_ms)} x2={xFor(hoverColumn.t_ms)} y1={TOP} y2={H - BOTTOM} stroke="hsl(var(--border-strong))" strokeWidth="1" strokeDasharray="3 4" vectorEffect="non-scaling-stroke" />
+                  <line
+                    x1={xFor(hoverColumn.t_ms)}
+                    x2={xFor(hoverColumn.t_ms)}
+                    y1={TOP}
+                    y2={H - BOTTOM}
+                    stroke={ANALYTICS_TOKENS.neutralLine}
+                    strokeWidth={ANALYTICS_MARK.gridWidth}
+                    strokeDasharray={ANALYTICS_MARK.crosshairDash}
+                    vectorEffect="non-scaling-stroke"
+                  />
                   {active.map((item) => (
                     <circle
                       key={"hover-" + item.key}
                       cx={xFor(hoverColumn.t_ms)}
                       cy={yFor(norm(hoverColumn, item.key))}
-                      r="4"
-                      style={{ fill: item.color, stroke: "hsl(var(--card))" }}
-                      strokeWidth="2"
+                      r={ANALYTICS_MARK.markerRadius}
+                      fill={ANALYTICS_TOKENS.accent}
+                      stroke={ANALYTICS_TOKENS.surface}
+                      strokeWidth={ANALYTICS_MARK.lineWidth}
                       vectorEffect="non-scaling-stroke"
                     />
                   ))}
                 </g>
               ) : null}
             </svg>
-            <div className="pointer-events-none absolute bottom-2 left-[52px] right-[18px] z-10 flex min-w-0 justify-between gap-1 text-[10px] text-muted">
+            <div className={"pointer-events-none absolute bottom-2 left-[52px] right-[18px] z-10 flex min-w-0 justify-between gap-1 " + ANALYTICS_TEXT.axis}>
               {xLabelIdxs.map((index) => <span key={"axis-" + index} className="min-w-0 max-w-[24%] break-words text-center">{columns[index].label}</span>)}
             </div>
             {hover !== null && hoverColumn ? (
               <div
                 id={tooltipId}
                 role="tooltip"
-                className="pointer-events-none absolute top-3 z-20 w-56 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-card p-3 text-xs shadow-card"
+                className="pointer-events-none absolute top-3 z-20 w-56 max-w-[calc(100%-1.5rem)] rounded-md border border-border bg-card p-3 text-xs shadow-none"
                 style={{
                   left: (xFor(hoverColumn.t_ms) / W) * 100 + "%",
                   transform: xFor(hoverColumn.t_ms) / W > 0.7 ? "translateX(-100%)" : xFor(hoverColumn.t_ms) / W < 0.3 ? "translateX(0)" : "translateX(-50%)",
@@ -291,9 +317,11 @@ export function AnalyticsChart({
                 <div className="mb-2 min-w-0 break-words font-medium text-fg">
                   {hoverColumn.label}{hoverColumn.projected ? " · projected" : ""}
                 </div>
-                {active.map((item) => (
+                {active.map((item, seriesIndex) => (
                   <div key={"tip-" + item.key} className="mb-1 flex min-w-0 items-center gap-2">
-                    <span className="h-0.5 w-5 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+                    <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
+                      <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+                    </svg>
                     <strong className="shrink-0 tabular-nums text-fg">{item.format(finite(hoverColumn.values[item.key]))}</strong>
                     <span className="min-w-0 break-words text-secondary">{item.label}</span>
                   </div>
@@ -307,7 +335,7 @@ export function AnalyticsChart({
             ) : null}
           </div>
           <div className="flex min-w-0 flex-col gap-2 border-t border-border p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
-            <p className="min-w-0 break-words text-xs text-secondary">
+            <p className={ANALYTICS_TEXT.caption}>
               {projectionIndex !== null
                 ? "Dashed segments project the current bucket from its measured rate."
                 : "No partial bucket is available for projection."}
@@ -316,7 +344,7 @@ export function AnalyticsChart({
               variant="outline"
               aria-expanded={tableOpen}
               aria-controls={tableId}
-              className="min-h-[44px] min-w-0 shrink-0"
+              className={ANALYTICS_PILL_CLASS}
               onClick={() => setTableOpen((value) => !value)}
             >
               {tableOpen ? "Hide table view" : "Table view"}
@@ -340,9 +368,11 @@ export function AnalyticsChart({
                       </th>
                       <td className="min-w-0 break-words p-3">
                         <div className="grid min-w-0 grid-cols-1 gap-1 sm:grid-cols-2">
-                          {active.map((item) => (
+                          {active.map((item, seriesIndex) => (
                             <span key={"cell-" + column.t_ms + "-" + item.key} className="flex min-w-0 items-center gap-1.5">
-                              <span className="h-0.5 w-3 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+                              <svg width="14" height="8" viewBox="0 0 14 8" aria-hidden="true">
+                                <line x1="0" y1="4" x2="14" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+                              </svg>
                               <strong className="shrink-0 tabular-nums text-fg">{item.format(finite(column.values[item.key]))}</strong>
                               <span className="min-w-0 break-words text-secondary">{item.label}</span>
                             </span>

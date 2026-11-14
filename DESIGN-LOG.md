@@ -749,3 +749,274 @@ Successor nomination from a real pending row: "billing-invoice-history-authority
 - [x] User's durable preferences honored and recorded - pointer: "Standing design register honored and recorded" in Step 0 (resumed), with measured enforcement (blurFilters 0, sampleBadge 0, annotations 0, meshCopy 0 in every comp variant; exhaustive ui scans for blur and badges).
 - [x] No test files, no secrets, no graphical symbols, no commit/push/branch/worktree/clone - pointer: "Skipped (resumed)" and "Step 0 (resumed)" exclusive-write-surface paragraph; attribution dywongcloud only, no Co-Authored-By line exists because no commit was made.
 - [x] Successor nominated from a real pending row - pointer: "Successor nomination" at the end of the resumed section: billing-invoice-history-authority-local, verified with prd_list full row dispatch 1794395458432-9160-126bdf9be3ad28c7.
+
+## Analytics console run, 2026-11-13
+
+Delimited new run for the operator brief: revise the project and storage analytics console, chart styling and theme so the data-dense console reads as Shadw.cloud, not as a vibe-coded gradient demo. This section APPENDS only. The prior responsive /storage + pricing run above remains INCOMPLETE at its own S1/S2/S3 with OPEN F1/F2/F9/F10; this run does not close, delete or rewrite any of it.
+
+### Step 0. Tooling inventory, real
+
+| Job | Tool used | Evidence |
+| --- | --- | --- |
+| Graph render | none available | Marked Mermaid text is below; no renderer or graph database was called. |
+| Frontier query | none available | Exact edge lines of /Users/dylanwong/.claude/skills/dada/references/anchor-graph.md were read with Read; candidates were computed by hand. |
+| Workflow state | DESIGN-LOG.md markdown | This append; no separate task-list tool was called. |
+| Panel | Agent tool, capped at two concurrent seats | Two independent READ-ONLY refuter agents were launched for R0; the full seven-seat panel is an external-limit item recorded below. |
+| Measurement | gm.exec_js | dispatch 1794625703335-5237-20dc2130d5032a72 (source baseline), 1794625154699-5168-7286b701afa0278f (contrast), 1794625321479-5195-b61e88d233ff448a (frozen hashes). |
+| Browser render | none used | The final console is unrendered; no headless Chromium and no next build were run. |
+
+External limit recorded before any source move: coordinator measurement CPU 0.0 percent idle, load 242.66, free memory 57 MiB; own gm.exec_js sample dispatch 1794625205253-5176-92f080d9f9de5b96 measured CPU 100 percent busy, 177 MiB free, 220 MiB available after the runner recycle term, loadavg 187.08 / 164.46 / 181.80. No more than two refuter subagents run at once. The full seven-seat WHOLE panel and two consecutive quiet WHOLE rounds are therefore not claimed. Skipped seats are named in the final OPEN frontier. The /dada run is INCOMPLETE even after the source edits land.
+
+### Traversal Plan
+
+Mode: Adaptive - a public customer-facing dashboard. Governing criterion: "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)"; the advanced pole and acceptable pole must both hold. The operator's memory register is honored: cinematic luminous light belongs to the marketing landing, not to this data console; here restraint is the premium signal. No mesh, peer-to-peer, QUIC or post-quantum copy appears in this run's UI text.
+
+Exact seed labels, copied from references/anchor-graph.md: Stance "White (Kenya Hara)"; Rule "Less Is More (Ludwig Mies van der Rohe)"; Rule "Ten Principles of Good Design (Dieter Rams)"; Rule "WCAG 2.2 Contrast and Perceivability (W3C)"; Breaker "Making and Breaking the Grid (Timothy Samara)"; dotted counterpoint "Tufte Style". Exact chain labels and edge labels: "White (Kenya Hara)" --restraint shared with--> "Occam's Razor"; "Less Is More (Ludwig Mies van der Rohe)" --slogan behind--> "Ten Principles of Good Design (Dieter Rams)"; "WCAG 2.2 Contrast and Perceivability (W3C)" --accessibility floor under--> "The End of Print (David Carson, Lewis Blackwell)"; "Making and Breaking the Grid (Timothy Samara)" -.loosens.-> "Grid Systems in Graphic Design (Josef Müller-Brockmann)"; "White (Kenya Hara)" -.emptiness counterpoint to.-> "Tufte Style".
+
+Brand reconciliation, measured before the first move: ui/app/globals.css:6-17 defines the light neutral tokens and --link: 212 100% 47%; ui/app/globals.css:21-32 defines the selected dark steps, including --link: 212 100% 62%; ui/tailwind.config.ts:24 maps link to hsl(var(--link)); ui/components/ui.tsx:32-39 is the shared Card (rounded-xl border border-border bg-card shadow-card); ui/components/landing/landing.css:8-9 keeps the luminous --lp-grad / --lp-edge in the marketing layer. The console uses the existing neutral and --link tokens only. It does not import the landing gradient palette and does not invent a new palette. Computed primary text contrast is 19.78:1 light and 16.04:1 dark; the brand link hue against the card is 4.60:1 light and 6.35:1 dark (dispatch 1794625154699-5168-7286b701afa0278f).
+
+Marked Mermaid graph, visited class applied to seed ids:
+
+```mermaid
+flowchart LR
+  haraW["White (Kenya Hara)"] -->|restraint shared with| c_occam["Occam's Razor"]
+  mies["Less Is More (Ludwig Mies van der Rohe)"] -->|slogan behind| rams["Ten Principles of Good Design (Dieter Rams)"]
+  wcag["WCAG 2.2 Contrast and Perceivability (W3C)"] -.->|accessibility floor under| carson["The End of Print (David Carson, Lewis Blackwell)"]
+  samBreak["Making and Breaking the Grid (Timothy Samara)"] -.->|loosens| mb["Grid Systems in Graphic Design (Josef Müller-Brockmann)"]
+  haraW -.->|emptiness counterpoint to| c_tufte["Tufte Style"]
+  maya["MAYA: Most Advanced Yet Acceptable (Raymond Loewy)"] -.->|tempers strangeness of| shklovsky["Art as Technique (Viktor Shklovsky)"]
+  class haraW,mies,rams,wcag,samBreak,c_tufte,maya visited
+```
+
+#### Frontier, initial
+
+| Candidate | Reached via (edge label, direction) | From anchor | Status |
+| --- | --- | --- | --- |
+| C1 one shared chart theme module | design language for, outgoing solid | "Design Systems (Alla Kholmatova)" | OPEN |
+| C2 remove injected palette and gradient declarations | less but better, outgoing solid | "Ten Principles of Good Design (Dieter Rams)" | OPEN |
+| C3 tabbed metric cards with active underline | dual criterion for, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | OPEN |
+| C4 neutral percentage bars and right-aligned values | emptiness counterpoint to, incoming dotted | "Tufte Style" | OPEN |
+| C5 solid hairline grid and one accent area/line styling | contrast floor constrains, dotted | "WCAG 2.2 Contrast and Perceivability (W3C)" | OPEN |
+| C6 BREAK decorative multi-hue system | loosens, dotted | "Making and Breaking the Grid (Timothy Samara)" | OPEN |
+| C7 S4 push all database series to one hue with dash-pattern identity | bounds the break of, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | OPEN |
+| C8 full seven-seat WHOLE panel and two quiet rounds | may pull, outgoing solid | "Andon" | OPEN, external headroom |
+
+R0 premortem: a WHOLE panel round on the inherited UI is required before the first source move. Because of the headroom limit, only two independent seats are convened first; the exact receipts and their objections are appended below before the source edits.
+
+### R0 diagnosis of the inherited UI, file:line and exact declaration
+
+- ui/app/projects/[project]/analytics/analytics-client.tsx:21-35 PALETTE_CSS injects 18 hard-coded hex hues plus a forced-colors repeating-linear-gradient; :275 active window uses background: "linear-gradient(90deg, var(--a-indigo), var(--a-cyan))" and color: "#ffffff"; :311 uses another vertical gradient strip; :363 uses gradient percentage bars. SERIES_META at :63-68 has four saturated series hues.
+- ui/app/storage/analytics/analytics-client.tsx:87-90 SERIES_COLORS declares twelve saturated hex hues; :721-729 is a 176px decorative hero gradient with maskImage; :764 active window uses linear-gradient(90deg, #6366f1, #22d3ee) with #ffffff; :829 toggles use a per-database gradient; :332 and :372 put gradient top bars on cards; :264-313 Sparkline uses linearGradient plus an eight-pixel under-stroke.
+- ui/components/analytics-chart.tsx:139 active legend uses linear-gradient(90deg, item.lit, item.color) and #ffffff; :151 empty state uses a vertical gradient strip; :177-180 creates one linearGradient per series; :217 draws strokeOpacity 0.16 at strokeWidth 8 as a glow; :190-205 draws dashed gridlines; :299 wraps the plot in another rounded-lg border.
+- ui/components/analytics-metric-card.tsx:56 puts a gradient top bar on every card; :75-78 defines a linearGradient; :82 draws strokeOpacity 0.18 at strokeWidth 8; :83 draws a 2.25px saturated line. The card has no tab and no active underline.
+- ui/components/analytics-breakdown.tsx:57 picks var(--a-indigo) instead of a dashboard token; :124 empty state uses a vertical gradient; :146 percentage bar uses linear-gradient(90deg, row.lit, row.color) at opacity 0.2; :163 prints a decorative purple Selected badge.
+- ui/components/storage-analytics-chart.tsx:285 empty state uses linear-gradient(180deg, #6366f1, #22d3ee); :321-324 defines a per-series linearGradient; :227-237 draws eight-pixel under-strokes; :299 wraps the plot in a second rounded-lg border; :334 and :349 draw dashed gridlines; :358 hardcodes hsl(var(--fg)) for the Average.
+- ui/components/storage-analytics-breakdown.tsx:157 uses linear-gradient(90deg, row.color + 55, row.color); :191 hardcodes #6366f1, #34d399; :224 hardcodes #fbbf24, #fb7185; :215 prints a decorative purple returned badge; :145 uses rounded-full percentage chrome.
+
+Baseline witness, dispatch 1794625703335-5237-20dc2130d5032a72, procedure: gm.exec_js reads the seven owned source files, counts /#[0-9a-fA-F]{3,8}\b/, /linear-gradient|<linearGradient|radial-gradient|repeating-linear-gradient/, /rounded(?:-[a-zA-Z\[\]0-9.]+)?/, inline colour styles, aria-label strings, byte counts and line counts; the two client hex arrays are parsed for distinct series colours. Baseline: 120713 bytes, 2750 lines, 41 hard-coded hex occurrences, 25 unique hex literals, 25 gradient declarations, 33 rounded declarations, 48 inline colour styles, 24 aria-label strings (ariaHash 68973c751c3dfba4), 25 distinct client series hex colours, API-and-type-line hash 51e4242f37914fbe. The seven frozen file SHA-256 values are in dispatch 1794625321479-5195-b61e88d233ff448a.
+
+### Decision Records, written BEFORE every source move below
+
+## Move M1: shared brand-token theme and deletion of the injected palette (BREAK)
+Depends on: none.
+Anchors: Stance "White (Kenya Hara)" | Rule "Ten Principles of Good Design (Dieter Rams)" | Rule "WCAG 2.2 Contrast and Perceivability (W3C)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Tufte Style" (dotted edge from "White (Kenya Hara)").
+Intent: make both clients and both chart families read from one set of neutral surfaces, one brand link hue, hairline axes and quiet typography; remove the competing per-file palette system.
+Formal argument: claim - a single source of chart tokens is more coherent than two injected palettes; grounds - the inherited tree declares 41 hex occurrences and 25 gradient declarations across seven files (dispatch 1794625703335-5237-20dc2130d5032a72); warrant - "Ten Principles of Good Design (Dieter Rams)" and "Grid Systems in Graphic Design (Josef Müller-Brockmann)" treat repetition and a programme as order, while "White (Kenya Hara)" makes emptiness the invitation. The BREAK is taken against the decorated-shed palette, not against the data.
+Alternatives rejected: (1) restyle each file locally with its own tuned blues - rejected because it preserves the drift that the brief names; (2) reuse the landing --lp-grad palette - rejected because the operator's register confines luminous marketing light to the landing and the console is data-dense.
+Consequence: one new shared module becomes a maintenance surface; every target file imports it. The cost is one indirection per token, paid once.
+Fence: the multi-hue palette existed to distinguish many series; that job moves to direct labels, dash patterns, legend text and the table view. No series value is deleted.
+Frontier effect: opens C1, C2, C5, C6 and the dark-mode recheck; dependents M2, M3 and M4 are REOPENED if the premise test fails.
+Advanced pole: one disciplined system shared by four rendering surfaces, anchored by "Grid Systems in Graphic Design (Josef Müller-Brockmann)". Acceptable pole: existing dashboard tokens, anchored by "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)".
+
+## Move M2: tabbed metric cards and neutral breakdown bars (KEEP-THE-RULE)
+Depends on: M1.
+Anchors: Stance "White (Kenya Hara)" | Rule "WCAG 2.2 Contrast and Perceivability (W3C)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Tufte Style" (dotted edge from "White (Kenya Hara)").
+Intent: put the active black/white underline on the metric card tabs, replace coloured row fills with a subtle neutral percentage bar, keep right-aligned values, and add a real View All ghost pill that reveals a table rather than hiding data.
+Formal argument: claim - active state belongs to a single thin line and comparison belongs to bar length, not to hue; grounds - the reference PNGs show a black underline, quiet grey bars, right-aligned values and a View All ghost pill; warrant - "Tufte Style" keeps data-ink proportional to the value, and "WCAG 2.2 Contrast and Perceivability (W3C)" keeps state from relying on colour alone.
+Alternatives rejected: (1) coloured tab pills - rejected because they reintroduce saturated chrome; (2) cap rows at five with no table - rejected because it would remove returned rows from the console.
+Consequence: new tab state and View All state are local to the clients; all existing labels, sort controls and meters remain reachable.
+Fence: not a broken rule; the existing tablist and sort semantics are the fence and are preserved.
+Frontier effect: opens C3, C4 and the accessibility-label hash check.
+Advanced pole: active state reduced to one underline, anchored by "White (Kenya Hara)". Acceptable pole: familiar tabs and a labelled View All affordance, anchored by "Don't Make Me Think (Steve Krug)".
+
+## Move M3: one accent line, pale flat fill, solid grid, dashed incomplete tail (KEEP-THE-RULE)
+Depends on: M1, M2.
+Anchors: Rule "Ten Principles of Good Design (Dieter Rams)" | Rule "WCAG 2.2 Contrast and Perceivability (W3C)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Tufte Style" (dotted edge from "White (Kenya Hara)").
+Intent: use a 2px brand-link line, a flat 10-percent wash, solid one-step-off-surface hairline grid, and a dashed final segment only where the bucket is still open or projected; remove glow under-strokes and inner plot borders.
+Formal argument: claim - the data mark should be the only saturated element; grounds - dataviz marks-and-anatomy.md fixes a 2px line and 10-percent area wash, anti-patterns.md calls dashed gridlines and thick saturated blocks wrong, and the inherited code uses 8px under-strokes; warrant - "Tufte Style" and "Ten Principles of Good Design (Dieter Rams)" keep non-data ink recessive.
+Alternatives rejected: (1) keep the projection dashed but leave gridlines dashed - rejected by the anti-pattern and by the reference; (2) project a new storage value - rejected because the endpoint does not return one and ui/AGENTS.md forbids invented dashboard numbers.
+Consequence: storage gains a derived still-open-bucket flag from reported granularity and a post-mount clock, never a new measurement. The foot caption says no value is projected.
+Fence: the current bucket's measured values remain the last real values; the dashed segment is a device, not data.
+Frontier effect: opens C5 and the no-fabricated-metric check.
+Advanced pole: line and wash as the only saturated ink, anchored by "WCAG 2.2 Contrast and Perceivability (W3C)". Acceptable pole: the existing projection wording and table view stay, anchored by "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)".
+
+## Move M4: S4 ambition push, all database series share one hue and carry dash-pattern identity (BREAK)
+Depends on: M1, M2, M3.
+Anchors: Stance "White (Kenya Hara)" | Rule "Less Is More (Ludwig Mies van der Rohe)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Tufte Style" (dotted edge from "White (Kenya Hara)").
+Intent: deliberately escalate the boldest move beyond the four project series: reduce the twelve-database storage palette to the same one brand hue, with fixed dash patterns, direct labels, legend text and a table view carrying identity instead of colour.
+Formal argument: claim - a 12-hue categorical system is the loudest remaining violation; grounds - storage-analytics-client.tsx:87-90 declares twelve saturated hues and the baseline finds 25 distinct client series hex colours; warrant - "Less Is More (Ludwig Mies van der Rohe)" and "Making and Breaking the Grid (Timothy Samara)" justify breaking the inherited rainbow at the point where it competes with the data.
+Alternatives rejected: (1) six desaturated greys - rejected because it is still a rank-dependent categorical ramp and violates dataviz anti-patterns.md; (2) small multiples for every database - rejected because it changes the existing chart/table layout and exceeds this run's owned surface.
+Consequence: colour is no longer an identity channel; dash pattern, label, legend and table must carry it. The measured source delta is the ambition witness; no rendered screenshot is claimed.
+Fence: every database remains in activeKeys, the legend, the tooltip, the table and every existing API call; no returned value is folded into Other.
+Frontier effect: reopens C7 and requires the final state re-measurement, objecting-critic recheck and S4 status to be recorded honestly as unrendered.
+Advanced pole: one hue across up to twelve entities, anchored by "Making and Breaking the Grid (Timothy Samara)". Acceptable pole: fixed dash patterns and the existing table view, anchored by "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)".
+
+### Panel, R0 premortem, round R0 (partial WHOLE, artifact examined: frozen original source paths and baseline measurements; unrendered)
+
+Two independent READ-ONLY refuter agents were seated, one per literary reference, under the external two-seat headroom cap. Both received the frozen original SHA-256 values from dispatch 1794625321479-5195-b61e88d233ff448a. No composite voice was used. The five remaining required seats are named in the final OPEN frontier.
+
+| Critic | Anchor used | Observed in the work | Verdict | Requested change |
+| --- | --- | --- | --- | --- |
+| Debord refuter | "The Society of the Spectacle (Guy Debord)" | ui/app/storage/analytics/analytics-client.tsx:725 background: "linear-gradient(180deg, rgba(99,102,241,0.14), rgba(34,211,238,0.05) 45%, transparent)" and :722 aria-hidden; ui/components/analytics-chart.tsx:217 strokeOpacity="0.16" strokeWidth="8"; ui/components/analytics-breakdown.tsx:163 Badge tone="purple". | OBJECT | Delete the aria-hidden gradient wash and halo strokes; replace 12-hue series and purple badges with one restrained hue plus data-bearing text; keep only marks that encode a value. |
+| Shklovsky refuter | "Art as Technique (Viktor Shklovsky)" | ui/components/analytics-chart.tsx:217 strokeOpacity="0.16" strokeWidth="8" before :218 strokeWidth="2.25"; :139 linear-gradient legend; ui/app/projects/[project]/analytics/analytics-client.tsx:45 BAR_ROLES six roles; ui/app/storage/analytics/analytics-client.tsx:87-90 twelve SERIES_COLORS; mixed rounded-full / rounded-lg / text-[10px] / fontSize="11". | OBJECT | Lay bare the measuring device, not the ornament: remove haloes and gradient swatches, hold one radius and one type scale. |
+
+Statements of meaning: Debord - "Measured analytics becomes a spectacle: luminous surface stands in for use value, so the eye contemplates an image of data rather than checks a number." Shklovsky - "The chart mistakes a bright costume for the act of seeing."
+Artist questions: Debord - "Does irradiation make the reader a spectator of the chart's own appearance?" Shklovsky - "Does the device make the measured bucket stony, or merely repeat the dashboard already known?"
+Neutral questions: Debord - "Which saturated layers encode a value, and which are decorative?" Shklovsky - "Which exact declarations expose the device and its reception?"
+Opinions, recorded only after the artist permitted them in the brief: Debord - decorative saturation colonizes the instrument; the more it glows, the less the measurement is used. Shklovsky - ostranenie is absent; perception is automatized by decoration, not sight.
+Andon pulled: yes, by both seats. No source move was made until the resolutions below. Two seats objected to the same decorative-region anchor, fewer than the three that force a frame swap.
+
+Premise tests before spending a move, dispatch 1794627509292-5434-cc03f8af3e70330c: gm.exec_js counted the literal word gradient 45 times across the seven owned files and also 45 across the nine analytics files, so Debord's 45-occurrence premise is true and its file-scope wording is corrected from nine to seven. The same command counted 25 actual gradient declarations, 4 Badge tone="purple" occurrences (analytics-breakdown.tsx:163, storage-analytics-breakdown.tsx:215, project analytics-client.tsx:291, storage analytics-client.tsx:736) and 2 exact halo strokes (analytics-chart.tsx:217, analytics-metric-card.tsx:82). Shklovsky's mixed-radius and thick-under-stroke premise is true. The premise that hue must keep carrying series identity is OVERRULED by dataviz anti-patterns.md lines 16-24 and 50-52: colour follows the entity, but a 12-hue categorical system is exactly the loud form this brief refuses; identity will be dash pattern plus label plus legend plus table.
+
+Resolutions, exactly one per OBJECT: Debord OBJECT -> ADAPT, because the aria-hidden wash, halo strokes, purple badges and 12-hue palette are decorative and are removed by M1, M2 and M4 without deleting a measured value. Shklovsky OBJECT -> ADAPT, because M1 gives one radius/type system, M2 gives the active underline and neutral bars, and M3 gives a 2px line with solid hairline grid; the "keep hue" sub-premise is the OVERRULE recorded above, not a second resolution.
+
+#### Frontier, after R0
+
+| Candidate | Reached via (edge label, direction) | From anchor | Status |
+| --- | --- | --- | --- |
+| R1 remove gradient wash, halos, purple badges | attacks the spectacle with, outgoing solid | "The Society of the Spectacle (Guy Debord)" | TAKEN M1, M2, M3, M4 |
+| R2 one radius/type system and device laid bare | makes strange with, outgoing solid | "Art as Technique (Viktor Shklovsky)" | TAKEN M1, M2, M3 |
+| C1 one shared chart theme module | design language for, outgoing solid | "Design Systems (Alla Kholmatova)" | TAKEN M1 |
+| C2 remove injected palette and gradient declarations | less but better, outgoing solid | "Ten Principles of Good Design (Dieter Rams)" | TAKEN M1 |
+| C3 tabbed metric cards with active underline | dual criterion for, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | TAKEN M2 |
+| C4 neutral percentage bars and right-aligned values | emptiness counterpoint to, incoming dotted | "Tufte Style" | TAKEN M2 |
+| C5 solid hairline grid and one accent area/line styling | contrast floor constrains, dotted | "WCAG 2.2 Contrast and Perceivability (W3C)" | TAKEN M3 |
+| C6 BREAK decorative multi-hue system | loosens, dotted | "Making and Breaking the Grid (Timothy Samara)" | TAKEN M1, M4 |
+| C7 S4 push all database series to one hue with dash-pattern identity | bounds the break of, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | TAKEN M4 |
+| F1 full seven-seat WHOLE panel | may pull, outgoing solid | "Andon" | OPEN, external headroom |
+| F2 two consecutive quiet WHOLE rounds | score both poles of, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | OPEN, external headroom |
+| F3 rendered screenshot, pixel contrast and 320/360/390/768/1024/1440 px witness | none available | none | OPEN, external headroom |
+
+Anchor Ledger, R0 additions: "The Society of the Spectacle (Guy Debord)" ADAPT, evidence gradient wash and halo lines above, replacement M1/M3 restraint; "Art as Technique (Viktor Shklovsky)" ADAPT, evidence thick under-stroke and mixed radii, replacement one radius/type system; "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" KEEP, strongest objection survived is that the advanced pole must not become a marketing gradient, acceptable pole keeps the existing dashboard tokens. Live graph update, no renderer: class haraW,mies,rams,wcag,samBreak,c_tufte,maya visited; class samBreak,mies adapted; class rams,wcag kept; class c_tufte adapted. The reference file itself is untouched.
+
+### Step S4, measured ambition push (source delta only, unrendered)
+
+M4 deliberately escalated the BREAK beyond the four project series: the twelve-database storage palette became one shared accent custom property with dash-pattern identity. Measurement command: gm.exec_js dispatch 1794629568182-5549-f4d7cafa8df7a6f2, collected by gm.task_output dispatch 1794629626123-5552-49090ad73ba49ab7. Computed values: distinct client series hex colours 25 -> 1 --analytics-accent definition with 0 hex literals and 26 ANALYTICS_TOKENS.accent references; hard-coded hex occurrences 41 -> 0; gradient declarations 25 -> 0; inline gradient style attributes 20 -> 0; rounded declarations 33 -> 17; source bytes 120713 -> 128176; source lines 2750 -> 2968; aria-label strings 24 -> 35 with all 22 distinct original labels retained (ariaMissing empty); API/type-line hash unchanged at 51e4242f37914fbe. This is a measured SOURCE delta. No headful browser, computed CSS value, screenshot or pixel population was witnessed, so the rendered half of S4 is NOT MET.
+
+### Measured moves, one computed value per move
+
+| Move | Measurement procedure | Before | After | Classification |
+| --- | --- | --- | --- | --- |
+| M1 shared module and deletion of injected palette | gm.exec_js regex over seven owned files | 41 hex occurrences, 25 gradient declarations, 0 theme injections | 0 hex occurrences in the two clients after M4, 0 gradient declarations after M3, 2 ANALYTICS_THEME_CSS injections | intended |
+| M2 tabbed cards and neutral bars | gm.exec_js count of role="tab", role="meter", aria-label strings | 1 role="tab", 3 role="meter", 24 aria-label strings | 4 role="tab", 3 role="meter", 35 aria-label strings, all original labels retained | intended |
+| M3 one accent line, flat fill, solid grid, dashed tail | gm.exec_js count of gradient declarations, strokeWidth="8" halo strokes and dashed grid strings | 25 gradient declarations, 2 halo strokes, dashed grid arrays present | 0 gradient declarations, 0 halo strokes, 0 dashed grid arrays; ANALYTICS_MARK.tailDash used in both chart families and both sparklines | intended |
+| M4 S4 one hue across all database series | gm.exec_js parse of client hex arrays and theme custom properties | 25 distinct client series hex colours | 1 --analytics-accent definition, 0 hex literals, 26 accent-token references | intended, unrendered |
+| Inert-edit trap | coordinator's inline-specificity finding plus final regex | inline gradient style attributes win over class CSS; 20 gradient/hardcoded declarations in four files | 0 inline gradient style attributes and 0 hardcoded hex literals in seven owned files | intended; the theme module alone was NOT treated as a change |
+
+### Panel, WHOLE, round W1 (NOT RUN, external headroom)
+
+Artifact examined: the frozen post-edit owned paths below. Render state: unrendered. No headless Chromium was used. Because CPU was 0.0 percent idle with 57 MiB free at the coordinator's check and the two-seat cap was in force, W1 and W2 were not convened. No verdict is invented for any skipped seat.
+
+Skipped panel seats, one agent per literary reference, named explicitly: "Mismatch: How Inclusion Shapes Design (Kat Holmes)"; "The Principles of Universal Design (Ronald Mace et al.)"; "The Visual Display of Quantitative Information (Edward Tufte)"; "How Charts Lie (Alberto Cairo)"; "Don't Make Me Think (Steve Krug)". The dotted Debord/Krug pair was therefore never seated together. R0 seated only "The Society of the Spectacle (Guy Debord)" and "Art as Technique (Viktor Shklovsky)".
+
+Outside-surface cohesion gap reported, not edited: ui/components/db-chart.tsx:7-27 DB_PALETTE_CSS and ui/components/db-log-table.tsx:146 still carry a second hardcoded palette. Leaving those files untouched makes any sibling database chart that uses them non-cohesive with this console; the orchestrator owns that write surface and decides the follow-up.
+
+### Step 2g, final-state re-measurement of every number this section prints
+
+| Printed figure | Procedure that reproduces it | Value at final state | Reproducible or corrected |
+| --- | --- | --- | --- |
+| DESIGN-LOG byte count | wc -c DESIGN-LOG.md after the final append | procedure, not a fixed number | reproducible; a fixed number would be stale by construction |
+| Source bytes 128176, lines 2968 | gm.exec_js dispatch 1794629568182-5549-f4d7cafa8df7a6f2 over the seven owned source files | 128176 bytes, 2968 lines | reproducible; re-run after the final append, source files unchanged |
+| Hex 41 -> 0, unique hex 25 -> 0 | same regex /#[0-9a-fA-F]{3,8}\b/ | 0, 0 | reproducible |
+| Gradients 25 -> 0, inline gradient styles 20 -> 0 | same gradient regex plus inline-style regex | 0, 0 | reproducible |
+| Radii 33 -> 17 | same /rounded(?:-[a-zA-Z\[\]0-9.]+)?/ regex | 17 | reproducible |
+| Aria labels 24 -> 35, role="tab" 1 -> 4, role="meter" 3 -> 3 | same aria/role regex and required-label set | 35, 4, 3; ariaMissing empty | reproducible |
+| API/type-line hash 51e4242f37914fbe unchanged | same SHA-256 over lines matching /v1/, apiGet, usePoll, interface, export type | 51e4242f37914fbe | reproducible |
+| Theme injections 2, root-class applications 2, accent definitions 1, accent references 26 | same literal regex | 2, 2, 1, 26 | reproducible |
+| Primary text contrast 19.78:1 light, 16.04:1 dark | HSL-to-linear-RGB W3C ratio from globals.css tokens, dispatch 1794625154699-5168-7286b701afa0278f | 19.78:1, 16.04:1 | reproducible; theme uses the same tokens |
+| Accent line contrast 4.60:1 light, 6.35:1 dark | same procedure against --link and --card | 4.60:1, 6.35:1 | reproducible; one brand hue |
+| Secrets 0, emoji/graphical-symbol matches 0 | same scan over owned source files | 0, 0 | reproducible |
+| tsc exit 0, git diff --check exit 0 | exact commands in the verification section | 0, 0 | reproducible |
+
+No rendered value, computed CSS value, screenshot pixel or phone-width measurement is claimed. The console is unrendered.
+
+### Anchor Ledger (complete for this run)
+
+| Anchor | Role | Status | Evidence | Replacement or note |
+| --- | --- | --- | --- | --- |
+| "White (Kenya Hara)" | Stance | ADAPT | R0 gradient premise test and M1/M2/M3 | emptiness becomes the console's restraint, not the landing's glow |
+| "Less Is More (Ludwig Mies van der Rohe)" | Rule | KEEP | M4 source delta, strongest objection survived: 12 series still need identity | identity moves to dash pattern, label, legend, table |
+| "Ten Principles of Good Design (Dieter Rams)" | Rule | KEEP | 25 gradients to 0, strongest objection survived: one system can become sterile | active underline and brand link hue preserve recognition |
+| "WCAG 2.2 Contrast and Perceivability (W3C)" | Rule | KEEP | 19.78:1 / 16.04:1 text and 4.60:1 / 6.35:1 accent, strongest objection survived: hue alone is not identity | dash patterns and text labels |
+| "Making and Breaking the Grid (Timothy Samara)" | Breaker | ADAPT | M1 and M4, dotted edge "loosens" to mb | break is the palette system, not the data |
+| "Grid Systems in Graphic Design (Josef Müller-Brockmann)" | Rule | KEEP | one module, two injections, 26 token references | programme replaces per-file tuning |
+| "Tufte Style" | Counterpoint | ADAPT | dotted edge "emptiness counterpoint to" from haraW; M2/M3 | neutral bars and recessive grid |
+| "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | Governing criterion | KEEP | both poles recorded in M1-M4, strongest objection survived: advanced pole unrendered | acceptable pole keeps existing dashboard tokens |
+| "Occam's Razor" | Catalog | KEEP | M1 removed two competing palettes, no new palette invented | one accent custom property |
+| "The End of Print (David Carson, Lewis Blackwell)" | Breaker target | SCRAP | dotted edge from wcag; expressive typographic liberation was declined for a data console | not used in the UI |
+| "Design Systems (Alla Kholmatova)" | System | KEEP | ANALYTICS_THEME_CSS, ANALYTICS_TOKENS, ANALYTICS_MARK, ANALYTICS_TEXT | one shared module |
+| "Don't Make Me Think (Steve Krug)" | Welcome | KEEP | View All ghost pill and table view, no row is hidden by default | skipped as a panel seat under headroom |
+| "Andon" | Catalog | KEEP | R0 two Andons resolved before source moves | full WHOLE Andon round remains OPEN |
+| "The Society of the Spectacle (Guy Debord)" | Critic lens | ADAPT | R0 OBJECT and premise test, M1/M3 | decorative saturation removed |
+| "Art as Technique (Viktor Shklovsky)" | Critic lens | ADAPT | R0 OBJECT and premise test, M1/M2/M3 | device laid bare by one radius/type/mark system |
+| "Mismatch: How Inclusion Shapes Design (Kat Holmes)" | Skipped Inclusion seat | DEFERRED | named in W1 skipped seats | external headroom |
+| "The Principles of Universal Design (Ronald Mace et al.)" | Skipped Inclusion seat | DEFERRED | named in W1 skipped seats | external headroom |
+| "The Visual Display of Quantitative Information (Edward Tufte)" | Skipped Evidence seat | DEFERRED | named in W1 skipped seats | external headroom |
+| "How Charts Lie (Alberto Cairo)" | Skipped Evidence seat | DEFERRED | named in W1 skipped seats | external headroom |
+
+Live graph update, no renderer: class haraW,mies,rams,wcag,samBreak,c_tufte,maya visited; class samBreak,haraW,c_tufte adapted; class rams,wcag,mies,mb kept; class carson scrapped. Dotted edges leaving used anchors: haraW -.-> c_tufte APPLIED (M2/M3); samBreak -.-> mb APPLIED (M1/M4); maya -.-> shklovsky DECLINED (ostranenie would restore decorative devices in a console); wcag -.-> carson DECLINED (typographic liberation is not the acceptable pole here); crit_prov_debord -.-> crit_use_krug DECLINED (Krug seat skipped under headroom). The enumeration is recorded, but S5 is not claimed met without the full seated panel.
+
+### Step 4. Stop test, S1-S5 with pointers
+
+- S1 Frontier has no OPEN items: NOT MET. Pointer: final OPEN frontier below has F1, F2, F3 OPEN.
+- S2 a WHOLE panel round returned PASS from every required critic with no Andon: NOT MET. Pointer: R0 was a two-seat partial WHOLE with 2 OBJECT and 2 Andon; W1 was not run.
+- S3 two consecutive quiet WHOLE rounds: NOT MET. Pointer: W1 and W2 were not run.
+- S4 ambition push with a rendered measured delta: NOT MET. Pointer: Step S4 above has a measured source delta but explicitly says the rendered half is unwitnessed.
+- S5 every dotted edge applied or declined with a seated panel: NOT MET. Pointer: dotted-edge enumeration above is written but the required panel was not seated.
+
+Conclusion: this Analytics console /dada run is INCOMPLETE. The inherited responsive /storage + pricing run above remains INCOMPLETE at its own S1/S2/S3 with OPEN F1/F2/F9/F10; nothing here closes it.
+
+### OPEN frontier and exact resume point
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| F1 full seven-seat WHOLE panel after the edits, with PASS from every required critic and no Andon | may pull, outgoing solid | "Andon" | OPEN, external headroom |
+| F2 two consecutive quiet WHOLE rounds with the S4 push in place | score both poles of, outgoing solid | "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" | OPEN, external headroom |
+| F3 headful render, computed CSS values, pixel contrast and 320/360/390/768/1024/1440 px witness | none available | none | OPEN, unrendered |
+| F4 sibling palette in db-chart.tsx and db-log-table.tsx | outside owned surface | none | DEFERRED to orchestrator |
+
+Exact resume point: DESIGN-LOG.md, immediately after this Compliance Check. Re-convene the seven required seats READ-ONLY on the frozen post-edit paths with fresh SHA-256 values, render headfully with headless:false, run W1, resolve any OBJECT, run W2 quiet, then re-run Step 2g. Do not start over; do not delete the prior run or this record.
+
+### Skipped, every step skipped stated plainly
+
+- W1 and W2 WHOLE panel rounds: not run; five seats named above were skipped; no verdict was fabricated.
+- Headful browser render, computed CSS, screenshot, pixel contrast, phone-width witness: not run; unrendered.
+- Graph renderer, graph-query tool, artifact page: none used; Mermaid text and markdown are the record.
+- Pugh-Matrix branch: condition not met; no two simultaneously plausible Breakers were branched.
+- Source edits outside the nine owned files: none; db-chart.tsx and db-log-table.tsx are reported, not edited.
+- next build, test files, mocking libraries, secrets, commit, push, branch, worktree: none. Attribution dywongcloud only; no commit exists, so no Co-Authored-By line was written.
+
+### Double loop
+
+The panel failed first: the two-seat cap made a full Adaptive panel impossible while the host was saturated, and the criterion failed second because MAYA's advanced pole cannot be witnessed by source counts alone. The graph itself needs a computed-CSS witness node and a critic seat that reads computed styles rather than source text. Graph amendments: add "Computed Style Witness (browser)" as a node adjacent to "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)", and add a panel rule that freezes post-edit file hashes before any critic dispatch. Process amendment: a theme module is not a completed change until the inline style declarations that outrank it are measured at zero.
+
+### Verification, exact command and output
+
+From /Users/dylanwong/fluid/hive (repo root), not from ui/: `ui/node_modules/.bin/tsc --noEmit -p ui/tsconfig.json`. exit_code 0. stdout: empty. stderr: empty. `git diff --check`: exit_code 0. stdout: empty. stderr: empty. Witness: gm.exec_js dispatch 1794629568182-5549-f4d7cafa8df7a6f2, collected by gm.task_output dispatch 1794629626123-5552-49090ad73ba49ab7. Final stdout line was __GM_RESULT__ with metrics bytes 128176, lines 2968, hex 0, uniqueHex 0, gradients 0, inlineGradientStyles 0, radii 17, aria 35, roleTab 4, meters 3, themeInjection 2, rootClass 2, accentDefinitions 1, accentTokens 26, apiHash 51e4242f37914fbe, ariaMissing [], secrets 0, emoji 0, tsc exit_code 0, gitDiffCheck exit_code 0. No next build was run.
+
+### Compliance Check (this run), each line with a pointer
+
+- [x] Tooling inventory done - pointer: Step 0 table.
+- [x] Mode stated with reason - pointer: Traversal Plan, Adaptive public customer-facing dashboard.
+- [x] Seed with exact labels and living Frontier - pointer: Traversal Plan seed chain, initial Frontier and Frontier after R0.
+- [x] At least one BREAK and no quota stop - pointer: M1 and M4 Decision Records; the stop is the external limit, not a move count.
+- [x] Decision Record before each move with all fields - pointer: Decision Records M1-M4.
+- [ ] Panel Report per round from a full seven-seat panel - pointer: R0 is partial; W1 NOT RUN.
+- [x] Every R0 OBJECT resolved ADAPT / SCRAP / OVERRULE with premise tests - pointer: Premise tests and Resolutions.
+- [ ] WHOLE rounds and S1-S5 shown met - pointer: Step 4 says all NOT MET.
+- [x] Every figure re-measured at final state with procedure - pointer: Step 2g table; DESIGN-LOG byte count is a procedure, not a stale fixed number.
+- [x] Anchor Ledger complete and live graph updated - pointer: Anchor Ledger and live graph update.
+- [x] Double-loop paragraph written - pointer: Double loop.
+- [x] Carry-Forward Ledger written beside the log - pointer: DESIGN-CARRY-FORWARD.md, Analytics console run 2026-11-13 section.
+- [x] No test files, secrets, graphical symbols, commit, push, branch, worktree - pointer: Skipped and Step 2g secrets 0, emoji 0.
+- [x] Final reply states mode, tools, stop conditions and skipped steps - pointer: terminal receipt to the orchestrator.

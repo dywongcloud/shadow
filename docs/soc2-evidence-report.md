@@ -119,3 +119,62 @@ witness bins); when a path IS supplied, an unreadable, unparsable or lossy file 
 hard FAIL. The binary prints one `RESULT PASS`/`RESULT FAIL` line and exits 0/1.
 The report is a technical-evidence artefact for an assessor to read, not a
 deliverable that makes any organization compliant.
+
+## Live authenticated admin route (node-local, no proxy)
+
+`GET /v1/admin/soc2/evidence` is the live path. `admin::router` mounts it behind
+`auth::require_auth` (the role is decided once by `roles::gate`; `RULES` lists
+this read at viewer) and the `require_auth_read` wrapper, which answers 401 for
+an anonymous GET while `HIVE_JWT_SECRET` is set. The route is NOT in
+`auth::is_open_route`, so it cannot skip the gate; tenancy is never read from
+`x-hive-team`. `ui/lib/team-role.ts` mirrors the viewer row as `soc2.evidence`.
+
+Query: `?period_start_ms=<u64>&period_end_ms=<u64>`, both optional. Defaults are
+`[now - 90 days, now]`; a reversed range or one longer than 366 days is 400.
+`db_contract::journal_evidence_snapshot` clones the responding node's live
+journal under its read lock and clones the signed oplog entries for
+`hive.billing-journal.v1`; if the bulkhead metering lane has not initialized the
+journal yet, replay runs on `spawn_blocking`. `evidence::generate_report` and
+`evidence::verify_report` also run on `spawn_blocking`, never on a serving tokio
+worker. The response is the full `EvidenceReport` plus an envelope naming
+`responding_node`, `node_id`, `oplog_contract_id`, `oplog_chain_tip`,
+`worm_tip`, `report_hash`, `public_key_hex`, `boundary`, `overall_status`, the
+structural self-check measurement, `pin_required: true` and `trust_limit`.
+`public_key_hex` is the WRITER's own `IntegritySigner` key, not an
+operator-pinned independent identity: `evidence::verify_report` re-derives the
+report's hashes and signatures under that same key. Reproduction is not fraud
+detection and does not name an independent publisher; no pinned identity means
+Inadmissible, never Dishonest. `trust_limit` says exactly that.
+
+Node-local honesty: `main::admin_ingress` serves GET/HEAD LOCALLY (mutations are
+forwarded to the leader; this path is NOT in `main::owner_routed`, so it is never
+forwarded), and public hosts are round-robin DNS. A GET therefore lands on one
+node and reports THAT node's shard: a fleet client hitting a public host gets
+whichever node answered, and `responding_node` + `public_key_hex` +
+`oplog_chain_tip` are the scope limit of the answer. There is NO owner proxy, NO `?node=` hop and NO `gossip::dispatch` arm: an unknown
+gossip path answers an EMPTY body, never a report relabelled as another node's
+log. To evidence a different node, address that node's admin listener directly
+and compare `responding_node` + `public_key_hex` + `oplog_chain_tip` with its
+pinned identity. The boundary is carried verbatim from
+`hive_contract::evidence::BOUNDARY`; AT-1/AT-2 stay UNMET and no verdict word is
+emitted. An empty operating period, a shard that cannot be replayed, or a report
+the independent verifier does not reproduce is 503 with a fixed sentence, never
+a fabricated commitment.
+
+Live runbook (JWT minted ON the node; :8786 is the loopback admin API):
+
+```
+curl -sS -H "Authorization: Bearer $JWT" \
+  "http://127.0.0.1:8786/v1/admin/soc2/evidence?period_start_ms=...&period_end_ms=..." \
+  | python3 -I -c 'import json,sys; r=json.load(sys.stdin); print(r["responding_node"], r["oplog_chain_tip"], r["report_hash"])'
+```
+
+The success log line is exactly
+`soc2 technical evidence report generated for responding node`. After a roll,
+`strings -a /proc/<MainPID>/exe | grep -c 'soc2 technical evidence report generated for responding node'`
+proves the RUNNING binary carries this live path; a Rust format literal in the
+source is not that proof.
+
+`check-contract-bindings.py --check` pins the `RULES` span and the
+`TEAM_ACTIONS` span. Adding the viewer row and its UI mirror changes both
+digests, so `scripts/contract-bindings.json` needs `--sync` (orchestrator-owned).

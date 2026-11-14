@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useId, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { ArrowLeft, RefreshCw } from "lucide-react";
 import { Badge, Button, Card, PageHeader, StateNotice } from "@/components/ui";
@@ -19,6 +19,17 @@ import {
   type StorageBreakdownRow,
   type StorageEventRow,
 } from "@/components/storage-analytics-breakdown";
+import {
+  ANALYTICS_CARD_CLASS,
+  ANALYTICS_MARK,
+  ANALYTICS_PILL_CLASS,
+  ANALYTICS_ROOT_CLASS,
+  ANALYTICS_TAB_CLASS,
+  ANALYTICS_TEXT,
+  ANALYTICS_THEME_CSS,
+  ANALYTICS_TOKENS,
+  analyticsSeriesDash,
+} from "@/components/analytics-theme";
 
 /** Every new wire key is OPTIONAL: a node rolled before the series payload answers with counters
  *  only. An absent reading never becomes a zero. */
@@ -83,11 +94,8 @@ const WINDOWS = {
 type WindowKey = keyof typeof WINDOWS;
 const WINDOW_KEYS: WindowKey[] = ["60m", "3h"];
 
-/** Six measured hues, then their deeper steps so a twelfth database still owns its own line. */
-const SERIES_COLORS = [
-  "#6366f1", "#22d3ee", "#34d399", "#fbbf24", "#fb7185", "#a78bfa",
-  "#4338ca", "#0e7490", "#047857", "#b45309", "#be123c", "#6d28d9",
-];
+/** Identity is the dash pattern, label, legend and table; colour stays the one dashboard accent. */
+const SERIES_COLORS: string[] = Array.from({ length: 12 }, () => ANALYTICS_TOKENS.accent);
 
 const TRAFFIC: { key: TrafficKey; label: string; format: (value: number) => string }[] = [
   { key: "requests", label: "Requests", format: formatCount },
@@ -261,10 +269,8 @@ function useStorageMetrics(idsKey: string, refreshToken: number) {
   return state;
 }
 
-/** A small gradient sparkline. Gaps are unreported buckets, never joined through a zero. */
+/** A small flat sparkline. Gaps are unreported buckets, never joined through a zero. */
 function Sparkline({ values, color, label }: { values: (number | null)[]; color: string; label: string }) {
-  const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
-  const gradientId = uid + "-spark-fill";
   const real = values.map(num);
   const measured = real.filter((value) => value !== null).length;
   const W = 240;
@@ -284,27 +290,48 @@ function Sparkline({ values, color, label }: { values: (number | null)[]; color:
       role="img"
       aria-label={label + " across " + measured + " measured buckets"}
     >
-      <defs>
-        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" style={{ stopColor: color, stopOpacity: 0.42 }} />
-          <stop offset="100%" style={{ stopColor: color, stopOpacity: 0.02 }} />
-        </linearGradient>
-      </defs>
-      <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke="hsl(var(--border))" strokeWidth="1" />
+      <line x1={PAD} y1={H - PAD} x2={W - PAD} y2={H - PAD} stroke={ANALYTICS_TOKENS.grid} strokeWidth={ANALYTICS_MARK.gridWidth} />
       {segments.map((segment) => {
         const points = segment.points;
         if (points.length === 1) {
-          return <circle key={segment.start} cx={points[0].x} cy={points[0].y} r="3.5" style={{ fill: color }} />;
+          return (
+            <circle
+              key={segment.start}
+              cx={points[0].x}
+              cy={points[0].y}
+              r={ANALYTICS_MARK.markerRadius}
+              fill={color}
+              stroke={ANALYTICS_TOKENS.surface}
+              strokeWidth={ANALYTICS_MARK.lineWidth}
+            />
+          );
         }
         const line = segmentPath(points);
         const first = points[0];
         const last = points[points.length - 1];
         const area = line + " L " + last.x.toFixed(2) + " " + (H - PAD) + " L " + first.x.toFixed(2) + " " + (H - PAD) + " Z";
+        const solidLine = segmentPath(points.slice(0, -1));
+        const tailLine = segmentPath(points.slice(-2));
         return (
           <g key={segment.start}>
-            <path d={area} fill={"url(#" + gradientId + ")"} />
-            <path d={line} fill="none" style={{ stroke: color }} strokeOpacity="0.16" strokeWidth="7" strokeLinecap="round" strokeLinejoin="round" />
-            <path d={line} fill="none" style={{ stroke: color }} strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" />
+            <path d={area} fill={ANALYTICS_TOKENS.accentSoft} />
+            <path
+              d={solidLine}
+              fill="none"
+              stroke={color}
+              strokeWidth={ANALYTICS_MARK.lineWidth}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            <path
+              d={tailLine}
+              fill="none"
+              stroke={color}
+              strokeWidth={ANALYTICS_MARK.lineWidth}
+              strokeDasharray={ANALYTICS_MARK.tailDash}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
           </g>
         );
       })}
@@ -318,36 +345,45 @@ function MetricCard({
   delta,
   values,
   color,
+  selected = false,
+  onSelect,
 }: {
   label: string;
   value: string;
   delta: Delta;
   values: (number | null)[];
   color: string;
+  selected?: boolean;
+  onSelect?: () => void;
 }) {
   return (
-    <Card className="relative min-w-0 w-full max-w-full overflow-hidden p-0">
-      <div
-        className="absolute inset-x-0 top-0 h-1"
-        style={{ background: "linear-gradient(90deg, " + color + ", transparent)" }}
-        aria-hidden="true"
-      />
-      <div className="min-w-0 p-4 sm:p-5">
-        <div className="flex min-w-0 items-start justify-between gap-2">
-          <div className="min-w-0">
-            <div className="min-w-0 break-words text-xs font-medium uppercase leading-tight tracking-wide text-muted">{label}</div>
-            <div className="mt-1 min-w-0 break-words text-2xl font-semibold leading-tight tabular-nums text-fg sm:text-3xl">{value}</div>
+    <Card className={ANALYTICS_CARD_CLASS + " relative overflow-hidden"}>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={selected}
+        aria-label={"Show " + label}
+        onClick={onSelect}
+        className="relative block min-w-0 w-full max-w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border"
+      >
+        <div className="min-w-0 p-4 sm:p-5">
+          <div className="flex min-w-0 items-start justify-between gap-2">
+            <div className="min-w-0">
+              <div className={ANALYTICS_TEXT.label}>{label}</div>
+              <div className={"mt-1 " + ANALYTICS_TEXT.value}>{value}</div>
+            </div>
+            <Badge tone={delta.tone} className="shrink-0 tabular-nums" aria-label={delta.aria}>
+              {delta.text}
+            </Badge>
           </div>
-          <Badge tone={delta.tone} className="shrink-0 tabular-nums" aria-label={delta.aria}>
-            {delta.text}
-          </Badge>
+          <Sparkline values={values} color={color} label={label} />
+          <div className={"mt-2 flex min-w-0 items-start justify-between gap-2 " + ANALYTICS_TEXT.captionTight}>
+            <span className="shrink-0">Aggregate buckets</span>
+            <span className="min-w-0 break-words text-right tabular-nums">{delta.hint}</span>
+          </div>
         </div>
-        <Sparkline values={values} color={color} label={label} />
-        <div className="mt-2 flex min-w-0 items-start justify-between gap-2 text-xs text-secondary">
-          <span className="shrink-0">Aggregate buckets</span>
-          <span className="min-w-0 break-words text-right tabular-nums">{delta.hint}</span>
-        </div>
-      </div>
+        <span className={"absolute inset-x-0 bottom-0 h-0.5 " + (selected ? "bg-fg" : "bg-transparent")} aria-hidden="true" />
+      </button>
     </Card>
   );
 }
@@ -358,26 +394,35 @@ function LatencyPanel({
   values,
   color,
   note,
+  selected = false,
+  onSelect,
 }: {
   label: string;
   value: string;
   values: (number | null)[];
   color: string;
   note: string;
+  selected?: boolean;
+  onSelect?: () => void;
 }) {
   return (
-    <Card className="relative min-w-0 w-full max-w-full overflow-hidden p-0">
-      <div
-        className="absolute inset-x-0 top-0 h-1"
-        style={{ background: "linear-gradient(90deg, " + color + ", transparent)" }}
-        aria-hidden="true"
-      />
-      <div className="min-w-0 p-4 sm:p-5">
-        <div className="min-w-0 break-words text-xs font-medium uppercase leading-tight tracking-wide text-muted">{label}</div>
-        <div className="mt-1 min-w-0 break-words text-2xl font-semibold leading-tight tabular-nums text-fg sm:text-3xl">{value}</div>
-        <Sparkline values={values} color={color} label={label} />
-        <p className="mt-2 min-w-0 break-words text-xs text-secondary">{note}</p>
-      </div>
+    <Card className={ANALYTICS_CARD_CLASS + " relative overflow-hidden"}>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={selected}
+        aria-label={"Show " + label}
+        onClick={onSelect}
+        className="relative block min-w-0 w-full max-w-full text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border"
+      >
+        <div className="min-w-0 p-4 sm:p-5">
+          <div className={ANALYTICS_TEXT.label}>{label}</div>
+          <div className={"mt-1 " + ANALYTICS_TEXT.value}>{value}</div>
+          <Sparkline values={values} color={color} label={label} />
+          <p className={"mt-2 " + ANALYTICS_TEXT.caption}>{note}</p>
+        </div>
+        <span className={"absolute inset-x-0 bottom-0 h-0.5 " + (selected ? "bg-fg" : "bg-transparent")} aria-hidden="true" />
+      </button>
     </Card>
   );
 }
@@ -388,6 +433,8 @@ export default function StorageAnalyticsClient() {
   const [latencyMetric, setLatencyMetric] = useState<LatencyKey>("avg_latency");
   const [hiddenKeys, setHiddenKeys] = useState<string[]>([]);
   const [refreshToken, setRefreshToken] = useState(0);
+  const [nowMs, setNowMs] = useState<number | null>(null);
+  const [selectedSummary, setSelectedSummary] = useState("requests");
   const { data: databases, error: listError, loading: listLoading, refresh: refreshList } = usePoll<Database[]>("/v1/databases", 5000);
 
   const ids = useMemo(() => (databases ?? []).slice(0, MAX_DATABASES).map((item) => item.id), [databases]);
@@ -693,17 +740,35 @@ export default function StorageAnalyticsClient() {
     }
     return latest;
   }, [dbs]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setNowMs(Date.now());
+  }, [lastObservedMs, rows.length]);
+
+  const granularityMs = firstFinite(dbs.map((db) => num(db.metrics?.granularity_ms)));
+  const latestBucketMs = rows.length ? rows[rows.length - 1].t_ms : null;
+  const incompleteTail =
+    granularityMs !== null &&
+    nowMs !== null &&
+    latestBucketMs !== null &&
+    rows.length > 1 &&
+    nowMs >= latestBucketMs &&
+    nowMs - latestBucketMs < granularityMs;
+  const tailNote = incompleteTail
+    ? " The dashed final segment marks the still-open bucket; no value is projected."
+    : "";
   const metricErrors = dbs.filter((db) => db.error !== null);
   const metricsPending = dbs.length > 0 && dbs.every((db) => db.metrics === null && db.error === null);
   const traffic = TRAFFIC.find((item) => item.key === trafficMetric) ?? TRAFFIC[0];
   const latency = LATENCY.find((item) => item.key === latencyMetric) ?? LATENCY[0];
   const windowLabel = WINDOWS[windowKey].label + " window";
   const trafficCaption =
-    "Each coloured line is one database's reported " + traffic.label.toLowerCase() +
-    " per bucket. The table view carries the plain sum across the selected databases.";
+    "Each line is one database's reported " + traffic.label.toLowerCase() +
+    " per bucket. The table view carries the plain sum across the selected databases." + tailNote;
   const latencyCaption = latencyMetric === "avg_latency"
-    ? "Computed as latency_sum_ms / requests for each database and bucket. Only reported buckets are drawn."
-    : "The largest latency_max_ms each database reported per bucket. Only reported buckets are drawn.";
+    ? "Computed as latency_sum_ms / requests for each database and bucket. Only reported buckets are drawn." + tailNote
+    : "The largest latency_max_ms each database reported per bucket. Only reported buckets are drawn." + tailNote;
 
   const refreshAll = useCallback(() => {
     refreshList();
@@ -717,23 +782,15 @@ export default function StorageAnalyticsClient() {
   }
 
   return (
-    <div className="relative min-w-0 w-full max-w-full overflow-x-hidden px-4 py-5 sm:px-6">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 h-44"
-        style={{
-          background: "linear-gradient(180deg, rgba(99,102,241,0.14), rgba(34,211,238,0.05) 45%, transparent)",
-          maskImage: "linear-gradient(90deg, transparent, black 12%, black 88%, transparent)",
-          WebkitMaskImage: "linear-gradient(90deg, transparent, black 12%, black 88%, transparent)",
-        }}
-      />
+    <div className={ANALYTICS_ROOT_CLASS + " relative min-w-0 w-full max-w-full overflow-x-hidden px-4 py-5 sm:px-6"}>
+      <style>{ANALYTICS_THEME_CSS}</style>
       <div className="relative min-w-0 w-full max-w-full">
         <PageHeader
           title="Storage analytics"
           desc="Measured requests, traffic, latency and request events across all databases returned for this tenant."
           action={
             <>
-              <Badge tone="purple" className="min-w-0 max-w-full">
+              <Badge tone="default" className="min-w-0 max-w-full">
                 <span className="min-w-0 break-words">
                   {lastObservedMs === null ? "Waiting for measurements" : "Last observation " + timeAgo(lastObservedMs)}
                 </span>
@@ -744,7 +801,7 @@ export default function StorageAnalyticsClient() {
               </Button>
               <Link
                 href="/storage"
-                className="inline-flex min-h-[44px] min-w-0 max-w-full items-center gap-2 rounded-md border border-border px-3 text-sm font-medium text-fg hover:bg-subtle"
+                className={ANALYTICS_PILL_CLASS}
               >
                 <ArrowLeft className="h-4 w-4 shrink-0" aria-hidden="true" />
                 <span className="min-w-0 break-words">Databases</span>
@@ -758,10 +815,10 @@ export default function StorageAnalyticsClient() {
           {WINDOW_KEYS.map((key) => (
             <Button
               key={key}
-              variant={key === windowKey ? "default" : "outline"}
+              variant="ghost"
               aria-pressed={key === windowKey}
-              className="min-h-[44px] min-w-0 px-3"
-              style={key === windowKey ? { background: "linear-gradient(90deg, #6366f1, #22d3ee)", color: "#ffffff", borderColor: "transparent" } : undefined}
+              className={ANALYTICS_TAB_CLASS + (key === windowKey ? " font-medium text-fg" : " text-secondary")}
+              style={key === windowKey ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
               onClick={() => setWindowKey(key)}
             >
               {WINDOWS[key].label}
@@ -808,36 +865,36 @@ export default function StorageAnalyticsClient() {
           <StateNotice tone="muted">The database list has not returned data.</StateNotice>
         ) : (
           <div className="flex min-w-0 w-full max-w-full flex-col gap-4" aria-busy={listLoading}>
-            <Card className="min-w-0 w-full max-w-full p-4 sm:p-5">
+            <Card className={ANALYTICS_CARD_CLASS + " p-4 sm:p-5"}>
               <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
-                <h2 className="min-w-0 break-words text-sm font-semibold text-fg">Databases with measured buckets</h2>
-                <Badge tone="blue" className="shrink-0 tabular-nums">
+                <h2 className={ANALYTICS_TEXT.title}>Databases with measured buckets</h2>
+                <Badge tone="default" className="shrink-0 tabular-nums">
                   {windowTotal === null ? "No bucket total" : "Σ " + traffic.format(windowTotal) + " across all databases in " + WINDOWS[windowKey].label}
                 </Badge>
               </div>
-              <p className="mt-1 min-w-0 break-words text-xs leading-snug text-secondary">{sourceCaption}</p>
+              <p className={"mt-1 " + ANALYTICS_TEXT.caption}>{sourceCaption}</p>
               <div className="mt-3 flex min-w-0 flex-wrap gap-2" role="group" aria-label="Database series toggles">
-                {series.map((item) => {
+                {series.map((item, seriesIndex) => {
                   const isActive = activeKeys.includes(item.key);
                   return (
                     <Button
                       key={item.key}
-                      variant="outline"
+                      variant="ghost"
                       aria-pressed={isActive}
-                      className="min-h-[44px] min-w-0 max-w-full gap-2 px-3 text-xs"
-                      style={isActive
-                        ? { borderColor: item.color, background: "linear-gradient(90deg, " + item.color + "2E, transparent)", color: "hsl(var(--fg))" }
-                        : { borderColor: item.color, opacity: 0.55 }}
+                      className={ANALYTICS_TAB_CLASS + (isActive ? " gap-2 font-medium text-fg" : " gap-2 text-secondary")}
+                      style={isActive ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
                       onClick={() => toggleDatabase(item.key)}
                     >
-                      <span className="h-0.5 w-4 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+                      <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
+                        <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+                      </svg>
                       <span className="min-w-0 break-words">{item.label}</span>
                     </Button>
                   );
                 })}
                 <span className="inline-flex min-h-[44px] min-w-0 items-center gap-2 rounded-md border border-border px-3 text-xs text-secondary">
                   <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
-                    <line x1="0" y1="4" x2="20" y2="4" stroke="hsl(var(--fg))" strokeWidth="2" strokeDasharray="3 4" />
+                    <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.text} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={ANALYTICS_MARK.averageDash} />
                   </svg>
                   <span className="min-w-0 break-words">Average (dotted)</span>
                 </span>
@@ -852,12 +909,12 @@ export default function StorageAnalyticsClient() {
               </p>
             </Card>
 
-            <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
-              <MetricCard label="Requests" value={totals.requests === null ? "—" : formatCount(totals.requests)} delta={halfDelta(aggRequests, null, formatCount)} values={aggRequests} color={SERIES_COLORS[0]} />
-              <MetricCard label="Errors" value={totals.errors === null ? "—" : formatCount(totals.errors)} delta={halfDelta(aggErrors, false, formatCount)} values={aggErrors} color={SERIES_COLORS[4]} />
-              <MetricCard label="Error rate" value={totals.errorRate === null ? "—" : formatPct(totals.errorRate)} delta={rateDelta(aggErrors, aggRequests)} values={errorRateSeries} color={SERIES_COLORS[3]} />
-              <MetricCard label="Ingress" value={totals.bytesIn === null ? "—" : formatBytes(totals.bytesIn)} delta={halfDelta(aggBytesIn, null, formatBytes)} values={aggBytesIn} color={SERIES_COLORS[2]} />
-              <MetricCard label="Egress" value={totals.bytesOut === null ? "—" : formatBytes(totals.bytesOut)} delta={halfDelta(aggBytesOut, null, formatBytes)} values={aggBytesOut} color={SERIES_COLORS[1]} />
+            <div role="tablist" aria-label="Storage summary metrics" className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              <MetricCard label="Requests" value={totals.requests === null ? "—" : formatCount(totals.requests)} delta={halfDelta(aggRequests, null, formatCount)} values={aggRequests} color={SERIES_COLORS[0]} selected={selectedSummary === "requests"} onSelect={() => { setSelectedSummary("requests"); setTrafficMetric("requests"); }} />
+              <MetricCard label="Errors" value={totals.errors === null ? "—" : formatCount(totals.errors)} delta={halfDelta(aggErrors, false, formatCount)} values={aggErrors} color={SERIES_COLORS[4]} selected={selectedSummary === "errors"} onSelect={() => { setSelectedSummary("errors"); setTrafficMetric("errors"); }} />
+              <MetricCard label="Error rate" value={totals.errorRate === null ? "—" : formatPct(totals.errorRate)} delta={rateDelta(aggErrors, aggRequests)} values={errorRateSeries} color={SERIES_COLORS[3]} selected={selectedSummary === "errorRate"} onSelect={() => setSelectedSummary("errorRate")} />
+              <MetricCard label="Ingress" value={totals.bytesIn === null ? "—" : formatBytes(totals.bytesIn)} delta={halfDelta(aggBytesIn, null, formatBytes)} values={aggBytesIn} color={SERIES_COLORS[2]} selected={selectedSummary === "bytesIn"} onSelect={() => { setSelectedSummary("bytesIn"); setTrafficMetric("bytes_in"); }} />
+              <MetricCard label="Egress" value={totals.bytesOut === null ? "—" : formatBytes(totals.bytesOut)} delta={halfDelta(aggBytesOut, null, formatBytes)} values={aggBytesOut} color={SERIES_COLORS[1]} selected={selectedSummary === "bytesOut"} onSelect={() => { setSelectedSummary("bytesOut"); setTrafficMetric("bytes_out"); }} />
             </div>
             <p className="min-w-0 break-words text-xs text-secondary">
               Card values are the sum of the counters each database reported. A delta compares the first half with the second half of the measured aggregate series; a bucket a database did not report is absent from both.
@@ -868,9 +925,10 @@ export default function StorageAnalyticsClient() {
               {TRAFFIC.map((item) => (
                 <Button
                   key={item.key}
-                  variant={item.key === trafficMetric ? "default" : "outline"}
+                  variant="ghost"
                   aria-pressed={item.key === trafficMetric}
-                  className="min-h-[44px] min-w-0 px-3"
+                  className={ANALYTICS_TAB_CLASS + (item.key === trafficMetric ? " font-medium text-fg" : " text-secondary")}
+                  style={item.key === trafficMetric ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
                   onClick={() => setTrafficMetric(item.key)}
                 >
                   {item.label}
@@ -887,6 +945,7 @@ export default function StorageAnalyticsClient() {
               format={traffic.format}
               windowLabel={windowLabel}
               showTotal
+              incompleteTail={incompleteTail}
               emptyText="No database returned a bucket with this metric in the selected window."
             />
 
@@ -895,9 +954,10 @@ export default function StorageAnalyticsClient() {
               {LATENCY.map((item) => (
                 <Button
                   key={item.key}
-                  variant={item.key === latencyMetric ? "default" : "outline"}
+                  variant="ghost"
                   aria-pressed={item.key === latencyMetric}
-                  className="min-h-[44px] min-w-0 px-3"
+                  className={ANALYTICS_TAB_CLASS + (item.key === latencyMetric ? " font-medium text-fg" : " text-secondary")}
+                  style={item.key === latencyMetric ? { borderBottomColor: ANALYTICS_TOKENS.underline } : undefined}
                   onClick={() => setLatencyMetric(item.key)}
                 >
                   {item.label}
@@ -913,15 +973,18 @@ export default function StorageAnalyticsClient() {
               average={latencyAverage}
               format={formatMs}
               windowLabel={windowLabel}
+              incompleteTail={incompleteTail}
               emptyText="No database returned latency readings in the selected window."
             />
 
-            <div className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2">
+            <div role="tablist" aria-label="Latency summary metrics" className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2">
               <LatencyPanel
                 label="Average latency"
                 value={avgLatencyWindow === null ? "—" : formatMs(avgLatencyWindow)}
                 values={avgLatencySeries}
                 color={SERIES_COLORS[5]}
+                selected={latencyMetric === "avg_latency"}
+                onSelect={() => setLatencyMetric("avg_latency")}
                 note="Computed from latency_sum_ms and requests in the reported buckets."
               />
               <LatencyPanel
@@ -929,10 +992,12 @@ export default function StorageAnalyticsClient() {
                 value={maxLatencyWindow === null ? "—" : formatMs(maxLatencyWindow)}
                 values={maxLatencySeries}
                 color={SERIES_COLORS[4]}
+                selected={latencyMetric === "max_latency"}
+                onSelect={() => setLatencyMetric("max_latency")}
                 note="The largest latency_max_ms the node reported in this window."
               />
             </div>
-            <p className="min-w-0 break-words text-xs text-secondary">
+            <p className={ANALYTICS_TEXT.caption}>
               The metrics endpoint does not report percentiles, so these panels report a computed mean and the largest observed per-bucket value.
             </p>
 

@@ -43,6 +43,11 @@ const MINTED_TOKEN_TTL_SECS: i64 = 60 * 60;
 const ORG_TOKEN_TTL_SECS_DEFAULT: i64 = 15 * 60;
 const DOMAIN_VERIFY_DEFAULT_SECS: u64 = 45;
 const MESH_FORWARD_TIMEOUT_SECS: u64 = 20;
+/// The node-local SOC 2 technical-evidence GET. A read, so `roles::RULES` lists it at viewer and
+/// `ui/lib/team-role.ts` mirrors the row. Bound the operating period so one GET cannot ask for an
+/// unbounded walk of the journal on a serving path.
+const SOC2_EVIDENCE_DEFAULT_PERIOD_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+const SOC2_EVIDENCE_MAX_PERIOD_MS: u64 = 366 * 24 * 60 * 60 * 1000;
 const PROJECT_DELETE_QUICK_PASS_PEER_BUDGET: Duration = Duration::from_secs(28);
 const FRAMEWORK_OUTPUT_DIRS: [&str; 6] = [
     ".vercel/output/static",
@@ -82,6 +87,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/mesh/establish", get(mesh_establish))
         .route("/v1/admin/runtime", get(admin_runtime))
         .route("/v1/admin/content-hash", get(admin_content_hash))
+        .route("/v1/admin/soc2/evidence", get(soc2_evidence_public))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -3770,6 +3776,108 @@ async fn fleet_deployments_public(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_fleet_read(claims.as_ref().map(|e| &e.0))?;
     Ok(fleet_deployments(State(c)).await)
+}
+
+/// The node-local SOC 2 technical-evidence GET. `admin_ingress` serves GET/HEAD LOCALLY and public
+/// hosts are round-robin DNS, so every node answers with ITS OWN signed oplog shard. There is
+/// deliberately NO owner proxy, NO `?node=` hop and NO `gossip::dispatch` arm: proxying one node's
+/// log under another node's name would misattribute the evidence (an unknown gossip path answers an
+/// EMPTY body). The response names the responding node, its OWN signing public key and that shard's
+/// signed chain tip; a verifier that wants a DIFFERENT node addresses that node's admin listener
+/// directly. That key is NOT an operator-pinned independent identity: `evidence::verify_report` here
+/// is a STRUCTURAL SELF-CHECK under the writer's own key, so `pin_required` is reported true.
+///
+/// Auth is `auth::require_auth` (role decided ONCE by `roles::gate`, viewer for this read) plus the
+/// `require_auth_read` wrapper, which refuses an unauthenticated GET with 401 while enforced. The
+/// route is NOT in `auth::is_open_route`, so it cannot skip the gate, and tenancy is never taken
+/// from `x-hive-team`. Heavy work (report generation, Merkle commitment, signing and the verifier)
+/// runs on `spawn_blocking`, never on a serving tokio worker.
+async fn soc2_evidence_public(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: Query<Soc2EvidenceQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let now = now_ms();
+    let period_end_ms = q.period_end_ms.unwrap_or(now);
+    let period_start_ms = q
+        .period_start_ms
+        .unwrap_or_else(|| period_end_ms.saturating_sub(SOC2_EVIDENCE_DEFAULT_PERIOD_MS));
+    if period_start_ms > period_end_ms
+        || period_end_ms.saturating_sub(period_start_ms) > SOC2_EVIDENCE_MAX_PERIOD_MS
+    {
+        return Err((StatusCode::BAD_REQUEST, "invalid operating period".into()));
+    }
+    let Some(snapshot) = crate::db_contract::journal_evidence_snapshot(&c).await else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "node-local journal evidence unavailable".into(),
+        ));
+    };
+    let node_id = c.node_name.clone();
+    let generated = match tokio::task::spawn_blocking(move || {
+        let report = hive_contract::evidence::generate_report(
+            &snapshot.journal,
+            &snapshot.oplog,
+            &node_id,
+            hive_contract::contracts::journal::CONTRACT_ID,
+            hive_contract::contracts::journal::CONTRACT_VERSION,
+            period_start_ms,
+            period_end_ms,
+            snapshot.signer.as_ref(),
+            &snapshot.public_key_hex,
+        )
+        .map_err(|_| "no signed evidence for the stated operating period".to_string())?;
+        hive_contract::evidence::verify_report(&report, &snapshot.public_key_hex)
+            .map_err(|_| "structural self-check did not reproduce the report".to_string())?;
+        Ok::<_, String>(report)
+    })
+    .await
+    {
+        Ok(Ok(report)) => report,
+        Ok(Err(reason)) => return Err((StatusCode::SERVICE_UNAVAILABLE, reason)),
+        Err(_) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "evidence generation failed".into(),
+            ))
+        }
+    };
+    let chain_tip = generated.oplog_chain_tip.clone();
+    let report_hash = generated.report_hash.clone();
+    tracing::info!(
+        node = %c.node_name,
+        chain_tip = %chain_tip,
+        report_hash = %report_hash,
+        "soc2 technical evidence report generated for responding node"
+    );
+    Ok(Json(json!({
+        "responding_node": c.node_name.clone(),
+        "node_id": generated.node_id.clone(),
+        "scope": generated.scope.clone(),
+        "scope_statement": generated.scope_statement.clone(),
+        "oplog_contract_id": generated.oplog_contract_id.clone(),
+        "oplog_chain_tip": chain_tip,
+        "worm_tip": generated.worm_tip.clone(),
+        "report_hash": report_hash,
+        "public_key_hex": generated.public_key_hex.clone(),
+        "period_start_ms": generated.period_start_ms,
+        "period_end_ms": generated.period_end_ms,
+        "boundary": generated.boundary.clone(),
+        "overall_status": generated.overall_status.clone(),
+        "verification": "structural self-check under the responding node's own signing key; no pinned independent identity",
+        "pin_required": true,
+        "trust_limit": "reproducing hashes and signatures under the writer's own key is not fraud detection; a pinned independent identity is required before this report names a publisher",
+        "report": generated,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct Soc2EvidenceQuery {
+    #[serde(default)]
+    period_start_ms: Option<u64>,
+    #[serde(default)]
+    period_end_ms: Option<u64>,
 }
 
 /// Public mount for [`anycast_table`]: the dashboard Network page reads it, so it takes the

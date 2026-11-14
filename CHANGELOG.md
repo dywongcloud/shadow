@@ -1,5 +1,91 @@
 # Changelog
 
+## 2026-11-13 - ui: analytics console uses the dashboard's own semantic theme
+
+The project and storage analytics consoles carried a PARALLEL hardcoded palette (`--a-*` /
+`--db-*` hex), six saturated per-series `-lit` hues, per-series SVG `linearGradient` fills,
+inline `linear-gradient(...)` style attributes, an `!important` forced-colors override and a
+`<style>` injection with `.dark .hive-analytics` specificity (0,2,0). Measured baseline: 20
+gradient/hardcoded-color declarations across the four chart components. That read as a
+vibe-coded demo, not Shadw.cloud.
+
+One shared primitive `ui/components/analytics-theme.ts` now holds the palette, grid/axis/
+typography tokens and the series dash patterns. It derives from the dashboard's OWN semantic
+tokens in `ui/app/globals.css` (`--link`, `--foreground`, `--card`, `--border`, `--muted`,
+`--secondary`, `--subtle`, `--green`, `--border-strong`) with a `.dark` variant, so light and
+dark both resolve. The luminous landing triad (`landing.css`) is deliberately NOT imported into a
+data-dense console. Both analytics clients inject `ANALYTICS_THEME_CSS` via `<style>` on the
+`hive-analytics` root, REPLACING `PALETTE_CSS`; a theme-only CSS file alone would have been inert
+because the old injection and inline styles outranked `:root`. Measured final state across the
+seven owned TSX files plus the new theme module: 0 hardcoded hex, 0 gradient declarations,
+single accent line + pale fill, tabbed metric cards with an underline, subtle percentage bars,
+no glows. Every existing metric, tab, filter, time range, API call and data shape is retained;
+no value is invented. `tsc --noEmit -p ui/tsconfig.json` exit 0.
+
+NOT WITNESSED: a rendered/computed-CSS value in a headful browser. The host was at 0% idle
+(load 173-242) for this run, so pixel-level contrast, phone widths and `getComputedStyle` remain
+an OPEN frontier item in `DESIGN-LOG.md` (F3); the /dada run is declared INCOMPLETE at S1/S2/S3
+for that reason. A second identical hardcoded palette at `ui/components/db-chart.tsx` serves the
+database-detail page (`/storage/[id]`), a different route; it is recorded as a residual cohesion
+gap and was NOT changed, to avoid widening an unverified surface.
+
+## 2026-11-13 - ci: disable the macos-15-intel blocking gate
+
+Operator decision. `macos-15-intel` is removed from the BLOCKING `build + unit tests`
+matrix and from the `shadw CLI` matrix in `.github/workflows/rust-ci.yml`.
+`.github/workflows/release-npm-cli.yml` is UNCHANGED: it still builds and ships x64
+macOS CLI release artifacts, which are not a CI gate. Branch protection is not enabled
+on `main`, so no required status-check context needed removal.
+
+`scripts/check-contract-bindings.py` now has `MACOS_LABELS = ["macos-15"]` and its
+comment records the decision; `scripts/contract-bindings.json` was regenerated locally
+with `--sync` (its `gate_sha256` changed) and `--sync` REMAINS forbidden in CI. No
+`continue-on-error`, no new FAIL_OPEN entry, no test file, no weakened security gate.
+`REQUIRED_MACOS_JOBS`, `RETIRED_MACOS_LABELS`, `FORBIDDEN` and the fail-open ratchet
+are untouched. Local `--check`: `RESULT PASS bindings=34 layers=4 gates=35
+fail_open=4 secrets_clean=1`.
+
+**Coverage reduction, stated plainly.** macOS x64 no longer runs the four blocking
+layers in CI; `gates=35` instead of 36 because the ratchet asserts one macOS label,
+not two. The Intel leg was the ONLY failing job in runs 43539658749 / 43378388377 /
+43350529081: three PRE-EXISTING `crates/fluid-gateway/tests/gateway.rs` fixtures
+(`:111`, `:427`, `:220`) assert 200/504 and get 404 because `Gateway::deploy` ->
+`sync_deploy_request` leaves the deployment not `Ready` before `select()` filters it.
+Nine sibling tests pass by constructing `DeployState::Ready` directly. Those three
+are NOT fixed by this change: diagnosing the shared primitive needs an Intel macOS
+runner, and this project never authors test files. Removing the leg removes the
+signal, not the defect. An unenforced node would now ship x64 macOS regressions
+silently; the x64 release build in `release-npm-cli.yml` is the remaining x64 signal.
+
+## 2026-11-13 - feat: live node-local SOC 2 technical-evidence GET
+
+Previously `hive_contract::evidence::generate_report` / `verify_report` were reachable ONLY from
+the `contract-double-entry` witness binary; exhaustive codesearch found zero `evidence::` hits in
+`crates/hive-cloud/src/` and `evidence_boundary=0` in the running binary on all six fleet hosts.
+`GET /v1/admin/soc2/evidence?period_start_ms=&period_end_ms=` now mounts on the admin router,
+behind `auth::require_auth` (role decided once by `roles::gate`), a viewer `RULES` row mirrored
+row-for-row in `ui/lib/team-role.ts`, and `require_auth_read` (401 for an anonymous GET while
+enforced). It is NOT in `auth::is_open_route`; no `x-hive-team` read. Defaults `[now-90d, now]`,
+max 366d, else 400.
+
+`db_contract::journal_evidence_snapshot` clones THIS node's live journal under its read lock and
+its signed `hive.billing-journal.v1` oplog entries; replay and report generation run on
+`spawn_blocking`, never a serving tokio worker. ZERO new persisted state: no `PlatformSnapshot`
+field, no serde-required key removed, no mixed-version state loss. The response names
+`responding_node`, `node_id`, `public_key_hex`, `oplog_chain_tip`, `worm_tip` and `report_hash`.
+
+`admin_ingress` serves GET/HEAD locally, so there is NO owner proxy, NO `?node=` hop and NO
+`gossip::dispatch` arm: a report relabelled as another node's log would misattribute evidence, and
+an unknown gossip path must answer an EMPTY body. The answer is scoped to whichever node was hit
+over round-robin DNS. TRUST LIMIT, enforced after adversarial review: `public_key_hex` is the
+WRITER's own `IntegritySigner` key. `verify_report` under that key is a STRUCTURAL SELF-CHECK, not
+verification under a pinned independent identity, so the response carries
+`verification: "structural self-check ... no pinned independent identity"`, `pin_required: true`
+and `trust_limit`. Reproducing hashes under the writer's own key is not fraud detection. No pinned
+identity means Inadmissible, never Dishonest. The non-attestation `BOUNDARY` is verbatim; AT-1/AT-2
+stay UNMET; no compliance verdict word is emitted. Runbook: `docs/soc2-evidence-report.md` and
+`docs/contract-verification.md` section 7.
+
 ## 2026-11-13 - feat: balanced double-entry journal and SOC 2 evidence
 
 Concept-level reimplementation from `VectorGuard-Labs/VectorLedger` (Rust, BUSL-1.1

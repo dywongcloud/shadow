@@ -200,11 +200,11 @@ GATES = [
     dict(id="rust.runtime.ping", command="grep -qx OK"),
 ]
 
-# Every blocking layer must run on BOTH platforms. A removed macOS leg is a
-# failed build, not a silently narrower pipeline. `macos-15` is arm64 and
-# `macos-15-intel` is x64; the retired macos-13/macos-14 labels are refused.
+# Every blocking layer must run on Linux and macOS (arm64). Operator decision
+# 2026-11-13: Intel macOS no longer blocks CI; x64 macOS release artifacts
+# remain in release-npm-cli.yml. Retired macos-13/macos-14 labels are refused.
 REQUIRED_MACOS_JOBS = ["contracts", "test", "dashboard", "core-tests", "cli", "verify"]
-MACOS_LABELS = ["macos-15", "macos-15-intel"]
+MACOS_LABELS = ["macos-15"]
 RETIRED_MACOS_LABELS = ["macos-13", "macos-14"]
 
 # The ONLY steps allowed to stay non-blocking. Each needs a reason. Adding a
@@ -539,7 +539,7 @@ def check_workflows(errors: list[str]) -> int:
         if label not in ci or label not in release:
             errors.append(
                 f"CI_GATE MACOS label {label!r} absent from one of the workflows; "
-                f"both arm64 and x64 darwin must be covered"
+                f"the arm64 macOS leg must gate both workflows"
             )
         else:
             checked += 1

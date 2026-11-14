@@ -112,6 +112,10 @@ const RULES: &[Rule] = &[
     // (platform_admin), which makes the effective access operator-only. `roles::gate`
     // short-circuits for platform_admin, so the floor never blocks the operator.
     rule(GET, "/v1/admin/usage/economics", Role::Admin),
+    // Node-local SOC 2 technical evidence: a READ over the responding node's OWN signed journal
+    // shard. Viewer, like every read; `admin::require_auth_read` still refuses an anonymous GET,
+    // and the response names the node and its chain tip instead of proxying another node's log.
+    rule(GET, "/v1/admin/soc2/evidence", Role::Viewer),
     rule(POST, "/v1/domains/:domain/import", Role::Admin),
     rule(PUT, "/v1/domains/:domain/nameservers", Role::Admin),
     rule(POST, "/v1/domains/:domain/records", Role::Admin),

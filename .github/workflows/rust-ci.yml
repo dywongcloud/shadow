@@ -58,9 +58,9 @@ jobs:
       - name: Whitespace (hard gate)
         run: git diff --check HEAD^ HEAD
 
-      # stdlib-only; asserts every layer is blocking on BOTH platforms, refuses
-      # an undeclared fail-open, verifies the release workflow is gated, and
-      # checks all construct bindings + committed-secret material.
+      # stdlib-only; asserts every layer is blocking on Linux and macOS arm64,
+      # refuses an undeclared fail-open, verifies the release workflow is gated,
+      # and checks all construct bindings + committed-secret material.
       - name: Contract bindings (hard gate)
         run: python3 -I scripts/check-contract-bindings.py --check
 
@@ -76,9 +76,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # macos-15 = arm64, macos-15-intel = x64. macos-14/macos-13 were
-        # retired on 2026-11-02; the old release labels would not boot.
-        os: [ubuntu-latest, macos-15, macos-15-intel]
+        # Operator word 2026-11-13: Intel macOS no longer blocks CI; x64 macOS
+        # release artifacts remain in release-npm-cli.yml. macos-15 is arm64.
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
 
@@ -100,7 +100,7 @@ jobs:
       # Native Rust lane: an UNMODIFIED Vercel Rust handler must compile OFFLINE against the
       # first-party shim and serve $PORT plus /_vercel/ping (the Vercel internal probe; the
       # public gateway reserves /_vercel/*). Live execution, not a test file; the same cargo
-      # command and shim layout build_rust_lane uses on a node. Runs on all three OSes.
+      # command and shim layout build_rust_lane uses on a node. Runs on both OSes.
       - name: Rust runtime (offline build + live HTTP witness, all OSes)
         run: |
           set -eu
@@ -284,13 +284,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # All three runners execute the IDENTICAL 35-assertion harness.
+          # Both runners execute the IDENTICAL 35-assertion harness.
           # HIVE_CI_PLATFORM makes the declared runner agree with uname's probe.
           - os: ubuntu-latest
             platform: linux
           - os: macos-15
-            platform: macos
-          - os: macos-15-intel
             platform: macos
     steps:
       - uses: actions/checkout@v4

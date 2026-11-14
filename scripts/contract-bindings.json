@@ -58,14 +58,14 @@
     },
     {
       "assertion": "beta BLOCKED from alpha's database (404)",
-      "canonical_sha256": "4a3e6bd35f70426cbfc7a3e8a7e964e81757d3c77883f708a73bcfc8595cc698",
+      "canonical_sha256": "4641caedadada9585e3bf93782e3a95bd6eb3b21f5007b13d333f2c74b7968aa",
       "id": "unit.roles.rules",
       "layer": "unit",
       "path": "crates/hive-cloud/src/roles.rs"
     },
     {
       "assertion": "npm run lint",
-      "canonical_sha256": "4fb76bee99bcb6052e60c3f8981c72851a49717b6ae167cb50c29b77337e15ae",
+      "canonical_sha256": "ee5e6a94b9d3629e79d4ff67cc5f4b494dc97ba157def53fee64e928f300939e",
       "id": "ui.roles.mirror",
       "layer": "integration",
       "path": "ui/lib/team-role.ts"
@@ -258,7 +258,7 @@
       "step": "npm audit (dashboard)"
     }
   ],
-  "gate_sha256": "90c14dc40bb0669311140127ce035067d7c47800b1d4ca1008635a489c38dcc8",
+  "gate_sha256": "21286f2859fe05a46cd475adf44c3e11086db705d4f2ef18fd44c654e66d9573",
   "gates": [
     {
       "command": "cargo test --workspace --locked --verbose",

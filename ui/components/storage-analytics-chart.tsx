@@ -2,6 +2,14 @@
 
 import { useId, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button, Card } from "@/components/ui";
+import {
+  ANALYTICS_CARD_CLASS,
+  ANALYTICS_MARK,
+  ANALYTICS_PILL_CLASS,
+  ANALYTICS_TEXT,
+  ANALYTICS_TOKENS,
+  analyticsSeriesDash,
+} from "@/components/analytics-theme";
 
 export interface StorageChartSeries {
   key: string;
@@ -76,8 +84,8 @@ function finite(value: number | null | undefined): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-/** One multi-series measured line chart: coloured strokes over per-series gradient fills, a
- *  computed dotted Average, a pointer/keyboard crosshair, and a table view of the same columns. */
+/** One multi-series measured line chart: one accent hue, dashed identity patterns, a computed
+ *  dotted Average, a pointer/keyboard crosshair, and a table view of the same columns. */
 export function StorageAnalyticsChart({
   title,
   caption,
@@ -89,6 +97,7 @@ export function StorageAnalyticsChart({
   windowLabel,
   emptyText,
   showTotal = false,
+  incompleteTail = false,
 }: {
   title: string;
   caption: string;
@@ -100,6 +109,7 @@ export function StorageAnalyticsChart({
   windowLabel: string;
   emptyText: string;
   showTotal?: boolean;
+  incompleteTail?: boolean;
 }) {
   const uid = useId().replace(/[^a-zA-Z0-9_-]/g, "");
   const tooltipId = uid + "-storage-tooltip";
@@ -136,7 +146,6 @@ export function StorageAnalyticsChart({
         : [],
     ),
   );
-  const gradientId = (key: string) => uid + "-storage-fill-" + key.replace(/[^a-zA-Z0-9_-]/g, "");
   const hoverColumn = hover !== null && hover >= 0 && hover < columns.length ? columns[hover] : null;
   const hoverAverage = hover !== null ? finite(average[hover]) : null;
   const hoverMissing = hoverColumn
@@ -200,7 +209,7 @@ export function StorageAnalyticsChart({
     }
   }
 
-  function draw(values: (number | null)[], color: string, gradientKey: string, dotted: boolean) {
+  function draw(values: (number | null)[], color: string, dotted: boolean, seriesIndex: number, tail: boolean) {
     const segments = chartSegments(values, xFor, yFor);
     return segments.map((segment) => {
       const points = segment.points;
@@ -210,9 +219,10 @@ export function StorageAnalyticsChart({
             key={segment.start}
             cx={points[0].x}
             cy={points[0].y}
-            r="4"
-            style={{ fill: color, stroke: "hsl(var(--card))" }}
-            strokeWidth="2"
+            r={ANALYTICS_MARK.markerRadius}
+            fill={color}
+            stroke={ANALYTICS_TOKENS.surface}
+            strokeWidth={ANALYTICS_MARK.lineWidth}
             vectorEffect="non-scaling-stroke"
           />
         );
@@ -221,48 +231,54 @@ export function StorageAnalyticsChart({
       const first = points[0];
       const last = points[points.length - 1];
       const area = line + " L " + last.x.toFixed(2) + " " + BASELINE + " L " + first.x.toFixed(2) + " " + BASELINE + " Z";
+      const isTail = tail && !dotted && segment.end === values.length - 1;
+      const solidLine = isTail ? segmentPath(points.slice(0, -1)) : line;
+      const tailLine = isTail ? segmentPath(points.slice(-2)) : "";
+      const dash = dotted ? ANALYTICS_MARK.averageDash : analyticsSeriesDash(seriesIndex);
       return (
         <g key={segment.start}>
-          {dotted ? null : <path d={area} fill={"url(#" + gradientId(gradientKey) + ")"} />}
-          {dotted ? null : (
-            <path
-              d={line}
-              fill="none"
-              style={{ stroke: color }}
-              strokeOpacity="0.14"
-              strokeWidth="8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
+          {dotted ? null : <path d={area} fill={ANALYTICS_TOKENS.accentSoft} />}
           <path
-            d={line}
+            d={solidLine}
             fill="none"
-            style={{ stroke: color }}
-            strokeOpacity={dotted ? 0.9 : 1}
-            strokeWidth={dotted ? 2 : 2.25}
-            strokeDasharray={dotted ? "3 6" : undefined}
+            stroke={color}
+            strokeOpacity={dotted ? 0.85 : 1}
+            strokeWidth={ANALYTICS_MARK.lineWidth}
+            strokeDasharray={dash}
             strokeLinecap="round"
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
+          {tailLine ? (
+            <path
+              d={tailLine}
+              fill="none"
+              stroke={color}
+              strokeWidth={ANALYTICS_MARK.lineWidth}
+              strokeDasharray={ANALYTICS_MARK.tailDash}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ) : null}
         </g>
       );
     });
   }
 
   return (
-    <Card className="min-w-0 w-full max-w-full p-0" aria-label={title}>
+    <Card className={ANALYTICS_CARD_CLASS} aria-label={title}>
       <div className="flex min-w-0 flex-col gap-2 border-b border-border p-4 sm:p-5 lg:flex-row lg:items-start lg:justify-between">
         <div className="min-w-0">
-          <h2 className="min-w-0 break-words text-sm font-semibold text-fg">{title}</h2>
-          <p className="mt-1 min-w-0 break-words text-xs leading-snug text-secondary">{caption}</p>
+          <h2 className={ANALYTICS_TEXT.title}>{title}</h2>
+          <p className={"mt-1 " + ANALYTICS_TEXT.caption}>{caption}</p>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-2" aria-label="Chart legend">
-          {legend.map((item) => (
+          {legend.map((item, seriesIndex) => (
             <span key={item.key} className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-xs text-secondary">
-              <span className="h-0.5 w-4 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+              <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
+                <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+              </svg>
               <span className="min-w-0 break-words">{item.label}</span>
             </span>
           ))}
@@ -271,7 +287,7 @@ export function StorageAnalyticsChart({
           ) : null}
           <span className="inline-flex shrink-0 items-center gap-1.5 text-xs text-secondary">
             <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
-              <line x1="0" y1="4" x2="20" y2="4" stroke="hsl(var(--fg))" strokeWidth="2" strokeDasharray="3 4" />
+              <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.text} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={ANALYTICS_MARK.averageDash} />
             </svg>
             Average
           </span>
@@ -280,12 +296,8 @@ export function StorageAnalyticsChart({
 
       {columns.length === 0 || active.length === 0 || !hasValues ? (
         <div className="flex min-h-[220px] min-w-0 items-center gap-3 p-5">
-          <span
-            className="h-16 w-1.5 shrink-0 rounded-full"
-            style={{ background: "linear-gradient(180deg, #6366f1, #22d3ee)" }}
-            aria-hidden="true"
-          />
-          <p className="min-w-0 break-words text-sm text-secondary">
+          <span className="h-12 w-px shrink-0 bg-border" aria-hidden="true" />
+          <p className={ANALYTICS_TEXT.caption}>
             {columns.length === 0
               ? emptyText
               : active.length === 0
@@ -296,7 +308,7 @@ export function StorageAnalyticsChart({
       ) : (
         <>
           <div
-            className="relative h-[300px] min-w-0 w-full max-w-full overflow-hidden rounded-lg border border-border bg-card sm:h-[360px]"
+            className="relative h-[300px] min-w-0 w-full max-w-full overflow-hidden bg-transparent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-border sm:h-[360px]"
             role="group"
             tabIndex={0}
             aria-label={windowLabel + " " + title + ". Use arrow keys to inspect reported buckets."}
@@ -310,20 +322,12 @@ export function StorageAnalyticsChart({
             onBlur={() => setHover(null)}
             onKeyDown={onChartKeyDown}
           >
-            <div className="pointer-events-none absolute left-1 z-10 flex w-[48px] flex-col justify-between text-right text-[10px] tabular-nums text-muted" style={{ top: "5.625%", bottom: "10.625%" }}>
+            <div className={"pointer-events-none absolute left-1 z-10 flex w-[48px] flex-col justify-between text-right " + ANALYTICS_TEXT.axis} style={{ top: "5.625%", bottom: "10.625%" }}>
               {TICKS.map((tick) => (
                 <span key={tick} className="min-w-0 break-words">{format(max * tick)}</span>
               ))}
             </div>
             <svg viewBox="0 0 1000 320" preserveAspectRatio="none" className="absolute inset-0 h-full w-full" aria-hidden="true">
-              <defs>
-                {active.map((item) => (
-                  <linearGradient key={item.key} id={gradientId(item.key)} x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="0%" style={{ stopColor: item.color, stopOpacity: 0.32 }} />
-                    <stop offset="100%" style={{ stopColor: item.color, stopOpacity: 0.01 }} />
-                  </linearGradient>
-                ))}
-              </defs>
               {TICKS.map((tick) => (
                 <line
                   key={"y-" + tick}
@@ -331,31 +335,17 @@ export function StorageAnalyticsChart({
                   x2={W - RIGHT}
                   y1={yFor(max * tick)}
                   y2={yFor(max * tick)}
-                  stroke="hsl(var(--border))"
-                  strokeWidth="1"
-                  strokeDasharray={tick === 0 ? undefined : "2 7"}
+                  stroke={ANALYTICS_TOKENS.grid}
+                  strokeWidth={ANALYTICS_MARK.gridWidth}
                   vectorEffect="non-scaling-stroke"
                 />
               ))}
-              {labelIndices.map((index) => (
-                <line
-                  key={"x-" + index}
-                  x1={xFor(index)}
-                  x2={xFor(index)}
-                  y1={TOP}
-                  y2={BASELINE}
-                  stroke="hsl(var(--border))"
-                  strokeWidth="1"
-                  strokeDasharray="2 9"
-                  vectorEffect="non-scaling-stroke"
-                />
-              ))}
-              {active.map((item) => (
+              {active.map((item, seriesIndex) => (
                 <g key={item.key}>
-                  {draw(columns.map((column) => finite(column.values[item.key])), item.color, item.key, false)}
+                  {draw(columns.map((column) => finite(column.values[item.key])), ANALYTICS_TOKENS.accent, false, seriesIndex, incompleteTail)}
                 </g>
               ))}
-              <g>{draw(average, "hsl(var(--fg))", "average", true)}</g>
+              <g>{draw(average, ANALYTICS_TOKENS.text, true, 0, false)}</g>
               {hover !== null && hoverColumn ? (
                 <g>
                   <line
@@ -363,9 +353,9 @@ export function StorageAnalyticsChart({
                     x2={xFor(hover)}
                     y1={TOP}
                     y2={BASELINE}
-                    stroke="hsl(var(--border-strong))"
-                    strokeWidth="1"
-                    strokeDasharray="3 4"
+                    stroke={ANALYTICS_TOKENS.neutralLine}
+                    strokeWidth={ANALYTICS_MARK.gridWidth}
+                    strokeDasharray={ANALYTICS_MARK.crosshairDash}
                     vectorEffect="non-scaling-stroke"
                   />
                   {active.map((item) => {
@@ -375,9 +365,10 @@ export function StorageAnalyticsChart({
                         key={"hover-" + item.key}
                         cx={xFor(hover)}
                         cy={yFor(value)}
-                        r="4"
-                        style={{ fill: item.color, stroke: "hsl(var(--card))" }}
-                        strokeWidth="2"
+                        r={ANALYTICS_MARK.markerRadius}
+                        fill={ANALYTICS_TOKENS.accent}
+                        stroke={ANALYTICS_TOKENS.surface}
+                        strokeWidth={ANALYTICS_MARK.lineWidth}
                         vectorEffect="non-scaling-stroke"
                       />
                     );
@@ -386,16 +377,17 @@ export function StorageAnalyticsChart({
                     <circle
                       cx={xFor(hover)}
                       cy={yFor(hoverAverage)}
-                      r="4"
-                      style={{ fill: "hsl(var(--card))", stroke: "hsl(var(--fg))" }}
-                      strokeWidth="2"
+                      r={ANALYTICS_MARK.markerRadius}
+                      fill={ANALYTICS_TOKENS.surface}
+                      stroke={ANALYTICS_TOKENS.text}
+                      strokeWidth={ANALYTICS_MARK.lineWidth}
                       vectorEffect="non-scaling-stroke"
                     />
                   )}
                 </g>
               ) : null}
             </svg>
-            <div className="pointer-events-none absolute bottom-2 z-10 flex min-w-0 justify-between gap-1 text-[10px] text-muted" style={{ left: "5.6%", right: "1.8%" }}>
+            <div className={"pointer-events-none absolute bottom-2 z-10 flex min-w-0 justify-between gap-1 " + ANALYTICS_TEXT.axis} style={{ left: "5.6%", right: "1.8%" }}>
               {labelIndices.map((index) => (
                 <span key={"axis-" + index} className="min-w-0 max-w-[24%] break-words text-center">
                   {columns[index].label}
@@ -406,17 +398,19 @@ export function StorageAnalyticsChart({
               <div
                 id={tooltipId}
                 role="tooltip"
-                className="pointer-events-none absolute top-3 z-20 w-56 max-w-[calc(100%-1.5rem)] rounded-lg border border-border bg-card p-3 text-xs shadow-card"
+                className="pointer-events-none absolute top-3 z-20 w-56 max-w-[calc(100%-1.5rem)] rounded-md border border-border bg-card p-3 text-xs shadow-none"
                 style={hoverRight ? { right: "0.75rem" } : { left: "0.75rem" }}
               >
                 <div className="mb-2 min-w-0 break-words font-medium text-fg">
                   {hoverColumn.label} UTC · {windowLabel}
                 </div>
-                {active.map((item) => {
+                {active.map((item, seriesIndex) => {
                   const value = finite(hoverColumn.values[item.key]);
                   return (
                     <div key={"tip-" + item.key} className="mb-1 flex min-w-0 items-center gap-2">
-                      <span className="h-0.5 w-4 shrink-0 rounded-full" style={{ background: item.color }} aria-hidden="true" />
+                      <svg width="20" height="8" viewBox="0 0 20 8" aria-hidden="true">
+                        <line x1="0" y1="4" x2="20" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+                      </svg>
                       <strong className="shrink-0 tabular-nums text-fg">{value === null ? "—" : format(value)}</strong>
                       <span className="min-w-0 break-words text-secondary">{item.label}</span>
                     </div>
@@ -435,14 +429,15 @@ export function StorageAnalyticsChart({
             ) : null}
           </div>
           <div className="flex min-w-0 flex-col gap-2 border-t border-border p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
-            <p className="min-w-0 break-words text-xs text-secondary">
+            <p className={ANALYTICS_TEXT.caption}>
               The dotted Average is the mean of the selected databases that reported each bucket. A gap is an unreported bucket, not a zero.
+              {incompleteTail ? " The dashed final segment marks the still-open bucket; no value is projected." : ""}
             </p>
             <Button
               variant="outline"
               aria-expanded={tableOpen}
               aria-controls={tableId}
-              className="min-h-[44px] min-w-0 shrink-0"
+              className={ANALYTICS_PILL_CLASS}
               onClick={() => setTableOpen((value) => !value)}
             >
               {tableOpen ? "Hide table view" : "Table view"}
@@ -454,9 +449,11 @@ export function StorageAnalyticsChart({
                 <thead className="sticky top-0 bg-card">
                   <tr className="border-b border-border text-muted">
                     <th scope="col" className="min-w-0 break-words p-3 text-left">Bucket (UTC)</th>
-                    {active.map((item) => (
+                    {active.map((item, seriesIndex) => (
                       <th key={item.key} scope="col" className="min-w-0 break-words p-3 text-left">
-                        <span className="inline-block h-0.5 w-3 shrink-0 rounded-full align-middle" style={{ background: item.color }} aria-hidden="true" />
+                        <svg width="14" height="8" viewBox="0 0 14 8" aria-hidden="true" className="inline-block align-middle">
+                          <line x1="0" y1="4" x2="14" y2="4" stroke={ANALYTICS_TOKENS.accent} strokeWidth={ANALYTICS_MARK.lineWidth} strokeDasharray={analyticsSeriesDash(seriesIndex)} />
+                        </svg>
                         <span className="ml-1.5 min-w-0 break-words">{item.label}</span>
                       </th>
                     ))}

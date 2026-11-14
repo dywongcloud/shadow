@@ -136,6 +136,47 @@ Interpretation:
 - The four `--state` tools read a snapshot of canonical state; they do not prove that state is
   correct, only that the contract's index and the projection can be compared.
 
+## 7. Live node-local SOC 2 evidence GET
+
+`crates/hive-cloud/src/admin.rs` mounts `GET /v1/admin/soc2/evidence`. It calls
+`hive_contract::evidence::generate_report` through
+`crates/hive-cloud/src/db_contract.rs::journal_evidence_snapshot`, which clones
+the responding node's live `Journal` and its signed `hive.billing-journal.v1`
+oplog entries, then re-derives the report with `evidence::verify_report` under
+the SAME node's `IntegritySigner` public key. That is a STRUCTURAL SELF-CHECK,
+not verification under a pinned independent identity: the response carries
+`pin_required: true` and `trust_limit`. Both run on `spawn_blocking`.
+
+The route is a READ: `roles::RULES` lists it at viewer and
+`ui/lib/team-role.ts` mirrors it as `soc2.evidence`. `auth::require_auth`
+decides the role once; `admin::require_auth_read` refuses an anonymous GET (401)
+while enforcement is on; the route is not in `auth::is_open_route`.
+`admin_ingress` serves GET/HEAD locally, so no leader proxy and no
+`gossip::dispatch` arm is added: the answer names `responding_node`,
+`public_key_hex` and that shard's `oplog_chain_tip`.
+
+Witness (JWT minted on the node, port 8786 is the loopback admin API):
+
+```
+curl -sS -o /tmp/soc2-evidence.json -w '%{http_code}\n' \
+  -H "Authorization: Bearer $JWT" \
+  "http://127.0.0.1:8786/v1/admin/soc2/evidence"
+python3 -I -c 'import json; r=json.load(open("/tmp/soc2-evidence.json")); print(r["responding_node"], r["oplog_chain_tip"], r["report_hash"], r["report"]["boundary"][:32])'
+```
+
+A 200 carries `boundary` verbatim, `control_matrix_reference.at1 == "UNMET"`,
+`control_matrix_reference.at2 == "UNMET"` and `type2.cpa_opinion == "ABSENT"`.
+A 503 with a fixed sentence means an empty period, a shard that could not be
+replayed, or a report the independent verifier did not reproduce. This route
+supplies technical evidence about ONE node's log; it is not a fleet-wide view and
+carries no opinion.
+
+Bindings drift: the new viewer row in `roles.rs::RULES` and its mirror in
+`ui/lib/team-role.ts::TEAM_ACTIONS` change the pinned spans `unit.roles.rules`
+and `ui.roles.mirror`. `python3 -I scripts/check-contract-bindings.py --check`
+reports CONTRACT_DRIFT with the new `actual=` digests until the orchestrator
+runs `--sync`.
+
 ---
 
 See also: `docs/smart-contracts.md`, `docs/verifiable-database.md`,
