@@ -83,6 +83,26 @@ export interface ExplorerView {
   labels: Record<string, string>;
 }
 
+/** `fetchOpsResult` casts `data as T` without a runtime check. A 200 with a misshapen body must render
+ *  ABSENT/error, never coerced. Validate the load-bearing shape once at the server boundary. */
+export function isExplorerView(v: unknown): v is ExplorerView {
+  if (!v || typeof v !== "object") return false;
+  const d = v as Record<string, unknown>;
+  return typeof d.responding_node === "string"
+    && typeof d.scope === "string"
+    && typeof d.seq_note === "string"
+    && typeof d.canonical_note === "string"
+    && typeof d.public_key_hex === "string"
+    && typeof d.pin_required === "boolean"
+    && isRecord(d.contract) && isRecord(d.shard) && isRecord(d.window)
+    && isRecord(d.verification) && isRecord(d.labels)
+    && Array.isArray(d.entries);
+}
+
+function isRecord(v: unknown): boolean {
+  return !!v && typeof v === "object" && !Array.isArray(v);
+}
+
 export const EXPLORER_CONTRACTS = [
   "hive.managed-db.v1",
   "hive.billing-journal.v1",

@@ -2,7 +2,7 @@ import { Suspense } from "react";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { fetchOpsResult } from "@/lib/ops-data";
 import { ExplorerClient } from "./explorer-client";
-import { explorerQuery, type ExplorerView } from "./types";
+import { explorerQuery, isExplorerView, type ExplorerView } from "./types";
 
 type Search = { [key: string]: string | string[] | undefined };
 
@@ -20,10 +20,19 @@ async function ExplorerData({ searchParams }: { searchParams: Promise<Search> })
     beforeSeq: one(p.before_seq),
     limit: one(p.limit),
   };
-  const { data, error } = await fetchOpsResult<ExplorerView>(
+  const { data, error: fetchError } = await fetchOpsResult<ExplorerView>(
     `/v1/admin/contract/explorer?${explorerQuery(query)}`,
   );
-  return <ExplorerClient view={data} error={error} query={query} />;
+  const shapeError = data !== null && !isExplorerView(data)
+    ? "ops GET returned an unrecognised contract explorer payload"
+    : null;
+  return (
+    <ExplorerClient
+      view={isExplorerView(data) ? data : null}
+      error={fetchError ?? shapeError}
+      query={query}
+    />
+  );
 }
 
 export default function ExplorerPage({ searchParams }: { searchParams: Promise<Search> }) {
