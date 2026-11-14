@@ -58,7 +58,7 @@ change requiring the operator's word; this change neither widens nor weakens it.
 ## Citation drift
 
 `path:line` numbers are observed at a point in time and drift as the tree moves; SYMBOLS are
-authoritative. These six symbol-to-location mappings are re-verified against the current tree:
+authoritative. Six symbol-to-location anchors (line numbers are hints, not a contract):
 
 - `RULES` -> `crates/hive-cloud/src/roles.rs:72`
 - `mint_token` -> `crates/hive-cloud/src/admin.rs:596`
