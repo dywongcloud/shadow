@@ -56,13 +56,14 @@ const VERIFY_WINDOW_MS: u64 = 60_000;
 /// 2FA still demands a code entered now). This is NEVER the login-session window.
 pub const STEP_UP_WINDOW_SECS: u64 = 300;
 
-/// Operator decision (2026-11-13): 2FA is a bounded LOGIN-SESSION factor, not a per-mint or
-/// per-request re-auth. Once a signed-in human has entered one code, every re-mint inside this
-/// window (team switch, token keeper refresh) carries the SAME original otp_at forward, so no
-/// second code is demanded. Accepted residual: a stolen session cookie / OTP-satisfied JWT keeps
-/// this window instead of 300 s; the instant is bounded from the REAL OTP time and never
-/// re-stamped, so a stolen cookie cannot become perpetual. Already-issued JWTs are not revoked
-/// and HIVE_JWT_SECRET is never rotated for this.
+/// 2FA is a bounded LOGIN-SESSION factor, not a per-mint or per-request re-auth. Once a signed-in
+/// human has entered one code, every re-mint inside this window (team switch, token keeper refresh)
+/// carries the SAME original otp_at forward, so no second code is demanded. The 8 h default and the
+/// stolen-cookie trade-off are an implementation choice made here, NOT an operator approval; the
+/// operator may set HIVE_2FA_SESSION_SECS to shorten it. Residual: a stolen session cookie /
+/// OTP-satisfied JWT keeps this window instead of 300 s; the instant is bounded from the REAL OTP
+/// time and never re-stamped, so a stolen cookie cannot become perpetual. Already-issued JWTs are
+/// not revoked and HIVE_JWT_SECRET is never rotated for this.
 pub const SESSION_STEP_UP_SECS: u64 = 8 * 60 * 60;
 
 /// Session window for auth::step_up_ok and admin::mint_token's otp_at carry-forward.

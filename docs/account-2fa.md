@@ -2,7 +2,7 @@
 
 Present tense; HISTORY lives in `CHANGELOG.md`. Symbols are authoritative; `path:line` hints drift.
 
-## The login-session model (operator decision, 2026-11-13)
+## The login-session model
 
 An enrolled account answers ONE OTP per bounded LOGIN SESSION, not once per mint, team switch or five
 minutes. `totp::session_step_up_secs()` is 8 h by default (`SESSION_STEP_UP_SECS`), overridable with
@@ -22,9 +22,10 @@ authenticated JSON body carrying `x-hive-internal`, never in a URL, `Location`, 
 `/v1/token` stays `is_open_route`, and the gate order (internal token, limiter, `mint_allowed`, then
 OTP) is unchanged.
 
-Residual, accepted explicitly: a stolen session cookie keeps the bounded session window (8 h) instead
-of 300 s. Instant is bounded from the REAL OTP time and never re-stamped. Already-issued JWTs are NOT
-revoked; `HIVE_JWT_SECRET` is never rotated to invalidate them. Disabling 2FA still demands a code
+Residual (an implementation trade-off, NOT an operator approval): a stolen session cookie keeps the
+bounded session window (8 h) instead of 300 s. `HIVE_2FA_SESSION_SECS` shortens it. Instant is
+bounded from the REAL OTP time and never re-stamped. Already-issued JWTs are NOT revoked;
+`HIVE_JWT_SECRET` is never rotated to invalidate them. Disabling 2FA still demands a code
 entered NOW: `totp::disable_handler` re-asserts `fresh_step_up`, and `totp::disable` runs its own
 `create_challenge` + `verify_login` (single-use, `step > last_used_step`).
 
@@ -237,7 +238,7 @@ secret, code, or challenge id enters a URL, `Location`, HTML, log line, or argv;
 
 **Residual.** Already-issued JWTs are not revoked; they keep living until their own expiry, at most
  `MINTED_TOKEN_TTL_SECS = 3600` (`crates/hive-cloud/src/admin.rs:41`, `:585-594`). A stolen session
-cookie keeps the bounded 8 h login-session window, not 300 s: the accepted cost of one OTP per
+cookie keeps the bounded 8 h login-session window, not 300 s: the trade-off for one OTP per
 session. Rotating `HIVE_JWT_SECRET` to invalidate them is explicitly forbidden: `secret()` and
 `enforced()` read that one variable (`crates/hive-cloud/src/auth.rs:104-112`), so a rotation
 invalidates every fleet token and flips enforcement on any node where it is unset.

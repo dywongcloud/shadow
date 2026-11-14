@@ -19,7 +19,8 @@ fresh code. `/api/token` derives `prior_token` server-side from the httpOnly coo
 body field), the QR label is the verified Clerk user id, and the challenge is detached from
 `mintInFlight` with a module-scope OTP form, so no read waits on a human or spends the failure budget.
 
-Accepted residual: a stolen session cookie keeps 8 h instead of 300 s. `HIVE_JWT_SECRET` is not
+Residual (implementation trade-off, not an operator approval): a stolen session cookie keeps 8 h
+instead of 300 s; `HIVE_2FA_SESSION_SECS` shortens the window. `HIVE_JWT_SECRET` is not
 rotated; already-issued JWTs are not revoked. A deployment/CI result is not claimed by this entry.
 
 ## 2026-11-13 - ui: analytics console uses the dashboard's own semantic theme
