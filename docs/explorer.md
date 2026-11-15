@@ -134,8 +134,26 @@ hashed to `34277da8e83a` with none of the three explorer literals; after, all si
 `01b8f355cf98` and `strings -a /proc/<MainPID>/exe` finds each literal. On each node `/healthz`
 is 200, an anonymous GET is 401, and an operator GET is 200 with `responding_node`,
 `pin_required: true`, a recomputed chain verdict and the honest labels. Mesh reports
-`visible == expected` and `isolated=false` on all six.
+`visible == expected` and `isolated=false` on all six; `expected_peers` is the four-ID boot
+roster minus self (so 3 or 4 per node), not a partition. Six real-domain round-robin samples
+of `https://shadw.cloud/admin/explorer` all answer `307 -> /` and the followed chain lands 200;
+all six nodes hold byte-identical `page.js` and SSR chunk digests with the honesty panel in the
+served `.js`.
 
-Residual (pre-existing, not a roll regression): fc-orlando's peer-facing `:8787` is unreachable
-from other fleet nodes because its `nft` INPUT `policy drop` PUBLIC chain never allowed 8787.
-The node itself answers 8787 and 8786 with 200 and its mesh is converged.
+Residuals (recorded, not hidden):
+
+- fc-orlando's peer-facing `:8787` is unreachable from other fleet nodes because its `nft`
+  INPUT `policy drop` PUBLIC chain never allowed 8787. The node itself answers 8787 and 8786
+  with 200 and its mesh is converged. The roll playbook has no firewall tasks, but no pre-roll
+  fleet-vantage 8787 baseline was taken, so "pre-existing" is inferred from the ruleset, not
+  measured before/after.
+- No owner-authenticated browser render of `/admin/explorer` is witnessed. The 307 is the
+  unauthenticated owner gate; the SSR bundle is verified on disk and by loopback, not behind a
+  signed-in Clerk session.
+- `HIVE_SECRET_KEY_OLD` is absent on fc-sanjose and fc-phoenix. The pre-roll audit passes
+  because no key rotation is in flight; a future rotation needs the old key installed first.
+
+An adversarial swarm of three read-only refuters scored the roll claim 1 SUPPORTED / 2 REFUTED.
+Two refutations kill the compound "fully verified" claim, so this document does not make it.
+Both named evidence gaps (real-domain/auth witness, baselines, provenance), not a roll failure;
+the measurable ones were closed by the witnesses above.

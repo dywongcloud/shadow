@@ -57,9 +57,26 @@ On every node `/healthz` is 200, an anonymous GET of `/v1/admin/contract/explore
 an operator GET is 200 with `responding_node`, `pin_required: true`, a recomputed chain verdict
 and the honest labels. Mesh reports `visible == expected` and `isolated=false` on all six.
 From a fleet vantage `https://shadw.cloud/` is 200 and `/admin/explorer` is a 307 owner-gate
-redirect, not a 404. `docs/explorer.md` carries the boundary and the one pre-existing residual:
-fc-orlando's nft INPUT `policy drop` PUBLIC chain never allowed peer-facing `:8787`, so peers
-cannot reach that port although the node itself answers 200 and its mesh is converged.
+redirect, not a 404. Six real-domain round-robin samples all answer `307 -> /`; the followed
+chain lands 200 on `/`. All six nodes hold byte-identical `page.js` and SSR chunk digests with
+the honesty panel compiled into the served `.js`, and the BUILD_ID is unchanged by the docs push
+(the platform repo is not an enrolled GitOps project). `docs/explorer.md` carries the boundary.
+
+The roll log stamps `2026-11-15T00:49:05Z` to `01:12:07Z` UTC; the local date of the operator's
+word is 2026-11-14. Three residuals are recorded, not hidden. (1) fc-orlando's nft INPUT
+`policy drop` PUBLIC chain never allowed peer-facing `:8787`, so peers cannot reach that port
+although the node itself answers 200; the roll playbook contains no firewall tasks, but no
+pre-roll fleet-vantage 8787 baseline was taken, so "pre-existing" is inferred from the ruleset,
+not measured before/after. (2) No owner-authenticated browser render of `/admin/explorer` was
+witnessed: the 307 is the unauthenticated owner gate, and the SSR bundle is verified on disk and
+by loopback, not behind a signed-in Clerk session. (3) `HIVE_SECRET_KEY_OLD` is absent on
+fc-sanjose and fc-phoenix; the audit passes because no key rotation is in flight, and a future
+rotation needs the old key added before the new one is installed.
+
+An adversarial swarm of three read-only refuters scored the roll claim 1 SUPPORTED / 2 REFUTED;
+two refutations kill the compound "fully verified" claim, so it is not made here. Both
+refutations named evidence gaps (real-domain/auth witness, baselines, provenance), not a roll
+failure; the measurable ones were closed by the additional witnesses above.
 
 ## 2026-11-13 - 2FA: one OTP per bounded login session, not per mint/team/5 minutes
 
