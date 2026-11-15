@@ -140,7 +140,8 @@ Reading the unsigned payload only SELECTS a credential: the backend re-verifies 
 and the role gate on every request, so a forged or stale claim grants nothing. With no operator
 mint, the first successful token is returned (an unenforced dev node accepts it), and
 `fetchOpsServer` finally falls back to the signed-in owner's own `hive_jwt` cookie, which the
-backend re-checks. `/api/token` never uses this helper: it mints the VERIFIED Clerk email, never
+backend re-checks. An empty `HIVE_OWNER_EMAIL` list mints once email-less, preserving the old
+local-dev behaviour. `/api/token` never uses this helper: it mints the VERIFIED Clerk email, never
 a configured one, so a tenant cannot borrow an owner address.
 
 ## Roll

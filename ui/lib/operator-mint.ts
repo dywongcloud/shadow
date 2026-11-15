@@ -30,7 +30,7 @@ function mintedPlatformAdmin(token: string): boolean {
  *  answers 403. Try each configured owner and keep the first token the backend actually marked
  *  as an operator. With no operator mint, return the first successful one so an unenforced
  *  (dev) node -- where `require_operator` is open -- keeps its old behaviour, and the caller's
- *  session cookie can take over on an enforced node. */
+ *  session cookie can take over on an enforced node. An empty owner list mints once email-less. */
 export async function mintOperatorBearer(opts: {
   admin: string;
   internal: string;
@@ -40,7 +40,11 @@ export async function mintOperatorBearer(opts: {
 }): Promise<MintedOperator | null> {
   if (!opts.internal) return null;
   let fallback: MintedOperator | null = null;
-  for (const email of ownerEmails()) {
+  // No configured owner is normal on a local dev node: mint once without an email, so an
+  // unenforced node keeps accepting the token exactly as it did before this helper existed.
+  const candidates = ownerEmails();
+  const emails: Array<string | undefined> = candidates.length ? candidates : [undefined];
+  for (const email of emails) {
     try {
       const r = await fetch(`${opts.admin}/v1/token`, {
         method: "POST",
@@ -49,7 +53,7 @@ export async function mintOperatorBearer(opts: {
           sub: opts.sub,
           tenant: opts.tenant,
           role: opts.role,
-          email,
+          ...(email ? { email } : {}),
         }),
         cache: "no-store",
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
