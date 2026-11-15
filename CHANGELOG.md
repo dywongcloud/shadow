@@ -37,8 +37,29 @@ a RESOLVED Promise in `getCache`, so every later call (including `fresh: true`) 
 anonymous body forever; `apiGet` and `opsGet` now delete the slot. Adding the RULES and
 TEAM_ACTIONS rows re-pins the two contract-binding spans via a LOCAL `--sync` (never in CI).
 
-A roll/deploy is a production change requiring the operator's word, which this request does not
-contain; no roll is claimed here.
+A roll/deploy is a production change requiring the operator's word. The roll is recorded in the
+entry below.
+
+## 2026-11-14 - roll: contract log explorer to the six live hosts
+
+At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags backend,ui --limit
+'fc-orlando:va:va3:sj:sj7:phx'` rolled `9028c3dcba7f797d640f01fcecf89b3f074125a6`. Pre-roll
+`scripts/audit-secret-keys.sh` passes on 6/6 (HIVE_SECRET_KEY, secret.key, integrity_signing.key).
+`ROLL_EXIT=0`, `failed=0 unreachable=0` on all six, `BACKEND VERIFIED 6/6`, `UI VERIFIED 6/6`
+serving the single BUILD_ID `BPVFN-8KAurgXrQEn8cWr`; `/admin/explorer` is present in every
+node's `app-paths-manifest.json`.
+
+The RUNNING controller is proved by `strings -a /proc/<MainPID>/exe`, never by grepping a
+Rust format literal. Before: all six ran `34277da8e83a` and contained none of the three
+commit-specific literals (`one hash-chained oplog entry at a seq`, `no retained entries to
+walk`, `oplog replay failed`). After: all six run `01b8f355cf98` and each literal is present.
+On every node `/healthz` is 200, an anonymous GET of `/v1/admin/contract/explorer` is 401, and
+an operator GET is 200 with `responding_node`, `pin_required: true`, a recomputed chain verdict
+and the honest labels. Mesh reports `visible == expected` and `isolated=false` on all six.
+From a fleet vantage `https://shadw.cloud/` is 200 and `/admin/explorer` is a 307 owner-gate
+redirect, not a 404. `docs/explorer.md` carries the boundary and the one pre-existing residual:
+fc-orlando's nft INPUT `policy drop` PUBLIC chain never allowed peer-facing `:8787`, so peers
+cannot reach that port although the node itself answers 200 and its mesh is converged.
 
 ## 2026-11-13 - 2FA: one OTP per bounded login session, not per mint/team/5 minutes
 

@@ -121,5 +121,21 @@ explorer reports `chain.ok: null` with "no retained entries to walk; an empty re
 UNKNOWN, not clean" rather than a vacuous green "consistent" — an empty window is never rendered
 as a clean one. This is why a rejected/faulted log is not silently shown as verified.
 
-A roll/deploy is a production change requiring the operator's word. This document records no
-roll.
+## Roll
+
+At the operator's word (`roll deploy`), `ansible/playbooks/parallel-deploy.yml --tags backend,ui
+--limit 'fc-orlando:va:va3:sj:sj7:phx'` rolled this change to the six live hosts. Pre-roll
+`scripts/audit-secret-keys.sh` passes 6/6. `ROLL_EXIT=0`, `failed=0 unreachable=0`,
+`BACKEND VERIFIED 6/6`, `UI VERIFIED 6/6` on one BUILD_ID `BPVFN-8KAurgXrQEn8cWr`, with
+`/admin/explorer` in every node's `app-paths-manifest.json`.
+
+The RUNNING binary is proved, not the source: before the roll `/proc/<MainPID>/exe` on all six
+hashed to `34277da8e83a` with none of the three explorer literals; after, all six hash to
+`01b8f355cf98` and `strings -a /proc/<MainPID>/exe` finds each literal. On each node `/healthz`
+is 200, an anonymous GET is 401, and an operator GET is 200 with `responding_node`,
+`pin_required: true`, a recomputed chain verdict and the honest labels. Mesh reports
+`visible == expected` and `isolated=false` on all six.
+
+Residual (pre-existing, not a roll regression): fc-orlando's peer-facing `:8787` is unreachable
+from other fleet nodes because its `nft` INPUT `policy drop` PUBLIC chain never allowed 8787.
+The node itself answers 8787 and 8786 with 200 and its mesh is converged.
