@@ -13,18 +13,15 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   header as 401 (`fetchAndValidate`), never as data, and seeds nothing without a token. `/api/git/deploy`
   and `/api/projects/:project/redeploy` forward the platform JWT AND the GitHub clone token as
   `body.git_token` (never returned to the browser; only for an `https://github.com/` clone).
-- Browser side (`ui/lib/api.ts`, `session-clock.ts`, `session-keeper.ts`): `/api/token` echoes the cookie's
-  lifetime as `expires_in`, recorded in a clock tabs share (`hive_session_clock`); ONE keeper per tab
-  (`startSessionKeeper`) re-mints at ~70%: hidden tabs never mint, a visible one under 20% left mints
-  at once, failures follow `MINT_MAX_CONSECUTIVE_FAILURES` then one attempt per period. Mints run one
-  at a time (`mintSessionToken`; a team switch/identity sync always fires). A request waits only when no
-  session exists or it lapses (`ensureSessionMinted`); a 401 or `x-hive-anon: 1` retries after at most
-  one re-mint per `AUTO_MINT_COOLDOWN_MS`, but a 403 on a KNOWN-valid session never re-mints: the
-  dashboard is the one `/v1/token` peer of every user. GET-cache keys are tenant-scoped
-  (`tenantScopedKey`), any mutation clears the cache, one bypassing `apiSend` calls
-  `invalidateApiCache()` itself. `x-hive-anon: 1` 200 is NEVER cached; 2FA challenge is
-  DETACHED from `mintInFlight` (no read waits on a human); OTP form is MODULE-scope and
-  success fires `hive-otp-satisfied` + cache clear. See `docs/account-2fa.md`.
+- Browser side (`ui/lib/api.ts`, `session-clock.ts`, `session-keeper.ts`): `/api/token` echoes the
+  cookie lifetime as `expires_in` into a shared clock (`hive_session_clock`); ONE keeper per tab
+  (`startSessionKeeper`) re-mints at ~70%, hidden tabs never mint, one at a time
+  (`mintSessionToken`). A request waits only when the session is absent/lapsed
+  (`ensureSessionMinted`); 401 or `x-hive-anon: 1` retries once per `AUTO_MINT_COOLDOWN_MS`, but
+  a 403 on a KNOWN-valid session never re-mints: the dashboard is the one `/v1/token` peer.
+  GET cache is tenant-scoped (`tenantScopedKey`), mutations clear it, `x-hive-anon: 1` 200 is
+  NEVER cached. 2FA challenge is DETACHED from `mintInFlight`, OTP form MODULE-scope;
+  `docs/account-2fa.md`.
 - The dashboard mirrors the backend role matrix (`crates/hive-cloud/src/roles.rs` `RULES`) in ONE table,
   `ui/lib/team-role.ts` `TEAM_ACTIONS` (action -> floor + covered routes: a `RULES` change is a diff
   against it), read through `can`, `useTeamRole` and `useCan`. The role is the mint answer's `role`
@@ -48,10 +45,15 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   namespace is `u_<uid>` (legacy `personal` only when the backend marks the owner); transient `"local"`
   (Clerk loading) never counts as a user change. Whole-page auth flips use `useSettledAuth()`, never
   `<SignedIn>/<SignedOut>`.
-- `fetchOpsServer` (`ui/lib/ops-data.ts`) has real operator authority (`HIVE_INTERNAL_TOKEN` authorizes
-  minting only): call only from pages behind `proxy.ts`'s owner allow-list (`/admin`, `/ops`);
-  `fetchOpsResult` returns `{data, error}` so a refused read is never rendered as empty.
-  `/admin/explorer` has NO client poller (`/ops`= tenant cookie only); `docs/explorer.md`.
+- `fetchOpsServer` (`ui/lib/ops-data.ts`) calls `/ops` behind `proxy.ts`'s owner allow-list;
+  `fetchOpsResult` returns `{data, error}` so a refused read is never rendered empty.
+  `/admin/explorer` has NO client poller (`/ops`= tenant cookie only). `mintOperatorBearer`
+  (`ui/lib/operator-mint.ts`) is the ONE machine mint (ops + Composio): try EVERY
+  `HIVE_OWNER_EMAIL`, keep the first `platform_admin:true` token. `.env.local` (group_vars) and a
+  node's `admin_emails` (HIVE_ADMIN_EMAILS + a HIVE_OWNER_EMAIL drop-in) DRIFT, so a 200 mint can
+  be a non-operator JWT that 403s every ops GET. Reading the unsigned payload only SELECTS a
+  credential; the backend re-verifies. Else dev fallback, then the owner's cookie. `/api/token`
+  mints the VERIFIED Clerk email, NEVER a configured owner. `docs/explorer.md`.
 
 ## Outbound requests, redirects, secrets
 
@@ -105,9 +107,8 @@ conventions, what must be true of the code now; history lives in `CHANGELOG.md`.
   `visibilitychange`; a new hook binds a fetcher, never copies the body. Fan-out read polls
   (`/v1/functions`, `/v1/metrics`, `/v1/admin/overview`) stay under the 15 s polled-response
   cache TTL (`OVERVIEW_POLL_MS`, `FUNCTIONS_POLL_MS`).
-- Dashboard numbers are measured or absent, never invented: counters from `/v1/metrics`/
-  `/v1/functions`, prices only from `rate_card`; unmeasured renders absent;
-  the dashboard rolls BEFORE or WITH the nodes.
+- Dashboard numbers are measured or absent: counters from `/v1/metrics`/`/v1/functions`, prices
+  only from `rate_card`; the dashboard rolls BEFORE or WITH the nodes.
 - A server/client-differing value (`window.location`, `localStorage`) never seeds a `useState`
   initializer (React #418): pass from the server or read post-mount.
 - The public `/status` board reads `PUBLIC_INCIDENTS_PATH` (`/v1/status/incidents`: operator-origin

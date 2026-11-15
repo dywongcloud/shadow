@@ -1,6 +1,6 @@
 import "server-only";
 import { cookies } from "next/headers";
-import { primaryOwnerEmail } from "@/lib/owner-emails";
+import { mintOperatorBearer } from "@/lib/operator-mint";
 
 // Server-side counterpart to lib/api.ts's opsGet for admin server components: an initial paint of live ops data without a client round trip, reading
 // the SAME env vars as next.config.mjs's ADMIN_OPS rewrite so it hits exactly what the browser's /ops proxy would.
@@ -8,7 +8,6 @@ const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
 const INTERNAL = process.env.HIVE_INTERNAL_TOKEN || "";
 const OPS_REQUEST_TIMEOUT_MS = 10_000;
-const TOKEN_TTL_FALLBACK_SECS = 3600;
 const RETIRE_BEFORE_EXPIRY_SECS = 120;
 const MIN_TOKEN_TTL_SECS = 60;
 
@@ -22,38 +21,23 @@ let expiry: ReturnType<typeof setTimeout> | null = null;
 let minting: Promise<string | null> | null = null;
 
 async function mintOpsBearer(): Promise<string | null> {
-  if (!INTERNAL) return null;
-  try {
-    const r = await fetch(`${ADMIN}/v1/token`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-hive-internal": INTERNAL },
-      body: JSON.stringify({
-        sub: "ui-ops-server",
-        tenant: "personal",
-        role: "owner",
-        email: primaryOwnerEmail() || undefined,
-      }),
-      cache: "no-store",
-      signal: AbortSignal.timeout(OPS_REQUEST_TIMEOUT_MS),
-    });
-    if (!r.ok) return null;
-    const d = (await r.json()) as { token?: string; expires_in?: number };
-    if (!d.token) return null;
-    const ttl = Math.max(
-      MIN_TOKEN_TTL_SECS,
-      (typeof d.expires_in === "number" ? d.expires_in : TOKEN_TTL_FALLBACK_SECS) - RETIRE_BEFORE_EXPIRY_SECS,
-    );
-    minted = { token: d.token };
-    if (expiry) clearTimeout(expiry);
-    expiry = setTimeout(() => {
-      minted = null;
-      expiry = null;
-    }, ttl * 1000);
-    unrefTimer(expiry);
-    return d.token;
-  } catch {
-    return null;
-  }
+  const result = await mintOperatorBearer({
+    admin: ADMIN,
+    internal: INTERNAL,
+    sub: "ui-ops-server",
+    tenant: "personal",
+    role: "owner",
+  });
+  if (!result) return null;
+  const ttl = Math.max(MIN_TOKEN_TTL_SECS, result.expires_in - RETIRE_BEFORE_EXPIRY_SECS);
+  minted = { token: result.token };
+  if (expiry) clearTimeout(expiry);
+  expiry = setTimeout(() => {
+    minted = null;
+    expiry = null;
+  }, ttl * 1000);
+  unrefTimer(expiry);
+  return result.token;
 }
 
 /** The ops console's own credential: HIVE_INTERNAL_TOKEN authorizes token MINTING only (`POST /v1/token`, `x-hive-internal`), not data GETs (as a
@@ -93,6 +77,12 @@ export async function fetchOpsServer<T>(path: string): Promise<T> {
   if ((r.status === 401 || r.status === 403) && bearer) {
     const fresh = await opsBearer(true);
     if (fresh && fresh !== bearer) r = await opsFetch(path, fresh, null);
+  }
+  // A mint can succeed with 200 yet carry platform_admin=false when the node's admin_emails
+  // drift from every configured owner. The signed-in owner's own cookie is the documented
+  // fallback: the backend re-checks platform_admin on it, so this cannot escalate a session.
+  if ((r.status === 401 || r.status === 403) && cookie) {
+    r = await opsFetch(path, null, cookie);
   }
   if (!r.ok) throw new Error(`ops GET ${path} -> ${r.status}`);
   return (await r.json()) as T;

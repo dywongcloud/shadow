@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { composioConfigured, listToolkits } from "@/lib/composio";
-import { primaryOwnerEmail } from "@/lib/owner-emails";
+import { mintOperatorBearer } from "@/lib/operator-mint";
 
 // Shared integrations-catalog cache: the backend admin-data collection `integration_index` (reported as source "guardian-db") plus the response header
 // `Cache-Control: public, s-maxage=3600` (edge CDN + browser). The route stays dynamic (it reads the index per request and issues no-store fetches, which
@@ -14,21 +14,16 @@ let _globalJwt: { token: string; expires: number } | null = null;
 async function globalJwt(): Promise<string | null> {
   if (!INTERNAL) return null;
   if (_globalJwt && _globalJwt.expires > Date.now() + 30_000) return _globalJwt.token;
-  try {
-    const r = await fetch(`${ADMIN}/v1/token`, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-hive-internal": INTERNAL },
-      body: JSON.stringify({ sub: "system", tenant: "_global", role: "admin", email: primaryOwnerEmail() }),
-      cache: "no-store",
-    });
-    if (!r.ok) return null;
-    const d = await r.json();
-    if (!d?.token) return null;
-    _globalJwt = { token: d.token, expires: Date.now() + (d.expires_in || 3600) * 1000 };
-    return d.token;
-  } catch {
-    return null;
-  }
+  const minted = await mintOperatorBearer({
+    admin: ADMIN,
+    internal: INTERNAL,
+    sub: "system",
+    tenant: "_global",
+    role: "admin",
+  });
+  if (!minted) return null;
+  _globalJwt = { token: minted.token, expires: Date.now() + minted.expires_in * 1000 };
+  return minted.token;
 }
 
 async function readIndex(): Promise<any[] | null> {

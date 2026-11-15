@@ -121,6 +121,28 @@ explorer reports `chain.ok: null` with "no retained entries to walk; an empty re
 UNKNOWN, not clean" rather than a vacuous green "consistent" — an empty window is never rendered
 as a clean one. This is why a rejected/faulted log is not silently shown as verified.
 
+## Operator mints must verify the claim
+
+`ui/lib/operator-mint.ts` is the ONE machine mint for `fetchOpsServer`, the Composio toolkit
+catalog and any other server-side ops read. It tries EVERY address in the dashboard's
+`HIVE_OWNER_EMAIL` and keeps the first token whose own claim says `platform_admin: true`.
+
+The dashboard's `HIVE_OWNER_EMAIL` is rendered into `.env.local` from `hive_owner_email`, while a
+node's `admin_emails` is `HIVE_ADMIN_EMAILS` plus `HIVE_OWNER_EMAIL` from `/proc/<pid>/environ` —
+which a per-node systemd drop-in overrides. Those lists drift. A 200 mint with
+`platform_admin: false` is a VALID JWT that every operator-gated ops GET refuses with 403, and
+before this fix `fetchOpsServer` retried the same identity and then threw. On 2026-11-15 the
+owner console reported `ops GET /v1/admin/contract/explorer -> 403`; `/v1/admin/overview`,
+`/v1/admin/audit` and the Composio index were affected too, on five of six nodes. The first UI
+owner address was absent from those nodes' `admin_emails` while the second was present.
+
+Reading the unsigned payload only SELECTS a credential: the backend re-verifies the signature
+and the role gate on every request, so a forged or stale claim grants nothing. With no operator
+mint, the first successful token is returned (an unenforced dev node accepts it), and
+`fetchOpsServer` finally falls back to the signed-in owner's own `hive_jwt` cookie, which the
+backend re-checks. `/api/token` never uses this helper: it mints the VERIFIED Clerk email, never
+a configured one, so a tenant cannot borrow an owner address.
+
 ## Roll
 
 At the operator's word (`roll deploy`), `ansible/playbooks/parallel-deploy.yml --tags backend,ui
@@ -149,7 +171,8 @@ Residuals (recorded, not hidden):
   measured before/after.
 - No owner-authenticated browser render of `/admin/explorer` is witnessed. The 307 is the
   unauthenticated owner gate; the SSR bundle is verified on disk and by loopback, not behind a
-  signed-in Clerk session.
+  signed-in Clerk session. The operator's own report of a 403 is a server-prefetch read behind
+  that gate, not a browser render.
 - `HIVE_SECRET_KEY_OLD` is absent on fc-sanjose and fc-phoenix. The pre-roll audit passes
   because no key rotation is in flight; a future rotation needs the old key installed first.
 

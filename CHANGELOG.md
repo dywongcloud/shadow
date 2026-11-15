@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-11-15 - ops mints verify platform_admin instead of assuming the first owner
+
+The owner console reported `ops GET /v1/admin/contract/explorer -> 403` on `shadw.cloud`.
+`/v1/admin/overview`, `/v1/admin/audit` and the Composio toolkit index were affected too, on
+five of six live nodes. `require_operator` and the ADMIN `RULES` row were correct: the dashboard
+minted a VALID JWT with `platform_admin: false`, because `mintOpsBearer` sent
+`primaryOwnerEmail()` (the first `HIVE_OWNER_EMAIL` in `.env.local`) and the backend derives
+`platform_admin` by matching that ONE email against its own `admin_emails`. Those lists drift:
+`.env.local` is rendered from `hive_owner_email`, while a node's `admin_emails` is
+`HIVE_ADMIN_EMAILS` plus `HIVE_OWNER_EMAIL` from `/proc/<pid>/environ`, which a per-node
+systemd drop-in overrides. The `--tags ui` roll re-templated `.env.local` and exposed the drift.
+
+`ui/lib/operator-mint.ts` is now the ONE machine mint, used by `fetchOpsServer` and the Composio
+catalog. It tries EVERY configured owner and keeps the first token whose own claim says
+`platform_admin: true`; reading the unsigned payload only SELECTS a credential, since the backend
+re-verifies the signature and the gate on every request. With no operator mint it returns the
+first success (an unenforced dev node accepts it), and `fetchOpsServer` finally falls back to the
+signed-in owner's own `hive_jwt` cookie. `/api/token` is unchanged: it mints the VERIFIED Clerk
+email, never a configured one, so no tenant can borrow an owner address. `docs/explorer.md`.
+
+Live witness: the shipped `mintOperatorBearer` transpiled and executed ON each of the six nodes
+returns 200 with `platform_admin=true`, `responding_node` set to that node, 5 entries and
+`pin_required=true`. Before this fix, minting with UI owner #1 answered 403 on fc-virginia,
+fc-virginia-3 and fc-sanjose while owner #2 answered 200; cookie-only operator tokens answered
+200 on all six. `tsc --noEmit` 0, `npm run lint` 0, contract bindings PASS, `git diff --check` 0.
+
 ## 2026-11-14 - admin contract log explorer: node-local oplog and recorded execution
 
 The admin ops console has no way to observe smart-contract operations or the append-only log
