@@ -1,5 +1,22 @@
 # Changelog
 
+## 2026-11-15 - roll the ops-mint fix to the six live hosts
+
+At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags ui --limit
+'fc-orlando:va:va3:sj:sj7:phx'` rolled `dd74f7a8fa2931ed93b635cfe4bbc195a2f94e31`.
+Pre-roll `scripts/audit-secret-keys.sh` passes 6/6. `ROLL_UI_EXIT=0`, `failed=0
+unreachable=0` on all six, `UI VERIFIED 6/6` serving BUILD_ID `XzWl6SEn1_MmTmp5FRfbo`;
+no backend task ran. Every node serves that BUILD_ID with `admin/explorer` in
+`app-paths-manifest.json` and the new mint source in the compiled chunks.
+
+The drift is STILL present after the roll: fc-virginia, fc-virginia-3 and fc-sanjose still
+have two owners whose FIRST is not a platform admin. The shipped `mintOperatorBearer`
+transpiled and executed ON each of the six nodes returns 200 with `platform_admin=true`,
+`responding_node` set, 5 entries and `pin_required=true` anyway -- the fix works on the
+drifted config, not because the roll happened to repair it. Cookie-only operator tokens
+answer 200 on the explorer, overview and audit. Mesh converged, `https://shadw.cloud/` 200
+from a fleet vantage. Both CI runs `completed|success`, 11/11 jobs each. `docs/explorer.md`.
+
 ## 2026-11-15 - ops mints verify platform_admin instead of assuming the first owner
 
 The owner console reported `ops GET /v1/admin/contract/explorer -> 403` on `shadw.cloud`.

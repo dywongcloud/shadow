@@ -176,6 +176,27 @@ Residuals (recorded, not hidden):
   that gate, not a browser render.
 - `HIVE_SECRET_KEY_OLD` is absent on fc-sanjose and fc-phoenix. The pre-roll audit passes
   because no key rotation is in flight; a future rotation needs the old key installed first.
+- No owner-authenticated browser render of `/admin/explorer` is witnessed. The 307 is the
+  Clerk owner gate; the SSR bundle is verified on disk, by loopback and through the real domain
+  from a fleet vantage, but not behind a signed-in Clerk session.
+
+## Ops-mint fix roll (2026-11-15)
+
+At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags ui --limit
+'fc-orlando:va:va3:sj:sj7:phx'` rolled `dd74f7a8fa2931ed93b635cfe4bbc195a2f94e31`.
+Pre-roll `scripts/audit-secret-keys.sh` passes 6/6. `ROLL_UI_EXIT=0`, `failed=0
+unreachable=0` on all six, `UI VERIFIED 6/6` on BUILD_ID `XzWl6SEn1_MmTmp5FRfbo`; no
+backend task ran. Every node serves that BUILD_ID with `admin/explorer` in its
+`app-paths-manifest.json` and the new mint source in the compiled chunks.
+
+The drift is STILL present after the roll (the UI role re-templates `.env.local`): fc-virginia,
+fc-virginia-3 and fc-sanjose still have two owners whose FIRST is not a platform admin. That
+is the useful witness -- the shipped `mintOperatorBearer` transpiled and executed ON each of
+the six nodes returns 200 with `platform_admin=true`, `responding_node` set, 5 entries and
+`pin_required=true` despite the drift. Cookie-only operator tokens answer 200 on
+`/v1/admin/contract/explorer`, `/v1/admin/overview` and `/v1/admin/audit`. Mesh is converged
+and `https://shadw.cloud/` is 200 from a fleet vantage. Both CI runs are `completed|success`
+(11/11 jobs each).
 
 An adversarial swarm of three read-only refuters scored the roll claim 1 SUPPORTED / 2 REFUTED.
 Two refutations kill the compound "fully verified" claim, so this document does not make it.
