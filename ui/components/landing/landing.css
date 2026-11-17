@@ -562,11 +562,27 @@ html:has(.lp-hero) {
   scroll-padding-top: 76px;
 }
 
-/* the dome keystone: the one card whose outline is the full Turbo Flow ramp; its dome sits wholly inside the frame (it used to cross the top edge, where the
-   border ran through the arc and the halo was cut) */
+/* the keystone: the one card whose outline is the full Turbo Flow ramp; the /new globe sits wholly inside the frame (it used to cross the top edge, where the
+   card's border ran through the arc). Its box is 2.69:1 bottom-anchored; a wrapper with `top` AND `bottom` would stretch the SVG instead. */
 .lp-card-keystone {
   border-width: 1.5px;
   background: linear-gradient(180deg, #060606, #000000) padding-box, linear-gradient(100deg, #e92a67, #a853ba 46%, #2a8af6) border-box;
+}
+.lp-globe-art svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  pointer-events: none;
+}
+@media print {
+  .lp-globe-art [stroke] {
+    stroke: #000 !important;
+  }
+}
+@media (forced-colors: active) {
+  .lp-globe-art [stroke] {
+    stroke: CanvasText !important;
+  }
 }
 
 /* the flow's rail: one lit line across the three cards' top edges with a point travelling along it */

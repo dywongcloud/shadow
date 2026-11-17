@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-11-17 - landing: the scroll-down globe becomes the /new globe
+
+The landing's second globe (the "Own your cloud" keystone reached by scrolling)
+and the default social/AI-search preview were the same hand-drawn dome: a
+Turbo Flow limb, halo strokes, meridians, blue links and nine node boxes. Both
+duplicated the geometry (`bento-visuals.tsx` `DomeKeystone` and
+`app/opengraph-image.tsx` `DOME_SVG`), so an edit to one left the other stale.
+They now draw the high-quality wireframe globe the /new deployment empty state
+renders (`public/globe-dark.svg`), from ONE module `components/globe-art.ts`.
+
+- `globeSvgMarkup` emits a complete SVG with a literal stroke and a radial
+  gradient stroke. The asset's `style="stroke:color(display-p3 ...)"` and
+  `style="mask-type:alpha"` CSS are not portable to Satori's resvg; its mask
+  was measured to be an opacity ramp only (a gradient stroke differs by
+  0.28/255 mean over 176128 pixels), so no `<mask>` can be silently dropped.
+  The share card embeds the markup as a base64 data URI; the keystone renders
+  the same markup inline. `#454545` was ~2.2:1 on a black surface, so the
+  shared `GLOBE_STROKE` is light slate, faded to 40% at the rim.
+- Removed the crappy drawing from both surfaces, with its `haloLayers` import
+  and the SMIL pulses. `landing.css` gives `.lp-globe-art` a bottom-anchored
+  intrinsic box (a wrapper with `top` AND `bottom` stretches an SVG) and
+  repaints the stroke for print and forced-colors. No caption, annotation,
+  count or region was added; the card text carries the meaning.
+
+Witness: a production `next start` build of a scratch copy served the new
+share card at `http://localhost:3188/opengraph-image` (200, 153240-byte PNG),
+read side by side with the old live card; the /new wireframe replaced the
+rainbow limb and the nine node boxes. A headful Chromium render of the keystone
+at 320/360/390/768/1024/1440 px measured 14 paths, no horizontal overflow, an
+unchanged 2.69:1 box and `svgBottomOffset=-1` (bottom-anchored) at every width.
+Satori/resvg rendered the same markup with 9457 lit pixels. The seven paths in
+`globe-art.ts` are byte-identical to `public/globe-dark.svg`; `npx tsc
+--noEmit`, `tsconfig.ci.json`, `npm run lint`, the production build and
+`check-contract-bindings.py --check` all exit 0.
+Local commit only: no push, no roll.
+
 ## 2026-11-17 - adversarial PRD sweep: three row premises closed by live execution
 
 An adversarial gm swarm (19 agents over two workflow passes, 12 independent refutations)

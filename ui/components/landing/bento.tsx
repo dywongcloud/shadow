@@ -3,7 +3,8 @@
 import { useEffect, useRef } from "react";
 import { Section, SectionHead } from "./section";
 import { delay, trackSpotlight } from "./lp-utils";
-import { Dns, LogsMetrics, ManagedData, DomeKeystone, Promote, PullRequests, ScaleToZero } from "./bento-visuals";
+import { Dns, LogsMetrics, ManagedData, Promote, PullRequests, ScaleToZero } from "./bento-visuals";
+import { GlobeArtwork } from "./globe-artwork";
 
 /** Every card names a feature the code has: running hosted or on your own machines (the pricing FAQ and the docs' Self-hosting section), pull-request
  *  previews, scale to zero, DNS + ACME, the `DbKind` engines, promote, logs and metrics. */
@@ -67,12 +68,7 @@ export function Bento() {
             </p>
           </div>
           <div className="relative h-[230px] sm:h-[290px] lg:col-span-8 lg:h-[400px]">
-            <div className="absolute inset-x-3 bottom-0 top-8 lg:hidden">
-              <DomeKeystone compact />
-            </div>
-            <div className="absolute inset-0 hidden lg:block">
-              <DomeKeystone />
-            </div>
+            <GlobeArtwork idPrefix="lp-keystone" className="absolute inset-x-3 bottom-0 lg:inset-x-0" />
           </div>
         </article>
         {CARDS.map((c, i) => (

@@ -6,7 +6,13 @@ the root `AGENTS.md` still apply.
 
 - **The copy sells outcomes, not architecture**: Git to a live URL, a preview per pull request, free to start, hosted or on your own
   machines. Peer-to-peer, mesh, QUIC and post-quantum belong to the docs, never to a hero, title, pill, card title, description or
-  social card (the person's rule: "people dont care about peer to peer"). The globe is art, and its caption says so.
+  social card (the person's rule: "people dont care about peer to peer"). The globe is art: it prints no count and names no region.
+- **One globe geometry**: the scroll-down keystone and the default social card both draw `components/globe-art.ts`, whose seven strokes are transcribed verbatim from
+  `public/globe-dark.svg`, the globe the /new deployment empty state renders. The module is a transcribed copy: a geometry change must edit BOTH the asset and
+  `GLOBE_PATHS`, or /new and the landing drift apart. The asset's
+  inline `color(display-p3)` stroke and `mask-type:alpha` CSS are NOT portable to Satori's resvg, so the module uses a literal stroke and a radial gradient stroke
+  (measured 0.28/255 mean difference from the mask). `globeSvgMarkup` builds the share card's data URI AND the keystone's inline SVG; `#454545` on black is ~2.2:1,
+  so the shared `GLOBE_STROKE` is light slate. Neither surface carries a caption, annotation label, node, link, count or region.
 - **Every sentence is one the code backs.** No illustration carries an annotation label: the owner asked for the `Illustrative` and `Sample`
   chips, the provenance captions and the "Free / Start on the Hobby plan" pill to be removed, and the battery asserts they stay gone
   (`annotations.js`; the same rule made the motion controls icon-only, with their name in `aria-label` or `sr-only` text). What the rule

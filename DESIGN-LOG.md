@@ -1262,3 +1262,180 @@ witness. These belong in DESIGN-CARRY-FORWARD.md.
 - [x] Double-loop paragraph and carry-forward facts written - pointer: Double loop.
 - [x] Final reply states mode, tools, stop conditions and skipped steps - pointer: terminal reply.
 - [x] No test files, secrets or graphical symbols in the diff - pointer: Skipped; `secrets_clean=1`.
+
+
+---
+
+## Bounded run 2026-11-17 — the landing's second globe becomes the /new globe
+
+Mode: **Adaptive** (MAYA). Reason: this is a public, customer-facing landing and
+its link preview, so the advanced pole (the /new wireframe geometry, one shared
+primitive) and the acceptable pole (legible on black, no layout regression at
+320 px, no annotation) must both hold. Anchors: `maya`, `krug`,
+`wcag-contrast`, `single-source-of-truth`. This is a BOUNDED run appended to
+the existing log; the earlier OPEN frontier (W2) is NOT claimed closed. No
+Lite mode was requested or used.
+
+### 1. Traversal Plan and living Frontier
+
+Tools actually used: `mcp__gm__gm_codemode` (`codesearch`, `git_status`,
+`git_diff`), `Read`, `Edit`, `Write`, `Bash` for `sharp`/Satori rasterisation
+and Python measurement, `bsk` headful Agent Window + `bsk emulate`, and two
+read-only adversarial checker subagents. Graph renderer, graph-query tool,
+workflow-state tool, artifact page and Pugh-Matrix branch: none available or
+used. A verifier that had not read the implementation was launched against the
+finished diff; its verdict is recorded in the Panel Reports.
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| C1 identify the "crappy" globe and its preview duplicate | solid (brief) | `maya` | TAKEN (M1) |
+| C2 refuse the naive `<img>` paste (theme flash, P3/mask CSS, dim ink) | dotted counterpoint | `wcag-contrast` | TAKEN (M2) |
+| C3 one shared markup builder for both surfaces | solid | `single-source-of-truth` | TAKEN (M3) |
+| C4 replace the mask with a measured gradient stroke | dotted | `krug` | TAKEN (M4) |
+| C5 re-measure at final state, six widths, print/forced-colors | back-reference | `wcag-contrast` | TAKEN (M5) |
+| C6 seven-seat Adaptive panel, one agent per literary reference | solid | `maya` | DEFERRED (panel not seated) |
+| C7 WHOLE round W1/W2 with no new OBJECT | solid | `maya` | DEFERRED (needs C6) |
+| C8 operator-authorised roll/deploy to the fleet | world-scoped one-way door | `krug` | DEFERRED (no operator word) |
+
+### 2. Decision Records
+
+- **M1 (BREAK)**: replace `DomeKeystone` in `bento.tsx` and `DOME_SVG` in
+  `opengraph-image.tsx` with the seven strokes of `public/globe-dark.svg`.
+  Depends on: none. Formal argument: the user named the /new globe as good and
+  the scroll-down one as crappy; the crappy geometry was duplicated verbatim in
+  both places, so one edit could not move both. Alternatives rejected: reuse
+  `GlobeEmptyState` (its `useTheme` hook paints the light asset until mount,
+  and `MarketingShell` forces dark), reuse the hero raster `GlobeWireframe`
+  (the user pointed at /new, whose live HTML has exactly one globe,
+  `/globe-dark.svg`). Consequence: the keystone loses its SMIL pulses; the
+  Pause state still governs every other decorative loop. Fence: `html.lp-paused`
+  is the single motion state, and a static drawing needs no pause.
+- **M2 (ADAPT)**: a literal stroke, not `#454545`. Measured 2.19:1 on black
+  (1.48:1 faded); the shared `GLOBE_STROKE` is `#9ba4bb`, 8.42:1 (3.97:1
+  faded). Alternatives rejected: keep the asset colour (invisible on the share
+  card), a CSS filter (the landing allows no blur filter beyond the nav).
+- **M3 (BREAK)**: ONE `globeSvgMarkup` builds the share card's base64 data URI
+  and the keystone's inline SVG. Alternatives rejected: two renderers (the
+  original failure), a React SVG plus a separate string builder.
+- **M4 (ADAPT)**: drop the `<mask>`. Measured: a radial gradient stroke differs
+  from the masked version by 0.28/255 mean over 176128 pixels (1570 pixels
+  >8/255); Satori/resvg then rendered the markup with 9457 lit pixels. This
+  closes the checker's most dangerous objection (resvg silently ignoring
+  `mask-type:alpha`/P3 inline CSS).
+- **M5 (KEEP-THE-RULE)**: bottom-anchored intrinsic box, print/forced-colors
+  repaint, no caption. Measured at six widths: 14 paths, `overflowX:false`,
+  2.69:1, `svgBottomOffset=-1` at every width. Built CSS carries both repaint
+  rules. The "drops the caption" objection was OVERRULED by measurement:
+  `codesearch` found no globe caption in the tree; the owner had the
+  provenance captions removed, and `stack-strip.tsx`'s `lp-caption` is the
+  toolchain line.
+
+### 3. Panel Reports
+
+| Round | Critic / checker | Observed in the rendered work | Verdict |
+| --- | --- | --- | --- |
+| R0 WHOLE (inherited) | `aa959f3355a4e4442` | `bento.tsx:71,74` is the first globe after the hero; the literals are duplicated, not shared | OBJECT (C1 SUPPORTED, C2/C3 REFUTED) |
+| R0 WHOLE (inherited) | `adea26e0f347497bc` | `#454545` on black, P3/`mask-type` CSS in a data URI, theme flash, 2.69:1 vs 1.9:1 | OBJECT (six items REFUTED) |
+| R0 WHOLE (inherited) | `a97f64f51b741d0b6` | rainbow limb, SMIL, `.lp-card-keystone` frame, six-width witness rule | OBJECT (four claims REFUTED) |
+| R1, M1-M5 | Provocateur (stand-in) | production share card PNG, old vs new | PASS with the gradient/stroke ADAPT |
+| R1 | Inclusion (stand-in) | 320/360/390/768/1024/1440 headful measurements | PASS, no overflow |
+| R1 | independent verifier `globe-final-c1` / `globe-final-c2` | final diff and served PNG/HTML | PENDING at time of writing; see final reply |
+
+Statements of meaning: the link preview and the scroll-down card now say the
+same thing the /new empty state says. Artist questions: is a static wireframe
+too quiet? Answer: the radial falloff and the keystone's gradient border carry
+the light. Critic questions: does Satori draw it? Answer: yes, measured.
+Opinions: none solicited. Andon pulled: yes, by `adea26e0f347497bc` on the
+resvg/P3 path; resolved by M2+M4 and a rendered PNG.
+
+### 4. Anchor Ledger
+
+| Anchor | Role | Status | Evidence |
+| --- | --- | --- | --- |
+| MAYA: Most Advanced Yet Acceptable | governing criterion | KEEP | advanced pole = shared geometry; acceptable pole = 8.42:1 ink, six-width fit |
+| Krug: Don't Make Me Think | acceptable pole | KEEP | no new caption, chip, count or region; one visual per surface |
+| WCAG contrast | rule | ADAPT | 2.19:1 -> 8.42:1 measured |
+| Single source of truth | rule | KEEP | one `globeSvgMarkup`, seven paths byte-identical to the asset |
+| Edition/one-way door | tension | DEFERRED | no push or roll without the operator's word |
+
+### 5. Step 2g final-state re-measurement
+
+Measured AFTER the last edit: `GLOBE_PATHS` 7 entries, byte-identical to
+`public/globe-dark.svg` (Python equality); production build `BUILD_EXIT=0`;
+`TSC_EXIT=0`, `TSC_CI_EXIT=0`, `LINT_EXIT=0`, `BINDINGS_EXIT=0`
+(`RESULT PASS bindings=34 layers=4 gates=35 fail_open=4 secrets_clean=1`),
+`DIFFCHECK_EXIT=0`; share card 200 / 153240-byte PNG with no rainbow limb or
+node boxes; headful geometry at 320/360/390/768/1024/1440 with
+`overflowX:false`, 14 paths and `svgBottomOffset=-1`; gradient-vs-mask
+0.28/255 mean. Final share-card placement `right:-140, bottom:-55` measured 46
+intruding pixels in the text block against 1241 for the first placement. Residual crappy literals (`DomeKeystone`, `DOME_SVG`,
+`DOME_URI`, `DOME_NODES`, `M20 400C20 150`, `haloLayers` in the two files):
+zero. No test files written.
+
+### Stop test — NOT MET
+
+- S1 Frontier has no OPEN items: **NOT MET** (C6, C7, C8 DEFERRED).
+- S2 WHOLE round PASS from every required critic: **NOT MET** (seven-seat
+  Adaptive panel not seated; two independent checkers only).
+- S3 saturation across two consecutive WHOLE rounds: **NOT MET**.
+- S4 measured ambition push: **PARTIAL** — M4 escalated the shared primitive
+  (mask -> gradient stroke) with a measured 0.28/255 delta; no second
+  escalation survived a WHOLE round.
+- S5 every dotted edge applied or declined with a reason: **NOT MET**.
+
+The run is INCOMPLETE. Exact resume point: this section, seat the seven
+Adaptive critics (one agent per named literary reference), run W1 and W2 quiet,
+resolve any OBJECT, then re-run Step 2g. C8 additionally needs the operator's
+word because `git push` auto-deploys through two triggers.
+
+### Skipped, stated plainly
+
+- Seven-seat Adaptive panel with one agent per literary reference, W1/W2 WHOLE
+  rounds, Pugh-Matrix branch, frame swap, graph renderer and workflow-state
+  tool: NOT RUN.
+- Authenticated live `https://shadw.cloud/new` headful render: NOT RUN; a
+  previous session's four attempts failed (page-frame timeouts, blank OS
+  captures). The live /new HTML was read instead and showed exactly one globe,
+  `/globe-dark.svg`.
+- Print and forced-colors COMPUTED stroke repaint: NOT RUN headfully. Only the
+  presence of both rules in the production CSS bundle was verified. The CSS is
+  a source-level claim, not a computed-style witness.
+- Push, roll, deploy, branch, worktree: NONE. No operator word was given.
+- Test files, mocks, secrets, graphical symbols: NONE.
+- the prior run's OPEN frontier W2 and its skipped items are still OPEN.
+
+### Double loop
+
+The criterion failed the work: MAYA's acceptable pole is only measurable on a
+rendered card, and the panel was never seated, so S2 cannot be witnessed by
+refutations and measurements alone. Graph amendments: add a "Rasteriser
+Regression (Satori/resvg)" node adjacent to `WCAG 2.2 Contrast and
+Perceivability (W3C)`, and a "Shared Primitive Drift" node adjacent to
+`Single Source of Truth`. Carry-forward facts (belong in
+`DESIGN-CARRY-FORWARD.md`): (1) an SVG `<mask>` whose only job is an opacity
+ramp is replaceable by a radial gradient stroke with a measured 0.28/255 mean
+delta, which is what made a data-URI SVG render under resvg; this changed M4.
+(2) `color(display-p3 ...)` and `mask-type:alpha` inline CSS in an SVG asset
+are not portable to Satori; this changed M2 and M4. (3) an absolutely
+positioned wrapper with BOTH `top` and `bottom` stretches an inline SVG instead
+of preserving its 2.69:1 box; this changed M5. (4) the Agent Window has a
+500 px OS minimum width, so 320/360/390 px witnesses need `bsk emulate`, not
+`bsk window resize`; measured by the six resize refusals. (5) a symlinked
+`node_modules` makes Turbopack refuse a scratch-copy build with "Symlink
+[project]/node_modules is invalid, it points out of the filesystem root"; the
+full 686 MB copy built cleanly. This changed the witness path for M5.
+
+### Compliance Check (this bounded run)
+
+- [x] Tooling inventory: Traversal Plan table.
+- [x] Mode stated with reason: opening paragraph.
+- [x] Seed, living Frontier, at least one BREAK, no quota stop: sections 1-2.
+- [x] Decision Record before each move with dependencies: section 2.
+- [ ] Panel Report per round from a compliant seven-seat panel: NOT MET.
+- [x] Every OBJECT resolved ADAPT / OVERRULE with a premise test: M2, M4, M5.
+- [ ] WHOLE rounds and S1-S5 met: NOT MET, stated above.
+- [x] Final-state re-measurement: section 5.
+- [x] Anchor Ledger complete: section 4.
+- [x] Double-loop paragraph and carry-forward facts: above.
+- [x] Final reply states mode, tools, stop conditions and everything skipped:
+  terminal reply.
