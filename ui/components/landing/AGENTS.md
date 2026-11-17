@@ -32,8 +32,13 @@ the root `AGENTS.md` still apply.
   layout's title, description and canonical (the landing's) and a crawler folds it into `/`; the battery finds routes by CRAWLING the links the pages print, never
   from a hand-kept list. Print is a surface: the landing is light on dark, which prints as pale text on white paper with every below-the-fold section at opacity 0,
   so `@media print` in `landing.css` makes it black on white and reveals everything. A probe's predicate must fail on an emptied page (`mutants.py`).
-- A public page declares its metadata with `pageMeta` (`lib/page-meta.ts`): a page's own `openGraph` or `twitter` object REPLACES the root's, images
+- **A public page declares its metadata with `pageMeta`** (`lib/page-meta.ts`): a page's own `openGraph` or `twitter` object REPLACES the root's, images
   included, so the helper names the share card on every page, and `title` is the page's own name (the root template adds " · shadw").
+- **The four `/compare/*` pages are static routes, not a generated `[slug]`**: a generated segment answered 200 with a 404 body for unknown slugs, and
+  inherits the landing's canonical without `generateMetadata`. Each page declares `pageMeta` + `darkViewport`; the index, nav, footer and `CompareStrip`
+  link all four. Rival claims live in `ui/lib/compare-data.ts` with a printed "As of" date and source links verified to answer 200 — describe a rival's
+  real capability (PR environments, managed Postgres, rollbacks) instead of denying it. Registering a new public route touches `proxy.ts` (`isPublic`,
+  `isClerkFree`, `PUBLIC_PAGES`), `next.config.mjs` (`publicPaths` and the private-cache catch-all exclusion), `sitemap.ts`, nav and footer.
 - Motion has one state, `html.lp-paused` (`motion-pause.tsx`): `PauseSkip` is the second Tab stop (through `MarketingShell`'s `lead`), the ticker's
   button is the same control, `prefers-reduced-motion` and a Pause the visitor remembered (`localStorage`) start the page paused (SMIL stopped, the
   terminal shows its whole transcript), and the pause rule skips `.lp-rise`, a one-shot entrance that would otherwise freeze invisible. An open mobile

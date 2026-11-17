@@ -35,6 +35,14 @@ html:has(#lp-content) {
   color: transparent;
   -webkit-text-fill-color: transparent;
 }
+/* forced-colors drops background images: a transparent text fill would leave the word invisible */
+@media (forced-colors: active) {
+  .lp-gradient-text {
+    background-image: none;
+    color: CanvasText;
+    -webkit-text-fill-color: CanvasText;
+  }
+}
 
 /* ───── entrance: hero pieces rise once the intro overlay lets go; sections reveal on scroll ───── */
 @media (scripting: enabled) {

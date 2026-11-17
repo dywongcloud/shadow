@@ -15,6 +15,7 @@ export const MARKETING_NAV: { label: string; href: string }[] = [
   { label: "Solutions", href: "/solutions" },
   { label: "Docs", href: "/docs" },
   { label: "Pricing", href: "/pricing" },
+  { label: "Compare", href: "/compare" },
 ];
 
 const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[] = [
@@ -25,6 +26,16 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
       { label: "Features", href: "/features" },
       { label: "Solutions", href: "/solutions" },
       { label: "Pricing", href: "/pricing" },
+    ],
+  },
+  {
+    title: "Compare",
+    links: [
+      { label: "All comparisons", href: "/compare" },
+      { label: "shadw vs Vercel", href: "/compare/vercel" },
+      { label: "shadw vs Railway", href: "/compare/railway" },
+      { label: "shadw vs Fly.io", href: "/compare/fly-io" },
+      { label: "shadw vs Cloudflare", href: "/compare/cloudflare" },
     ],
   },
   {
@@ -138,7 +149,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
           <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
             <Logo className="h-6 sm:h-8" />
           </Link>
-          <nav aria-label="Primary" className="col-start-2 hidden min-w-0 items-center gap-10 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex">
+          <nav aria-label="Primary" className="col-start-2 hidden min-w-0 items-center gap-5 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex xl:gap-10">
             {MARKETING_NAV.map((n) => (
               <Link
                 key={n.href}
@@ -277,7 +288,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
           </span>
         </div>
         <div className="relative z-10 mx-auto max-w-[1500px] px-6 pt-14 lg:px-10">
-          <div className="grid grid-cols-2 gap-10 md:grid-cols-4">
+          <div className="grid grid-cols-2 gap-10 md:grid-cols-5">
             <div className="col-span-2 md:col-span-1">
               <Logo className="h-6 sm:h-7" />
               <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-400">
@@ -285,7 +296,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
               </p>
             </div>
             {FOOTER_COLS.map((col) => (
-              <div key={col.title} className={col.title === "Company" ? "col-span-2 md:col-span-1" : ""}>
+              <div key={col.title}>
                 <div className="text-sm font-semibold text-white">{col.title}</div>
                 <ul className="mt-3 lg:space-y-0.5">
                   {col.links.map((l) => (

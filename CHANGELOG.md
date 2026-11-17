@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-11-17 - four dedicated /compare pages
+
+Four static comparison pages (`/compare/vercel`, `/compare/railway`, `/compare/fly-io`,
+`/compare/cloudflare`) and a `/compare` index now sit in `MarketingShell`'s dark surface.
+The format follows scibly.com/en/vs/glean: a "shadw vs. X" hero, two "How it works"
+columns, four numbered differences, a comparison table, a "strong fit if" list, a dated
+sources line and a closing CTA. Each page declares its own `pageMeta` title, canonical,
+og:url and description, plus `darkViewport`. The landing page links to all four through the
+nav, a footer column and a `CompareStrip` section.
+
+Competitor statements in `ui/lib/compare-data.ts` were checked against each provider's own
+published docs on 17 November 2026, with the retrieval date printed on the page and all 20
+source URLs verified to answer 200. A rival capability is described, never denied to flatter shadw: Railway and
+Cloudflare PR environments, Fly.io Managed Postgres and Vercel/Cloudflare rollbacks are all
+named as the strengths they are. A generated `[slug]` route was discarded because it returned
+HTTP 200 with a 404 body for unknown slugs; four static routes return a real 404 instead.
+
+Route registration: `/compare(.*)` in `proxy.ts` `isPublic` + `isClerkFree`, `compare` in
+`PUBLIC_PAGES`, `/compare/:path*` in `next.config.mjs` `publicPaths` and the private-cache
+catch-all exclusion, plus five sitemap entries. Local witnesses: `tsc --noEmit`,
+`tsc -p tsconfig.ci.json`, `npm run lint`, `npm run build`,
+`check-contract-bindings.py --check`, `git diff --check`, and live HTTP 200/404 checks
+against `next start`. No push and no roll: a fleet deploy needs the operator's word.
+
 ## 2026-11-16 - lakebed as a supported framework + shadw-bound example
 
 `crates/fluid-build/src/framework.rs` gains a `lakebed` preset (`npx lakebed build`,

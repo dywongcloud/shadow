@@ -14,6 +14,11 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/docs", freq: "weekly", priority: 0.9 },
     { path: "/docs/getting-started", freq: "weekly", priority: 0.8 },
     { path: "/docs/api-reference", freq: "weekly", priority: 0.7 },
+    { path: "/compare", freq: "monthly", priority: 0.7 },
+    { path: "/compare/vercel", freq: "monthly", priority: 0.7 },
+    { path: "/compare/railway", freq: "monthly", priority: 0.7 },
+    { path: "/compare/fly-io", freq: "monthly", priority: 0.7 },
+    { path: "/compare/cloudflare", freq: "monthly", priority: 0.7 },
     { path: "/contact", freq: "monthly", priority: 0.5 },
     { path: "/privacy", freq: "yearly", priority: 0.3 },
   ];
