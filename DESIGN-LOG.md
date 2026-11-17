@@ -1020,3 +1020,245 @@ From /Users/dylanwong/fluid/hive (repo root), not from ui/: `ui/node_modules/.bi
 - [x] Carry-Forward Ledger written beside the log - pointer: DESIGN-CARRY-FORWARD.md, Analytics console run 2026-11-13 section.
 - [x] No test files, secrets, graphical symbols, commit, push, branch, worktree - pointer: Skipped and Step 2g secrets 0, emoji 0.
 - [x] Final reply states mode, tools, stop conditions and skipped steps - pointer: terminal receipt to the orchestrator.
+
+## Run 2026-11-16 - remove the /storage and overview/metrics rainbow (Adaptive, INCOMPLETE)
+
+The brief: a regression put six-hue chart palettes, gradient strips and glows on the customer
+dashboard; remove them so the storage and metrics surfaces read as one Vercel-like neutral
+system, with `f∘f≡f` (idempotence) and `Style(x)≡Style(y)` (one style for every code path).
+This record continues the OPEN frontier above; it does not claim to close it.
+
+### Traversal Plan
+
+Mode: Adaptive. The brief names a public customer-facing dashboard and a brand reference
+(Vercel); MAYA governs, so the advanced pole (one ink, six dash identities, no hue ladder) and
+the acceptable pole (legend, toggle, tooltip and table keep every series readable) must both
+hold. Tools actually called: `mcp__gm__gm_codemode` (`codesearch`, `git_status`, `git_diff`),
+the `Agent` tool for the adversarial swarm, `Read`/`Edit`/`Write` for files, `Bash` for the six
+gates. Graph renderer, graph-query tool, workflow-state tool and artifact page: NOT USED, no
+claim that none exists. Panel: subagents, one per assigned slice, NOT one per literary reference.
+Log: this file. Live graph: Mermaid text below, no renderer; visited classes recorded in prose.
+
+Seed, exact labels from `references/anchor-graph.md`: Stance `White (Kenya Hara)`; Rules
+`Less Is More (Ludwig Mies van der Rohe)`, `Ten Principles of Good Design (Dieter Rams)` and
+`WCAG 2.2 Contrast and Perceivability (W3C)`; Breaker `Making and Breaking the Grid (Timothy
+Samara)`; dotted counterpoint `Tufte Style` reached by `haraW -.->|emptiness counterpoint to|
+c_tufte`. Chain: `White (Kenya Hara)` --stance of--> `Designing Design (Kenya Hara)`
+--restraint shared with--> `Occam's Razor`; `Less Is More (Ludwig Mies van der Rohe)` and
+`Ten Principles of Good Design (Dieter Rams)` ground the deletion; `Making and Breaking the
+Grid (Timothy Samara)` --dotted--> `Grid Systems in Graphic Design (Josef Müller-Brockmann)`
+is the counterpoint held in reserve. Initial Frontier: every hue literal, gradient declaration,
+inline `style` color, series-dash collision, forced-colors override and semantic-status use in
+the 14 dashboard files; plus the two `public/product/dashboard-*.png` captures named by
+`ui/components/landing/AGENTS.md:14`.
+
+R0 premortem ran as five read-only scout agents over the inherited tree. Their findings, not a
+plan written in advance, became the first Frontier candidates: the six-hue `db-chart.tsx`
+palette, the `db-query-builder.tsx` hex palette, gradient strips in `home-dashboard.tsx` and
+`project-detail-client.tsx`, Tremor color arrays, and residual hues in `usage-view.tsx`.
+
+### Decision Records
+
+M1 (BREAK). Depends on: none. Anchors: Rules `Less Is More (Ludwig Mies van der Rohe)`,
+`Ten Principles of Good Design (Dieter Rams)`; Breaker `Making and Breaking the Grid (Timothy
+Samara)`; dotted counterpoint `Tufte Style`. Intent: delete every decorative hue ladder,
+gradient strip, area-fill gradient, glow and tinted editor wash from the 14 dashboard files.
+Formal argument: claim - a rainbow is a competing system, not a series encoding; grounds - the
+brief names Vercel-style neutral cohesion and `Style(x)≡Style(y)`; warrant - `Occam's Razor`
+and Rams: one ink plus dash identity carries six series with less ink than six hues.
+Alternatives rejected: (a) desaturate the six hues to grey steps, rejected because chip B4
+measured that a light sixth ink sits below the 3:1 non-text contrast floor; (b) keep hues only
+in charts, rejected because the brief names the overview/metrics rainbow too. Consequence:
+color no longer distinguishes series, so legend, toggle, tooltip and dash must; semantic
+status colors and real marketplace brand marks are retained. Fence for the broken rule: a hue
+ladder exists to separate categorical series; the fence is satisfied by dash identity repeated
+in all three affordances. Frontier effect: dash collisions, forced-colors, residual hex,
+`--analytics-accent`. Mode field: advanced pole = one ink; acceptable pole = three readable
+affordances. Measurement: 14 files, 112 insertions, 199 deletions; residual-count audit
+`TOTAL_RESIDUAL 0` for hex literals, `linear-gradient`, `radial-gradient`, `--db-*-lit` and
+hue-named Tailwind classes across the edited files.
+
+M2 (ADAPT). Depends on: M1. Chip B4 REFUTED the first six-step alpha ladder
+(`--db-ink-6: hsl(var(--foreground) / 0.32)` fails any 3:1 floor, and forced-colors collapsed
+all six series to one `3 4` dash). Premise test: read the CSS and the forced-colors block; the
+premise held, so ADAPT, not OVERRULE. The `role.lit` field was deleted, the ladder collapsed to
+one `--db-ink` at full opacity, `analyticsSeriesDash(0..5)` became the identity, and the
+forced-colors `stroke-dasharray: 3 4` override was removed so each series keeps its own dash.
+Measurement: six distinct dashes in toggle, legend and tooltip; one ink token.
+
+M3 (ADAPT). Depends on: M1. Chips B1 and C3 REFUTED completeness. B1 named
+`speed-insights.tsx` (fixed), `region-map.tsx`, `service-graph.tsx` and `network/page.tsx`
+(NOT fixed, recorded OPEN below). C3 REFUTED "a headful render is impossible"; the local-dev
+path `HIVE_AUTH_BYPASS=1 NEXT_PUBLIC_HIVE_DEV_MINT=1` at `ui/AGENTS.md:161` makes a LOCAL
+render possible, so the honest claim is that it was not run, not that it cannot be. Premise
+test: read that line; premise held. Measurement: a file-by-file residual audit found and fixed
+two rainbow rows in `usage-view.tsx`, three residual hex literals in `speed-insights.tsx`, and
+the project-detail gradients.
+
+M4 (KEEP-THE-RULE). Depends on: M1. Chips A3 and A4 REFUTED as stated. A3: MARKETPLACE
+provider colors in `ui/app/storage/page.tsx` are real brand marks, not decorative rainbow;
+retained. A4: semantic red/amber/green status is load-bearing and retained, but the decorative
+blue-to-purple gradient and amber favorite star were removed, and Badge `blue`/`purple` tones
+were retained because they are the existing semantic token set. Chip A5 SUPPORTED keeping
+`ui/components/landing/*` luminous gradients out of scope; that is why the only `gradient`
+claims in any AGENTS.md remain true. Premise tests: read the provider map and the Badge tones.
+
+M5 (ADAPT). Depends on: M1. Chip B2 REFUTED "analytics-theme.ts is already monochrome": its
+`--analytics-accent: hsl(var(--link))` is a blue hue. A forced-colors `CanvasText` override was
+added; the link accent itself was NOT changed (26 `ANALYTICS_TOKENS.accent` references resolve
+through the custom property, and the brief names rainbow removal, not zero hue). Recorded as
+OPEN below. Measurement: one new forced-colors rule.
+
+### Panel Reports
+
+Round R1, artifact examined: the 14-file diff and the six gate outputs. The panel was nine
+adversarial gm subagents (five scouts, three checker children A/B/C, one premise refuter s5),
+NOT the required Adaptive seven-seat panel and NOT one agent per literary reference; the
+composition rule is therefore NOT MET. Verdicts: A1 REFUTED, A2 SUPPORTED, A3 REFUTED,
+A4 REFUTED as stated, A5 SUPPORTED; B1 REFUTED, B2 REFUTED, B3 REFUTED, B4 REFUTED;
+C1 REFUTED, C2 REFUTED, C3 REFUTED, C4 REFUTED; premise refuter C1..C7 all REFUTED
+(7 REFUTED / 0 SUPPORTED). Statements of meaning: the inherited palette reads as a second,
+unfinished product pasted onto a neutral console. Artist questions: which series truly need
+independent identity, and is status color a third system? Critic questions: does the surviving
+`--link` accent break strict monochrome, and is a dash identity legible in forced-colors?
+Opinions: the deletion is the improvement; no new system was invented. Andon pulled: yes, by
+B4 (contrast) and B1 (completeness); both resolved by M2 and M3 before another move.
+
+Round R2 (final gate pass), artifact examined: the same tree after M1-M5.
+`TSC_EXIT=0`, `TSC_CI_EXIT=0`, `LINT_EXIT=0`,
+`RESULT PASS bindings=34 layers=4 gates=35 fail_open=4 secrets_clean=1`,
+`DIFFCHECK_EXIT=0`, `MANIFEST_DIFF_EXIT=0`, and `npm run build` `BUILD_EXIT=0` (after a
+pre-existing 0444 generated-artifact EACCES was identified, byte-compared to its source and
+made writable). No Andon. This is a source-and-build witness, NOT a rendered-artifact witness.
+
+### Anchor Ledger
+
+| Anchor | Role | Status | Evidence | Note |
+| --- | --- | --- | --- | --- |
+| `White (Kenya Hara)` | Stance | KEEP | one ink survives M2 | strongest objection survived: B4 contrast |
+| `Less Is More (Ludwig Mies van der Rohe)` | Rule | KEEP | 199 deletions vs 112 insertions | A2: dash identity still separates six series |
+| `Ten Principles of Good Design (Dieter Rams)` | Rule | KEEP | semantic tokens and brand marks retained | A3 |
+| `WCAG 2.2 Contrast and Perceivability (W3C)` | Rule | ADAPT | B4 measured the alpha ladder below 3:1 | one full-opacity ink |
+| `Tufte Style` | Catalog counterpoint (dotted) | ADAPT | M2 removes the forced-colors collapse | data-ink ratio, no decorative ink |
+| `Making and Breaking the Grid (Timothy Samara)` | Breaker | KEEP | M1 deletes the competing system | A5 kept the landing out of scope |
+| `Occam's Razor` | Catalog | KEEP | no new palette invented | M1 |
+| `Design Systems (Alla Kholmatova)` | System | KEEP | `analytics-theme.ts` remains the one token module | M5 |
+| `The Society of the Spectacle (Guy Debord)` | Critic lens | DEFERRED | required Provocateur seat not seated | OPEN F1 |
+| `Art as Technique (Viktor Shklovsky)` | Critic lens | DEFERRED | required Provocateur seat not seated | OPEN F1 |
+| `Mismatch: How Inclusion Shapes Design (Kat Holmes)` | Critic lens | DEFERRED | required Inclusion seat not seated | OPEN F1 |
+| `The Principles of Universal Design (Ronald Mace et al.)` | Critic lens | DEFERRED | required Inclusion seat not seated | OPEN F1 |
+| `The Visual Display of Quantitative Information (Edward Tufte)` | Critic lens | DEFERRED | required Evidence seat not seated | OPEN F1 |
+| `How Charts Lie (Alberto Cairo)` | Critic lens | DEFERRED | required Evidence seat not seated | OPEN F1 |
+| `Don't Make Me Think (Steve Krug)` | Critic lens | DEFERRED | required Usability seat not seated | OPEN F1 |
+
+Live graph update, no renderer: `class haraW,mies,rams,wcag,samBreak,c_tufte,c_occam,kholmatova
+visited`; `class wcag,c_tufte adapted`; `class haraW,mies,rams,samBreak,c_occam,kholmatova
+kept`. Dotted edges leaving used anchors: `haraW -.-> c_tufte` APPLIED (M2/M3);
+`samBreak -.-> mb` DECLINED (a grid break is not the move here); `wcag -.-> carson` DECLINED
+(expressive typography is not the acceptable pole); `maya -.-> shklovsky` NOT ENUMERATED
+without a seated panel. S5 is NOT claimed met.
+
+### Step 2f deletion review and residual diff
+
+Pre-existing elements that earned their keep: the `analytics-theme.ts` token module (one source
+of truth, kept); the semantic Badge tones and provider brand marks (real meaning, kept); the
+landing gradients (out of scope, kept); the DB chart's legend/toggle/tooltip/table (they now
+carry series identity, kept). Elements SCRAPped: the hue ladder, all gradient strips and area
+fills, glow shadows, tinted editor washes, the `role.lit` field, the `color` prop on `ShareBar`,
+and the `BAR_COLORS` map. Residual diff: computed values changed = series color (intended),
+series dash (intended), forced-colors dash (intended regression fixed in M2), build output
+(inert, generated musql files byte-identical to their source), TypeScript gate results (all
+0 after two inert attempts caused by a duplicate `aria-pressed` and a duplicate `className`,
+both fixed). No regression left open from the edits.
+
+### Step 2g final-state re-measurement
+
+| Printed figure | Procedure | Value at final state | Reproducible |
+| --- | --- | --- | --- |
+| 14 files, +112/-199 | `git diff --stat` on the 14 paths | 14 files, +112/-199 before the doc edits | yes |
+| `TOTAL_RESIDUAL 0` | Python scan for hex literals, gradients, `--db-*-lit`, hue classes | 0 across the edited files | yes |
+| `TSC_EXIT=0`, `TSC_CI_EXIT=0`, `LINT_EXIT=0`, `DIFFCHECK_EXIT=0`, `MANIFEST_DIFF_EXIT=0` | the six gates re-run after the last source edit (the `analytics-theme.ts` comment) | all 0 | yes |
+| `BUILD_EXIT=0` | `npm run build` in `ui/` | 0, route list includes `/storage` and `/storage/analytics` | yes |
+| `RESULT PASS bindings=34 layers=4 gates=35` | `python3 -I scripts/check-contract-bindings.py --check` | PASS, manifest unchanged | yes |
+| six distinct series dashes | read `analyticsSeriesDash(0..5)` and the toggle/legend/tooltip | six, distinct | yes |
+
+### Step 4. Stop test, S1-S5
+
+- S1 Frontier has no OPEN items: NOT MET. Pointer: F1-F5 below are OPEN.
+- S2 a WHOLE round returned PASS from every required critic with no Andon: NOT MET. Pointer:
+  R1 was a nine-agent adversarial swarm, not the seven-seat Adaptive panel; R2 was a gate pass.
+- S3 two consecutive quiet WHOLE rounds: NOT MET. W1 and W2 were not run.
+- S4 ambition push with a rendered measured delta: NOT MET. Pointer: M1 is a deletion with a
+  measured source delta, but no rendered computed-CSS or pixel measurement was taken.
+- S5 every dotted edge applied or declined with a seated panel: NOT MET. Pointer: the
+  enumeration above is written, the panel was not seated.
+
+Conclusion: this run is INCOMPLETE at S1-S5. The inherited OPEN frontier (F1/F2/F3 of the
+2026-11-13 run) is NOT closed by it; nothing here deletes or rewrites that record.
+
+### OPEN frontier and exact resume point
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| F1 seven-seat Adaptive WHOLE panel (Provocateur Debord + Shklovsky, Inclusion Holmes + Mace, three more distinct seats), one agent per literary reference, PASS from every seat and no Andon | pull, outgoing solid | `Andon` | OPEN |
+| F2 two consecutive quiet WHOLE rounds with the S4 push in place | score both poles of, outgoing solid | `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | OPEN |
+| F3 headful Chromium (headless: false) render of LOCAL `http://localhost:PORT/storage` with a seeded node and `HIVE_AUTH_BYPASS=1 NEXT_PUBLIC_HIVE_DEV_MINT=1`, computed CSS, pixel contrast, 320/390/768/1440 px | none | none | OPEN, unrendered |
+| F4 recapture `public/product/dashboard-*.png` from a seeded local node | `ui/components/landing/AGENTS.md:14` | none | OPEN, requires F3 |
+| F5 remaining hue sources outside this diff: `ui/components/region-map.tsx`, `ui/components/service-graph.tsx`, `ui/app/network/page.tsx`; and `--analytics-accent: hsl(var(--link))` if strict zero-hue is wanted | B1/B2 refutations | none | OPEN, unscoped by the brief |
+| F6 roll/deploy the built dashboard to the fleet | `AGENTS.md:22`, `AGENTS.md:137` | none | OPEN, operator's word required |
+
+Exact resume point: this section, after the Compliance Check. Seat the seven Adaptive critics
+READ-ONLY on the frozen post-edit paths, run W1, resolve every OBJECT, run W2 quiet, then render
+headfully and re-run Step 2g. Do not start over; do not delete the prior run or this record.
+
+### Skipped, every step skipped stated plainly
+
+- Seven-seat Adaptive panel, one agent per literary reference, W1/W2 WHOLE rounds: NOT RUN.
+- Headful browser render, computed CSS, screenshot, pixel contrast, phone-width witness: NOT RUN.
+- Authenticated live `https://shadw.cloud/storage` render: NOT RUN. `curl` returned a 307 to
+  the sign-in shell, so the live authenticated page is unwitnessed.
+- `public/product/dashboard-*.png` recapture: NOT RUN; the landing AGENTS.md rule now names an
+  outstanding obligation, recorded in CHANGELOG.md.
+- Graph renderer, graph-query tool, workflow-state tool, artifact page, Pugh-Matrix branch: NOT USED.
+- Test files: NONE written, per the project rule. No mocks, no `#[cfg(test)]`.
+- Push, roll, deploy, branch, worktree: NONE. `git push` auto-deploys through two triggers, so it
+  is a production change needing the operator's word; no such word was given in this run.
+- `npm ci`, `cargo build/test --workspace --locked`, `scripts/cli-acceptance.sh`, clippy and
+  the CI-only audit jobs: NOT RUN locally; they gate CI after a push, not this local tree.
+
+### Double loop
+
+The panel failed first: an adversarial code swarm is not a seated Adaptive critic panel, so S2
+cannot be witnessed by refutations alone. The criterion failed second: MAYA's acceptable pole
+(what a signed-in customer actually sees) cannot be measured by source counts or a production
+build. The graph needs a rendered-computed-style witness node and a rule that a palette change
+is incomplete until the two `dashboard-*.png` frames are recaptured. Graph amendments: add
+"Computed Style Witness (headful browser)" adjacent to `MAYA: Most Advanced Yet Acceptable
+(Raymond Loewy)`, and add "Asset Recapture Check" adjacent to
+`WCAG 2.2 Contrast and Perceivability (W3C)`.
+
+Carry-forward ledger: (1) one ink plus dash identity is a complete six-series encoding on this
+console - measured by the final residual audit and the six distinct dashes; it changed M2.
+(2) A light alpha step of `hsl(var(--foreground))` falls below a 3:1 non-text contrast floor -
+measured by B4's refutation; it changed M2. (3) `npm run build` in `ui/` copies
+`crates/hive-browser/www/musql/` into `ui/public/browser-node/musql/`; a read-only generated
+file there fails the build with EACCES and the files are byte-identical to their source -
+measured by the first failed build and the seven-file sha256 comparison. (4) `git diff --check`
+and the bindings `--check` do not cover a rendered page; measured by R2 passing with no browser
+witness. These belong in DESIGN-CARRY-FORWARD.md.
+
+### Compliance Check (this run), each line with a pointer
+
+- [x] Tooling inventory done - pointer: Traversal Plan, tools actually called.
+- [x] Mode stated with reason - pointer: Traversal Plan, Adaptive for a public branded console.
+- [x] Seed with exact labels, one dotted counterpoint, living Frontier - pointer: Traversal Plan.
+- [x] At least one BREAK, no quota stop - pointer: M1; the stop is the OPEN frontier, not a count.
+- [x] Decision Record before each move with all fields - pointer: M1-M5.
+- [ ] Panel Report per round from a compliant seven-seat Adaptive panel - pointer: Panel Reports, NOT MET.
+- [x] Every R1 OBJECT resolved ADAPT / KEEP / OVERRULE with a premise test - pointer: M2-M5.
+- [ ] WHOLE rounds run and S1-S5 shown met - pointer: Step 4, all NOT MET.
+- [x] Every figure re-measured at final state - pointer: Step 2g table.
+- [x] Anchor Ledger complete and live graph updated - pointer: Anchor Ledger and the class list.
+- [x] Double-loop paragraph and carry-forward facts written - pointer: Double loop.
+- [x] Final reply states mode, tools, stop conditions and skipped steps - pointer: terminal reply.
+- [x] No test files, secrets or graphical symbols in the diff - pointer: Skipped; `secrets_clean=1`.

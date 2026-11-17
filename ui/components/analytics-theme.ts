@@ -1,6 +1,9 @@
 /** Shared visual primitives for the project and storage analytics consoles.
  *  The palette is the dashboard's own neutral tokens plus its existing --link
- *  hue; the luminous landing palette is deliberately not imported here. */
+ *  hue; the luminous landing palette is deliberately not imported here.
+ *  Multiple data series share ONE ink and are told apart by analyticsSeriesDash,
+ *  never by a hue ladder, gradient or glow; accent is one link color, and
+ *  red/amber/green are reserved for measured status. */
 export const ANALYTICS_ROOT_CLASS = "hive-analytics";
 
 export const ANALYTICS_THEME_CSS = [
@@ -28,6 +31,7 @@ export const ANALYTICS_THEME_CSS = [
   "  --analytics-bar-fill: hsl(var(--foreground) / 0.16);",
   "}",
   "@media (forced-colors: active) {",
+  "  .hive-analytics { --analytics-accent: CanvasText; --analytics-accent-soft: Canvas; --analytics-accent-softer: Canvas; }",
   "  .hive-analytics .analytics-bar { outline: 1px solid CanvasText; }",
   "}",
   "@media (prefers-contrast: more) {",

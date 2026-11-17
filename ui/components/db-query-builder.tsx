@@ -38,13 +38,16 @@ export interface DbQueryBuilderProps {
   title?: string;
 }
 
+/** Neutral ink ladder: every `P.*` name is a stable syntax role, not a hue. Keys, strings,
+ *  numbers and punctuation differ by lightness and weight, never by color, so the console stays
+ *  inside the dashboard's monochrome theme in light and dark. */
 const P = {
-  indigo: "#6366f1",
-  cyan: "#22d3ee",
-  emerald: "#34d399",
-  amber: "#fbbf24",
-  rose: "#fb7185",
-  violet: "#a78bfa",
+  indigo: "hsl(var(--foreground))",
+  cyan: "hsl(var(--secondary))",
+  emerald: "hsl(var(--foreground) / 0.72)",
+  amber: "hsl(var(--muted))",
+  rose: "hsl(var(--foreground) / 0.48)",
+  violet: "hsl(var(--foreground) / 0.86)",
 };
 
 const SQL_KINDS: BrowserKind[] = ["sqlite", "postgres", "supabase", "browser_sqlite"];
@@ -308,7 +311,7 @@ function colorize(text: string): React.ReactNode[] {
     const [full, str, colon, number, bool, nul, punct, space] = match;
     if (str) {
       out.push(<span key={"s" + n} style={{ color: colon ? P.violet : P.emerald }}>{str}</span>);
-      if (colon) out.push(<span key={"c" + n} style={{ color: "#94a3b8" }}>{colon}</span>);
+      if (colon) out.push(<span key={"c" + n} style={{ color: "hsl(var(--muted))" }}>{colon}</span>);
     } else if (number) {
       out.push(<span key={"n" + n} style={{ color: P.amber }}>{number}</span>);
     } else if (bool) {
@@ -316,11 +319,11 @@ function colorize(text: string): React.ReactNode[] {
     } else if (nul) {
       out.push(<span key={"z" + n} style={{ color: P.cyan }}>{nul}</span>);
     } else if (punct) {
-      out.push(<span key={"p" + n} style={{ color: "#94a3b8" }}>{punct}</span>);
+      out.push(<span key={"p" + n} style={{ color: "hsl(var(--muted))" }}>{punct}</span>);
     } else if (space) {
       out.push(<span key={"w" + n}>{space}</span>);
     } else {
-      out.push(<span key={"o" + n} style={{ color: "#cbd5e1" }}>{full}</span>);
+      out.push(<span key={"o" + n} style={{ color: "hsl(var(--secondary))" }}>{full}</span>);
     }
   }
   return out;
@@ -564,15 +567,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
             <Plus className="h-4 w-4" style={{ color: P.cyan }} aria-hidden />
           </button>
         </div>
-        <div
-          aria-hidden
-          className="h-[2px] w-full min-w-0"
-          style={{
-            background: "linear-gradient(90deg, " + P.indigo + ", " + P.cyan + ", " + P.emerald + ", " + P.amber + ", " + P.rose + ", " + P.violet + ")",
-            maskImage: "linear-gradient(90deg, #000 0%, #000 72%, transparent 100%)",
-            WebkitMaskImage: "linear-gradient(90deg, #000 0%, #000 72%, transparent 100%)",
-          }}
-        />
+        <div aria-hidden className="h-px w-full min-w-0 bg-border" />
       </div>
 
       <div className="flex min-w-0 flex-col gap-3 p-3 sm:p-4">
@@ -583,7 +578,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
               aria-pressed={view.mode === "builder"}
               onClick={() => patch(view.id, { mode: "builder" })}
               className="inline-flex min-h-[44px] items-center gap-1.5 rounded px-2 text-xs font-medium"
-              style={view.mode === "builder" ? { color: "#fff", background: P.indigo } : { color: "hsl(var(--secondary))" }}
+              style={view.mode === "builder" ? { color: "hsl(var(--accent-foreground))", background: "hsl(var(--accent))" } : { color: "hsl(var(--secondary))" }}
             >
               <ListFilter className="h-3.5 w-3.5" aria-hidden /> Query Builder
             </button>
@@ -592,7 +587,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
               aria-pressed={view.mode === "code"}
               onClick={() => patch(view.id, { mode: "code" })}
               className="inline-flex min-h-[44px] items-center gap-1.5 rounded px-2 text-xs font-medium"
-              style={view.mode === "code" ? { color: "#07131a", background: P.cyan } : { color: "hsl(var(--secondary))" }}
+              style={view.mode === "code" ? { color: "hsl(var(--accent-foreground))", background: "hsl(var(--accent))" } : { color: "hsl(var(--secondary))" }}
             >
               <Code2 className="h-3.5 w-3.5" aria-hidden /> Code Editor
             </button>
@@ -817,7 +812,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
         )}
 
         {view.error && (
-          <p role="alert" className="min-w-0 break-words rounded-md border px-3 py-2 text-xs" style={{ color: P.rose, borderColor: tint(P.rose, 0.4), background: tint(P.rose, 0.08) }}>{view.error}</p>
+          <p role="alert" className="min-w-0 break-words rounded-md border border-red-500/40 bg-red-500/5 px-3 py-2 text-xs text-red-500">{view.error}</p>
         )}
         {view.note && <p className="min-w-0 break-words text-[11px] text-muted">{view.note}</p>}
 
@@ -875,8 +870,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
                   </span>
                 </div>
                 <div
-                  className="relative min-w-0 rounded-lg border border-border"
-                  style={{ background: "linear-gradient(135deg, rgba(99,102,241,0.12), rgba(34,211,238,0.05) 45%, #0b1020 100%)" }}
+                  className="relative min-w-0 rounded-lg border border-border bg-subtle"
                 >
                   <pre
                     ref={preRef}
@@ -895,8 +889,7 @@ export function DbQueryBuilder(props: DbQueryBuilderProps) {
                     }}
                     spellCheck={false}
                     rows={10}
-                    className="relative block max-h-80 w-full min-w-0 resize-y overflow-auto whitespace-pre-wrap break-words bg-transparent p-3 font-mono text-xs leading-relaxed text-transparent outline-none selection:bg-indigo-500/30"
-                    style={{ caretColor: P.indigo }}
+                    className="relative block max-h-80 w-full min-w-0 resize-y overflow-auto whitespace-pre-wrap break-words bg-transparent p-3 font-mono text-xs leading-relaxed text-transparent outline-none selection:bg-fg/20 caret-fg"
                   />
                 </div>
                 <div className="flex min-w-0 flex-wrap items-center gap-2">

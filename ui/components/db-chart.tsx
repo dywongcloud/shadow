@@ -2,36 +2,41 @@
 
 import { useId, useMemo, useState, type KeyboardEvent, type PointerEvent } from "react";
 import { Button, Card, StateNotice } from "@/components/ui";
+import { analyticsSeriesDash } from "./analytics-theme";
 import type { DbInstanceMetrics, DbMetricBucket } from "@/lib/api";
 
-/** Scoped color steps. The six `-lit` values are the requested luminous hues (gradient stops,
- *  glow strokes, top strips); the `color` steps are re-stepped for a 2px stroke to pass the
- *  lightness, CVD-separation and 3:1 contrast checks on a light surface. Dark mode gets its own
- *  selected steps, never an automatic flip. Both sets were measured with validate_palette.js. */
+/** Dashboard series identity is the dash pattern, the legend, the tooltip and the table --
+ *  never hue. All six series use ONE ink at full opacity, so every mark clears the 3:1
+ *  non-text contrast floor on both surfaces and forced-colors keeps each series' own dash.
+ *  The role keys are stable series slots, not color names. Every `var()` fallback is neutral,
+ *  so a missing `<style>` injection degrades to monochrome instead of resurrecting a rainbow. */
 export const DB_PALETTE_CSS = [
   ".hive-db-observe {",
-  "  --db-indigo: #4239c2; --db-cyan: #1296aa; --db-emerald: #0c8d63;",
-  "  --db-amber: #826001; --db-rose: #9d1239; --db-violet: #896cd8;",
-  "  --db-indigo-lit: #6366f1; --db-cyan-lit: #22d3ee; --db-emerald-lit: #34d399;",
-  "  --db-amber-lit: #fbbf24; --db-rose-lit: #fb7185; --db-violet-lit: #a78bfa;",
+  "  --db-ink: hsl(var(--foreground));",
+  "  --db-wash: hsl(var(--foreground) / 0.055);",
   "}",
   ".dark .hive-db-observe {",
-  "  --db-indigo: #4d4ad3; --db-cyan: #149db2; --db-emerald: #07976a;",
-  "  --db-amber: #8c6800; --db-rose: #ae2846; --db-violet: #8163ce;",
+  "  --db-wash: hsl(var(--foreground) / 0.09);",
   "}",
   "@media (forced-colors: active) {",
   "  .hive-db-observe .db-fill { background-image: repeating-linear-gradient(45deg, CanvasText 0 1px, transparent 1px 6px) !important; }",
-  "  .hive-db-observe .db-area { fill: none !important; stroke: CanvasText; stroke-dasharray: 3 4; }",
+  "  .hive-db-observe .db-area { fill: none !important; stroke: CanvasText; }",
+  "}",
+  "@media (prefers-contrast: more) {",
+  "  .hive-db-observe { --db-wash: hsl(var(--foreground) / 0.12); }",
   "}",
 ].join("\n");
 
+/** One ink, six dash identities from the analytics console's shared dash ladder. The average,
+ *  crosshair and grid already use `3 7`, `3 4` and `2 7` guides; the six series dashes come
+ *  from `analyticsSeriesDash`, and each is repeated in the toggle, legend and tooltip. */
 export const DB_COLORS = {
-  indigo: { color: "var(--db-indigo, #4239c2)", lit: "var(--db-indigo-lit, #6366f1)" },
-  cyan: { color: "var(--db-cyan, #1296aa)", lit: "var(--db-cyan-lit, #22d3ee)" },
-  emerald: { color: "var(--db-emerald, #0c8d63)", lit: "var(--db-emerald-lit, #34d399)" },
-  amber: { color: "var(--db-amber, #826001)", lit: "var(--db-amber-lit, #fbbf24)" },
-  rose: { color: "var(--db-rose, #9d1239)", lit: "var(--db-rose-lit, #fb7185)" },
-  violet: { color: "var(--db-violet, #896cd8)", lit: "var(--db-violet-lit, #a78bfa)" },
+  indigo: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(0) },
+  cyan: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(1) },
+  emerald: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(2) },
+  amber: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(3) },
+  rose: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(4) },
+  violet: { color: "var(--db-ink, hsl(var(--foreground)))", dash: analyticsSeriesDash(5) },
 } as const;
 
 export type DbColorRole = keyof typeof DB_COLORS;
@@ -343,7 +348,6 @@ function DbChartPanel({
 
   const hovered = hover !== null && hover >= 0 && hover < buckets.length ? buckets[hover] : null;
   const avgColor = DB_COLORS[panel.averageRole];
-  const gradientId = (key: string) => `${uid}-fill-${key}`;
 
   return (
     <Card className="min-w-0 w-full max-w-full p-0" aria-label={`${panel.title} measured series, ${windowLabel}`}>
@@ -366,12 +370,11 @@ function DbChartPanel({
               variant={isActive ? "default" : "outline"}
               aria-pressed={isActive}
               className="min-h-[44px] min-w-0 max-w-full gap-2 px-3 text-xs"
-              style={isActive
-                ? { background: `linear-gradient(90deg, ${role.lit}, ${role.color})`, color: "#ffffff", borderColor: "transparent" }
-                : { borderColor: role.color }}
               onClick={() => toggle(s.key)}
             >
-              <span className="h-0.5 w-5 shrink-0 rounded-full" style={{ background: role.color }} aria-hidden="true" />
+              <svg width="20" height="6" viewBox="0 0 20 6" aria-hidden="true" className="shrink-0">
+                <line x1="0" y1="3" x2="20" y2="3" style={{ stroke: role.color }} strokeWidth="2" strokeDasharray={role.dash} />
+              </svg>
               <span className="min-w-0 break-words">{s.label}</span>
               {last !== null && <strong className="shrink-0 tabular-nums">{panel.format(last)}</strong>}
             </Button>
@@ -382,12 +385,10 @@ function DbChartPanel({
             variant={showAverage ? "outline" : "ghost"}
             aria-pressed={showAverage}
             className="min-h-[44px] min-w-0 max-w-full gap-2 px-3 text-xs"
-            style={showAverage ? { borderColor: avgColor.color } : undefined}
             onClick={() => setShowAverage((v) => !v)}
           >
             <span
-              className="h-0 w-5 shrink-0 border-t-2 border-dotted"
-              style={{ borderColor: avgColor.color }}
+              className="h-0 w-5 shrink-0 border-t-2 border-dotted border-muted"
               aria-hidden="true"
             />
             <span className="min-w-0 break-words">Average</span>
@@ -399,8 +400,7 @@ function DbChartPanel({
       {!hasData ? (
         <div className="flex min-h-[180px] min-w-0 items-center gap-3 px-4 pb-5 sm:px-5">
           <span
-            className="db-fill h-14 w-1.5 shrink-0 rounded-full"
-            style={{ background: "linear-gradient(180deg, var(--db-indigo-lit, #6366f1), var(--db-emerald-lit, #34d399))" }}
+            className="db-fill h-14 w-1.5 shrink-0 rounded-full bg-border-strong"
             aria-hidden="true"
           />
           <p className="min-w-0 break-words text-sm text-secondary">
@@ -430,17 +430,6 @@ function DbChartPanel({
               ))}
             </div>
             <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none" className="absolute inset-0 h-full w-full" aria-hidden="true">
-              <defs>
-                {shown.map((s) => {
-                  const role = DB_COLORS[s.role];
-                  return (
-                    <linearGradient key={s.key} id={gradientId(s.key)} x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="0%" style={{ stopColor: role.lit, stopOpacity: 0.32 }} />
-                      <stop offset="100%" style={{ stopColor: role.color, stopOpacity: 0.02 }} />
-                    </linearGradient>
-                  );
-                })}
-              </defs>
               {TICK_FRACTIONS.map((f) => (
                 <line
                   key={`y-${f}`}
@@ -490,9 +479,8 @@ function DbChartPanel({
                     : "";
                   return (
                     <g key={`${s.key}-${segment[0]}`}>
-                      {area && <path className="db-area" d={area} fill={`url(#${gradientId(s.key)})`} />}
-                      <path d={line} fill="none" style={{ stroke: role.lit }} strokeOpacity="0.18" strokeWidth="9" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
-                      <path d={line} fill="none" style={{ stroke: role.color }} strokeWidth="2.25" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+                      {area && <path className="db-area" d={area} fill="var(--db-wash)" />}
+                      <path d={line} fill="none" style={{ stroke: role.color }} strokeWidth="2.25" strokeDasharray={role.dash} strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
                     </g>
                   );
                 });
@@ -547,7 +535,9 @@ function DbChartPanel({
                 <div className="mb-2 min-w-0 break-words font-medium tabular-nums text-fg">{dbUtc(hovered.t_ms)}</div>
                 {shown.map((s) => (
                   <div key={`tip-${s.key}`} className="mb-1 flex min-w-0 items-center gap-2">
-                    <span className="h-0.5 w-4 shrink-0 rounded-full" style={{ background: DB_COLORS[s.role].color }} aria-hidden="true" />
+                    <svg width="16" height="6" viewBox="0 0 16 6" aria-hidden="true" className="shrink-0">
+                      <line x1="0" y1="3" x2="16" y2="3" style={{ stroke: DB_COLORS[s.role].color }} strokeWidth="2" strokeDasharray={DB_COLORS[s.role].dash} />
+                    </svg>
                     <strong className="shrink-0 tabular-nums text-fg">{panel.format(values[hover as number][s.key] ?? 0)}</strong>
                     <span className="min-w-0 break-words text-secondary">{s.label}</span>
                   </div>
@@ -643,9 +633,6 @@ export function DbChartGrid({
               variant={isActive ? "default" : "outline"}
               aria-pressed={isActive}
               className="min-h-[44px] min-w-0 px-3 text-xs"
-              style={isActive
-                ? { background: "linear-gradient(90deg, var(--db-indigo-lit, #6366f1), var(--db-cyan-lit, #22d3ee))", color: "#ffffff", borderColor: "transparent" }
-                : undefined}
               onClick={() => setWindowKey(key)}
             >
               {key}
@@ -667,8 +654,7 @@ export function DbChartGrid({
       {!reported && !error && (
         <Card className="flex min-w-0 items-center gap-3">
           <span
-            className="db-fill h-14 w-1.5 shrink-0 rounded-full"
-            style={{ background: "linear-gradient(180deg, var(--db-indigo-lit, #6366f1), var(--db-violet-lit, #a78bfa))" }}
+            className="db-fill h-14 w-1.5 shrink-0 rounded-full bg-border-strong"
             aria-hidden="true"
           />
           <p className="min-w-0 break-words text-sm text-secondary">

@@ -41,10 +41,12 @@ function fmtVital(key: keyof VitalPercentiles, value: number): string {
   return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.round(value)} ms`;
 }
 
+/** Rating is semantic status, not series identity: green / amber / red are the dashboard's
+ *  reserved status colors (ui.tsx Badge), never categorical hues. */
 const RATING_COLOR: Record<Rating, string> = {
-  great: "#3fa45a",
-  needs: "#d9a528",
-  poor: "#e5484d",
+  great: "hsl(var(--green))",
+  needs: "hsl(38 92% 50%)",
+  poor: "hsl(0 84% 60%)",
 };
 
 const PERCENTILES = ["P75", "P90", "P95", "P99"] as const;
@@ -270,7 +272,7 @@ function Gauge({ score, size }: { score: number | null; size: number }) {
   const stroke = size > 60 ? 6 : 3.5;
   const r = (size - stroke) / 2;
   const circ = 2 * Math.PI * r;
-  const color = score === null ? "hsl(var(--muted))" : score >= 90 ? "#3fa45a" : score >= 50 ? "#d9a528" : "#e5484d";
+  const color = score === null ? "hsl(var(--muted))" : RATING_COLOR[score >= 90 ? "great" : score >= 50 ? "needs" : "poor"];
   return (
     <span className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">
@@ -312,9 +314,9 @@ function MiniBar({ pos }: { pos: number }) {
   return (
     <div className="relative h-1 w-24 overflow-visible rounded-full">
       <div className="flex h-1 overflow-hidden rounded-full">
-        <span className="h-full" style={{ width: "20%", background: "#e5484d" }} />
-        <span className="h-full" style={{ width: "30%", background: "#d9a528" }} />
-        <span className="h-full flex-1" style={{ background: "#3fa45a" }} />
+        <span className="h-full" style={{ width: "20%", background: RATING_COLOR.poor }} />
+        <span className="h-full" style={{ width: "30%", background: RATING_COLOR.needs }} />
+        <span className="h-full flex-1" style={{ background: RATING_COLOR.great }} />
       </div>
       <span
         className="absolute top-1/2 h-2 w-2 -translate-y-1/2 rounded-full border-2 border-card bg-fg"

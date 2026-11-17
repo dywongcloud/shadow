@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import { ListFilter, ScrollText } from "lucide-react";
 import { Badge, Button, Card, Input, StateNotice } from "@/components/ui";
 import type { DbMetricEvent } from "@/lib/api";
-import { DB_COLORS, dbBytes, dbFinite, dbMs, dbPlain, dbUtc } from "./db-chart";
+import { dbBytes, dbFinite, dbMs, dbPlain, dbUtc } from "./db-chart";
 
 const PAGE = 25;
 const MAX_EVENTS = 200;
@@ -142,9 +142,6 @@ export function DbLogTable({
                 variant={isActive ? "default" : "outline"}
                 aria-pressed={isActive}
                 className="min-h-[44px] min-w-0 px-3 text-xs"
-                style={isActive
-                  ? { background: "linear-gradient(90deg, var(--db-indigo-lit, #6366f1), var(--db-cyan-lit, #22d3ee))", color: "#ffffff", borderColor: "transparent" }
-                  : undefined}
                 onClick={() => { setOutcome(key); setLimit(PAGE); }}
               >
                 {key === "all" ? "All" : key === "ok" ? "Successful" : "Errors"}
@@ -183,8 +180,7 @@ export function DbLogTable({
       {!reported && !error ? (
         <div className="flex min-h-[140px] min-w-0 items-center gap-3 px-4 py-5 sm:px-5">
           <span
-            className="db-fill h-12 w-1.5 shrink-0 rounded-full"
-            style={{ background: "linear-gradient(180deg, var(--db-rose-lit, #fb7185), var(--db-violet-lit, #a78bfa))" }}
+            className="db-fill h-12 w-1.5 shrink-0 rounded-full bg-border-strong"
             aria-hidden="true"
           />
           <p className="min-w-0 break-words text-sm text-secondary">
@@ -266,7 +262,7 @@ export function DbLogTable({
       )}
 
       <div className="flex min-w-0 items-center gap-2 border-t border-border px-4 py-3 sm:px-5">
-        <span className="h-0.5 w-5 shrink-0 rounded-full" style={{ background: DB_COLORS.rose.color }} aria-hidden="true" />
+        <span className="h-0.5 w-5 shrink-0 rounded-full bg-border-strong" aria-hidden="true" />
         <p className="min-w-0 break-words text-xs text-muted">
           An error badge carries the server&apos;s fixed error class, never an engine message or connection string.
         </p>

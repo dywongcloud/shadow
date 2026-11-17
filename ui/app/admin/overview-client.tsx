@@ -75,7 +75,7 @@ export function AdminOverviewClient({
             data={series}
             index="time"
             categories={["Requests", "Errors"]}
-            colors={["blue", "rose"]}
+            colors={["blue", "slate"]}
             showLegend
             showGridLines={false}
             curveType="monotone"

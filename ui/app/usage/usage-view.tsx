@@ -232,7 +232,7 @@ export default function UsageView() {
       <Card className="mb-4 min-w-0 w-full max-w-full">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-blue-500/10 text-blue-500"><Coins className="h-4 w-4 shrink-0" /></span>
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-subtle text-muted"><Coins className="h-4 w-4 shrink-0" /></span>
             <div className="min-w-0">
               <div className="text-sm text-secondary">Included Credit</div>
               <div className="min-w-0 break-words text-lg font-semibold tabular-nums whitespace-normal">
@@ -251,7 +251,7 @@ export default function UsageView() {
               <div className="text-sm text-secondary">On-Demand Charges</div>
               <div className="min-w-0 break-words text-lg font-semibold tabular-nums whitespace-normal">{moneyMeasured(onDemand)}</div>
             </div>
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-purple-500/10 text-purple-500"><DollarSign className="h-4 w-4 shrink-0" /></span>
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-subtle text-muted"><DollarSign className="h-4 w-4 shrink-0" /></span>
           </div>
         </div>
         {includedPct === null ? (
@@ -260,8 +260,8 @@ export default function UsageView() {
           </div>
         ) : (
           <div className="mt-4 flex h-2.5 overflow-hidden rounded-full bg-subtle">
-            <div className="h-full bg-[#0070f3]" style={{ width: `${includedPct}%` }} />
-            <div className="h-full bg-[#7928ca]" style={{ width: `${100 - includedPct}%` }} />
+            <div className="h-full bg-fg" style={{ width: `${includedPct}%` }} />
+            <div className="h-full bg-border-strong" style={{ width: `${100 - includedPct}%` }} />
           </div>
         )}
       </Card>
@@ -293,7 +293,7 @@ export default function UsageView() {
             data={chart}
             index="date"
             categories={["Edge Requests", "Cache Hits", "Blocked"]}
-            colors={["blue", "emerald", "rose"]}
+            colors={["blue", "slate", "cyan"]}
             stack
             showLegend
             showAnimation
@@ -308,15 +308,15 @@ export default function UsageView() {
           </div>
 
           <GroupHeader name="OpenEdge Delivery Network" />
-          <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={fmtMeasured(requests)} charge={rowCharge(edgeCharge)} />
-          <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={fmtMeasured(cacheHits)} charge={Number.NaN} />
-          <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={blockedS} usage={fmtMeasured(blocked)} charge={rowCharge(wafCharge)} />
+          <Row color="bg-fg" name="Edge Requests" spark={edgeS} usage={fmtMeasured(requests)} charge={rowCharge(edgeCharge)} />
+          <Row color="bg-fg/70" name="Cache Hits" spark={cacheS} usage={fmtMeasured(cacheHits)} charge={Number.NaN} />
+          <Row color="bg-fg/40" name="Firewall — Blocked Requests" spark={blockedS} usage={fmtMeasured(blocked)} charge={rowCharge(wafCharge)} />
 
           <GroupHeader name="OpenEdge Functions (Fluid · Active CPU pricing)" />
-          <Row color="bg-amber-500" name="Function Invocations" spark={[]} usage={fmtMeasured(invocations)} charge={Number.NaN} />
-          <Row color="bg-purple-500" name="Active CPU" spark={[]} usage={unitMeasured(activeCpuMs === null ? null : activeCpuMs / 1000, 1, "s")} charge={rowCharge(cpuCharge)} />
+          <Row color="bg-fg/20" name="Function Invocations" spark={[]} usage={fmtMeasured(invocations)} charge={Number.NaN} />
+          <Row color="bg-fg/20" name="Active CPU" spark={[]} usage={unitMeasured(activeCpuMs === null ? null : activeCpuMs / 1000, 1, "s")} charge={rowCharge(cpuCharge)} />
           <Row color="bg-teal-500" name="Provisioned Memory" spark={[]} usage={unitMeasured(memGbHrs, 3, "GB-hr")} charge={rowCharge(memCharge)} />
-          <Row color="bg-cyan-500" name="Provisioned Instances" spark={[]} usage={fmtMeasured(instances)} charge={Number.NaN} />
+          <Row color="bg-fg/20" name="Provisioned Instances" spark={[]} usage={fmtMeasured(instances)} charge={Number.NaN} />
         </div>
       </Card>
 

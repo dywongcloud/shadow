@@ -327,7 +327,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
             </Card>
 
             <Card className="relative min-w-0 overflow-hidden p-5">
-              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400" />
+              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-border" />
               <div className="mb-4 flex min-w-0 items-center justify-between gap-2">
                 <span className="min-w-0 break-words font-medium">Observability</span>
                 <Link
@@ -346,8 +346,8 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
             </Card>
 
             <Card className="relative flex min-w-0 flex-col items-center justify-center gap-3 overflow-hidden p-5 text-center">
-              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-indigo-500 via-cyan-400 to-emerald-400" />
-              <Activity className="h-8 w-8 text-indigo-500 dark:text-indigo-400" />
+              <span aria-hidden="true" className="absolute inset-x-0 top-0 h-px bg-border" />
+              <Activity className="h-8 w-8 text-muted" />
               <div className="min-w-0 break-words font-medium">Analytics</div>
               <p className="min-w-0 break-words text-sm text-secondary">Measured request series, status classes and top paths.</p>
               <Link
@@ -573,7 +573,7 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 /** A real-data sparkline: every point is a request count the metrics endpoint measured for this project. With fewer than
- *  two buckets there is no series to draw, so the card's gradient accent is the only colour. */
+ *  two buckets there is no series to draw, so the card stays neutral. */
 function RequestSparkline({ buckets, label }: { buckets: MetricBucket[]; label: string }) {
   if (buckets.length < 2) return null;
   const values = buckets.map((b) => (Number.isFinite(b.requests) ? b.requests : 0));
@@ -582,14 +582,7 @@ function RequestSparkline({ buckets, label }: { buckets: MetricBucket[]; label: 
   return (
     <div className="mt-1 min-w-0">
       <svg viewBox="0 0 100 28" preserveAspectRatio="none" className="h-8 w-full" aria-hidden="true">
-        <defs>
-          <linearGradient id="project-request-spark" x1="0" y1="0" x2="1" y2="0">
-            <stop offset="0%" stopColor="#6366f1" />
-            <stop offset="50%" stopColor="#22d3ee" />
-            <stop offset="100%" stopColor="#34d399" />
-          </linearGradient>
-        </defs>
-        <polyline points={points} fill="none" stroke="url(#project-request-spark)" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
+        <polyline points={points} fill="none" stroke="hsl(var(--foreground))" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" vectorEffect="non-scaling-stroke" />
       </svg>
       <div className="min-w-0 break-words text-xs text-muted">{label}</div>
     </div>
@@ -632,7 +625,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
 
   if (!prod || !pv) {
     return (
-      <div className={`${box} flex items-center justify-center bg-gradient-to-br from-orange-100/60 to-card dark:from-orange-500/10 dark:to-card`}>
+      <div className={`${box} flex items-center justify-center bg-subtle`}>
         <Loader2 className="h-5 w-5 animate-spin text-muted" />
       </div>
     );
@@ -662,18 +655,18 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
       try { body = JSON.stringify(JSON.parse(body), null, 2); } catch {}
     }
     return (
-      <div className={`${box} bg-[#0b0b0b]`}>
+      <div className={`${box} bg-card`}>
         <div className="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1.5 text-[11px]">
           <span className="flex items-center gap-1.5 text-secondary"><Terminal className="h-3 w-3" /> Service response</span>
           <span className="font-mono text-muted">{pv.content_type?.split(";")[0] || (pv.kind === "json" ? "application/json" : "text/plain")}{pv.status ? ` · ${pv.status}` : ""}</span>
         </div>
-        <pre className="no-scrollbar h-[calc(100%-30px)] overflow-auto p-3 font-mono text-[11px] leading-relaxed text-emerald-300/90">{body || "(empty response)"}</pre>
+        <pre className="no-scrollbar h-[calc(100%-30px)] overflow-auto p-3 font-mono text-[11px] leading-relaxed text-fg">{body || "(empty response)"}</pre>
       </div>
     );
   }
 
   return (
-    <div className={`${box} flex items-center justify-center bg-gradient-to-br from-orange-100/60 to-card dark:from-orange-500/10 dark:to-card`}>
+    <div className={`${box} flex items-center justify-center bg-subtle`}>
       <Triangle className="h-12 w-12" />
     </div>
   );

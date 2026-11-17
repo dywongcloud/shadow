@@ -18,7 +18,6 @@ const RANGES = [
 ];
 const DEFAULT_RANGE_MINUTES = 720;
 
-const BAR_COLORS = ["#0070f3", "#f5a623", "#7928ca", "#50e3c2", "#e00", "#f81ce5", "#0070f3", "#79ffe1"];
 
 const ABSENT = "-";
 
@@ -125,18 +124,18 @@ export function ObservabilityClient({
   return (
     <div className="min-w-0 w-full max-w-full">
       {tabBar}
-      <div className="mb-6 flex min-w-0 w-full max-w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="min-w-0 break-words text-lg font-semibold">Observability</h1>
-        <div className="flex min-w-0 w-full max-w-full flex-wrap items-center gap-2">
-          <button className="flex min-w-0 w-full max-w-full items-center gap-2 rounded-md border border-border bg-card px-3 py-1.5 text-sm">
-            <span className="min-w-0 break-words">Production</span>
+      <div className="mb-6 flex min-w-0 w-full max-w-full flex-wrap items-center justify-between gap-x-4 gap-y-3">
+        <h1 className="min-w-0 shrink-0 whitespace-nowrap text-lg font-semibold">Observability</h1>
+        <div className="ml-auto flex min-w-0 max-w-full flex-wrap items-center justify-end gap-2">
+          <button className="flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md border border-border bg-card px-3 py-1.5 text-sm">
+            <span>Production</span>
             <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted" />
           </button>
-          <div className="relative min-w-0 w-full max-w-full">
+          <div className="relative min-w-0 shrink-0">
             <select
               value={range}
               onChange={(e) => setRange(Number(e.target.value))}
-              className="w-full max-w-full appearance-none rounded-md border border-border bg-card py-1.5 pl-9 pr-8 text-sm"
+              className="w-40 max-w-full appearance-none rounded-md border border-border bg-card py-1.5 pl-9 pr-8 text-sm"
             >
               {RANGES.map((r) => <option key={r.m} value={r.m}>{r.label}</option>)}
             </select>
@@ -151,13 +150,13 @@ export function ObservabilityClient({
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <MetricCard title="Edge Requests" metric="Invocations" value={fmtNum(totalReq)} href="/observability"
-          data={reqSeries} categories={["Requests", "Errors"]} colors={["blue", "amber"]} label={rangeLabel} />
+          data={reqSeries} categories={["Requests", "Errors"]} colors={["blue", "slate"]} label={rangeLabel} />
         <MetricCard title="Cache Hit Ratio" metric="Hits vs Misses" value={cacheHitPct === null ? ABSENT : `${cacheHitPct.toFixed(1)}%`} href="/observability"
-          data={cacheSeries} categories={["Hits", "Misses"]} colors={["blue", "amber"]} label={rangeLabel} />
+          data={cacheSeries} categories={["Hits", "Misses"]} colors={["blue", "slate"]} label={rangeLabel} />
         <MetricCard title="Functions" metric="Invocations" value={fmtNum(totalReq)} href="/observability"
           data={reqSeries} categories={["Requests"]} colors={["blue"]} label={rangeLabel} />
         <MetricCard title="Middleware Invocations" metric="Invocations" value={fmtNum(totalMw)} href="/firewall"
-          data={mwSeries} categories={["Invocations"]} colors={["amber"]} label={rangeLabel} />
+          data={mwSeries} categories={["Invocations"]} colors={["slate"]} label={rangeLabel} />
       </div>
 
       <div className="mt-6 min-w-0 w-full max-w-full">
@@ -176,14 +175,14 @@ export function ObservabilityClient({
               <span className="min-w-0 break-words">Project</span>
               <span className="flex shrink-0 items-center gap-1">Requests <ChevronDown className="h-3 w-3 shrink-0" /></span>
             </div>
-            {projects.map((p, i) => (
+            {projects.map((p) => (
               <Link
                 key={p.project}
                 href={`/projects/${encodeURIComponent(p.project)}`}
                 className="flex min-w-0 w-full max-w-full items-center justify-between gap-3 border-b border-border px-4 py-3 text-sm last:border-0 hover:bg-subtle"
               >
                 <span className="flex min-w-0 items-center gap-3">
-                  <span className="h-4 w-1 shrink-0 rounded-full" style={{ background: BAR_COLORS[i % BAR_COLORS.length] }} />
+                  <span className="h-4 w-1 shrink-0 rounded-full bg-fg" aria-hidden="true" />
                   <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-fg text-bg">
                     <svg width="9" height="8" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor" /></svg>
                   </span>

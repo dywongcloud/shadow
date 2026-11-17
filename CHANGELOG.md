@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-11-16 - dashboard metrics and storage use one neutral ink
+
+`/storage`, the DB detail observability tabs, the admin/usage/observability metrics charts and
+the home/project usage cards no longer carry the six-hue palette, gradient strips, gradient area
+fills, glows or tinted editor washes. The DB series use one `--foreground` ink at full opacity
+plus `analyticsSeriesDash` identities, repeated in the toggle, legend and tooltip; the only
+color is the dashboard semantic token set plus its single `--link` accent. `analytics-theme.ts`
+gains a `forced-colors` accent override. Tremor `colors` arrays collapse to `blue`/`slate`
+(both safelisted), with semantic green/amber/red reserved for status. The MARKETPLACE provider
+brand marks and the landing pages' deliberate luminous light are unchanged.
+
+A local `npx tsc --noEmit`, `npx tsc --noEmit -p tsconfig.ci.json`, `npm run lint`,
+`npm run build`, `python3 -I scripts/check-contract-bindings.py --check` and `git diff --check`
+all pass. `npm run build` passes after a PRE-EXISTING local EACCES on the untracked
+`ui/public/browser-node/musql/wasm_exec.js`: the tracked source is mode `0444`, so the copy
+lands read-only and a later copy into it fails; the seven generated files were verified
+byte-identical to `crates/hive-browser/www/musql/` and made writable. They stay untracked.
+A headful browser render of the authenticated live `/storage` is NOT witnessed; the
+two `public/product/dashboard-*.png` landing captures are still frames of the previous
+dashboard and need a seeded-local-node recapture. No roll/deploy was authorized or run.
+
 ## 2026-11-15 - roll the ops-mint fix to the six live hosts
 
 At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags ui --limit

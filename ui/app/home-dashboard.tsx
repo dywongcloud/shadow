@@ -209,7 +209,7 @@ function UsageBox({ billing, ledger }: { billing: BillingInfo | null; ledger: Le
             <span className="flex items-center gap-1 tabular-nums"><ShieldCheck className="h-3.5 w-3.5 text-muted" /> {usd(onDemand)}</span>
           </div>
           <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-subtle">
-            <div className="h-full rounded-full" style={{ width: `${Math.max(4, pct * 100)}%`, background: "linear-gradient(90deg,#0070f3,#7c3aed)" }} />
+            <div className="h-full rounded-full bg-fg" style={{ width: `${Math.max(4, pct * 100)}%` }} />
           </div>
         </div>
         {items.length > 0 && (

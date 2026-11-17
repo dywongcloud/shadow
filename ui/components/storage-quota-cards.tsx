@@ -19,15 +19,6 @@ const METRICS_POLL_MS = 20_000;
 const BILLING_POLL_MS = 30_000;
 const ABSENT = "—";
 
-const COLOR = {
-  databases: "#a78bfa",
-  requests: "#6366f1",
-  bandwidth: "#22d3ee",
-  storage: "#34d399",
-  cost: "#fbbf24",
-  costEnd: "#fb7185",
-} as const;
-
 /** Only a finite numeric field is a measurement. A refused poll, an older node or a missing
  *  optional key stays absent, never a fabricated zero. */
 function measured(v: unknown): number | null {
@@ -105,8 +96,6 @@ function QuotaCard({
   label,
   value,
   caption,
-  color,
-  endColor,
   icon,
   badge,
   ratio,
@@ -115,8 +104,6 @@ function QuotaCard({
   label: string;
   value: string;
   caption: string;
-  color: string;
-  endColor?: string;
   icon: ReactNode;
   badge?: ReactNode;
   ratio?: number | null;
@@ -126,23 +113,11 @@ function QuotaCard({
     ratio !== null && ratio !== undefined && Number.isFinite(ratio)
       ? Math.max(0, Math.min(ratio, 1)) * 100
       : null;
-  const strip = `linear-gradient(90deg, ${color} 0%, ${endColor ?? color} 48%, ${color}00 100%)`;
-  const mask = "linear-gradient(90deg, #000 0%, #000 68%, transparent 100%)";
   return (
     <Card className="relative flex min-w-0 flex-col gap-2 overflow-hidden p-4 sm:p-5">
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 top-0 h-[3px]"
-        style={{ backgroundImage: strip, WebkitMaskImage: mask, maskImage: mask }}
-      />
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-x-0 bottom-0 h-px"
-        style={{ backgroundImage: `linear-gradient(90deg, ${color}55, ${color}00)` }}
-      />
       <div className="flex min-w-0 items-center justify-between gap-2">
         <span className="flex min-w-0 items-center gap-1.5 text-[11px] font-semibold uppercase leading-tight tracking-[0.12em] text-muted">
-          <span className="shrink-0" style={{ color }}>{icon}</span>
+          <span className="shrink-0 text-muted">{icon}</span>
           <span className="min-w-0 break-words">{label}</span>
         </span>
         {badge ?? null}
@@ -163,7 +138,7 @@ function QuotaCard({
           >
             <div
               className="h-full rounded-full"
-              style={{ width: `${pct}%`, backgroundImage: `linear-gradient(90deg, ${color}, ${endColor ?? color})` }}
+              style={{ width: `${pct}%`, background: "hsl(var(--foreground))" }}
             />
           </div>
           <p className="m-0 mt-1 min-w-0 break-words text-[11px] leading-snug text-muted">{ratioCaption}</p>
@@ -245,21 +220,18 @@ export function StorageQuotaCards({ managedIds }: { managedIds: string[] }) {
           label="Databases"
           value={fmtCount(ids.length)}
           caption="managed databases · no plan allowance reported"
-          color={COLOR.databases}
           icon={<Database className="h-3.5 w-3.5" aria-hidden="true" />}
         />
         <QuotaCard
           label="Requests"
           value={fmtCount(requests)}
           caption={`gateway request counters · ${scope} · no plan allowance reported`}
-          color={COLOR.requests}
           icon={<Activity className="h-3.5 w-3.5" aria-hidden="true" />}
         />
         <QuotaCard
           label="Bandwidth"
           value={fmtBytes(bandwidth)}
           caption="ingress + egress bytes from the same counters · no plan allowance reported"
-          color={COLOR.bandwidth}
           icon={<ArrowUpDown className="h-3.5 w-3.5" aria-hidden="true" />}
         />
         <QuotaCard
@@ -270,7 +242,6 @@ export function StorageQuotaCards({ managedIds }: { managedIds: string[] }) {
               ? `reported byte sizes from ${storageSamples.length} of ${ids.length} databases · no plan allowance reported`
               : "no managed databases to measure · no plan allowance reported"
           }
-          color={COLOR.storage}
           icon={<HardDrive className="h-3.5 w-3.5" aria-hidden="true" />}
         />
         <QuotaCard
@@ -281,8 +252,6 @@ export function StorageQuotaCards({ managedIds }: { managedIds: string[] }) {
               ? "metered usage this period · no plan allowance reported"
               : "metered usage this period · real plan allowance reported"
           }
-          color={COLOR.cost}
-          endColor={COLOR.costEnd}
           icon={<Gauge className="h-3.5 w-3.5" aria-hidden="true" />}
           ratio={planRatio}
           ratioCaption={
@@ -295,8 +264,6 @@ export function StorageQuotaCards({ managedIds }: { managedIds: string[] }) {
           label="Invoice"
           value={fmtCents(invoiceCents)}
           caption="current period invoice · no plan allowance reported"
-          color={COLOR.costEnd}
-          endColor={COLOR.cost}
           icon={<DollarSign className="h-3.5 w-3.5" aria-hidden="true" />}
           badge={
             invoiceStatus ? (

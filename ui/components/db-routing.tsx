@@ -3,7 +3,7 @@
 import { Server } from "lucide-react";
 import { Badge, Card } from "@/components/ui";
 import type { DbInstanceMetrics } from "@/lib/api";
-import { ABSENT, DB_COLORS, dbBytes, dbFinite, dbPlain, dbUtc } from "./db-chart";
+import { ABSENT, dbBytes, dbFinite, dbPlain, dbUtc } from "./db-chart";
 
 /** `series_sources` (or the older `sources`) names the nodes that contributed to the measured
  *  series. The counters on the wire are ONE aggregate for the whole database: the response does
@@ -17,9 +17,9 @@ function sourcesOf(data: DbInstanceMetrics): { names: string[]; field: string } 
   return { names, field: series ? "series_sources" : legacy ? "sources" : "not reported" };
 }
 
-/** A colored share bar is only drawn for a share that is actually measured: 100% of the one
- *  aggregate counter set. No per-node fraction is estimated from a node count. */
-function ShareBar({ pct, color }: { pct: number; color: string }) {
+/** A share bar is only drawn for a share that is actually measured: 100% of the one aggregate
+ *  counter set. No per-node fraction is estimated from a node count. */
+function ShareBar({ pct }: { pct: number }) {
   return (
     <span
       className="db-fill relative block h-2 min-w-0 w-full overflow-hidden rounded-full bg-subtle"
@@ -32,7 +32,7 @@ function ShareBar({ pct, color }: { pct: number; color: string }) {
     >
       <span
         className="absolute inset-y-0 left-0 rounded-full"
-        style={{ width: `${pct}%`, background: `linear-gradient(90deg, ${color}, transparent)` }}
+        style={{ width: `${pct}%`, background: "hsl(var(--foreground) / 0.55)" }}
       />
     </span>
   );
@@ -86,8 +86,7 @@ export function DbRouting({ data, error }: { data: DbInstanceMetrics | null; err
       {names.length === 0 && !hasCounters ? (
         <div className="flex min-h-[120px] min-w-0 items-center gap-3 px-4 py-5 sm:px-5">
           <span
-            className="db-fill h-12 w-1.5 shrink-0 rounded-full"
-            style={{ background: "linear-gradient(180deg, var(--db-cyan-lit, #22d3ee), var(--db-indigo-lit, #6366f1))" }}
+            className="db-fill h-12 w-1.5 shrink-0 rounded-full bg-border-strong"
             aria-hidden="true"
           />
           <p className="min-w-0 break-words text-sm text-secondary">
@@ -109,14 +108,14 @@ export function DbRouting({ data, error }: { data: DbInstanceMetrics | null; err
                 <tr key={name} className="border-b border-border align-top">
                   <th scope="row" className="min-w-0 max-w-[220px] p-3 text-left font-mono font-medium text-fg">
                     <span className="flex min-w-0 items-center gap-2">
-                      <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: DB_COLORS.indigo.color }} aria-hidden="true" />
+                      <span className="h-2 w-2 shrink-0 rounded-full bg-fg" aria-hidden="true" />
                       <span className="min-w-0 break-all">{name}</span>
                     </span>
                   </th>
                   <td className="min-w-0 p-3 tabular-nums">{oneNode ? dbPlain(requests) : ABSENT}</td>
                   <td className="min-w-0 w-[22%] p-3">
                     {oneNode && requests !== null && requests > 0 ? (
-                      <ShareBar pct={100} color={DB_COLORS.indigo.color} />
+                      <ShareBar pct={100} />
                     ) : (
                       <span className="min-w-0 break-words text-muted">{oneNode ? ABSENT : "not split per node"}</span>
                     )}
@@ -129,14 +128,14 @@ export function DbRouting({ data, error }: { data: DbInstanceMetrics | null; err
               <tr className="border-b border-border bg-subtle/30 align-top">
                 <th scope="row" className="min-w-0 p-3 text-left font-medium text-fg">
                   <span className="flex min-w-0 items-center gap-2">
-                    <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: DB_COLORS.emerald.color }} aria-hidden="true" />
+                    <span className="h-2 w-2 shrink-0 rounded-full bg-fg" aria-hidden="true" />
                     <span className="min-w-0 break-words">Measured total</span>
                   </span>
                 </th>
                 <td className="min-w-0 p-3 tabular-nums">{dbPlain(requests)}</td>
                 <td className="min-w-0 w-[22%] p-3">
                   {requests !== null && requests > 0 ? (
-                    <ShareBar pct={100} color={DB_COLORS.emerald.color} />
+                    <ShareBar pct={100} />
                   ) : (
                     <span className="min-w-0 break-words text-muted">{ABSENT}</span>
                   )}
