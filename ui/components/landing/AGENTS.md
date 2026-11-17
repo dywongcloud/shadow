@@ -12,7 +12,11 @@ the root `AGENTS.md` still apply.
   `GLOBE_PATHS`, or /new and the landing drift apart. The asset's
   inline `color(display-p3)` stroke and `mask-type:alpha` CSS are NOT portable to Satori's resvg, so the module uses a literal stroke and a radial gradient stroke
   (measured 0.28/255 mean difference from the mask). `globeSvgMarkup` builds the share card's data URI AND the keystone's inline SVG; `#454545` on black is ~2.2:1,
-  so the shared `GLOBE_STROKE` is light slate. Neither surface carries a caption, annotation label, node, link, count or region.
+  so the shared `GLOBE_STROKE` is light slate. `detail` is share-card-only: nine blue node squares on the meridian/parallel intersections, twelve blue links and a
+  blue-white lit horizon built from stacked strokes on the outermost path. The keystone stays the bare wireframe. The card's blue corner wash is gone -- it hazed the
+  right half with light from no object (flat blue-wash pixels 100132 -> 1); a faint cool cast remains but is attached to the lit horizon (blur(20) mean B-R 5.39 vs 33.28).
+  The violet top-left ambient light remains.
+  Neither surface carries a caption, annotation label, count or region.
 - **Every sentence is one the code backs.** No illustration carries an annotation label: the owner asked for the `Illustrative` and `Sample`
   chips, the provenance captions and the "Free / Start on the Hobby plan" pill to be removed, and the battery asserts they stay gone
   (`annotations.js`; the same rule made the motion controls icon-only, with their name in `aria-label` or `sr-only` text). What the rule

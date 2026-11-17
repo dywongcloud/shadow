@@ -1464,3 +1464,149 @@ full 686 MB copy built cleanly. This changed the witness path for M5.
 - [x] Double-loop paragraph and carry-forward facts: above.
 - [x] Final reply states mode, tools, stop conditions and everything skipped:
   terminal reply.
+
+
+---
+
+## Bounded run 2026-11-17 (second) -- link preview enhancement
+
+Mode: **Adaptive** (MAYA), same reason as the preceding bounded run: a public
+customer-facing card where the advanced pole (restore the blue nodes and lit
+horizon) and the acceptable pole (no muddy glow, no text intrusion, no layout
+change) must both hold. This record is appended; the earlier OPEN frontier is
+NOT claimed closed. No Lite mode was requested.
+
+### 1. Traversal Plan and Frontier
+
+Tools used: `Read`, `Edit`, `Write`, `Bash` for `sharp`/Satori measurement and
+`curl`, a headful `bsk` Agent Window, and two read-only adversarial checker
+subagents. Graph renderer, workflow-state tool, Pugh-Matrix branch, artifact
+page: none used.
+
+| Candidate | Reached via | Status |
+| --- | --- | --- |
+| C1 restore nine blue node squares on the /new geometry | brief | TAKEN (M1) |
+| C2 restore a glowing horizon | brief | TAKEN (M2) |
+| C3 remove the diffuse blue corner wash | brief | TAKEN (M3) |
+| C4 compare blue-white limb vs brand-ramp limb | dotted counterpoint | TAKEN (M4) |
+| C5 keep `detail` share-card-only so the keystone is unchanged | back-reference | TAKEN (M5) |
+| C6 seven-seat Adaptive panel, W1/W2 WHOLE rounds | `maya` | DEFERRED |
+| C7 operator-authorised roll/deploy | one-way door | DEFERRED (no operator word) |
+
+### 2. Decision Records
+
+- **M1 (BREAK)**: nine 18 px blue squares at `globe-art.ts` `GLOBE_NODES`, on
+  the /new globe's own meridian/parallel intersections, joined by twelve
+  `GLOBE_LINKS`. Depends on: none. Alternatives rejected: copy the old
+  hand-drawn node coordinates (they are in a 760x470 dome space, not the /new
+  688x256 sphere), random scatter (not grounded in the geometry). Consequence:
+  the old hand-drawn dome's sample topology returns without its rainbow limb.
+- **M2 (BREAK)**: a blue-white lit horizon from four stacked strokes
+  (width 22/12/6/2.2, opacity 0.05/0.08/0.18/1) on `GLOBE_PATHS[0]`, the
+  outermost circle's visible arc. Alternatives rejected: a CSS blur glow (the
+  landing forbids blur filters), a single stroke (no falloff), restoring the
+  old rainbow limb (the owner asked for a better blue glow, not the rainbow).
+- **M3 (BREAK)**: delete `radial-gradient(circle at 86% 100%, ...)`. Measured
+  blue haze 109516 -> 7144 pixels (-93%) in the globe region; crisp blue
+  accents 0 -> 2408, bright blue 0 -> 1913, white 0 -> 383, magenta 0. The
+  violet top-left ambient light stays. Consequence: the right half is now
+  black except where the globe actually emits light.
+- **M4 (ADAPT)**: six candidates rendered through Satori and measured before
+  any source edit. `A` (no blue wash, blue-white limb), `B/D` (tight or halo
+  blue wash), `C` (bottom band), `E/K` (brand-ramp limb), `G/H/I/J` (with
+  links and a horizon bloom). The blue-white limb with no corner wash and
+  links won; the brand ramp reintroduced magenta and halved white pixels
+  (383 -> 222).
+- **M5 (KEEP-THE-RULE)**: `globeSvgMarkup` takes an options object with
+  `detail`; only `opengraph-image.tsx` passes it. Landing HTML measured after
+  the edit: 10 `<path>` in the inline globe (7 strokes x 2 groups is the
+  pre-existing count in the served segment), 0 `<rect>`, 0 limb gradient,
+  `viewBox="0 0 688 256"`. No caption, count or region was added.
+
+### 3. Panel Reports
+
+| Round | Critic / checker | Observed | Verdict |
+| --- | --- | --- | --- |
+| R0 | independent verifier `enhance-c1` (`ad4fe6d4560400bb2`) | final diff, 7094-byte generated SVG, 200/148926-byte PNG, production DOM | 5/5 visual claims SUPPORTED; OVERALL REFUTED on procedural grounds (no live hydration-console witness) |
+| R0 | independent verifier `enhance-c2` (`a0b4de76ad26a7b58`) | three PNGs, template NMS, link corridors, arc-band luma, glyph contrast | "looks better" REFUTED (taste unmeasured); 7/10 component claims SUPPORTED |
+
+**R1/R0 resolutions.** `enhance-c2` REFUTED "no diffuse blue haze" as
+stated: flat blue-wash pixels fell 100132 -> 1, but a blur(20) low-frequency
+measure still found 47.4% of the globe region with mean B-R 5.39, down from
+98% with mean B-R 33.28. ADAPTED the wording in CHANGELOG.md and
+`ui/components/landing/AGENTS.md`: the corner wash is gone, a faint cool cast
+remains attached to the horizon. It also REFUTED the aesthetic "looks
+better" claim because no perceptual witness exists; that is an honest
+limitation, recorded as such rather than overruled. Its text-intrusion
+measurement (44 differing pixels, 0 glyph-core) is a strict-baseline caveat,
+not a defect. `enhance-c1` REFUTED the unused-export/hydration claim with a
+TypeScript program over 1412 files: six exported constants had 0 external
+importers. ADAPTED: `GLOBE_NODES` and `GLOBE_LINKS` are now module-local.
+Its missing hydration-console witness is recorded as unwitnessed; the markup
+is a deterministic module constant and 0 duplicate IDs were measured. Both
+verifiers confirmed the seven paths byte-identical, 0 added captions/counts/
+regions, glyph contrast min 8.55:1, arc-band mean luma 71.02 vs 38.78, 9
+node squares and 12 link corridors. The gm spool was saturated (32/32
+claimed, ~3470 queued) for both, so neither started new dispatches.
+
+Statements of meaning: the link preview no longer looks like a plain wireframe
+pasted onto a blue fog; its blue light now comes from nine nodes and one
+horizon. Artist questions: is a blue-white horizon too cold next to the violet
+ambient? Answer: measured magenta 0 and white 383, the violet stays confined
+to the top-left. Andon: none pulled at time of writing.
+
+### 4. Anchor Ledger
+
+| Anchor | Status | Evidence |
+| --- | --- | --- |
+| MAYA advanced/acceptable poles | KEEP | nodes + horizon restored; haze -93%; text block unintruded |
+| Light is gradients and stroke stacks, never a blur filter | KEEP | four stacked strokes, no filter |
+| One shared geometry, surface-specific decoration | KEEP | `detail` flag, seven paths unchanged, byte-identical to the asset |
+| World-scoped one-way door (push/roll) | DEFERRED | no operator word |
+
+### 5. Step 2g final-state re-measurement
+
+Measured AFTER the last edit: enhanced card 200 / 148926-byte PNG from
+production `next start`; blue haze 7144, blue accents 2408, bright blue 1913,
+white 383, magenta 0 (globe region x580-1200,y390-630) against 109516 / 0 /
+0 / 0 / 0 for the previous card. `TSC_EXIT=0`, `TSC_CI_EXIT=0`,
+`LINT_EXIT=0`, `BUILD_EXIT=0`. Landing HTML: 0 rects, 0 limb gradient.
+No test files written.
+
+### Stop test -- NOT MET
+
+S1 (no OPEN Frontier), S2 (WHOLE round PASS from every required critic),
+S3 (saturation), S5 (every dotted edge): **NOT MET**. S4: **PARTIAL** -- M4
+escalated the decoration with a measured 109516 -> 7144 haze delta, but no
+WHOLE round confirmed it. The run is INCOMPLETE. Resume point: this section;
+seat the seven Adaptive critics, run W1/W2, resolve OBJECTs, re-run Step 2g.
+C7 needs the operator's word because `git push` auto-deploys.
+
+### Skipped
+
+Seven-seat panel, W1/W2 WHOLE rounds, Pugh-Matrix branch, frame swap, graph
+renderer, workflow-state tool, artifact page: NOT RUN. Authenticated live
+`https://shadw.cloud/new` headful render: NOT RUN. Computed print and
+forced-colors repaint: NOT RUN headfully; only built-CSS presence verified.
+Push, roll, deploy, branch, worktree: NONE. Test files, mocks, secrets,
+graphical symbols: NONE. The prior runs' OPEN frontiers remain OPEN.
+
+### Double loop
+
+The criterion failed the work again: MAYA's acceptable pole needs a rendered
+card, and the panel was never seated, so no S2 is witnessed. Amendment: add a
+"Physically Motivated Light" node adjacent to `MAYA: Most Advanced Yet
+Acceptable (Raymond Loewy)` -- ambient glow must be attached to an object that
+emits it. Carry-forward fact for `DESIGN-CARRY-FORWARD.md`: a
+`radial-gradient(circle at 86% 100%)` blue corner wash produced 109516 blue
+haze pixels with no emitting object; deleting it and putting the glow on the
+horizon arc measured 7144 while crisp blue accents rose from 0 to 2408.
+
+### Compliance Check (this bounded run)
+
+- [x] Tooling inventory, mode with reason, seed, living Frontier, BREAK: sections 1-2.
+- [x] Decision Record before each move with dependencies: section 2.
+- [ ] Panel Report from a compliant seven-seat panel and WHOLE rounds S1-S5: NOT MET.
+- [x] Objects resolved with premise tests: M3, M4, M5.
+- [x] Final-state re-measurement, Anchor Ledger, double loop: sections 4-6.
+- [x] Final reply states mode, tools, stop conditions and skipped steps.

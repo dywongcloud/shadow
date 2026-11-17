@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-11-17 - link preview: restore blue nodes and a lit horizon
+
+The first replacement of the crappy dome kept the /new wireframe but lost the
+old card's blue node squares, blue links and glowing limb, and shipped a diffuse
+blue radial wash in the bottom-right corner that hazed the right half with
+light from no object. The share card now carries those features back, on the
+/new geometry, from one `globeSvgMarkup({ detail: true })`.
+
+- Nine 18 px blue node squares sit on the /new globe's meridian/parallel
+  intersections, joined by twelve blue links, with a blue-white lit horizon
+  built from four stacked strokes of falling width on the outermost path. No
+  blur filter, no caption, no count, no region. `detail` is share-card-only;
+  the landing keystone remains the bare wireframe.
+- Removed the `circle at 86% 100%` blue corner wash. Measured in the globe
+  region (x580-1200, y390-630): flat blue-wash pixels 100132 -> 1, crisp blue
+  accents 0 -> 2408, bright blue 0 -> 1913, white 0 -> 383, magenta 0. A faint
+  cool cast does remain, but it is now attached to the horizon that emits it:
+  a blur(20) low-frequency measure found 47.4% of the region with mean B-R
+  5.39, down from 98% with mean B-R 33.28. The violet top-left ambient light
+  and the black card stay.
+- Six design candidates were rendered through Satori and measured before a
+  source edit (blue-white vs brand-ramp limb, with/without links and four
+  wash variants); the blue-white limb with no corner wash won on crisp accents
+  and lowest haze. The old card's rainbow limb was NOT restored: the owner
+  asked for a better blue glow, not the rainbow.
+
+Witness: production `next start` served the enhanced card (200, 148926-byte
+PNG) which was read side by side with the previous card and the old live card;
+`tsc`, `tsc-ci`, lint and the production build all exit 0. The landing HTML
+still has 7 paths x 2 stroke groups, 0 rects and 0 limb gradient. Local
+commit only: no push, no roll.
+
 ## 2026-11-17 - landing: the scroll-down globe becomes the /new globe
 
 The landing's second globe (the "Own your cloud" keystone reached by scrolling)

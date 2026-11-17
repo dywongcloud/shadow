@@ -12,7 +12,7 @@ export function GlobeArtwork({ className, idPrefix }: { className?: string; idPr
     <div
       className={`lp-globe-art ${className ?? ""}`}
       aria-hidden="true"
-      dangerouslySetInnerHTML={{ __html: globeSvgMarkup(GLOBE_STROKE, idPrefix, true) }}
+      dangerouslySetInnerHTML={{ __html: globeSvgMarkup({ stroke: GLOBE_STROKE, idPrefix, fillContainer: true }) }}
     />
   );
 }
