@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-17 - lakebed example: fix the deployed client module route
+
+An adversarial refuter found a real end-to-end defect the first witness could not see:
+`examples/lakebed-todo/fluid.json` declared only `/api` -> function and `/` -> static, so
+`fluid_core::Manifest::resolve("/client/index.mjs")` returned `Static`. With
+`static_dir: "public"` the gateway reads `public/client/index.mjs` (absent) and falls back
+to `public/index.html` with `text/html`; a `<script type="module">` import is then refused.
+The original witness hit `server/serve.mjs` directly on its own port and so never exercised
+the gateway's route resolution. `fluid.json` now declares `framework: "lakebed"` and an
+explicit `/client` -> `api` route. `scripts/lakebed-witness.sh` compiles a small program
+against the REAL `fluid_core` rlib and asserts `Manifest::from_json` + `resolve` maps
+`/` -> Static and `/api/*`, `/client/*` -> `Function("api")` before exercising the capsule.
+Live witness: 17/17 assertions pass. The published commit `07ef0dbc` passed all 11 CI
+jobs on Linux + macOS. A fleet roll remains HELD: no operator word.
+
 ## 2026-11-17 - four dedicated /compare pages
 
 Four static comparison pages (`/compare/vercel`, `/compare/railway`, `/compare/fly-io`,

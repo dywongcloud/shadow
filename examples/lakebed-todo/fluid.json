@@ -1,5 +1,6 @@
 {
   "project": "lakebed-todo",
+  "framework": "lakebed",
   "static_dir": "public",
   "functions": [
     {
@@ -14,6 +15,7 @@
   ],
   "routes": [
     { "pattern": "/api", "target": { "function": "api" } },
+    { "pattern": "/client", "target": { "function": "api" } },
     { "pattern": "/", "target": "static" }
   ]
 }

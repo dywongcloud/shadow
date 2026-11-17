@@ -31,6 +31,44 @@ done
 curl -s -m2 "$API/healthz" | grep -q . || { echo "node did not come up"; tail -20 "$DATA/node.log"; exit 1; }
 ok "real node /healthz"
 
+echo "==> real route resolution (fluid_core::Manifest::from_json + resolve)"
+# The browser imports /client/index.mjs. With static_dir=public that path MUST go
+# to the api function: a Static route reads public/client/index.mjs (absent) and
+# falls back to index.html with text/html, so the module import would be refused.
+# This compiles against the REAL fluid_core rlib, not a reimplementation.
+cat > "$DATA/route.rs" <<'RS'
+extern crate fluid_core;
+use fluid_core::Manifest;
+fn main() {
+    let p = std::env::args().nth(1).expect("path to fluid.json");
+    let raw = std::fs::read_to_string(&p).expect("read fluid.json");
+    let m = Manifest::from_json(&raw).expect("Manifest::from_json");
+    assert_eq!(m.static_dir.as_deref(), Some("public"));
+    assert_eq!(m.framework, "lakebed");
+    for (path, want) in [("/", "Static"), ("/index.html", "Static"),
+        ("/api/health", "Function(\"api\")"), ("/api/files/x", "Function(\"api\")"),
+        ("/client/index.mjs", "Function(\"api\")")] {
+        let got = format!("{:?}", m.resolve(path));
+        println!("ROUTE {path} -> {got}");
+        assert_eq!(got, want, "route {path}");
+    }
+    println!("RESULT PASS route-resolution");
+}
+RS
+ROUTE_OK=0
+for RLIB in $(ls -t "$REPO"/target/debug/deps/libfluid_core-*.rlib 2>/dev/null); do
+  if rustc --edition 2021 -L dependency="$REPO/target/debug/deps" \
+      --extern fluid_core="$RLIB" "$DATA/route.rs" -o "$DATA/route" 2>>"$DATA/route-build.log" \
+      && "$DATA/route" "$EX/fluid.json" 2>&1 | grep -q 'RESULT PASS route-resolution'; then
+    ROUTE_OK=1; break
+  fi
+done
+if [ "$ROUTE_OK" -eq 1 ]; then
+  ok "real Manifest::resolve routes /client/ to the api function"
+else
+  bad "route resolution"; /usr/bin/head -20 "$DATA/route-build.log" 2>/dev/null
+fi
+
 echo "==> framework catalog exposes lakebed"
 FW="$(curl -s -m5 "$API/v1/build/frameworks")"
 python3 -I -c 'import sys,json; d=json.load(sys.stdin); assert any(p.get("slug")=="lakebed" for p in d), "no lakebed preset"' <<<"$FW" \

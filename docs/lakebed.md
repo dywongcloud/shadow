@@ -37,10 +37,16 @@ External references: [database](https://docs.lakebed.dev/database/),
   on shadw's plain Node lane via `fluid.json`'s `start_cmd`, and `client/index.mjs`
   provides the `lakebed/client`-shaped browser surface. Zero npm dependencies, so a
   `fluid.json` deployment (which ships the checkout as-is, with no install/build)
-  runs it directly.
+  runs it directly. `fluid.json` declares `framework: "lakebed"`, `static_dir: "public"`
+  (only the HTML is static) and an explicit `/client` → `api` function route: without
+  it the browser's `/client/index.mjs` would resolve to Static, miss
+  `public/client/index.mjs`, and get the SPA fallback `text/html` for a module script.
+  The witness compiles the real `fluid_core::Manifest::from_json` + `resolve` to assert
+  `/` → Static and `/api/*` and `/client/*` → `Function("api")`.
 - **Live witness.** A real `hive-cloud` binary on isolated ports, a real provisioned
-  Blob database, and the real capsule server measured 16 passing assertions:
-  insert → list → count → toggle → delete, upload → exact read-back, delete via the
+  Blob database, and the real capsule server measured 17 passing assertions:
+  route resolution against the real `fluid_core` manifest parser, insert → list →
+  count → toggle → delete, upload → exact read-back, delete via the
   sanctioned console path, static client, typed refusals, and no credential in any
   response. No test file was added.
 
@@ -79,7 +85,7 @@ External references: [database](https://docs.lakebed.dev/database/),
 
 ```sh
 # From the repo root, after `cargo build -p hive-cloud --bin hive-cloud`:
-bash scripts/lakebed-witness.sh   # live node + real capsule, 16 assertions
+bash scripts/lakebed-witness.sh   # live node + real capsule, 17 assertions
 ```
 
 The script mints a throwaway API key on a throwaway node with a throwaway
