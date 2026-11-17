@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-11-17 - adversarial PRD sweep: three row premises closed by live execution
+
+An adversarial gm swarm (19 agents over two workflow passes, 12 independent refutations)
+triaged six real pending rows. Every proposed code edit drew two refutations, so no source
+change landed; three rows were instead closed by live execution against the shipped code.
+
+- `acme-san-gated-on-single-public-resolver` was written when `effective_sans` asked ONE
+  public resolver. The contract has since changed: a platform-wide DNS question is asked of
+  `dns_quorum::VANTAGES` (7 endpoints / 5 independent operators) and admitted only by
+  `Tally::admits` (`yes >= MIN_CONFIRMING_VANTAGES && yes > self.no`), where an erroring
+  resolver ABSTAINS. The row's other two demands -- Seer-authoritative resolution for
+  delegated zones, and treating any disagreement as "not yet resolvable" -- were
+  deliberately NOT implemented and are superseded by that invariant. Recording the
+  contract change here is what makes closing the row honest rather than losing the reason.
+  Witness: the dependency-free `crates/hive-cloud/src/dns_quorum.rs` was compiled standalone
+  with rustc and exercised (split resolver 2 yes/1 no/2 abstain admits, one operator does
+  not, a 2/2 tie drops), plus a literal scan of the four-call chain in `effective_sans`.
+
+- `aaa-read-window-error-swallow-2026-11-16` claimed `Store::open` swallowed a corrupt
+  segment inside an attested window. The premise is false: `read_entries_from` parses and
+  verifies EVERY line of EVERY present segment with `?` before filtering by seq, and
+  `Store::open:643` propagates it. Witness: the shipped `contract-persist` binary built a
+  real store, then its cold `reopen` phase refused a segment with one non-JSON line
+  (`Corrupt`, exit 101) and booted cleanly after that segment was deleted (exit 0,
+  `CHILD_INDEX_HASH` rebuilt). No change to this fail path.
+
+- `aaa-upsert-env-idempotence-2026-11-16` asked whether `upsert_env` stamping `now_ms()`
+  on identical input is churn or a defect. It is by design: the strictly monotonic
+  `updated_ms` is the only key `merge_take` uses to make a divergent peer adopt a row;
+  a no-op guard would break `MERGE_STORES` convergence. Decision recorded, no change.
+
+Four rows remain held with witnessed blockers: `api-key-create-invisible-node-local-read`
+(and its gossip-arm fix) needs a two-node witness and an operator-authorised roll;
+`aaa-request-path-panic-hardening-2026-11-16` needs callers/impact re-scoping plus a
+poison-injection witness; `agents-md-size-cap-blocks-prose-addition` needs a measured
+byte cap and enforcing hook; `admin-read-route-classification` needs a 7-day report mode
+and a UI-first deploy. No push or roll: a push auto-deploys through two triggers.
+
 ## 2026-11-17 - lakebed example: fix the deployed client module route
 
 An adversarial refuter found a real end-to-end defect the first witness could not see:
