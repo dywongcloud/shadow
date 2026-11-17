@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-11-16 - lakebed as a supported framework + shadw-bound example
+
+`crates/fluid-build/src/framework.rs` gains a `lakebed` preset (`npx lakebed build`,
+`.lakebed/artifacts`, Serverless) and detection by `lakebed.json`, a `server/index.*` + `client/index.*` pair whose server entry
+declares `capsule(` (a generic pair stays static), or a `lakebed` dependency; the check
+precedes the Vite/Node markers. `GET /v1/build/frameworks`, `preset_by_name` and the
+settings override need no change. `ui/app/new/page.tsx` TEMPLATES gains a Lakebed tile
+pointing at the public `examples/lakebed-todo` path.
+
+`examples/lakebed-todo/` is a Lakebed-shaped Todo capsule that runs on shadw's plain
+Node lane with zero npm dependencies: `server/shadow.mjs` is ONE cohesive binding whose
+`database()` and `storage()` map Lakebed's `ctx.db` / `client.storage` to shadw's
+tenant-scoped Blob REST. `server/index.mjs` is idiomatic `capsule({schema, queries,
+mutations, endpoints})`, `server/serve.mjs` executes it via `fluid.json`, and
+`client/index.mjs` is the `lakebed/client`-shaped browser surface. `docs/lakebed.md`
+states the boundary: no Lakebed hosted source runtime, no server-side index pushdown
+or transactions, no unauthenticated public objects; delete uses the database console
+`DELETE <key>` because shadw registers no blob DELETE REST route, and an upload reads
+the bytes back before claiming durability.
+
+Witnessed live against the real `hive-cloud` binary: 16/16 assertions (framework catalog,
+insert/list/count/toggle/delete, upload/exact read-back, console delete, static client,
+typed refusals, no credential in responses). No test files added. A roll is HELD: no
+operator word.
+
 ## 2026-11-16 - dashboard metrics and storage use one neutral ink
 
 `/storage`, the DB detail observability tabs, the admin/usage/observability metrics charts and

@@ -1,0 +1,19 @@
+{
+  "project": "lakebed-todo",
+  "static_dir": "public",
+  "functions": [
+    {
+      "name": "api",
+      "runtime": "node",
+      "start_cmd": ["node", "server/serve.mjs"],
+      "max_concurrency": 5,
+      "min_instances": 1,
+      "max_instances": 2,
+      "idle_ttl_secs": 8
+    }
+  ],
+  "routes": [
+    { "pattern": "/api", "target": { "function": "api" } },
+    { "pattern": "/", "target": "static" }
+  ]
+}

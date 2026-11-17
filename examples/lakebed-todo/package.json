@@ -1,0 +1,12 @@
+{
+  "name": "lakebed-todo-shadw",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Lakebed-shaped capsule whose database and storage are one cohesive binding to shadw storage. No npm dependencies.",
+  "scripts": {
+    "start": "node server/serve.mjs",
+    "check": "node --check server/serve.mjs && node --check server/index.mjs && node --check server/shadow.mjs && node --check server/lakebed.mjs"
+  },
+  "engines": { "node": ">=20" }
+}

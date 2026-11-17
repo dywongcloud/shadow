@@ -10,6 +10,42 @@ use std::io::Read;
 use std::path::Path;
 
 const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
+const MAX_CAPSULE_ENTRY_BYTES: u64 = 256 * 1024;
+
+/// A `server/index.*` + `client/index.*` pair alone is NOT Lakebed: plenty of
+/// generic apps use that layout. Only treat it as a capsule when the server
+/// entry actually declares one (`capsule(`) or imports `lakebed/server`.
+/// The read is bounded and never follows a symlink, so an untrusted checkout
+/// cannot turn detection into an unbounded read or a host-file probe.
+fn capsule_entry_declares_lakebed(repo: &Path, entries: &[&str]) -> bool {
+    entries.iter().any(|entry| {
+        let path = repo.join(entry);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            return false;
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > MAX_CAPSULE_ENTRY_BYTES
+        {
+            return false;
+        }
+        let Ok(mut file) = File::open(&path) else {
+            return false;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .by_ref()
+            .take(MAX_CAPSULE_ENTRY_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || bytes.len() as u64 > MAX_CAPSULE_ENTRY_BYTES
+        {
+            return false;
+        }
+        let source = String::from_utf8_lossy(&bytes);
+        source.contains("capsule(") || source.contains("lakebed/server")
+    })
+}
 
 /// What primitive a framework's build maps to in the Build Output API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -167,6 +203,16 @@ pub const PRESETS: &[FrameworkPreset] = &[
         build_command: "cargo build --release --offline --bins",
         dev_command: "cargo run",
         output_dir: "target/release",
+        primitive: Primitive::Serverless,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "lakebed",
+        name: "Lakebed",
+        install_command: "npm install",
+        build_command: "npx lakebed build",
+        dev_command: "npx lakebed dev",
+        output_dir: ".lakebed/artifacts",
         primitive: Primitive::Serverless,
         emits_build_output: false,
     },
@@ -687,6 +733,30 @@ fn detect_with_package(
     if crate::rust::parse(repo).ok().flatten().is_some() {
         return preset("rust").unwrap();
     }
+    // A Lakebed capsule carries `lakebed.json` (its deployId) and a `server/index.*`
+    // capsule entry paired with a `client/index.*` UI entry. Detect it BEFORE
+    // the generic Vite/Node markers: a capsule also ships a client bundle and may
+    // carry a `vite.config.*` for that bundle, which would otherwise misroute it
+    // to the static Vite lane and deploy TypeScript source as a website. A bare
+    // `server/index.*` is not enough on its own (other frameworks use that path),
+    // so require the Lakebed marker file, the documented server/client pair, or
+    // the declared dependency.
+    let server_entry = ["server/index.ts", "server/index.mts", "server/index.mjs"];
+    let client_entry = [
+        "client/index.tsx",
+        "client/index.ts",
+        "client/index.jsx",
+        "client/index.mjs",
+    ];
+    let lakebed = repo.join("lakebed.json").exists()
+        || (server_entry.iter().any(|f| repo.join(f).exists())
+            && client_entry.iter().any(|f| repo.join(f).exists())
+            && capsule_entry_declares_lakebed(repo, &server_entry))
+        || (server_entry.iter().any(|f| repo.join(f).exists())
+            && package.is_some_and(|p| has_dep(p, "lakebed")));
+    if lakebed {
+        return preset("lakebed").unwrap();
+    }
     for f in [
         "open-next.config.ts",
         "open-next.config.js",
@@ -732,6 +802,9 @@ fn detect_with_package(
 
     if let Some(package) = package {
         let dep = |name: &str| has_dep(package, name);
+        if dep("lakebed") {
+            return preset("lakebed").unwrap();
+        }
         if dep("next") {
             return preset("nextjs").unwrap();
         }

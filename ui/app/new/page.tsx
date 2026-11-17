@@ -80,6 +80,7 @@ const TEMPLATES: Template[] = [
   { name: "Remix", desc: "Full stack web framework, focused on web standards.", repo: "https://github.com/vercel/vercel", root: "examples/remix", tag: "Rx", color: "#000", icon: "/frameworks/remix.png" },
   { name: "Astro", desc: "Content-driven sites, fast by default.", repo: "https://github.com/vercel/vercel", root: "examples/astro", tag: "A", color: "#000", icon: "/frameworks/astro.png" },
   { name: "Node.js", desc: "A minimal Node.js server, deployed to Fluid compute.", repo: "https://github.com/vercel/vercel", root: "examples/node", tag: "No", color: "#539e43", icon: "/frameworks/node.png" },
+  { name: "Lakebed", desc: "A typed capsule whose database and storage are bound to shadw storage.", repo: "https://github.com/dywongcloud/shadow", root: "examples/lakebed-todo", tag: "Lb", color: "#000" },
   { name: "Bun", desc: "Incredibly fast all-in-one JavaScript runtime.", repo: "https://github.com/oven-sh/bun", root: "examples/bun-http", tag: "Bu", color: "#fbf0df", icon: "/frameworks/bun.png" },
   { name: "Deno", desc: "Secure runtime for JavaScript and TypeScript.", repo: "https://github.com/denoland/examples", root: "http-server", tag: "De", color: "#000", icon: "/frameworks/deno.png" },
   { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-publisher-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },

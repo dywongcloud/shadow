@@ -35,6 +35,7 @@ oplog or execution-transparency contract.
 - `docs/pqc-migration-scope.md` - post-quantum migration scope RFC.
 - `docs/per-route-execution.md` - Next.js per-route function splitting.
 - `docs/BUN_RUNTIME.md` - Bun as a deployment/runtime target.
+- `docs/lakebed.md` - Status: IMPLEMENTED (detection, preset, template and a live-witnessed capsule). Lakebed on shadw: one cohesive `database`/`storage` binding to shadw storage; NO hosted source runtime.
 - `docs/lagon.md` - upstream Lagon runtime overview.
 - `docs/pvm-upstream-report.md` - PVM 6.12 to 7.1 port bug report.
 - `docs/usage-metering.md` - profitable 11-SKU rate card (price above COGS, 60% gross-margin

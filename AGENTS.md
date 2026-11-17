@@ -15,12 +15,12 @@ fix a failure CLASS at the shared primitive. `cargo check` skips `cfg(target_os=
 `--no-run`; a dep change ships `Cargo.lock` (`--locked`). `check-contract-bindings.py --check` gates CI; drift names
 `--sync`, never in CI. Darwin `mktemp` ignores `TMPDIR`: `/private/tmp`.
 - Cargo/disk traps: keep the user's PATH (Homebrew cargo has no cross std); `hive-cloud` is bin-only; `df` before a build; never
-build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count unpushed work via
+build in `ui/`, never kill fc-lax. A stray `refs/heads/origin/main` makes `origin/main` ambiguous: count via
 `refs/remotes/origin/main..HEAD`. Never commit `ansible/inventory/hosts.ini` or ANY backup form.
-`hive_health_interval` > `hive_health_timeout`; an empty reviewed resolver set fails build-executor preflight;
-raise `deploy_serial_backend` only with quorum-safety evidence.
+`hive_health_interval` > `hive_health_timeout`; empty reviewed resolver set fails preflight;
+`deploy_serial_backend` only with quorum-safety evidence.
 - A roll/deploy is a production change: operator's word first, then `ansible/AGENTS.md` (dashboard: `ui/AGENTS.md`);
-prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never by grepping a Rust format literal;
+prove the RUNNING binary with `strings -a /proc/<MainPID>/exe | grep -c '<log text>'`, never a Rust format literal;
 never `git_reword` during a roll (rewrites every later SHA).
 
 ## Fleet, hosts, access
@@ -141,20 +141,21 @@ bounded by `HIVE_DEPLOY_DISPATCH_FALLBACK_MAX` (3).
 - Isolated BuildExecutor: `NodeInfo::build_isolation_protocol` comes from the boot probe
 `build_executor::init_installed()`; a fault logs `BUILD_ISOLATION_UNAVAILABLE`, advertises `None`, drops the node from
 repository-build placement.
-- Rust: `crates/vercel-runtime` shim serves the Vercel public handler API on `$PORT`; `Cargo.toml` `[[bin]]` -> `api/*.rs`
+- Rust: `crates/vercel-runtime` serves Vercel's handler API on `$PORT`; `Cargo.toml` `[[bin]]` -> `api/*.rs`
 builds `--offline` into `Runtime::Command`. `cargo`+`rustc` PROBED (bit `1<<7`, last free exit bit; `None`=NOT
 CAPABLE, no npm substitute), gates placement. Builder contract OPT-IN, reviewed base + roll operator-only.
 `docs/rust-functions.md`.
-- Checkouts live in `git::deploy_root()`; prefix scanners cover BOTH roots, BOTH name forms and a renamed project's old names
+- Lakebed: preset/detection ONLY; `examples/lakebed-todo/` binds `ctx.db`/`storage` to Blob. `docs/lakebed.md`.
+- Checkouts live in `git::deploy_root()`; prefix scanners cover BOTH roots, BOTH name forms, a renamed project's old names
 (`git::checkout_prefixes`); a missing direct entry fails the BUILD (`git::preflight_direct_entries`), never the launch.
 - The default `GET /v1/gitops/projects?view=summary` stays byte-identical; `project_redeploy` alone rebuilds
 from `last_build`. Legacy env scope `""` matches build AND runtime (`env_scope_matches`); build-inlined `NEXT_PUBLIC_*`
 needs `$HIVE_DATA/build-cache/*.tar` cleared before a redeploy of unchanged source: verify the SERVED bundle.
-- **The host build lane's registry is part of node health**: inherits `/root/.npmrc`, so a dead mirror fails
+- **Host build lane's registry is part of node health**: inherits `/root/.npmrc`, so a dead mirror fails
 every uncached install; `build_registry::assess` swaps a 0600 `npm_config_userconfig` to the public registry only
 for a dark KNOWN public mirror while registry.npmjs.org answers.
-- **Credentials resolve SERVER-SIDE**: the GitHub connection rides in an ENCRYPTED host-only browser cookie, NOT
-persisted and cannot cross devices; build/deploy credentials resolve on the node (`git.rs::resolve_clone_credentials`).
+- **Credentials resolve SERVER-SIDE**: GitHub rides an ENCRYPTED host-only cookie, NOT persisted,
+cannot cross devices; build/deploy credentials resolve on the node (`git.rs::resolve_clone_credentials`).
 
 ## Placement & capacity
 
@@ -193,7 +194,7 @@ a full `PendingTable` EVICTS the oldest stuck connection; `splice` copies each d
 `StateWrite` at RUNTIME, not by type: public fields/`Deserialize` bypass it, so `validate`/`commit` MUST recheck.
 `crates/hive-cloud/src/db_contract.rs` is the ONLY seam: it does NOT authorize or fail the request —
 **the caller mutates FIRST and records afterwards**, so a REFUSED entry is a RECORD, not a prevention (counts writes even on refusal).
-A `db.write` outcome is a MEASUREMENT, not `Ok(())`; `created` forwards its outcome, `purged`/`deleted`
+A `db.write` outcome is a MEASUREMENT, not `Ok(())`; `created` forwards it, `purged`/`deleted`
 pass `Ok(())`. Unattributed = REFUSED `unattributed:<kind>:<tenant>::<name>`; unopenable log: NO entry;
 persist fault: `persist_error`. `docs/contract-platform-seam.md`.
 - `/v1/admin/contract/explorer` is NODE-LOCAL, ADMIN `RULES` + `require_operator`, bounded replay
