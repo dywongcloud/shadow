@@ -27,7 +27,12 @@ renders (`public/globe-dark.svg`), from ONE module `components/globe-art.ts`.
 Witness: a production `next start` build of a scratch copy served the new
 share card at `http://localhost:3188/opengraph-image` (200, 153240-byte PNG),
 read side by side with the old live card; the /new wireframe replaced the
-rainbow limb and the nine node boxes. A headful Chromium render of the keystone
+rainbow limb and the nine node boxes. Two independent adversarial verifiers
+then attacked the final diff and the served PNG: one returned NOT REFUTED on
+all five claims, the other raised two objections that were overruled by
+measurement (the violet/blue wash is the card's pre-existing ambient light,
+not the globe; and all six widths were measured, with the three missing
+screenshots captured after the checker reported). A headful Chromium render of the keystone
 at 320/360/390/768/1024/1440 px measured 14 paths, no horizontal overflow, an
 unchanged 2.69:1 box and `svgBottomOffset=-1` (bottom-anchored) at every width.
 Satori/resvg rendered the same markup with 9457 lit pixels. The seven paths in

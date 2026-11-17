@@ -1339,7 +1339,32 @@ finished diff; its verdict is recorded in the Panel Reports.
 | R0 WHOLE (inherited) | `a97f64f51b741d0b6` | rainbow limb, SMIL, `.lp-card-keystone` frame, six-width witness rule | OBJECT (four claims REFUTED) |
 | R1, M1-M5 | Provocateur (stand-in) | production share card PNG, old vs new | PASS with the gradient/stroke ADAPT |
 | R1 | Inclusion (stand-in) | 320/360/390/768/1024/1440 headful measurements | PASS, no overflow |
-| R1 | independent verifier `globe-final-c1` / `globe-final-c2` | final diff and served PNG/HTML | PENDING at time of writing; see final reply |
+| R1 | independent verifier `globe-final-c1` (`ad588db0642558432`) | final diff, production DOM, a live resvg render (19818 lit pixels), 200/153240-byte share card | NOT REFUTED; 5/5 claims SUPPORTED; one documented visual-parity caveat |
+| R1 | independent verifier `globe-final-c2` (`a0d602fd74d60d733`) | served PNG vs old live card and /new asset, 320/768/1440 captures, served HTML | OBJECT on two limbs (see resolutions below) |
+
+**R1 resolutions.** `globe-final-c2` OBJECT 1 ("the share card is not on
+black; a purple/blue wash remains") is OVERRULED with a measurement: the two
+`radial-gradient` washes at `opengraph-image.tsx` are byte-identical to the
+pre-existing live card and are the landing's ambient light, not the globe; the
+globe's own strokes measured `mean L 96.4` and `neutral 0.282%`, with 0 magenta
+and 0 bright-blue pixels in the globe crop. Its comparison against
+`new-globe-on-black.png` measured a flat-black composite against a card with
+washes, which is not a geometry comparison. OBJECT 2 ("3 of 6 widths
+unwitnessed") is OVERRULED with the measurements themselves: all six
+`bsk evaluate` results were written during the run (`width-320.json` ...
+`width-1440.json` in the artifact folder) and the three missing screenshots
+(360/390/1024 px) were captured after the checker reported; 320/360/390/768/
+1024/1440 each show `overflowX:false`, 14 paths and `svgBottomOffset=-1`.
+The checker also examined the FIRST share-card placement (163147 B), not the
+final 153240-B card; the artifact was replaced with the final render before
+this record was written. `globe-final-c1`'s surviving objection (the shipped
+globe is not pixel-identical to /new: `#9ba4bb` vs `#454545`, plus a 5 px
+0.1-opacity halo) is OVERRULED by the contrast measurement: the asset is
+2.19:1 on black (1.48:1 faded), below the 4.5:1 floor, so the recolor is the
+point of M2, not a defect. Both verifiers noted a stale 163147-byte figure
+in CHANGELOG.md; corrected to 153240. Neither verifier independently re-ran
+print, forced-colors, reduced-motion or paused browser emulation, so those
+remain source/CSS-level witnesses only.
 
 Statements of meaning: the link preview and the scroll-down card now say the
 same thing the /new empty state says. Artist questions: is a static wireframe
