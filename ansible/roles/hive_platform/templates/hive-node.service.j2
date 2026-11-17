@@ -85,7 +85,7 @@ Environment="HIVE_GEO={{ hive_geo }}"
 # is a key no peer can ever serve a blob for (the writing node is gone) and is
 # retired. Unset => the reaper refuses entirely rather than treating every node
 # as departed, so removing this line is safe, not destructive.
-Environment=HIVE_NODE_ROSTER={{ groups['platform'] | map('extract', hostvars, 'hive_name') | select('defined') | join(',') }}
+Environment=HIVE_NODE_ROSTER={{ groups['platform'] | map('extract', hostvars) | rejectattr('hive_retired', 'defined') | map(attribute='hive_name') | select('defined') | join(',') }}
 # Health probing. The code defaults (2s timeout / 5s interval) are below
 # hive-p2p's 5s connect_budget, so any peer needing a fresh dial is cancelled
 # before it can connect and flaps unhealthy -- on the leader that removes live

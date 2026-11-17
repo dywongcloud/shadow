@@ -25,7 +25,7 @@ PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
 # scripts/deploy-ui-fleet.sh already uses for its own host list), whenever a
 # node joins/leaves/changes IP. A hand-typed roster is exactly how this list
 # went stale the first time (6 of 12 current nodes, missing every GPU/CVM node).
-PEERS="209.23.0.183 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 170.106.177.140 93.188.162.67"
+PEERS="209.23.0.183 43.166.206.175 43.172.25.45 170.106.158.151 170.106.177.140 93.188.162.67"
 # Fleet nodes' PRIVATE (VPC/CCN) addresses, from `hive_private_ip=` in the same
 # inventory. A peer reaching this node over the private path arrives with this
 # source, never its public IP, so strict mode (below) must know both.
