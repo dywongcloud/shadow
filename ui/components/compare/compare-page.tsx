@@ -72,7 +72,7 @@ function SectionHead({ eyebrow, title, lead }: { eyebrow: string; title: React.R
 
 function Approaches({ c }: { c: Comparison }) {
   const cols = [
-    { n: "01", title: `How ${c.rival} works`, body: c.rivalApproach },
+    { n: "01", title: <>How <Tok>{c.rival}</Tok> works</>, body: c.rivalApproach },
     { n: "02", title: "How shadw works", body: c.shadwApproach },
   ];
   return (
@@ -194,7 +194,7 @@ function Sources({ c }: { c: Comparison }) {
   return (
     <MarketingSection className="pb-10">
       <div className="border-t border-white/10 pt-8">
-        <p className="lp-caption text-[14px] text-zinc-400">As of {c.asOf}, from what {c.rival} publishes.</p>
+        <p className="lp-caption text-[14px] text-zinc-400">As of <Tok>{c.asOf}</Tok>, from what <Tok>{c.rival}</Tok> publishes.</p>
         <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1">
           <span className="text-[14px] text-zinc-400">Sources:</span>
           {c.sources.map((s) => (

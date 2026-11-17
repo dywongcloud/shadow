@@ -1,7 +1,6 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { Section, SectionHead } from "./section";
-import { delay } from "./lp-utils";
 import { Tok } from "./tok";
 import { COMPARE_LINKS } from "@/lib/compare-links";
 
@@ -16,8 +15,8 @@ export function CompareStrip() {
         lead="Compare shadw with four other ways to ship: a preview per pull request, managed data in the same project, and the choice to run on your own machines."
       />
       <ul className="lp-limb-top relative mt-12 grid gap-px overflow-hidden rounded-3xl border border-white/10 bg-white/10 sm:grid-cols-2 lg:grid-cols-4">
-        {COMPARE_LINKS.map((c, i) => (
-          <li key={c.slug} className="lp-reveal lp-fact bg-[#050505] p-6" style={delay(i * 80)}>
+        {COMPARE_LINKS.map((c) => (
+          <li key={c.slug} className="lp-fact bg-[#050505] p-6">
             <p className="lp-caption text-[12px] uppercase tracking-[0.18em] text-zinc-400">shadw vs.</p>
             <h3 className="lp-card-title mt-2 !text-[20px]"><Tok>{c.rival}</Tok></h3>
             <Link

@@ -27,10 +27,14 @@ nav, a footer column and a `CompareStrip` section.
 
 Competitor statements in `ui/lib/compare-data.ts` were checked against each provider's own
 published docs on 17 November 2026, with the retrieval date printed on the page and all 20
-source URLs verified to answer 200. A rival capability is described, never denied to flatter shadw: Railway and
-Cloudflare PR environments, Fly.io Managed Postgres and Vercel/Cloudflare rollbacks are all
-named as the strengths they are. A generated `[slug]` route was discarded because it returned
-HTTP 200 with a 404 body for unknown slugs; four static routes return a real 404 instead.
+source URLs verified to answer 200. Rival strengths are named as strengths: Railway and
+Cloudflare PR environments, Railway serverless, Fly.io Git-driven deploys and Managed
+Postgres, and Vercel/Cloudflare rollbacks. An adversarial refuter then killed eight claims
+that overstated shadw or implied a rival lacked a feature it has; the pricing model is now
+`$0 Hobby, fixed monthly tiers with included compute` (not "usage-based paid plans"), and
+the paid-tier copy names the features those tiers add. A generated `[slug]` route was
+discarded because it returned HTTP 200 with a 404 body for unknown slugs; four static
+routes return a real 404 instead.
 
 Route registration: `/compare(.*)` in `proxy.ts` `isPublic` + `isClerkFree`, `compare` in
 `PUBLIC_PAGES`, `/compare/:path*` in `next.config.mjs` `publicPaths` and the private-cache

@@ -2,8 +2,8 @@
  *  ui/app/pricing/page.tsx, ui/app/layout.tsx or crates/hive-cloud/src/billing.rs.
  *  Every rival statement was checked against that provider's own published docs on
  *  17 November 2026; the sources are printed on the page with the retrieval date.
- *  Competitor capabilities are described, not denied: a rival feature that exists is
- *  never presented as missing just to make shadw look better. */
+ *  Rival strengths (PR previews, managed Postgres, serverless, rollback) are named as
+ *  strengths; differences describe a different shape of workflow, not a missing feature. */
 
 export type Comparison = {
   slug: string;
@@ -43,7 +43,7 @@ const SELF_HOST_DIFFERENCE = {
 const FREE_START_DIFFERENCE = {
   title: "Previews and HTTPS are in the free tier",
   body:
-    "Hobby is a no-payment tier, and preview deployments, automatic HTTPS and custom domains with DNS are part of it. Paid tiers raise the project, member and compute allowances rather than adding the basics.",
+    "Hobby is a no-payment tier, and preview deployments, automatic HTTPS and custom domains with DNS are part of it. Paid tiers raise the allowances and add things like deployment protection and longer log history.",
 };
 
 export const VERCEL: Comparison = {
@@ -89,7 +89,7 @@ export const VERCEL: Comparison = {
       { label: "Rollback", shadw: "Promote any earlier immutable deployment", rival: "Instant rollbacks when reverting changes on a custom domain" },
       { label: "Custom domains and TLS", shadw: "Managed DNS, automatic TLS, wildcard preview subdomains", rival: "Automatic certificates for added domains" },
       { label: "Where it runs", shadw: "Hosted service or your own nodes", rival: "Vercel's managed cloud, with configurable function regions" },
-      { label: "Pricing model", shadw: "No-payment Hobby tier, usage-based paid plans", rival: "Free Hobby plan, Pro with included usage credit, pay as you go" },
+      { label: "Pricing model", shadw: "Hobby $0, fixed monthly tiers with included compute", rival: "Free Hobby plan, Pro with included usage credit, pay as you go" },
     ],
     fit: [
       "You want the database and the app in one project instead of connecting a Marketplace provider.",
@@ -118,9 +118,9 @@ export const RAILWAY: Comparison = {
     twitterDescription:
       "Git deploys, previews, managed data and the option to self-host. See how shadw compares with Railway.",
     summary:
-      "Both deploy a repository or a Dockerfile with managed databases and PR environments. shadw adds a no-payment tier, serverless functions and the option to run on your own nodes.",
+      "Both deploy a repository or a Dockerfile with managed databases and PR environments, and both can scale to zero when idle. shadw differences: a no-payment tier, functions beside Dockerfile services, and your own nodes.",
     heroLead:
-      "Railway deploys a repository or a Dockerfile with managed databases and isolated PR environments. shadw covers the same ground, with serverless functions, a no-payment tier and the option to run on your own machines.",
+      "Railway deploys a repository or a Dockerfile with managed databases and isolated PR environments. shadw covers the same ground, with functions beside Dockerfile services, a no-payment tier and the option to run on your own machines.",
     heroSub:
       "Both put an app online without a server to provision, and both can give a pull request its own environment. The differences are the release workflow and where the platform can run.",
     approachesLead:
@@ -140,7 +140,7 @@ export const RAILWAY: Comparison = {
       {
         title: "Rollback is a promotion",
         body:
-          "Every build is an immutable, content-addressed deployment. Recovering from a bad release means promoting an earlier deployment back to production, not rebuilding the previous commit.",
+          "Every build is an immutable, content-addressed deployment. Recovering from a bad release means promoting an earlier deployment back to production rather than redeploying it.",
       },
     ],
     rows: [
@@ -151,7 +151,7 @@ export const RAILWAY: Comparison = {
       { label: "Rollback", shadw: "Promote any earlier immutable deployment", rival: "Redeploy an earlier deployment" },
       { label: "Custom domains and TLS", shadw: "Managed DNS, automatic TLS, wildcard preview subdomains", rival: "Railway-provided domains, custom domains, automatic SSL" },
       { label: "Where it runs", shadw: "Hosted service or your own nodes", rival: "Railway's managed cloud, with selectable regions" },
-      { label: "Pricing model", shadw: "No-payment Hobby tier, usage-based paid plans", rival: "Subscription plus metered usage by the second" },
+      { label: "Pricing model", shadw: "Hobby $0, fixed monthly tiers with included compute", rival: "Subscription plus metered usage by the second" },
     ],
     fit: [
       "You want a no-payment starting tier with previews, HTTPS and custom domains included.",
@@ -176,13 +176,13 @@ export const FLY_IO: Comparison = {
     title: "shadw vs Fly.io",
     socialTitle: "shadw vs Fly.io — a Fly.io alternative with Git deploys and previews",
     description:
-      "How shadw compares with Fly.io: Git push to a live URL instead of a CLI launch, preview per pull request, managed data, and the option to run on your own machines. With sources.",
+      "How shadw compares with Fly.io: a connected repository instead of a deployment workflow you assemble, preview per pull request, managed data, and the option to run on your own machines. With sources.",
     twitterDescription:
-      "Git push to a live URL, a preview per pull request and managed data, with the option to self-host. See how shadw compares with Fly.io.",
+      "A connected repository, a preview per pull request and managed data, with the option to self-host. See how shadw compares with Fly.io.",
     summary:
       "Fly.io gives you Machines, regions and volumes with fine-grained control. shadw starts at a Git push and carries the framework, previews and managed databases for you.",
     heroLead:
-      "Fly.io gives you fast-booting Machines in regions you choose, with a Dockerfile and a CLI. shadw starts at a Git push: framework detection, a live URL, a preview per pull request and the databases in the same project.",
+      "Fly.io gives you fast-booting Machines in regions you choose, with a Dockerfile and a CLI. shadw starts at a connected repository: framework detection, a live URL, a preview per pull request and the databases in the same project.",
     heroSub:
       "Both can run a real container. The difference is how much of the deployment you configure versus how much the platform does for you.",
     approachesLead:
@@ -193,9 +193,9 @@ export const FLY_IO: Comparison = {
     differencesLead: "Four differences you will notice on your first deploy.",
     differences: [
       {
-        title: "Git push is the deploy command",
+        title: "The repository connection is built in",
         body:
-          "Connect a repository and shadw detects the framework and builds on push. There is no launch command, machine size or region to choose before the first URL exists.",
+          "Connect a repository and shadw detects the framework and builds on push, without a separate continuous-deployment workflow. Fly.io's Git-driven deploy is wired through a GitHub Actions workflow.",
       },
       {
         title: "Previews come from the connected repository",
@@ -217,7 +217,7 @@ export const FLY_IO: Comparison = {
       { label: "Long-running services", shadw: "Dockerfile services alongside functions", rival: "Fly Machines, with regions and volumes you choose" },
       { label: "Custom domains and TLS", shadw: "Managed DNS, automatic TLS, wildcard preview subdomains", rival: "Automatic Let's Encrypt certificates for custom domains" },
       { label: "Where it runs", shadw: "Hosted service or your own nodes", rival: "Fly.io's managed cloud, with Machines in multiple regions" },
-      { label: "Pricing model", shadw: "No-payment Hobby tier, usage-based paid plans", rival: "Usage-based, with a free starting credit" },
+      { label: "Pricing model", shadw: "Hobby $0, fixed monthly tiers with included compute", rival: "Usage-based, with a free starting credit" },
     ],
     fit: [
       "You would rather push code than maintain a Dockerfile, machine sizes and region placement.",
@@ -243,13 +243,13 @@ export const CLOUDFLARE: Comparison = {
     title: "shadw vs Cloudflare",
     socialTitle: "shadw vs Cloudflare — a Cloudflare alternative for full app deployments",
     description:
-      "How shadw compares with Cloudflare Workers, Pages and D1: Git deploys for framework apps, a preview per pull request, Postgres and Redis alongside SQLite, and the option to run on your own machines. With sources.",
+      "How shadw compares with Cloudflare Workers, Pages and D1: framework apps and containers, Postgres and Redis alongside SQLite, a preview per pull request, and the option to run on your own machines. With sources.",
     twitterDescription:
       "Full framework apps from a Git push, previews, managed data and the option to self-host. See how shadw compares with Cloudflare.",
     summary:
-      "Cloudflare runs code on its global network with Workers, Pages and D1. shadw deploys a whole framework app from Git and puts Postgres, Redis and SQLite in the same project.",
+      "Cloudflare runs code on its global network with Workers, Pages and D1. shadw deploys framework apps and containers from a connected repository, with Postgres, Redis and SQLite in the same project.",
     heroLead:
-      "Cloudflare runs code across a global network with Workers, Pages and D1. shadw deploys a whole framework app from a Git push, with a preview per pull request and managed Postgres, Redis and SQLite in the same project.",
+      "Cloudflare runs code across a global network with Workers, Pages and D1. shadw deploys framework apps and containers from a connected repository, with a preview per pull request and managed Postgres, Redis and SQLite in the same project.",
     heroSub:
       "Both serve an app without a server to manage, and both give a pull request a preview URL. The difference is the runtime your code targets and how much of the app the platform builds for you.",
     approachesLead:
@@ -270,9 +270,9 @@ export const CLOUDFLARE: Comparison = {
           "Managed Postgres, Redis and SQLite are all available in the same project. Cloudflare's documented managed database is D1, with SQLite's SQL semantics, plus KV, R2 and Durable Objects for other data shapes.",
       },
       {
-        title: "A preview per connected pull request",
+        title: "Managed DNS and wildcard previews",
         body:
-          "A connected GitHub pull request gets its own live URL, with wildcard preview subdomains and automatic TLS when you bring a custom domain. Pages also creates a preview URL per pull request, so this is a shared strength rather than a gap.",
+          "Custom domains come with managed DNS, automatic TLS and wildcard subdomains for previews in the same project. Cloudflare Pages issues certificates for custom domains through Cloudflare zones.",
       },
       SELF_HOST_DIFFERENCE,
     ],
@@ -284,7 +284,7 @@ export const CLOUDFLARE: Comparison = {
       { label: "Custom domains and TLS", shadw: "Managed DNS, automatic TLS, wildcard preview subdomains", rival: "Cloudflare-issued certificates for custom domains" },
       { label: "Rollback", shadw: "Promote any earlier immutable deployment", rival: "Instant rollback to a previous production deployment" },
       { label: "Where it runs", shadw: "Hosted service or your own nodes", rival: "Cloudflare's global network" },
-      { label: "Pricing model", shadw: "No-payment Hobby tier, usage-based paid plans", rival: "Workers Free plan, then a usage-based paid plan" },
+      { label: "Pricing model", shadw: "Hobby $0, fixed monthly tiers with included compute", rival: "Workers Free plan, then a usage-based paid plan" },
     ],
     fit: [
       "Your app is a framework app or a container you want to deploy as it is, rather than reshape around a serverless runtime.",
