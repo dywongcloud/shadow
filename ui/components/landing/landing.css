@@ -613,6 +613,56 @@ html:has(#lp-content) {
   }
 }
 
+/* ───── tips section ───── */
+/* A 42-character hex address cannot stay whole at 320 px. It stays ONE text
+   node (no <wbr>, so screen readers and a manual selection see the exact
+   string) and wraps only where it must, never clipping. Sizes are px: the
+   dashboard root scales rem to 83.125%. */
+.lp-tips-address {
+  display: block;
+  margin-top: 10px;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 14px;
+  line-height: 1.7;
+  letter-spacing: 0.01em;
+  color: #e9edff;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.lp-tips-status {
+  min-height: 20px;
+  margin: 12px 0 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #a8a8b8;
+}
+.lp-tips-networks .lp-chip {
+  justify-content: center;
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media print {
+  .lp-tips-well {
+    background: transparent !important;
+    border-color: #000 !important;
+  }
+  .lp-tips-address {
+    color: #000 !important;
+    -webkit-text-fill-color: #000 !important;
+  }
+  .lp-tips button,
+  .lp-tips-status {
+    display: none !important;
+  }
+}
+@media (forced-colors: active) {
+  .lp-tips-address {
+    color: CanvasText !important;
+  }
+  .lp-tips-networks .lp-chip {
+    border-color: CanvasText !important;
+  }
+}
+
 /* ───── section light ───── */
 .lp-wash {
   position: absolute;

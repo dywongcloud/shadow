@@ -13,6 +13,7 @@ const isPublic = createRouteMatcher([
   "/case-studies(.*)",
   "/contact(.*)",
   "/privacy(.*)",
+  "/tips(.*)",
   "/opengraph-image(.*)",
   "/offline.html",
   "/sw.js",
@@ -37,6 +38,7 @@ const isClerkFree = createRouteMatcher([
   "/case-studies(.*)",
   "/contact(.*)",
   "/privacy(.*)",
+  "/tips(.*)",
   "/status(.*)",
   "/opengraph-image(.*)",
   "/offline.html",
@@ -60,7 +62,7 @@ const NO_STORE = [
 ];
 
 const PUBLIC_PAGES = [
-  /^\/(product|solutions|features|pricing|compare|blog|case-studies|contact|privacy|docs|status)(\/|$)/,
+  /^\/(product|solutions|features|pricing|compare|blog|case-studies|contact|privacy|tips|docs|status)(\/|$)/,
 ];
 
 const LANDING_CACHE = "public, max-age=60, s-maxage=300, stale-while-revalidate=300";

@@ -14,6 +14,7 @@ import { Developer } from "@/components/landing/developer";
 import { UnderTheHood } from "@/components/landing/under-the-hood";
 import { CompareStrip } from "@/components/landing/compare-strip";
 import { ClosingCta } from "@/components/landing/closing-cta";
+import { TipsSection } from "@/components/landing/tips";
 import { useReveal } from "@/components/landing/lp-utils";
 import "@/components/landing/landing.css";
 
@@ -35,6 +36,7 @@ export function Landing() {
         <UnderTheHood />
         <CompareStrip />
         <ClosingCta />
+        <TipsSection />
       </div>
     </MarketingShell>
   );

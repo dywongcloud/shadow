@@ -20,6 +20,7 @@ export default function sitemap(): MetadataRoute.Sitemap {
     { path: "/compare/fly-io", freq: "monthly", priority: 0.7 },
     { path: "/compare/cloudflare", freq: "monthly", priority: 0.7 },
     { path: "/contact", freq: "monthly", priority: 0.5 },
+    { path: "/tips", freq: "yearly", priority: 0.3 },
     { path: "/privacy", freq: "yearly", priority: 0.3 },
   ];
   return routes.map((r) => ({

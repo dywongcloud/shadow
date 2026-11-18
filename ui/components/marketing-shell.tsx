@@ -53,6 +53,7 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
     links: [
       { label: "Contact", href: "/contact" },
       { label: "Privacy", href: "/privacy" },
+      { label: "Tips", href: "/tips" },
     ],
   },
 ];
