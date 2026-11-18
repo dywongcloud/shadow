@@ -38,6 +38,45 @@ workload. Caching CIPHERTEXT, non-secret usage-key bindings, or an
 absolute-TTL zeroizing cache inside an attested memory-encrypted CVM are the
 salvageable forms; `docs/lit-blind-admin-design.md` spells out all three.
 
+A third question, "maybe we only do one lit call per day, 24 hour cache",
+was measured with a second witness (`cache-24h.json`, sha256
+`9ae75a4e29aa5d214ef368a9db7cf23ff9c3cb9a0b42531f30238109aef2972a`). A 24h
+absolute cache removes the burst-dependence - the $95/day saving becomes
+unconditional instead of probabilistic - but the ceiling stays $5/day
+($1,825/yr) for one call per tenant per day, and the platform-wide reading
+(one $0.01 call/day) needs one shared master seed for all 500 tenants, which
+eliminates tenant isolation. Plaintext exposure rises 96x from 125 to 12,000
+seed-hours/day (72,000 with six node-local copies). 24 hours is longer than
+every authorization window in the tree: `MINTED_TOKEN_TTL_SECS` 3600,
+`ORG_TOKEN_TTL_SECS_DEFAULT` 900, `SESSION_STEP_UP_SECS` 8h, queue-token
+rotation 6h. A rolling 24h TTL never expires for a tenant that deploys daily.
+The salvageable 24-hour window caches CIPHERTEXT (free GETs) and non-secret
+group/CID bindings; any plaintext seed cache belongs inside an attested CVM
+with an absolute zeroizing TTL bounded by the 900s org-token window.
+
+Two further operator messages proposed ChainSecured (Sovereign) mode to cut
+Lit costs. The first claim - that it moves management writes off Stripe onto
+raw Base gas - is CORRECT but bounded to provisioning: it replaces a one-time
+$20 with gas, 0.0548% of the $36,500/yr execution line. The stronger claim -
+that ChainSecured makes runtime decryption a free read and yields ~$0.20/month
+for 1,000 projects and 4,000 deployments - is REFUTED. `pricing.md:108` says
+Lit Action execution is "$0.01/second via Stripe - identical to API mode" in
+ChainSecured, and `:110` says the conversion "moves only the admin-write half
+of billing off Stripe". An executed witness
+(`chainssecured-claim.json`, sha256
+`e1088898a531c67d8927ad33a47b8fe09c28a95a8930a1e5c6e32aad8fdb3689`) measures
+$40.12-$40.80/month against the claimed $0.20 - a 204x error. ChainSecured
+saves $3.20/month, entirely on management writes. A Lit Action execution is
+`POST /core/v1/lit_action`, not one of the free read-only GETs at
+`pricing.md:17-22`. Conversion is ONE-WAY with no path back
+(`account_modes.md:21-22`), needs ETH on Base per admin write, and
+`account_modes.md:110-116` recommends API mode for exactly the CI pipeline
+credential this design needs. Litebox cannot execute a Lit Action: it is a
+syscall-interception sandbox on an operator host with no PKP key material.
+The $0.0003-$0.002 Base gas range and the EIP-4844 attribution are
+UNMEASURED. Only fewer executions (or client-held keys at $0/month) reach a
+$5-$10 bill.
+
 Phase 3 is HELD: the brief stops for approval after Phases 1 and 2, no
 approval has been received, tool results are not user input, there is no roll
 word in the request, and a `git push` auto-deploys through two triggers. Held

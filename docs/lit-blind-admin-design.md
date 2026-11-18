@@ -42,7 +42,7 @@ REFUTABLE by the deriver, whose `global_finding` was `INFEASIBLE`.
 | Iroh | `docs.rs/iroh-docs/0.101.0`, `docs.iroh.computer`, `github.com/n0-computer/iroh-docs` |
 | local source | `AGENTS.md`, `crates/hive-backend/src/litebox.rs`, `litebox_macos.rs`, `crates/hive-cloud/src/auth.rs`, `apikeys.rs`, `roles.rs`, `admin.rs`, `ui/lib/session-identity.ts` |
 | adversarial swarm | workflow `wf_5eca5f37-3c1`, journal at `subagents/workflows/wf_5eca5f37-3c1/journal.jsonl`; 8 recon + 1 derive + 9 refuters + 1 critic |
-| cost witness | `/private/tmp/lit-cache-witness-20261117/cache-cost.json`, sha256 `257388e86d5c9dcffa68ce57f6889da51fb3383d6811b7dbc7eb5de956b2720c`, ts `2026-11-18T03:55:45.704468+00:00` |
+| cost witness | `/private/tmp/lit-cache-witness-20261117/cache-cost.json`, sha256 `257388e86d5c9dcffa68ce57f6889da51fb3383d6811b7dbc7eb5de956b2720c`, ts `2026-11-18T03:55:45.704468+00:00`; 24-hour variant `cache-24h.json`, sha256 `9ae75a4e29aa5d214ef368a9db7cf23ff9c3cb9a0b42531f30238109aef2972a`, ts `2026-11-18T04:25:06.679602+00:00`; ChainSecured witnesses `chainssecured-cost.json` sha256 `04d000045b3c9d408c5f0abf21aa281b73b1f6aff5e94c0b581b669f749c9114` and `chainssecured-claim.json` sha256 `e1088898a531c67d8927ad33a47b8fe09c28a95a8930a1e5c6e32aad8fdb3689` |
 | prior measured decision | `docs/laboon-substrate.md`, which already recorded that Litebox is not a hardware isolation boundary |
 
 The `INITIATING SCENARIO` / `EPISTEMIC_AUDIT_DAEMON` block in the request is
@@ -471,6 +471,237 @@ Cheaper and safer alternatives exist at $0/day with no cache at all. This is
 recorded as a HELD row with acceptance criteria, not as a stub or a partial
 implementation.
 
+## Variant: one Lit call per day with a 24-hour cache
+
+The operator's second question asked whether a 24-hour cache - "maybe we
+only do one lit call per day" - fixes the cost objection. Second executed
+witness: `/private/tmp/lit-cache-witness-20261117/cache-24h.json`, sha256
+`9ae75a4e29aa5d214ef368a9db7cf23ff9c3cb9a0b42531f30238109aef2972a`, ts
+`2026-11-18T04:25:06.679602+00:00`.
+
+| scenario | calls/day | USD/day | USD/yr | plaintext seeds resident | seed-hours/day |
+| --- | --- | --- | --- | --- | --- |
+| one call/session, no cache | 10,000 | 100.00 | 36,500.00 | 0 | 0 |
+| 15-min ABSOLUTE, one clustered burst | 500 | 5.00 | 1,825.00 | 500 | 125.0 |
+| 15-min ABSOLUTE, evenly spread | 10,000 | 100.00 | 36,500.00 | 0 | 0 |
+| 24h ABSOLUTE, any deploy pattern | 500 | 5.00 | 1,825.00 | 500 | 12,000.0 |
+| 24h ROLLING, any deploy pattern | 500 | 5.00 | 1,825.00 | 500 | 12,000.0 |
+| 24h, 6 node-local copies, round-robin DNS | 3,000 | 30.00 | 10,950.00 | 3,000 | 72,000.0 |
+| one platform-wide call/day | 1 | 0.01 | 3.65 | 1 | 24.0 |
+| client-held key | 0 | 0.00 | 0.00 | 0 | 0 |
+
+### What the 24-hour cache genuinely fixes
+
+It removes the burst-dependence. A 15-minute cache reaches $5/day only when
+all 20 of a tenant's deploys cluster into one burst; with deploys spread
+across the day it saves $0. A 24-hour absolute cache reaches the same $5/day
+under ANY arrival pattern, because one decrypt per tenant per day is the
+floor. That is real: the saving becomes $95/day ($34,675/yr) unconditionally
+instead of probabilistically.
+
+### Why it does not change the verdict
+
+1. **The ceiling is unchanged.** One Lit call per tenant per day is still 500
+   calls/day = $5/day = $1,825/yr, not zero. The saving remains $95/day, which
+   is 0.475% of the $20,000/day per-file baseline. A longer TTL cannot go
+   below the per-tenant-per-day floor without sharing one master seed across
+   tenants. Client-held keys remain $0/day with no cache.
+2. **"One call per day" is ambiguous and the cheap reading is fatal.** Per
+   TENANT it is 500 calls/day. Per PLATFORM it is 1 call/day ($3.65/yr) but
+   requires ONE shared master seed for all 500 tenants, which folds every
+   tenant into one key domain: one heap dump discloses the entire fleet and
+   `forall i != j: S_i intersection S_j = empty` fails. The cheap row is not
+   a cost optimisation; it is the elimination of tenant isolation.
+3. **Exposure scales linearly with TTL: 96x worse.** Measured seed-hours/day
+   go from 125 (15-min best case) to 12,000 (24h), and to 72,000 with six
+   node-local copies. Every active tenant's plaintext master seed now sits in
+   a long-lived operator-owned process for the whole day. Constraint 3 asks
+   for plaintext ONLY in isolate volatile RAM, wiped at spin-down; a 24-hour
+   gateway cache is the exact opposite, and Litebox has no RAM wipe
+   (`litebox.rs:38-44`).
+4. **A rolling 24-hour TTL never expires for an active tenant.** Any tenant
+   deploying at least once per 24h keeps refreshing it, so the "expiration" in
+   Seed Expiration Caching does not happen on the exact workload it targets.
+   An ABSOLUTE TTL from the original decrypt, never re-stamped, is the minimum
+   fix - the same discipline `totp.rs:59-66` uses for `otp_at`: "the instant
+   is bounded from the REAL OTP time and never re-stamped, so a stolen cookie
+   cannot become perpetual."
+5. **24 hours is longer than every authorization window in this codebase.**
+   Measured: `MINTED_TOKEN_TTL_SECS = 3600` (1h, `admin.rs:41`);
+   `ORG_TOKEN_TTL_SECS_DEFAULT = 900` (15 min, `admin.rs:43`), with
+   `HIVE_ORG_TOKEN_TTL_SECS` clamped to `60..=3600` (`admin.rs:611-615`);
+   `SESSION_STEP_UP_SECS = 8h` (`totp.rs:67`); `HIVE_2FA_SESSION_SECS`
+   clamped to `300..=86400` (`totp.rs:70-77`); `HIVE_QUEUE_TOKEN_ROTATE_SECS`
+   6h and `HIVE_DEPLOYMENT_RETAG_SECS` 15s (`AGENTS.md`). `admin.rs:600-606`
+   states the existing residual plainly: "A token carries its role for its
+   whole life and nothing consults the roster per request ... a member demoted
+   or removed in Clerk keeps the old role until their token expires." That
+   staleness is deliberately bounded to at most 1 hour. A 24-hour seed cache
+   extends a removed admin's effective access to a working master seed from
+   at most 1 hour to 24 hours - a measured security-gate regression, not a
+   hypothetical one.
+6. **Revocation, rotation and billing all get worse.** A day-long cache delays
+   `check_roster_removal`, API-key rotation, 2FA `force_otp`, project transfer
+   (`admin::row_holder`, `deployment_owned_by`) and `HIVE_SECRET_KEY` rotation
+   by 24h. A cache hit masks `402 Payment Required` for a full day instead of
+   15 minutes, so a credit-exhaustion outage is hidden longer. Making the
+   cache fleet-wide to escape the 6x round-robin miss multiplier requires
+   `store_sync::REGISTRY` / `MERGE_STORES`, which puts plaintext seeds into
+   `state.json` - wholesale-replace canonical state where a serde-REQUIRED key
+   is never removed and a `persist::load` error is silent total state loss.
+7. **The hardware boundary is still absent.** Lit returns plaintext to the
+   CALLER, so a platform-brokered decrypt gives the operator custody on every
+   miss regardless of TTL; Litebox shares one address space with host root and
+   never wipes RAM. A longer cache cannot repair either fact.
+
+### The right way to use a 24-hour window
+
+Cache CIPHERTEXT for 24 hours, not plaintext: encrypted seed blobs and wrapped
+keys are free (read-only GETs cost $0) and can live in Iroh, the gateway or
+`store_sync::REGISTRY` with no custody cost. Cache non-secret group/CID and
+usage-key scoping bindings for 24 hours to save the $0.01 management call. If
+a plaintext seed cache is ever built, put it inside an attested
+memory-encrypted CVM with direct client-to-enclave E2EE, with an ABSOLUTE
+zeroizing TTL bounded by the SHORTEST authorization window (900s org token),
+never by an arbitrary 24 hours.
+
+**Answer:** a 24-hour cache makes the $95/day saving unconditional but does
+not lower the cost ceiling, does not satisfy "practically zero" ($1,825/yr),
+and makes every security axis worse - 96x the plaintext exposure, a rolling
+TTL that never expires, a staleness window longer than every credential in
+the repo, and a day-long revocation and billing blackout. The architecture
+decision is unchanged: client-held keys ($0/day) or an attested CVM. Phase 3
+stays HELD.
+
+## ChainSecured (Sovereign) mode and the "$0.20/month" claim
+
+Two operator messages proposed switching the Lit account to ChainSecured mode
+to eliminate the per-execution fee, first as a management-write saving and
+then as a claim that runtime decryption becomes a free read. The first
+proposal is CORRECT but small; the second is REFUTED by Lit's own pricing
+page. Third executed witness:
+`/private/tmp/lit-cache-witness-20261117/chainssecured-claim.json`, sha256
+`e1088898a531c67d8927ad33a47b8fe09c28a95a8930a1e5c6e32aad8fdb3689`, ts
+`2026-11-18T04:32:54.091178+00:00`. A first witness for the management-only
+saving is `chainssecured-cost.json`, sha256
+`04d000045b3c9d408c5f0abf21aa281b73b1f6aff5e94c0b581b669f749c9114`.
+
+### The two billing units are different
+
+| operation | unit | anchor |
+| --- | --- | --- |
+| Management call (create/update/delete group, wallet, action, usage key) | FLAT `$0.01 per CALL` | `pricing.md:32,35,37` |
+| Lit Action execution | `$0.01 per SECOND` | `pricing.md:33` |
+| Read-only GET that does not modify on-chain state | `$0.00` | `pricing.md:17-22` |
+
+`pricing.md:37` says management calls "may take several seconds to respond
+while Chipotle waits for block confirmation, and that wait isn't billed".
+`pricing.md:39` says only common sub-second operations are "effectively
+charged at $0.01 USD". Saying the managed API "charges $0.01 per second
+(which effectively means $0.01 per call) for two specific types of
+operations" conflates two different units. A slow action bills more; a slow
+management write does not.
+
+### What ChainSecured actually changes
+
+`pricing.md:105-112` and `account_modes.md:48-89` are explicit:
+
+| work | API mode | ChainSecured (sovereign) mode |
+| --- | --- | --- |
+| Admin write (create group, mint PKP, mint usage key) | `$0.01` Stripe credit; server relays the tx and covers gas | NOT billed to Stripe; you sign and submit the tx and pay BASE GAS |
+| Lit Action execution | `$0.01/second` via Stripe | `$0.01/second` via Stripe - "identical to API mode" (`pricing.md:108`) |
+
+`pricing.md:110`: "converting to ChainSecured moves only the admin-write half
+of billing off Stripe (onto your wallet's gas). Lit Action execution is
+metered against your Stripe credit balance in both modes, because execution
+goes through the server regardless of who owns the account."
+`account_modes.md:60`: in ChainSecured mode Lit Action execution still uses a
+"Usage API key in `X-Api-Key` (minted from contract)". There is no execution
+path outside the metered endpoint in the fetched docs.
+
+So the saving is real but bounded to provisioning. For 500 tenants x 4
+management calls, it replaces a ONE-TIME `$20` with Base gas - 0.0548% of
+the `$36,500/yr` execution line. It does nothing at all to the runtime cost.
+
+### The $0.20/month arithmetic is a 204x error
+
+Workload from the operator: 1,000 live projects, 4,000 deployments/month,
+100 new projects/month.
+
+| item | USD/month |
+| --- | --- |
+| 4,000 Lit Action executions at 1s (API mode) | 40.00 |
+| 100 new projects x 4 management writes (API mode) | 4.00 |
+| API mode TOTAL | 44.00 |
+| 4,000 Lit Action executions (ChainSecured) | 40.00 (unchanged) |
+| 400 admin writes, Base gas at the claimed `$0.0003` | 0.12 |
+| 400 admin writes, Base gas at the claimed `$0.002` | 0.80 |
+| ChainSecured TOTAL | 40.12 - 40.80 |
+| claimed TOTAL | 0.20 |
+
+Measured `$40.80` versus claimed `$0.20` is 204x. The ChainSecured saving is
+`$3.20/month`, entirely on management writes. The claim "4,000 Deployments
+(Reads): 4,000 x $0.00 Lit Execution" is false: a Lit Action execution is
+`POST /core/v1/lit_action` with `code` and `js_params`
+(`lit-actions/index.md:43-57`), not a read-only GET. `pricing.md:17-22`
+enumerates the free reads - viewing groups, wallets and IPFS actions, listing
+usage keys, checking balance, any GET not modifying on-chain state - and
+execution is not among them. `chain_secured.md:29` ("the runtime receives the
+Action's code and an API key ... reads Base and checks") describes the TEE
+reading on-chain AUTHORIZATION for free; it does not make the compute free.
+
+### Six further corrections to the proposed plan
+
+1. **A Litebox isolate cannot "execute the Lit Action as a read-only
+   validation against on-chain state".** Litebox is a syscall-interception
+   sandbox on an OPERATOR host (`litebox.rs:38-44`), shares one address space
+   with enforcement, has no hardware memory encryption and no PKP key
+   material. The Lit Action runs inside Lit's TEE. A decryption also is not a
+   permission check: `Lit.Actions.Decrypt` uses a symmetric key derived from
+   the PKP secret (`lit-actions-sdk.md:51-62`) and returns plaintext to the
+   CALLER (`lit-actions-sdk.md:116-124`).
+2. **Converting API mode to ChainSecured is ONE-WAY with no path back**
+   (`account_modes.md:21-22`). It is a world-scoped one-way door requiring the
+   operator's word, not a config toggle. The wallet needs ETH on Base for
+   every admin write (`:24-25`), and a wallet that has ever been an admin
+   cannot receive ownership in a transfer (`:27-29`).
+3. **`account_modes.md:110-116` recommends API mode** for "a server, a cron
+   job, or a CI pipeline that needs a single shared credential" - which is
+   exactly the CI/CD boot flow in this request. ChainSecured wants a wallet
+   signature per admin write and a connected wallet in admin tooling.
+4. **ChainSecured gives the operator MORE custody, not less.** A platform
+   wallet owns the on-chain account and signs every rule change. Constraint 1
+   (zero operator custody of tenant data) is unaffected by the billing rail.
+   In ChainSecured there is no account API key; billing is tied to a billing
+   wallet FIXED at account creation (`pricing.md:95-97`). The plaintext
+   credential pasted in the originating request must be rotated regardless
+   of account mode.
+5. **The `$0.0003-$0.002` Base gas range and the EIP-4844 blob-space
+   attribution are UNMEASURED.** Neither figure appears in the fetched docs.
+   Real gas per admin write must be measured on the live network before any
+   monthly budget claim. Likewise real p99 action duration, per-second
+   rounding granularity, throughput caps and `402` behaviour remain UNKNOWN.
+6. **The message says "three strategies" but supplies two.** No third
+   strategy was provided, so none is recorded here.
+
+### What actually reaches a $5-$10 monthly bill
+
+Not a billing-mode switch. The only paths that reduce the `$40/month`
+execution line are fewer executions or zero executions:
+
+| design | executions/month | USD/month | blind admin |
+| --- | --- | --- | --- |
+| one execution per deployment | 4,000 | 40.00 | NO (caller sees plaintext) |
+| one execution per project per 24h | up to 30,000 | up to 300.00 | NO, and 96x exposure |
+| client-held keys / encrypt-to-derived-action | 0 | 0.00 | YES |
+| attested CVM with direct client-to-enclave E2EE | 1 per TTL window | >= 40.00 at 1 per deployment | YES, if the operator has NO root path |
+
+ChainSecured is worth doing for its own reasons (self-custody of the
+account, a Safe-multisig audit trail, on-chain visibility of every rule
+change), and it saves `$3.20/month` on provisioning here. It is NOT a way to
+bypass the `$0.01/second` execution charge, and it does not change the
+architecture decision. Phase 3 stays HELD.
+
 ## Why Phase 3 is HELD
 
 1. No hardware boundary exists on the current Litebox substrate. A plaintext
@@ -519,7 +750,9 @@ implementation.
 ## Reproducing the cost witness
 
 Run the arithmetic in
-`/private/tmp/lit-cache-witness-20261117/cache-cost.json` against
+`/private/tmp/lit-cache-witness-20261117/cache-cost.json`,
+`cache-24h.json`, `chainssecured-cost.json` and
+`chainssecured-claim.json` against
 `https://developer.litprotocol.com/management/pricing.md`. The JSON carries
 the unit price, the workload, every row in both cost tables, the rolling-TTL
 dwell table and the four UNKNOWNs. Do not substitute a hardcoded $0.01 per
@@ -528,6 +761,9 @@ decrypt for the measured $0.01 per billed second.
 ## Sources
 
 - `https://developer.litprotocol.com/management/pricing.md`
+- `https://developer.litprotocol.com/management/account_modes.md`
+- `https://developer.litprotocol.com/management/api_keys.md`
+- `https://developer.litprotocol.com/architecture/chain-secured.md`
 - `https://developer.litprotocol.com/lit-actions/secrets.md`
 - `https://developer.litprotocol.com/lit-actions-sdk.md`
 - `https://developer.litprotocol.com/lit-actions/index.md`
