@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { Section, SectionHead } from "./section";
-import { Tok } from "./tok";
+import { RivalLogo } from "@/components/compare/rival-logo";
 import { COMPARE_LINKS } from "@/lib/compare-links";
 
 /** A compact link strip on the landing page: the four comparisons are reachable from the page
@@ -18,7 +18,9 @@ export function CompareStrip() {
         {COMPARE_LINKS.map((c) => (
           <li key={c.slug} className="lp-fact bg-[#050505] p-6">
             <p className="lp-caption text-[12px] uppercase tracking-[0.18em] text-zinc-400">shadw vs.</p>
-            <h3 className="lp-card-title mt-2 !text-[20px]"><Tok>{c.rival}</Tok></h3>
+            <h3 className="lp-card-title mt-2 flex min-h-[30px] items-center !text-[20px]">
+              <RivalLogo slug={c.slug} rival={c.rival} />
+            </h3>
             <Link
               href={`/compare/${c.slug}`}
               className="tap-44 group mt-4 inline-flex min-h-[44px] items-center gap-2 text-sm font-medium text-white transition-colors hover:text-zinc-300"

@@ -3,6 +3,7 @@ import { ArrowRight, Check } from "lucide-react";
 import { MarketingShell, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { Tok } from "@/components/landing/tok";
 import { CompareNav } from "@/components/compare/compare-nav";
+import { RivalLogo } from "@/components/compare/rival-logo";
 import type { Comparison } from "@/lib/compare-data";
 
 function Hero({ c }: { c: Comparison }) {
@@ -35,7 +36,7 @@ function Hero({ c }: { c: Comparison }) {
           <p aria-hidden="true" className="flex flex-wrap items-center justify-center gap-x-5 gap-y-2 text-[clamp(28px,5vw,56px)] font-medium leading-[1.1] tracking-tight">
             <span className="lp-gradient-text">shadw</span>
             <span className="lp-mono text-[0.42em] uppercase tracking-[0.2em] text-zinc-500">vs.</span>
-            <span className="text-white"><Tok>{c.rival}</Tok></span>
+            <RivalLogo slug={c.slug} rival={c.rival} size="hero" />
           </p>
         </div>
 
@@ -88,9 +89,10 @@ function Approaches({ c }: { c: Comparison }) {
       <div className="mt-12 grid gap-5 md:grid-cols-2">
         {cols.map((col) => (
           <GlowCard key={col.n}>
-            <div className="flex items-center gap-3 border-b border-white/10 pb-4">
+            <div className="flex min-w-0 items-center gap-3 border-b border-white/10 pb-4">
               <span className="lp-mono text-[13px] tabular-nums text-zinc-500">{col.n}</span>
-              <h3 className="lp-card-title font-semibold text-white">{col.title}</h3>
+              <h3 className="lp-card-title min-w-0 font-semibold text-white">{col.title}</h3>
+              {col.n === "01" && <RivalLogo slug={c.slug} rival={c.rival} size="nav" showName={false} className="ml-auto shrink-0" />}
             </div>
             <p className="lp-card-copy mt-5">{col.body}</p>
           </GlowCard>
@@ -153,7 +155,7 @@ function ComparisonTable({ c }: { c: Comparison }) {
                 shadw
               </th>
               <th scope="col" className="w-[40%] py-4 text-[18px] font-medium text-zinc-300 max-md:w-auto">
-                <Tok>{c.rival}</Tok>
+                <RivalLogo slug={c.slug} rival={c.rival} size="table" />
               </th>
             </tr>
           </thead>

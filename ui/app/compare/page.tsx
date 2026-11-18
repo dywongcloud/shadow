@@ -3,9 +3,9 @@ import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { darkViewport, pageMeta } from "@/lib/page-meta";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
-import { Tok } from "@/components/landing/tok";
 import { COMPARISONS } from "@/lib/compare-data";
 import { CompareNav } from "@/components/compare/compare-nav";
+import { RivalLogo } from "@/components/compare/rival-logo";
 import "@/components/landing/landing.css";
 
 export const metadata: Metadata = pageMeta({
@@ -47,7 +47,9 @@ export default function CompareIndex() {
           {COMPARISONS.map((c) => (
             <GlowCard key={c.slug}>
               <p className="lp-eyebrow lp-mono">shadw vs.</p>
-              <h3 className="lp-card-title mt-3 !text-2xl font-semibold text-white"><Tok>{c.rival}</Tok></h3>
+              <h3 className="lp-card-title mt-3 flex min-h-[34px] items-center !text-2xl font-semibold text-white">
+                <RivalLogo slug={c.slug} rival={c.rival} />
+              </h3>
               <p className="lp-card-copy mt-3 min-h-[72px]">{c.summary}</p>
               <Link
                 href={`/compare/${c.slug}`}
