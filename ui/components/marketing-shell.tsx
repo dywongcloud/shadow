@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Menu, X } from "lucide-react";
 import Image from "next/image";
+import { HalftoneHorizon } from "@/components/landing/halftone-horizon";
 import "@/components/landing/landing.css";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
@@ -261,6 +262,8 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
       <div id="lp-content" tabIndex={-1} className="outline-none">
         {children}
       </div>
+
+      <HalftoneHorizon />
 
       <footer className="relative overflow-hidden bg-[#000000]">
         <div
