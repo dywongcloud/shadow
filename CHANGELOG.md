@@ -1,5 +1,43 @@
 # Changelog
 
+## 2026-11-17 - comparison rival marks and a dot-matrix horizon
+
+The four `/compare/*` pages, the `/compare` index, the comparison nav, the
+landing's `CompareStrip` and the "How X works" card now show each rival's own
+mark instead of only a text label. Supplied assets are trimmed to their ink,
+held at 2x display height and served unoptimized from `public/brands/` (an SVG
+never enters the image optimizer). One `RivalLogo` box keeps a wide wordmark
+and a square icon on the same optical line; the name stays as text for screen
+readers, print and forced colors, where a white wordmark would vanish. The h1
+and the table caption keep their text for search and accessibility.
+
+`HalftoneHorizon` draws Spheron's dot-grid idea from OUR OWN horizon geometry:
+a blue-white lit arc, two dashed orbital paths, a beam and node squares sampled
+into a 7 px dot grid. The supplied Spheron source carried its own white
+medallion logo, so the shipped `public/horizon-source.webp` is regenerated
+with our blue node square at center; no rival badge is rendered. It sits above
+`MarketingShell`'s footer on every marketing page. Luminance drives dot radius,
+alpha and colour; a 0.14 floor keeps the field sparse (offline simulation
+3573 dots / 20520 cells, 325 bright). Motion follows the landing's one state:
+a 30 fps shimmer only while visible, unhidden, unpaused and without reduced
+motion, gated by IntersectionObserver, a `MutationObserver` on html's class,
+ResizeObserver and `prefers-reduced-motion`. No CSS blur filter, no captions,
+no counts. Print and forced colors hide the decorative canvas.
+
+The separate Cloudflare comparison rewrite from this session is committed as
+`d1a94fb7eb`: both are edge compute platforms, Workers are polyglot and
+Containers run images on the Paid plan; the unverified "V8 isolates only
+cover JavaScript", "Litebox covers all runtimes and OCI images" and rival
+Kubernetes/AWS control-plane claims are not printed.
+
+Witnessed locally on a production build of a scratch copy: tsc, tsc-ci, lint,
+`check-contract-bindings.py --check`, `git diff --check` and `npm run build`
+all exit 0; all four comparison pages, `/compare`, the four marks and the
+horizon source answer 200; headful Chromium at 320/360/390/768/1024/1440 px
+showed 7/7 marks loaded, no mark outside the viewport, no horizontal overflow
+and a DPR-sized canvas at every width; the live canvas exported 26,671 lit
+pixels (6,635 white, 18,579 blue). No push and no roll: `git push` auto-deploys
+through two triggers, so that needs the operator's word.
 ## 2026-11-17 - laboon substrate assessment: researched, measured, HELD
 
 An adversarial gm swarm (17 agents: 6 recon surfaces, 3 derived claims, 9

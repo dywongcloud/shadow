@@ -7,6 +7,10 @@ the root `AGENTS.md` still apply.
 - **The copy sells outcomes, not architecture**: Git to a live URL, a preview per pull request, free to start, hosted or on your own
   machines. Peer-to-peer, mesh, QUIC and post-quantum belong to the docs, never to a hero, title, pill, card title, description or
   social card (the person's rule: "people dont care about peer to peer"). The globe is art: it prints no count and names no region.
+  Scoped owner decision 2026-11-17: the four `/compare/*` pages are technical comparison documents with printed sources, so their
+  difference cards, table rows and approach copy MAY name peer-to-peer transport, the owner chain and CRDT lanes, because the
+  operator asked for those facts there. Their hero, h1, `pageMeta` description, `socialTitle` and `twitterDescription` stay
+  outcome-led; no architecture word appears in those fields. The landing hero, pills, card titles and share card keep the rule.
 - **One globe geometry**: the scroll-down keystone and the default social card both draw `components/globe-art.ts`, whose seven strokes are transcribed verbatim from
   `public/globe-dark.svg`, the globe the /new deployment empty state renders. The module is a transcribed copy: a geometry change must edit BOTH the asset and
   `GLOBE_PATHS`, or /new and the landing drift apart. The asset's
