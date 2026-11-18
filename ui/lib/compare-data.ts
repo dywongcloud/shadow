@@ -1,9 +1,10 @@
 /** Comparison pages. Every shadw statement here is backed by ui/app/features/page.tsx,
- *  ui/app/pricing/page.tsx, ui/app/layout.tsx or crates/hive-cloud/src/billing.rs.
- *  Every rival statement was checked against that provider's own published docs on
- *  17 November 2026; the sources are printed on the page with the retrieval date.
- *  Rival strengths (PR previews, managed Postgres, serverless, rollback) are named as
- *  strengths; differences describe a different shape of workflow, not a missing feature. */
+ *  ui/app/pricing/page.tsx, ui/app/docs/getting-started/page.tsx, README.md or the
+ *  crates named in the row. Every rival statement was checked against that provider's
+ *  own published docs on 17 November 2026; the sources are printed on the page with
+ *  the retrieval date. Rival strengths (PR previews, managed Postgres, polyglot
+ *  Workers, Containers, rollback) are named as strengths, never denied. Competitor
+ *  infrastructure internals are never asserted: no primary source publishes them. */
 
 export type Comparison = {
   slug: string;
@@ -40,6 +41,16 @@ const SELF_HOST_DIFFERENCE = {
     "The hosted service is one way to run shadw. The platform also runs on your own nodes, so a team that needs its own infrastructure keeps the same Git-to-URL workflow instead of changing tools.",
 };
 
+/** The platform-level architecture facts the owner asked for on 17 November 2026.
+ *  Transport is peer-to-peer; the control plane is an owner chain with a quorum, not
+ *  a leaderless mesh. CRDT is real in the browser-database lane and per-row setting
+ *  merges, not in canonical state replication. No competitor internals are claimed. */
+const EDGE_MESH_DIFFERENCE = {
+  title: "An edge pipeline on a peer-to-peer mesh",
+  body:
+    "Every shadw node runs routing, WAF and bot filtering, a CDN cache with stale-while-revalidate, then compute. Requests between nodes travel over iroh QUIC, with an HTTP fallback. Leader-only jobs are gated by an owner chain and a quorum; browser databases converge through CRDT change batches and project settings rows merge per row with tombstones. Self-hosting is one node binary plus a state directory, TLS certificates and secrets; a second node joins with --peer for the full mesh with anycast and failover.",
+};
+
 const FREE_START_DIFFERENCE = {
   title: "Previews and HTTPS are in the free tier",
   body:
@@ -66,8 +77,9 @@ export const VERCEL: Comparison = {
     rivalApproach:
       "Connect a Git repository and Vercel deploys automatically on branch pushes and production merges. A pull request gets a unique preview deployment with its own generated URL. Functions handle each incoming request as a scaled invocation, and Postgres, KV and NoSQL databases are provisioned through Vercel Marketplace providers such as Neon and Upstash.",
     shadwApproach: SHADW_APPROACH,
-    differencesLead: "Four differences you will notice on your first deploy.",
+    differencesLead: "Five differences you will notice on your first deploy.",
     differences: [
+      EDGE_MESH_DIFFERENCE,
       SELF_HOST_DIFFERENCE,
       {
         title: "The database is part of the project",
@@ -128,8 +140,9 @@ export const RAILWAY: Comparison = {
     rivalApproach:
       "Deploy from GitHub, the CLI, a Docker image or a template; Railway detects a Dockerfile at the root of the source directory. PostgreSQL and Redis are available as zero-configuration database templates. PR environments provision isolated, temporary infrastructure when a pull request opens and remove it when the pull request closes, and services can sleep when inactive.",
     shadwApproach: SHADW_APPROACH,
-    differencesLead: "Four differences you will notice on your first deploy.",
+    differencesLead: "Five differences you will notice on your first deploy.",
     differences: [
+      EDGE_MESH_DIFFERENCE,
       FREE_START_DIFFERENCE,
       SELF_HOST_DIFFERENCE,
       {
@@ -190,8 +203,9 @@ export const FLY_IO: Comparison = {
     rivalApproach:
       "Describe the app in a Dockerfile, or let fly launch generate one for common frameworks, then fly deploy builds the image and refreshes Machines. Git-driven deployment is wired through a GitHub Actions workflow, and ephemeral per-pull-request review apps are available as a GitHub Actions blueprint. Fly.io also offers a fully managed Postgres service.",
     shadwApproach: SHADW_APPROACH,
-    differencesLead: "Four differences you will notice on your first deploy.",
+    differencesLead: "Five differences you will notice on your first deploy.",
     differences: [
+      EDGE_MESH_DIFFERENCE,
       {
         title: "The repository connection is built in",
         body:
@@ -241,53 +255,68 @@ export const CLOUDFLARE: Comparison = {
     slug: "cloudflare",
     rival: "Cloudflare",
     title: "shadw vs Cloudflare",
-    socialTitle: "shadw vs Cloudflare — a Cloudflare alternative for full app deployments",
+    socialTitle: "shadw vs Cloudflare — two edge platforms, different execution models",
     description:
-      "How shadw compares with Cloudflare Workers, Pages and D1: framework apps and containers, Postgres and Redis alongside SQLite, a preview per pull request, and the option to run on your own machines. With sources.",
+      "How shadw compares with Cloudflare: both run an edge request pipeline with a CDN cache; shadw deploys full app runtimes and container images from a Git repository with Postgres, Redis and SQLite in the same project, a preview per pull request, and the option to run on your own nodes. With sources.",
     twitterDescription:
-      "Full framework apps from a Git push, previews, managed data and the option to self-host. See how shadw compares with Cloudflare.",
+      "Two edge platforms. shadw ships framework apps, functions and containers from Git, with managed data and the option to self-host. See how shadw compares with Cloudflare.",
     summary:
-      "Cloudflare runs code on its global network with Workers, Pages and D1. shadw deploys framework apps and containers from a connected repository, with Postgres, Redis and SQLite in the same project.",
+      "Both are edge platforms. Cloudflare's global CDN is much larger; shadw runs the pipeline on nodes you can operate yourself and deploys full runtimes and container images from one repository.",
     heroLead:
-      "Cloudflare runs code across a global network with Workers, Pages and D1. shadw deploys framework apps and containers from a connected repository, with a preview per pull request and managed Postgres, Redis and SQLite in the same project.",
+      "Both are edge compute platforms. Cloudflare runs Workers, Pages, D1 and Containers on a global network; shadw runs routing, WAF, a CDN cache and compute on each node, from a Git repository, with managed Postgres, Redis and SQLite in the same project.",
     heroSub:
-      "Both serve an app without a server to manage, and both give a pull request a preview URL. The difference is the runtime your code targets and how much of the app the platform builds for you.",
+      "Both serve an app without a server to manage. The difference is the execution model and who operates the nodes.",
     approachesLead:
-      "Cloudflare is an edge platform built around Workers, Pages and its own data services. shadw is a Git-driven deploy platform for framework apps and containers.",
+      "Two edge platforms with different shapes. Cloudflare's network is global; shadw runs its edge pipeline on nodes you can also host yourself.",
     rivalApproach:
-      "Connect a Git provider to Pages, use Direct Upload, or deploy Workers with the CLI. Every new pull request gets a unique preview URL that stays updated as commits arrive, and rollbacks instantly revert to a previous production deployment. Workers is a serverless execution environment, and D1 is a managed serverless database with SQLite's SQL semantics; KV, R2 and Durable Objects cover other data needs.",
-    shadwApproach: SHADW_APPROACH,
-    differencesLead: "Four differences you will notice on your first deploy.",
+      "Connect a Git provider to Pages, use Direct Upload, or deploy Workers with the CLI. Workers executes in V8 isolates and Cloudflare documents first-class JavaScript, TypeScript, Python and Rust, plus WebAssembly modules from languages including C, C++, Kotlin and Go; Cloudflare Containers on the Workers Paid plan run code in any runtime from a container image. Every new pull request gets a unique preview URL, and rollbacks revert a production deployment. D1 is a managed serverless SQLite database; KV, R2 and Durable Objects cover other data needs.",
+    shadwApproach:
+      "Connect a repository and shadw detects the framework, builds an immutable deployment and serves it at a live URL. Every node runs the same edge request pipeline: routing, WAF and bot filtering, a CDN cache with HIT/MISS/STALE states and stale-while-revalidate, then compute. Requests between nodes travel over a peer-to-peer QUIC mesh (iroh), with an HTTP fallback. Leader-only jobs are gated by an owner chain and a quorum: an owner that loses its fresh view or contact with voters holds rather than acting alone. A connected pull request gets its own preview, and managed Postgres, Redis and SQLite databases are available in the same project as the app. Replicated browser databases converge through CRDT change batches, and project settings rows merge per row with tombstones.",
+    differencesLead: "Six differences you will notice on your first deploy.",
     differences: [
       {
-        title: "Framework apps and containers are the deploy unit",
+        title: "Both are edge platforms",
         body:
-          "shadw detects the framework and builds the app, and a Dockerfile can ship a long-running service alongside functions. Cloudflare's documented primary platform for new projects is Workers, with Pages for connected Git repositories.",
+          "Cloudflare's CDN spans a global network; shadw runs the same pipeline on each of its nodes — routing, WAF, bot management, a CDN cache with HIT/MISS/STALE/REVALIDATED states and stale-while-revalidate before compute. The difference is scale: Cloudflare's network is much larger, and shadw's edge nodes can also be yours. Neither platform is only a CDN and neither is only an app host.",
+      },
+      {
+        title: "Full runtimes and container images from one repository",
+        body:
+          "shadw deploys framework apps, serverless functions and Dockerfile images as containers from one repository. Cloudflare's default compute unit is a Workers V8 isolate, which Cloudflare documents as polyglot: JavaScript, TypeScript, Python, Rust and WebAssembly. Cloudflare Containers run arbitrary runtimes from an image on the Workers Paid plan. Both platforms cover containers; shadw does it from the same Git-to-URL workflow, with the databases in the same project.",
+      },
+      {
+        title: "A peer-to-peer mesh between nodes",
+        body:
+          "Requests between shadw nodes travel over iroh QUIC. The self-hosting guide is one node binary plus a state directory, TLS certificates and secrets; a second node joins with --peer for the full mesh with anycast and failover. Cloudflare's network is operated by Cloudflare, so there is no node to install.",
+      },
+      {
+        title: "CRDT data lanes and an owner chain",
+        body:
+          "Browser databases replicate through hive_crsql CRDT change batches, and project settings rows merge per row with tombstones. Leader-only jobs are gated by leadership::may_act: the owner must have a fresh view, not be isolated, and a backup owner needs fresh direct contact with a strict majority of voters held for the job's tenure. Cloudflare's control plane is managed for you.",
       },
       {
         title: "Postgres and Redis alongside SQLite",
         body:
           "Managed Postgres, Redis and SQLite are all available in the same project. Cloudflare's documented managed database is D1, with SQLite's SQL semantics, plus KV, R2 and Durable Objects for other data shapes.",
       },
-      {
-        title: "Managed DNS and wildcard previews",
-        body:
-          "Custom domains come with managed DNS, automatic TLS and wildcard subdomains for previews in the same project. Cloudflare Pages issues certificates for custom domains through Cloudflare zones.",
-      },
       SELF_HOST_DIFFERENCE,
     ],
     rows: [
       { label: "Deploy trigger", shadw: "Push to a connected Git repository", rival: "Connected Git provider, Direct Upload or CLI" },
       { label: "Preview per pull request", shadw: "A live URL for every connected GitHub pull request", rival: "A unique preview URL per pull request, updated on each commit" },
-      { label: "Runtime", shadw: "Framework apps, serverless functions and Dockerfile services", rival: "Workers serverless environment and Pages Functions" },
+      { label: "Edge request pipeline", shadw: "Routing, WAF, CDN cache with stale-while-revalidate, then compute on each node", rival: "Global CDN and edge network" },
+      { label: "Runtime", shadw: "Framework apps, functions and Dockerfile images as containers", rival: "Workers V8 isolates (JS, TS, Python, Rust, WASM); Containers on Workers Paid" },
+      { label: "Node-to-node transport", shadw: "Peer-to-peer QUIC mesh (iroh) with an HTTP fallback", rival: "Cloudflare-managed global network" },
       { label: "Managed databases", shadw: "Postgres, Redis and SQLite in the same project", rival: "D1 SQLite, plus KV, R2 and Durable Objects" },
       { label: "Custom domains and TLS", shadw: "Managed DNS, automatic TLS, wildcard preview subdomains", rival: "Cloudflare-issued certificates for custom domains" },
       { label: "Rollback", shadw: "Promote any earlier immutable deployment", rival: "Instant rollback to a previous production deployment" },
-      { label: "Where it runs", shadw: "Hosted service or your own nodes", rival: "Cloudflare's global network" },
+      { label: "Where it runs", shadw: "Hosted service or your own nodes (one node binary per host)", rival: "Cloudflare's global network" },
+      { label: "Adding capacity", shadw: "One node binary per host; a second joins with --peer", rival: "Cloudflare scales its network for you" },
       { label: "Pricing model", shadw: "Hobby $0, fixed monthly tiers with included compute", rival: "Workers Free plan, then a usage-based paid plan" },
     ],
     fit: [
-      "Your app is a framework app or a container you want to deploy as it is, rather than reshape around a serverless runtime.",
+      "Your app is a framework app, a function or a container you want to deploy as it is, rather than reshape around a serverless runtime.",
+      "You want the edge request pipeline to run on nodes you can operate yourself, joined over a peer-to-peer mesh.",
       "You want Postgres or Redis provisioned with the app alongside a SQLite database.",
       "You want every pull request to have a URL that reviewers can open immediately.",
       "You may need to run the same platform on your own machines later.",
@@ -295,10 +324,19 @@ export const CLOUDFLARE: Comparison = {
     asOf: AS_OF,
     sources: [
       { label: "Cloudflare Workers", href: "https://developers.cloudflare.com/workers/" },
+      { label: "Cloudflare Workers languages", href: "https://developers.cloudflare.com/workers/languages/" },
+      { label: "Cloudflare WebAssembly", href: "https://developers.cloudflare.com/workers/runtime-apis/webassembly/" },
+      { label: "Cloudflare Containers", href: "https://developers.cloudflare.com/containers/" },
+      { label: "Cloudflare V8 isolates", href: "https://developers.cloudflare.com/workers/reference/how-workers-works/" },
       { label: "Cloudflare Pages", href: "https://developers.cloudflare.com/pages/" },
       { label: "Cloudflare preview deployments", href: "https://developers.cloudflare.com/pages/configuration/preview-deployments/" },
+      { label: "Cloudflare CDN", href: "https://www.cloudflare.com/cdn/" },
       { label: "Cloudflare D1", href: "https://developers.cloudflare.com/d1/" },
+      { label: "Cloudflare KV", href: "https://developers.cloudflare.com/kv/" },
+      { label: "Cloudflare R2", href: "https://developers.cloudflare.com/r2/" },
+      { label: "Cloudflare Durable Objects", href: "https://developers.cloudflare.com/durable-objects/" },
       { label: "Workers pricing", href: "https://developers.cloudflare.com/workers/platform/pricing/" },
+      { label: "shadw self-hosting guide", href: "/docs/getting-started#self-hosting" },
       { label: "shadw features", href: "/features" },
     ],
   };
