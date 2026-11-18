@@ -1,5 +1,39 @@
 # Changelog
 
+## 2026-11-17 - laboon substrate assessment: researched, measured, HELD
+
+An adversarial gm swarm (17 agents: 6 recon surfaces, 3 derived claims, 9
+independent refuters, 1 completeness critic) examined
+`github.com/samyfodil/laboon` as a replacement for podman. All three
+implementation claims were REFUTED 3/3; `allow_list=[]`.
+
+- laboon `v0.1.0` was published the same day, from a 25-day-old,
+  1-star/7-commit single-author repo. `README.md:32-35` says its daemon and
+  OCI runtime "should not be read as claims of production maturity or
+  complete engine compatibility".
+- `laboond` is a 12-route demo Docker API shim (`daemon.go:36-51`): no
+  `/volumes`, `/networks`, `-p`, `exec`, `logs`, `build`, `restart`, health,
+  auth or persistence. `handlers.go:28-38` has no `HostConfig` and silently
+  drops binds/ports/labels. `laboon-runtime` is a partial OCI spec
+  (`spec.go:9-17`) with no namespaces, cgroups, hooks or `WithNet`.
+  Neither ships as a release binary (`.goreleaser.yaml:16-47`,
+  `ci.yml:107-114`); only `laboon` and `laboon-mcp` do.
+- Live witnesses with the checksum-verified darwin/arm64 binary: image runs
+  and `-v HOST:GUEST` bind-mount read/write/persistence PASS; unrestricted
+  `-net` egress passes; allowlisted egress and guest-to-host loopback FAIL;
+  a guest listener is reachable on the HOST loopback under `-net`; nested
+  podman (`apk add` ok, `podman --version`) kills the Go supervisor with
+  "fatal error: traceback did not unwind completely" (exit 139/2), twice.
+- A swap would break `rm -f -v` 2048-lock reclaim, `env_clear()`, the
+  tenant-string-as-host-path gate, `KillMode=process` orphan reaping via
+  `hive.owner`/`hive.boot`, managed SQLite/CRR host-absolute paths, and the
+  contract-bound `resources.rs` capability advertisement.
+
+Decision record: `docs/laboon-substrate.md`. Held row with 7 acceptance
+criteria: `.gm/prd/laboon-primary-substrate-2026-11-17.yml`. No production
+code change, no push, no roll: the request contains no roll word, a push
+auto-deploys through two triggers, and no security gate was weakened.
+
 ## 2026-11-17 - "Own your cloud" draws the same detailed globe
 
 The share card got the blue nodes, links and lit horizon in the previous
