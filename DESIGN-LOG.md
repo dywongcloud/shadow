@@ -1729,3 +1729,95 @@ built CSS as `fill:#0000!important` and `fill:canvas!important`.
 - [x] Objections resolved with premise tests: M1, M3.
 - [x] Final-state re-measurement, Anchor Ledger, double loop: sections 4-6.
 - [x] Final reply states mode, tools, stop conditions and skipped steps.
+
+---
+
+## Bounded run 2026-11-17 (fourth) -- rival marks and dot-matrix horizon
+
+Mode: **Adaptive** (a public marketing surface: both the advanced pole -- a
+canvas dot matrix sampled from a lit horizon -- and the acceptable pole --
+legible rival marks, no overflow, print and forced-colors fallbacks -- must
+hold). Tooling inventory: gm `codesearch` for the call sites; `sharp` for asset
+measurement and an offline SVG simulation of the renderer; Node for the
+luminance sweep; headful Chromium through `bsk` for the six-width DOM witness;
+`next start` on a production build of a scratch copy. No graph tool, no
+workflow engine, no seven-seat panel was seated this run.
+
+### Traversal Plan and living Frontier
+
+Seed: `Single Source of Truth` -> `Respect the Medium` -> `Honest Content`
+(BREAK: a competitor badge is not our brand) -> dotted counterpoint
+`MAYA: Advanced vs Acceptable`. Frontier after the run:
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| Replace text labels with supplied marks | outgoing `applies` | Respect the Medium | TAKEN (M4) |
+| One box for wordmark and square icon | outgoing `extends` | Single Source of Truth | TAKEN (M5) |
+| Remove the rival medallion from the sampling source | dotted `counterpoint` | Honest Content | TAKEN (M6) |
+| Print / forced-colors name fallback | incoming `grounds` | MAYA acceptable pole | TAKEN (M7) |
+| Gate the shimmer on the ONE motion state | incoming `grounds` | Respect the Medium | TAKEN (M8) |
+| Seven-seat panel and WHOLE rounds | dotted `counterpoint` | MAYA | DEFERRED (not seated this run) |
+
+### Decision Records
+
+- **M4 (KEEP-THE-RULE)** Replace the plain rival text with the supplied marks
+  on the four comparison pages, the index, nav, landing strip and approach
+  card. Intent: the eye reads a brand before a word. Alternatives rejected:
+  (a) emoji/letter avatars -- not the owner's assets; (b) a CSS-drawn mock of
+  each logo -- dishonest. Consequence: 4 static assets in `/brands`, 236 added
+  lines, and a scoped exception to the outcome-led copy rule.
+- **M5 (KEEP-THE-RULE)** One `RivalLogo` box per size, with a separate square
+  icon variant. Measured: before the fix the Cloudflare 256x256 tile floated in
+  the middle of a 300x56 wordmark box; after, its box is 56x56 and the tile
+  sits directly after "vs." (headful capture compared). Fence: sizes are px
+  because the dashboard root scales rem.
+- **M6 (BREAK)** Do not ship the supplied Spheron source: it carries Spheron's
+  white medallion logo at x=1185..1215, y=297..327 (measured from raw pixels).
+  Regenerate the same horizon geometry with our blue node square at center.
+  Dependents: M6 -> M8. Consequence: no rival badge above our footer.
+- **M7 (KEEP-THE-RULE)** White-on-transparent wordmarks vanish on white paper
+  and in forced colors; the name becomes visible text there. Verified in the
+  built CSS (`@media print` and `@media (forced-colors:active)`).
+- **M8 (KEEP-THE-RULE)** A 30 fps shimmer only while visible, unhidden,
+  unpaused and without reduced motion. A `MutationObserver` on html's class
+  was added after a witness showed that toggling `html.lp-paused` did not call
+  `sync()` -- a real defect, fixed before the final build.
+
+### Panel Reports
+
+NOT SEATED. No independent critics were run this run; the checks below are
+measurements, not a panel. The screenshot captures and the six-width DOM sweep
+are the observed artifact.
+
+### Anchor Ledger
+
+| Anchor | Role | Status | Evidence |
+| --- | --- | --- | --- |
+| Single Source of Truth | rule | KEEP | one `RIVAL_LOGOS` map, one `HalftoneHorizon` renderer |
+| Respect the Medium | rule | KEEP | px sizes, no CSS blur, unoptimized SVG |
+| Honest Content | stance | KEEP | no rival badge, no unverified architecture claims |
+| MAYA: Advanced vs Acceptable | counterpoint | ADAPT | 26,671 lit pixels and 7/7 marks decoded at every width |
+| One Artwork, No Surface Switch | amendment from run 3 | KEEP | one horizon source for all marketing pages |
+
+### Compliance Check
+
+- [x] Tooling inventory and Adaptive mode with reason: above.
+- [x] Seed, exact labels, living Frontier: above.
+- [x] At least one BREAK move taken (M6).
+- [x] Decision Record per move with dependencies and fences: above.
+- [ ] A Panel Report from a compliant seven-seat panel: **NOT MET** (not seated).
+- [ ] WHOLE rounds and S1-S5: **NOT MET** (S1 has one DEFERRED item; S2, S3,
+  S4, S5 not run). No quota was used as a stopping rule.
+- [x] Final-state re-measurement: tsc, tsc-ci, lint, build, bindings `--check`,
+  `git diff --check` all exit 0 after the M8 fix; all four comparison pages,
+  `/compare`, four marks and the horizon source answer 200; headful Chromium
+  320/360/390/768/1024/1440 px with 7/7 marks, no overflow, DPR-sized canvas.
+- [x] Double loop: the criterion (MAYA) did not fail; the panel was not seated,
+  which is a process gap. Amendment: add a "Sampling Source Provenance" node
+  beside "Honest Content" -- an image used only as a luminance source can still
+  carry a third party's mark.
+- [ ] Carry-forward ledger entry written to `DESIGN-CARRY-FORWARD.md`: NOT MET.
+
+Resume point: seat the seven-seat panel on the four headful captures and the
+live canvas export, run two WHOLE rounds, push the Breaker further with a
+measured delta, then close S1-S5.
