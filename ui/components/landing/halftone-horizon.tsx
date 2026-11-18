@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { dotColor, sampleIntensity } from "./dot-matrix";
 
 const SOURCE = "/horizon-source.webp";
 const SPACING = 7;
-const FLOOR = 0.14;
 
 /** A dot-matrix horizon above the marketing footer. A blue-lit arc, two dashed
  *  orbital paths, a vertical beam and node squares are sampled into a 7 px dot
@@ -53,11 +53,7 @@ export function HalftoneHorizon() {
       const sy = (image.naturalHeight - sh) / 2;
       offCtx.drawImage(image, sx, sy, sw, sh, 0, 0, cols, rows);
       const px = offCtx.getImageData(0, 0, cols, rows).data;
-      intensity = new Float32Array(cols * rows);
-      for (let i = 0; i < cols * rows; i++) {
-        const lum = (0.2126 * px[4 * i] + 0.7152 * px[4 * i + 1] + 0.0722 * px[4 * i + 2]) / 255;
-        intensity[i] = Math.max(0, Math.min(1, 1.35 * Math.sqrt(lum) - FLOOR));
-      }
+      intensity = sampleIntensity(px, cols * rows);
     };
 
     const draw = (time: number) => {
@@ -73,7 +69,7 @@ export function HalftoneHorizon() {
           const shimmer = time === 0 ? 1 : 0.78 + 0.22 * Math.sin(2.2 * seconds - 0.18 * col + 0.06 * row);
           const radius = Math.min(maxR, maxR * v * shimmer);
           if (radius < 0.35) continue;
-          ctx.fillStyle = v > 0.62 ? "#ffffff" : v > 0.34 ? "#8fd8ff" : "#2a8af6";
+          ctx.fillStyle = dotColor(v);
           ctx.globalAlpha = Math.min(1, 0.35 + v);
           ctx.beginPath();
           ctx.arc(col * SPACING + SPACING / 2, row * SPACING + SPACING / 2, radius, 0, Math.PI * 2);

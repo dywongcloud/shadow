@@ -613,6 +613,112 @@ html:has(#lp-content) {
   }
 }
 
+/* ───── dot-matrix steps ───── */
+/* A bracketed stepper: the reference's 1 px frame, corner ticks, hairline
+   header, four dashes and a dot halftone. No printed counter, no badge, no
+   annotation label (AGENTS.md). Sizes are px; no filter blur -- the field's
+   light is gradients and hairlines. */
+.lp-dots-frame {
+  position: relative;
+  border: 1px solid rgba(143, 216, 255, 0.16);
+  background:
+    radial-gradient(620px 300px at 50% 46%, rgba(42, 138, 246, 0.17), transparent 72%),
+    #04060b;
+}
+.lp-dots-stage {
+  position: relative;
+  min-height: 420px;
+  overflow: hidden;
+  cursor: crosshair;
+}
+.lp-dots-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  inset: 0;
+}
+.lp-dots-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(90deg, rgba(143, 216, 255, 0.055) 1px, transparent 1px),
+    linear-gradient(rgba(143, 216, 255, 0.055) 1px, transparent 1px);
+  background-size: 25% 100%, 100% 25%;
+}
+.lp-dots-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 24px;
+  padding: 8px 16px 8px 8px;
+  border-top: 1px solid rgba(143, 216, 255, 0.12);
+}
+.lp-dots-copy {
+  margin: 0;
+  flex: 1 1 260px;
+  text-align: right;
+  font-size: 13px;
+  color: #a8b6c8;
+  text-wrap: balance;
+}
+@media (max-width: 640px) {
+  .lp-dots-stage { min-height: 300px; }
+  .lp-dots-copy { text-align: left; }
+}
+/* paper and forced colors: the halftone is decorative, the four states are
+   printed as plain text so no reader loses the outcome */
+.lp-dots-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.lp-dots-tab {
+  justify-content: flex-start;
+  padding: 0 12px;
+  border: 1px solid rgba(143, 216, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.02);
+  color: #a8b6c8;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 180ms ease, color 180ms ease, background-color 180ms ease;
+}
+.lp-dots-tab:hover { border-color: rgba(143, 216, 255, 0.45); color: #e8f4ff; }
+.lp-dots-tab:focus-visible { outline: 2px solid #8fd8ff; outline-offset: 2px; }
+.lp-dots-tab.is-active {
+  border-color: #8fd8ff;
+  border-width: 2px;
+  background: rgba(42, 138, 246, 0.16);
+  color: #ffffff;
+}
+.lp-dots-fallback { display: none; }
+@media print {
+  .lp-dots-frame { display: none !important; }
+  .lp-dots-fallback {
+    display: block;
+    margin: 18px 0 0;
+    padding-left: 22px;
+    color: #000 !important;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+}
+@media (forced-colors: active) {
+  .lp-dots-frame { display: none !important; }
+  .lp-dots-fallback {
+    display: block;
+    margin: 18px 0 0;
+    padding-left: 22px;
+    color: CanvasText;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+}
+
 /* ───── tips section ───── */
 /* A 42-character hex address cannot stay whole at 320 px. It stays ONE text
    node (no <wbr>, so screen readers and a manual selection see the exact

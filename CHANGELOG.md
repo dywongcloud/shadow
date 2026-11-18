@@ -1,5 +1,56 @@
 # Changelog
 
+## 2026-11-18 - dot-matrix stepper on the landing
+
+The supplied Spheron base stills and two screen recordings were measured, not
+copied. The recordings are 1410x954 at 120/240 fps; the stills are 1400x781,
+1400x788 and 1600x900. A scanline autocorrelation measured the dot pitch at
+8 px for a 940 px-wide frame (about 12 px native), and frame-to-frame changed
+pixel centroids travel (485,345) -> (548,310) -> (543,275) -> (441,293): the
+dots DISPLACE into curved streamlines around a moving centre; bright-pixel
+population varies 8421 -> 13459. The chrome is a 1 px bracketed frame with
+corner ticks, a monospace eyebrow, a step counter and four progress dashes.
+The base stills carry NVIDIA and PyTorch badges; they are sampling references
+only and are NOT shipped.
+
+Implemented as ONE dot-matrix primitive, `ui/components/landing/dot-matrix.ts`,
+shared with the existing footer horizon (the horizon keeps its 7 px grid; the
+stepper uses 118 columns). `paintScene` paints four luminance sources in code
+from our own blue node squares, arcs, plates, dotted globe and bar panels --
+no rival artwork, no downloaded image, no badge. `sampleIntensity` maps
+luminance to dot radius, alpha and colour; `vortex` bends the lattice into
+streamlines with an `exp(-r^2/2sigma^2)` falloff. Full-resolution paint is
+downsampled to the dot grid so 1-3 px strokes survive sampling. The canvas
+draws a faint base lattice plus bright dots, with 4x4 dot clusters at the four
+corners instead of CSS bracket ticks. Steps change ONLY on a visitor click;
+there is no autoplay. The swirl follows the pointer and settles to a still
+halftone when the pointer stops. Motion respects the landing's ONE state,
+`html.lp-paused`, plus prefers-reduced-motion, document.hidden and an
+IntersectionObserver. A defensive box check re-reads the stage each frame so
+the backing store is never CSS-scaled down on a narrow viewport.
+
+Four outcome-led steps (`Push to Git`, `Get a live URL`, `Attach a domain`,
+`Watch it run`) are named 44 px tabs inside the frame foot with
+`aria-current="step"`, a 2 px selected border and an sr-only live status.
+Print and forced-colors hide the canvas and print all four outcomes as plain
+black text. The frame prints NO digit, NO counter, NO badge, NO annotation
+label and NO status claim. No third-party asset and no new dependency.
+
+Witnessed on a clean production build of a scratch copy at
+320/360/390/768/1024/1440 px: no horizontal overflow, all tabs 44 px, frame
+opacity 1 at rest. Four clicks produce four distinct canvas hashes (lit pixels
+97,284 / 147,964 / 105,117 / 168,725). Pumping the real rAF callback yields
+three distinct canvas hashes and lit counts 92,308 / 96,777 / 92,626; the
+traveling vortex's max dot displacement was escalated 79.8 px -> 115.0 px
+(displaced cells 3,140 -> 3,417). Pointer-driven swirl gives three distinct
+position signatures (max displacement 62.2 / 114.9 / 129.2 px). tsc, tsconfig.ci.json,
+npm run lint, check-contract-bindings.py --check and git diff --check all exit 0.
+
+See DESIGN-LOG.md run 6 for the dada panel, Decision Records, frame swaps and
+Compliance Check. No push and no roll: a `git push` auto-deploys through two
+triggers, which needs the operator's word.
+
+
 ## 2026-11-18 - roll the latest UI to the six live hosts
 
 At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags ui

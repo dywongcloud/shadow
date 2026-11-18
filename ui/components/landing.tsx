@@ -15,6 +15,7 @@ import { UnderTheHood } from "@/components/landing/under-the-hood";
 import { CompareStrip } from "@/components/landing/compare-strip";
 import { ClosingCta } from "@/components/landing/closing-cta";
 import { TipsSection } from "@/components/landing/tips";
+import { DotMatrixSteps } from "@/components/landing/dot-matrix-steps";
 import { useReveal } from "@/components/landing/lp-utils";
 import "@/components/landing/landing.css";
 
@@ -30,6 +31,7 @@ export function Landing() {
         <MarqueeBanner />
         <StackStrip />
         <HowItWorks />
+        <DotMatrixSteps />
         <Bento />
         <ProductShowcase />
         <Developer />
