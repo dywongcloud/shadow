@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-11-17 - "Own your cloud" draws the same detailed globe
+
+The share card got the blue nodes, links and lit horizon in the previous
+commit; the landing keystone was deliberately left as a bare wireframe. The
+owner asked for the same detail on "Own your cloud". Both surfaces now call
+`globeSvgMarkup` with no switch at all.
+
+- Deleted the `detail` option. It had exactly one `true` caller and one bare
+  caller, so it was a branch with no remaining reason: the landing keystone,
+  the share card and the /new empty state all describe one globe. This also
+  resolves the adversarial verifier's unused-export objection: `GLOBE_VIEWBOX`,
+  `GLOBE_WIDTH`, `GLOBE_HEIGHT` and `GLOBE_PATHS` are now module-local, leaving
+  only `GLOBE_STROKE` and `globeSvgMarkup` exported (both used by two callers).
+- `landing.css` print and forced-colors rules now repaint the node rects' dark
+  fill as well as their stroke, so the nine squares stay legible on white paper
+  and in high-contrast mode. Built CSS carries both `fill:#0000!important` and
+  `fill:canvas!important` rules.
+- The share card is byte-identical to the previous commit (148926 bytes,
+  sha256 d782d5c6...), so enabling detail on the keystone changed no other
+  surface.
+
+Witness: production `next start` build of a scratch copy (`BUILD_EXIT=0`);
+headful Chromium DOM measurement at 320/360/390/768/1024/1440 px showed 30
+paths, 18 node rects and 1 limb gradient, an unchanged 2.688:1 ratio,
+`svgBottomOffset=-1` and `overflowX:false` at every width. Headful captures
+were written for 320/360/390/768/1440 px; the 1024 px viewport capture timed
+out repeatedly and is DOM-witnessed only. `tsc`, `tsc-ci`, lint and
+`check-contract-bindings.py --check` all exit 0. Local commit only: no push,
+no roll.
+
 ## 2026-11-17 - link preview: restore blue nodes and a lit horizon
 
 The first replacement of the crappy dome kept the /new wireframe but lost the

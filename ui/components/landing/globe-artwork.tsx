@@ -1,12 +1,12 @@
 import { GLOBE_STROKE, globeSvgMarkup } from "@/components/globe-art";
 
-/** The /new deployment globe, drawn from the ONE markup builder that also
- *  builds the social card (`app/opengraph-image.tsx`). `public/globe-dark.svg`
- *  is the source the seven strokes are transcribed from and still renders
- *  /new's own empty state. The markup is a module constant, never user input:
- *  it carries no SMIL, no nodes, no counts and no regions; the card text
- *  carries the meaning. `idPrefix` keeps two instances from sharing an id.
- *  `lp-globe-art` lets print and forced-colors repaint the literal stroke. */
+/** "Own your cloud" keystone globe: the SAME /new artwork the share card and
+ *  the /new empty state draw -- seven wireframe strokes, nine blue node
+ *  squares, twelve links and a blue-white lit horizon. The markup is a module
+ *  constant, never user input: no SMIL, no counts, no regions; the card text
+ *  carries the meaning. `idPrefix` keeps this instance's gradient ids apart
+ *  from the share card's. `lp-globe-art` lets print and forced-colors repaint
+ *  the literal strokes. */
 export function GlobeArtwork({ className, idPrefix }: { className?: string; idPrefix: string }) {
   return (
     <div

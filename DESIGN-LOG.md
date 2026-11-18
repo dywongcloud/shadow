@@ -1610,3 +1610,122 @@ horizon arc measured 7144 while crisp blue accents rose from 0 to 2408.
 - [x] Objects resolved with premise tests: M3, M4, M5.
 - [x] Final-state re-measurement, Anchor Ledger, double loop: sections 4-6.
 - [x] Final reply states mode, tools, stop conditions and skipped steps.
+
+
+---
+
+## Bounded run 2026-11-17 (third) -- "Own your cloud" gets the detail
+
+Mode: **Adaptive** (MAYA), same reason as the preceding two bounded runs: a
+public branded card where the advanced pole (the lit horizon and blue nodes)
+and the acceptable pole (no layout regression at phone width, no text
+intrusion) must both hold. Appended; the earlier OPEN frontiers are NOT
+claimed closed. No Lite mode was requested.
+
+### 1. Traversal Plan and Frontier
+
+Tools used: `Read`, `Edit`, `Write`, `Bash` for `sharp` rasterisation and
+`curl`, headful `bsk` Agent Window + `bsk emulate`. Graph renderer,
+workflow-state tool, Pugh-Matrix branch, artifact page: none used.
+
+| Candidate | Reached via | Status |
+| --- | --- | --- |
+| C1 pass `detail:true` in `GlobeArtwork` | brief | TAKEN then SUPERSEDED by M1 |
+| C2 delete the `detail` switch entirely (one shared artwork) | dotted counterpoint to C1 | TAKEN (M1) |
+| C3 repaint node-rect fills for print/forced-colors | solid (M1 consequence) | TAKEN (M2) |
+| C4 measure at six widths | back-reference | TAKEN (M3) |
+| C5 seven-seat Adaptive panel, W1/W2 WHOLE rounds | `maya` | DEFERRED |
+| C6 operator-authorised roll/deploy | one-way door | DEFERRED (no operator word) |
+
+### 2. Decision Records
+
+- **M1 (BREAK, replaces C1)**: remove `detail` instead of adding a second
+  `true` caller. Depends on: none. Formal argument: a branch with one `true`
+  and one bare caller is a decision the owner has now overruled; both surfaces
+  describe one globe, so the switch earns nothing. Alternatives rejected:
+  keep the flag for a hypothetical future bare variant (no such caller exists,
+  and `AGENTS.md` says pressure removes what the change did not need); copy
+  the detail markup into `GlobeArtwork` (two renderers drift). Consequence:
+  the /new empty state still renders the bare source asset, which is the
+  third representation -- documented in `AGENTS.md`. Also made four constants
+  module-local, closing the previous run's unused-export objection.
+- **M2 (KEEP-THE-RULE)**: the node rects carry `fill="#04070e"`, which the
+  existing print/forced-colors rules did not touch (they only repainted
+  `[stroke]`). Added `.lp-globe-art rect` fill rules; verified both in the
+  built CSS (`fill:#0000!important`, `fill:canvas!important`). Fence: print
+  is a surface in `landing/AGENTS.md`; dark squares would otherwise print as
+  solid black blocks on white paper.
+- **M3 (KEEP-THE-RULE)**: measured at six widths. 30 paths, 18 rects, 1
+  limb gradient, ratio 2.688, bottomOffset -1, no horizontal overflow at
+  every width. Overruled the transient `svgW=0` reading by measuring the
+  parent chain in a fresh session (771x287 at 1440). Alternatives rejected:
+  trusting the first transient measurement.
+
+### 3. Panel Reports
+
+| Round | Critic | Observed | Verdict |
+| --- | --- | --- | --- |
+| R0 | owner's direct instruction | the keystone lacked the horizon and nodes while the share card had them | OBJECT, resolved by M1 |
+| R1 | measured production build | 18 rects / 1 limb / 30 paths in HTML; share card byte-identical | PASS |
+
+Statements of meaning: one globe, three surfaces, no bare variant. Artist
+question: do nine blue squares crowd the 320 px card? Measured: the globe is
+257x96 there and the squares remain distinct in the capture. Andon: none.
+
+### 4. Anchor Ledger
+
+| Anchor | Status | Evidence |
+| --- | --- | --- |
+| One shared geometry, no surface-specific decoration switch | KEEP | `detail` removed; both callers pass the same options |
+| MAYA advanced/acceptable poles | KEEP | detail added; ratio and overflow unchanged at six widths |
+| Print and forced-colors are surfaces | KEEP | node-fill rules in built CSS |
+| World-scoped one-way door (push/roll) | DEFERRED | no operator word |
+
+### 5. Step 2g final-state re-measurement
+
+Measured AFTER the last edit: landing 200; keystone SVG 30 paths / 18 rects /
+1 linearGradient / ids `lp-keystone-grad`, `lp-keystone-limb`; share card
+200 / 148926 B, sha256 `d782d5c6...`, byte-identical to the previous commit.
+Six-width DOM: ratio 2.688 and overflowX false at every width. Built CSS
+carries both repaint rules. `TSC_EXIT=0`, `TSC_CI_EXIT=0`, `LINT_EXIT=0`,
+`BUILD_EXIT=0`, `BINDINGS_EXIT=0`, `DIFFCHECK_EXIT=0`. Rasterised the shared
+detailed globe: 30631 blue pixels, 2262 white. No test files written.
+
+### Stop test -- NOT MET
+
+S1, S2, S3, S5: **NOT MET** (no seven-seat panel, no W1/W2 WHOLE rounds).
+S4: **PARTIAL** -- M1 escalated the shared primitive with a measured removal
+of a branch, but no WHOLE round confirmed it. The run is INCOMPLETE. Resume
+point: this section; seat the seven critics, run W1/W2, resolve OBJECTs,
+re-run Step 2g. C6 needs the operator's word because `git push` auto-deploys.
+
+### Skipped
+
+Seven-seat panel, W1/W2 WHOLE rounds, Pugh-Matrix branch, frame swap, graph
+renderer, workflow-state tool, artifact page: NOT RUN. Authenticated live
+`https://shadw.cloud/new` headful render: NOT RUN. Computed print and
+forced-colors repaint: NOT RUN headfully; only built-CSS presence verified.
+1024 px viewport screenshot: repeatedly timed out; DOM-witnessed only, and
+the stale bare-globe image was removed from the preview rather than shown as
+current. Push, roll, deploy, branch, worktree: NONE. Test files, mocks,
+secrets, graphical symbols: NONE. Earlier OPEN frontiers remain OPEN.
+
+### Double loop
+
+The criterion failed the work again: MAYA's acceptable pole needs a rendered
+card and the panel was never seated. Amendment: add a "One Artwork, No
+Surface Switch" node adjacent to `Single Source of Truth` -- a decoration
+flag whose callers all pass the same value is a branch to delete, not a
+configuration surface. Carry-forward fact for `DESIGN-CARRY-FORWARD.md`:
+adding filled `<rect>` nodes to an inline SVG requires print/forced-colors
+`fill` rules in addition to the existing `[stroke]` rules; measured in the
+built CSS as `fill:#0000!important` and `fill:canvas!important`.
+
+### Compliance Check (this bounded run)
+
+- [x] Tooling inventory, mode with reason, seed, living Frontier, BREAK: sections 1-2.
+- [x] Decision Record before each move with dependencies: section 2.
+- [ ] Panel Report from a compliant seven-seat panel and WHOLE rounds S1-S5: NOT MET.
+- [x] Objections resolved with premise tests: M1, M3.
+- [x] Final-state re-measurement, Anchor Ledger, double loop: sections 4-6.
+- [x] Final reply states mode, tools, stop conditions and skipped steps.

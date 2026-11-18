@@ -574,14 +574,22 @@ html:has(.lp-hero) {
   height: auto;
   pointer-events: none;
 }
+/* the globe's node squares are the only <rect>s in .lp-globe-art; they carry a
+   dark fill, so print and forced-colors must repaint it as well as the stroke */
 @media print {
   .lp-globe-art [stroke] {
     stroke: #000 !important;
+  }
+  .lp-globe-art rect {
+    fill: transparent !important;
   }
 }
 @media (forced-colors: active) {
   .lp-globe-art [stroke] {
     stroke: CanvasText !important;
+  }
+  .lp-globe-art rect {
+    fill: Canvas !important;
   }
 }
 

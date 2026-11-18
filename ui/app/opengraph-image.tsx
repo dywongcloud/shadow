@@ -9,11 +9,10 @@ export const contentType = "image/png";
  *  masks, gradients and strokes are the rasteriser's, not its CSS subset's.
  *  `globeSvgMarkup` carries no inline CSS (the asset's display-p3 stroke and
  *  mask-type:alpha are not portable), and the literal stroke is legible on the
- *  black card. `detail` adds the lit horizon, blue links and nine node squares
- *  the old hand-drawn card had; the landing keystone draws the same geometry
- *  without them. The diffuse blue corner wash is gone: its light came from no
- *  object on the page, and it hazed the whole right half of the card. */
-const GLOBE_URI = `data:image/svg+xml;base64,${Buffer.from(globeSvgMarkup({ stroke: GLOBE_STROKE, idPrefix: "share", detail: true })).toString("base64")}`;
+ *  black card. The same markup draws the /new globe, the landing keystone and
+ *  this share card: blue nodes, links and a lit horizon on one geometry. The
+ *  diffuse blue corner wash is gone: its light came from no object on the page. */
+const GLOBE_URI = `data:image/svg+xml;base64,${Buffer.from(globeSvgMarkup({ stroke: GLOBE_STROKE, idPrefix: "share" })).toString("base64")}`;
 
 /** Default social / AI-search preview card (1200×630) for every page that declares none: self-contained (system font, no external fetch) so it builds under the self-hosted node runtime. */
 export default function OpengraphImage() {
