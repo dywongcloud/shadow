@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-11-17 - Lit V3 blind-admin design: Phase 1+2 delivered, Phase 3 HELD
+
+`docs/lit-blind-admin-design.md` records the research, architecture analysis,
+four sequence diagrams, API contract and cost analysis for using Lit Protocol
+so platform admins hold no tenant secrets. An 8-surface adversarial gm swarm
+(`wf_5eca5f37-3c1`) derived 3 refutable claims and attacked them across
+correctness, security and roll-gate lenses; the deriver's global finding was
+INFEASIBLE and every landed refuter vote was REFUTED.
+
+Measured corrections to the brief: Chipotle IS current v3; decryption is
+`Lit.Actions.Decrypt({ pkpId, ciphertext })`, not `decrypt()`; action CIDs are
+derived from code sent with the request and bound by an on-chain group;
+`Lit.Auth`/`jwt` are deprecated in Chipotle; no in-action RS256/JWKS helper
+exists and an immutable CID cannot pin a rotating issuer; whatever `main`
+returns reaches the CALLER, so a platform-brokered decrypt hands the operator
+the plaintext seed; `api.clerk.com/v1/jwks` is secret-key gated and Clerk
+session tokens are user-bound, wrong for CI/CD; Iroh has no smart contracts or
+consensus; canonical state here remains ONE in-memory representation
+(`state.json` + `store_sync`). Litebox is not a hardware TEE: guest and
+enforcement share one address space, seccomp-bpf is the only backstop, and
+teardown never wipes RAM. Chipotle bills `$0.01 per Lit Action execution
+SECOND`, not per decrypt; 10,000 sessions/day costs $100/day at one call per
+session versus $20,000/day at one call per file, and $0/day with client-held
+keys.
+
+The second question, Seed Expiration Caching in the authentication gateway,
+is REFUTED as specified. An
+executed witness (`/private/tmp/lit-cache-witness-20261117/cache-cost.json`,
+sha256 `257388e86d5c9dcffa68ce57f6889da51fb3383d6811b7dbc7eb5de956b2720c`)
+shows a 15-minute gateway cache buys at most $95/day on a line already 200x
+below the per-file baseline, saves $0 when deploys are evenly spaced, and
+yields $30/day with six node-local caches under round-robin DNS. A rolling TTL
+never expires when deploys are 5, 10 or 14 minutes apart, so the plaintext
+master seed is effectively permanent in gateway RAM under exactly the targeted
+workload. Caching CIPHERTEXT, non-secret usage-key bindings, or an
+absolute-TTL zeroizing cache inside an attested memory-encrypted CVM are the
+salvageable forms; `docs/lit-blind-admin-design.md` spells out all three.
+
+Phase 3 is HELD: the brief stops for approval after Phases 1 and 2, no
+approval has been received, tool results are not user input, there is no roll
+word in the request, and a `git push` auto-deploys through two triggers. Held
+row with 8 acceptance criteria: `.gm/prd/lit-blind-admin-2026-11-17.yml`. No
+production code, no push and no roll. A credential pasted in plaintext in the
+originating request was neither read, echoed, stored nor used and must be
+rotated; no secret-shaped literal appears in any artifact.
+
 ## 2026-11-17 - comparison rival marks and a dot-matrix horizon
 
 The four `/compare/*` pages, the `/compare` index, the comparison nav, the
