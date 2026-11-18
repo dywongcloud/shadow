@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-11-17 - tips and donations on eight EVM networks
+
+A quiet "Leave a tip" section now sits on the landing page just above the
+dot-matrix horizon, and a dedicated `/tips` page carries the same panel with
+its own `pageMeta`, canonical and dark viewport. `ui/lib/tips.ts` is the one
+source of truth: the operator-supplied address
+`0x7874258AcBcE8ADF90693B2ad6b0A9481A0AB1CD` and the eight network names
+(Ethereum, Optimism, Base, Arbitrum, Polygon, Avalanche, Monad, ZKsync).
+The address is a public identifier, never a secret; it is a display constant
+and is never interpolated into a URL, HTML attribute or `Location`.
+
+The supplied mixed-case address was verified as a correct EIP-55 checksum
+against a local pure-Python Keccak-256 (the empty-input vector matched
+`c5d24601...d85a470`), so a wallet that checks the checksum accepts it.
+The 42-character address stays one text node with `overflow-wrap: anywhere`:
+it wraps at 320 px without clipping, and a screen reader or a manual text
+selection sees the exact string (no `<wbr>` inserting a pause). The copy
+button uses `navigator.clipboard.writeText`; a refused
+clipboard selects the address instead and says so in an `aria-live` status,
+with no `alert`. Print hides the control and prints the address in black on
+white; forced-colors repaints it as `CanvasText`.
+
+Registering `/tips` touched `proxy.ts` (`isPublic`, `isClerkFree`,
+`PUBLIC_PAGES`), `next.config.mjs` (`publicPaths` and the private-cache
+catch-all exclusion), `sitemap.ts` and the `MarketingShell` footer. The
+primary product nav was left on product surfaces; the landing section and
+the footer link are the discovery paths.
+
+No push and no roll: `git push` auto-deploys through two triggers, so that
+needs the operator's word.
+
 ## 2026-11-17 - Lit V3 blind-admin design: Phase 1+2 delivered, Phase 3 HELD
 
 `docs/lit-blind-admin-design.md` records the research, architecture analysis,

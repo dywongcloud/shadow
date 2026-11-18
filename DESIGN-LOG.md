@@ -1821,3 +1821,100 @@ are the observed artifact.
 Resume point: seat the seven-seat panel on the four headful captures and the
 live canvas export, run two WHOLE rounds, push the Breaker further with a
 measured delta, then close S1-S5.
+
+---
+
+## Bounded run 2026-11-17 (fifth) -- tips on eight EVM networks
+
+Mode: **Adaptive** (a public support surface: the advanced pole is one
+checksum-verified address shared across eight networks; the acceptable pole is
+a copy button that never fails silently, an address that never clips at
+320 px, and paper/forced-colors legibility). Tooling inventory: gm
+`codesearch`/`phase_status`/`git_status`/`fs_read`/`fs_write`/`fs_edit`;
+pure-Python Keccak-256 for the EIP-55 checksum; `next start` on a clean
+production build of a scratch copy; headful Chromium through `bsk`. No graph
+tool, no workflow engine, no seven-seat panel was seated this run.
+
+### Traversal Plan and living Frontier
+
+Seed: `Honest Content` -> `Single Source of Truth` -> `Respect the Medium`
+(BREAK: a donation address is one exact string, so do not split it for
+layout) -> dotted counterpoint `MAYA: Advanced vs Acceptable`.
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| Verify the supplied address before printing it | outgoing `grounds` | Honest Content | TAKEN (M9) |
+| One constant for address and network names | outgoing `extends` | Single Source of Truth | TAKEN (M10) |
+| Register `/tips` on every public-route surface | incoming `grounds` | Respect the Medium | TAKEN (M11) |
+| Split the address into chunks for a 320 px wrap | dotted `counterpoint` | MAYA | **SCRAP (M12)** |
+| Print/forced-colors fallback for the address | incoming `grounds` | Respect the Medium | TAKEN (M13) |
+| Seven-seat panel and WHOLE rounds | dotted `counterpoint` | MAYA | DEFERRED (not seated) |
+
+### Decision Records
+
+- **M9 (KEEP-THE-RULE)** Verify the mixed-case address with a local
+  pure-Python Keccak-256 before shipping it. Witness: empty-input vector
+  `c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470` matched,
+  and the supplied string equalled its own EIP-55 checksum. Alternatives
+  rejected: (a) print it without checking -- a mistyped checksum loses funds;
+  (b) lowercase it -- changes the operator's exact string.
+- **M10 (KEEP-THE-RULE)** `ui/lib/tips.ts` holds the address and the eight
+  names; the landing section and `/tips` page both render `TipsPanel`.
+  Dependents: M10 -> M12, M13. Consequence: one place to correct a network.
+- **M11 (KEEP-THE-RULE)** Register `/tips` in `proxy.ts` (isPublic,
+  isClerkFree, PUBLIC_PAGES), `next.config.mjs` (publicPaths and the
+  private-cache catch-all exclusion), `sitemap.ts` and the footer. Witness:
+  `/tips` answers 200 with `cache-control: public, max-age=300` (the public
+  rule, not the private catch-all), and `sitemap.xml` lists it. The primary
+  product nav was deliberately left on product surfaces.
+- **M12 (BREAK, then SCRAP)** First attempt split the address into two
+  `whitespace-nowrap` spans with a `<wbr>` so it wrapped at 320 px without
+  tearing a hex token. Measured: `textContent` and a manual `Range`
+  selection both gave the exact 42-character string, but the accessibility
+  tree read a **space** at the `<wbr>`, so a screen-reader user would hear a
+  pause in an address that must be copied byte-exactly. SCRAP. Substitute:
+  one text node with `overflow-wrap: anywhere`. Re-measured at
+  320/360/390/768/1024/1440 px: exact string, one child node, `clipped:
+  false`, `wellClipped: false`, `overflowX: false` at every width.
+- **M13 (KEEP-THE-RULE)** Print hides the button and prints the address in
+  black; forced-colors repaints it as `CanvasText`. Both rules were found in
+  the built CSS.
+
+### Panel Reports
+
+NOT SEATED. No independent critics were run this run; the six-width DOM
+sweep, the clipboard success/refusal witnesses and the built-CSS audit are
+measurements, not a panel.
+
+### Anchor Ledger
+
+| Anchor | Role | Status | Evidence |
+| --- | --- | --- | --- |
+| Honest Content | stance | KEEP | checksum verified; no unverified "goes straight to" claim |
+| Single Source of Truth | rule | KEEP | one `ui/lib/tips.ts`, one `TipsPanel` |
+| Respect the Medium | rule | KEEP | 44 px target, single text node, no `<wbr>`, no `alert` |
+| MAYA: Advanced vs Acceptable | counterpoint | ADAPT | M12 SCRAP after the accessibility-tree measurement |
+| Sampling Source Provenance | amendment from run 4 | KEEP | no third-party logo or badge was introduced |
+
+### Compliance Check
+
+- [x] Tooling inventory and Adaptive mode with reason: above.
+- [x] Seed, exact labels, living Frontier: above.
+- [x] At least one BREAK move taken (M12, then SCRAP with a measured reason).
+- [x] Decision Record per move with dependencies and fences: above.
+- [ ] A Panel Report from a compliant seven-seat panel: **NOT MET**.
+- [ ] WHOLE rounds and S1-S5: **NOT MET** (S1 has one DEFERRED item; S2-S5
+  not run). No quota was used as a stopping rule.
+- [x] Final-state re-measurement: tsc, tsc-ci, lint, bindings `--check`,
+  `git diff --check` and a clean production build exit 0 after the M12 fix;
+  six-width headful sweep; both clipboard paths wrote/selected the exact
+  address; print and forced-colors rules present in the built CSS.
+- [x] Double loop: the criterion (MAYA) did not fail; the panel was not
+  seated, a process gap. Amendment: add a "Do Not Split Identifiers" node
+  beside "Honest Content" -- a layout `<wbr>` in a value that must be copied
+  byte-exactly is a correctness regression even when `textContent` is exact.
+- [ ] Carry-forward ledger entry written to `DESIGN-CARRY-FORWARD.md`: NOT MET.
+
+Resume point: seat the seven-seat panel on the `/tips` capture, run two
+WHOLE rounds, push the Breaker further with a measured delta, then close
+S1-S5.
