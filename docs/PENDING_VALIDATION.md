@@ -32,5 +32,10 @@ once, fixes only what fails, reruns only what failed, then pushes.
 - `cargo run -p hive-contract --locked --offline --bin contract-persist`: `RESULT: ALL PROBES PASSED`, exit 0.
 - `cargo test -p hive-contract --locked --offline`: exit 0.
 
-No push or roll was performed: a `git push` auto-deploys through the webhook and
-`git::spawn_git_poll_reconcile` triggers, which needs the operator's word.
+At the operator's word on 2026-11-18 the UI roll ran on the six live hosts:
+`--tags ui --limit 'fc-orlando:va:va3:sj:sj7:phx'`, `ROLL_UI_EXIT=0`,
+`UI VERIFIED 6/6` on BUILD_ID `KkqEqBbjz9BLAsjQoK82Y`, failed=0 unreachable=0.
+All six nodes answer 200 on `/tips` and `/` from their own loopback; the running
+controller binary is unchanged. The push follows separately; CI on the pushed SHA
+is watched. The backend roll remains HELD: it would restart the control-plane
+chain head and ship Rust not named by this request. See CHANGELOG.md 2026-11-18.

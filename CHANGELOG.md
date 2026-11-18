@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-11-18 - roll the latest UI to the six live hosts
+
+At the operator's word, `ansible/playbooks/parallel-deploy.yml --tags ui
+--limit 'fc-orlando:va:va3:sj:sj7:phx'` rolled the tree at
+3c34488710c8aecb7ca94159bff313749684d6c5. Pre-roll gate
+`scripts/audit-secret-keys.sh` passed 6/6 live hosts, skipped 0;
+`ansible-playbook --syntax-check` and `ansible -m ping` passed on all
+six. `ROLL_UI_EXIT=0`, `failed=0 unreachable=0` on every host, and
+`UI VERIFIED: 6/6 hosts serving BUILD_ID KkqEqBbjz9BLAsjQoK82Y` against
+one canonical build.
+
+Verified from each node's own loopback :3002, never the laptop: before the
+run all six served `/tips` as a 307 to `/sign-in` on BUILD_ID
+XzWl6SEn1_MmTmp5FRfbo; after it `/tips` and `/` both answer 200 on
+KkqEqBbjz9BLAsjQoK82Y. The 14 `hive_retired=true` inventory lines were
+not targeted: the live-only `--limit` resolves to exactly six hosts.
+The running controller binary is unchanged on all six (01b8f355cf98,
+hive-node and hive-ui both active), proving no backend restart happened.
+
+No backend roll was run. The 28 changed files are UI and docs only; HEAD
+adds no Rust beyond bf0eb806, whose CI is 11/11 green, but the fleet's
+running controller still predates three already-pushed Rust commits and
+two HELD validation rows name Rust behaviour. A `--tags backend` run
+would restart the control-plane chain head and ship Rust this request did
+not name, so it remains a separate operator decision.
+
+Gates on the rolled tree: `cargo test --workspace --locked` rerun (61
+`test result:` lines, 0 FAILED, exit 0), `sh scripts/cli-acceptance.sh`
+(35 passed, 0 failed), `check-contract-bindings.py --check` (PASS),
+`npx tsc --noEmit`, tsconfig.ci.json, `npm run lint` and
+`git diff --check` all exit 0. One gateway test
+(`wait_until_lease_held_open_after_response_for_a_bun_function`) failed
+under load with 404, then passed alone and on the full-suite rerun;
+recorded as a load-sensitive flake, not a fix.
+
 ## 2026-11-17 - tips and donations on eight EVM networks
 
 A quiet "Leave a tip" section now sits on the landing page just above the
