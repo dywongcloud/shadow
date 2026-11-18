@@ -793,7 +793,10 @@ impl Store {
             detail: format!("entry {seq} does not serialize: {e}"),
         })?;
         line.push('\n');
-        let f = self.seg.as_mut().expect("segment opened above");
+        let f = self.seg.as_mut().ok_or_else(|| StoreError::Io {
+            op: "append entry".into(),
+            detail: format!("no open segment for window base {wbase}"),
+        })?;
         f.write_all(line.as_bytes())
             .await
             .map_err(io("append entry"))?;

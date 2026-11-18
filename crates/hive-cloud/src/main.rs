@@ -2302,7 +2302,17 @@ pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client>
     > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = format!("{ip}|{api_host}");
-    if let Some(c) = cache.lock().unwrap().get(&key) {
+    // A poisoned lock on this cache is recoverable: the guarded value is a pure
+    // HashMap<key, Client> with no cross-field invariant, so the inner map is
+    // still valid. Panicking here would take down a serving request.
+    if let Some(c) = cache
+        .lock()
+        .unwrap_or_else(|p| {
+            tracing::warn!("leader client cache lock poisoned; recovered inner map");
+            p.into_inner()
+        })
+        .get(&key)
+    {
         return Some(c.clone());
     }
     let addr = std::net::SocketAddr::new(ip.parse::<std::net::IpAddr>().ok()?, 443);
@@ -2313,7 +2323,10 @@ pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client>
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .ok()?;
-    cache.lock().unwrap().insert(key, client.clone());
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(key, client.clone());
     Some(client)
 }
 
@@ -2525,13 +2538,25 @@ async fn dashboard_proxy(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let _ = http;
-    static NOFOLLOW: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let http = NOFOLLOW.get_or_init(|| {
-        reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .expect("reqwest client")
-    });
+    static NOFOLLOW: std::sync::OnceLock<Option<reqwest::Client>> = std::sync::OnceLock::new();
+    // A no-redirect client is load-bearing for the Clerk auth loop: a 3xx must
+    // bounce the BROWSER, never be followed server-side. If the TLS backend
+    // cannot build one, answer 502 instead of panicking on a serving request.
+    let Some(http) = NOFOLLOW
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .ok()
+        })
+        .as_ref()
+    else {
+        return (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "dashboard proxy client unavailable",
+        )
+            .into_response();
+    };
     let public_host = req
         .headers()
         .get(axum::http::header::HOST)
