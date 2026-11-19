@@ -36,6 +36,15 @@ once, fixes only what fails, reruns only what failed, then pushes.
 - `cargo run -p hive-contract --locked --offline --bin contract-persist`: `RESULT: ALL PROBES PASSED`, exit 0.
 - `cargo test -p hive-contract --locked --offline`: exit 0.
 
+Headful browser witness (2026-11-19): production scratch build RIZdUXwd0ho2Y3WLV8O6b
+exit 0; six widths 320/360/390/768/1024/1440 with 29 rows and 8 groups each,
+no overflow, catalog rows all >=44px, prices render from rate_card.catalog, absent
+values print "-", indexed rows print "Not billed" (never $0.00 beside "-"), and an
+older-node payload without catalog prints the exact empty state with 0 invented
+rows. RESULT gm_dispatch=1795069190252-7662-6e49246a75994245. Two PRE-EXISTING
+dashboard chrome deviations measured but not in scope: main gutter 13.3/19.95px
+(not 16px) and 9 main buttons 23.27-31.92px (not 44px); neither is the catalog card.
+
 At the operator's word on 2026-11-18 the UI roll ran on the six live hosts:
 `--tags ui --limit 'fc-orlando:va:va3:sj:sj7:phx'`, `ROLL_UI_EXIT=0`,
 `UI VERIFIED 6/6` on BUILD_ID `KkqEqBbjz9BLAsjQoK82Y`, failed=0 unreachable=0.
