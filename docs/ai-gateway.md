@@ -131,29 +131,43 @@ full upstream body is logged.
 
 ## Failover and bounds
 
-`HIVE_AI_GATEWAY_MAX_ATTEMPTS` defaults to 3 with a hard cap of
-`providers.len().min(4)`. Each attempt has ONE `tokio::time::timeout` of
-`HIVE_AI_GATEWAY_TIMEOUT_MS` (default 45000 ms, hard cap 120000 ms). Non-stream
-bodies are read through `hive_outbound::read_limited` at 2 MiB; SSE is bounded
-by `HIVE_AI_GATEWAY_STREAM_MAX_BYTES` (default 4 MiB) plus a wall deadline and
-a capped line length, never an unbounded `BufReader::lines()`. Retry happens
-ONLY on a connect error, a timeout, HTTP 429 or a 5xx. There is NO retry after
-the first response byte has been streamed, so a client is never billed twice.
-A 4xx other than 429 returns a Vercel-shaped error with one of the fixed safe
-sentences from `hive_outbound::describe`; the upstream body is never forwarded.
+`HIVE_AI_GATEWAY_MAX_ATTEMPTS` defaults to 3 with a hard cap of 4. ONE
+absolute wall deadline `HIVE_AI_GATEWAY_TOTAL_DEADLINE_MS` (default 90000 ms,
+hard cap 110000 ms) covers every attempt AND the upstream body read; it is
+strictly under `ADMIN_REQUEST_TIMEOUT_SECONDS_DEFAULT = 120`, so the admin
+router's `TimeoutLayer` cannot truncate a chain mid-flight. Each attempt takes
+`min(per_provider_timeout, remaining_deadline)`. The upstream response is read
+by `read_bounded_owned`, not `hive_outbound::read_limited`: the latter has a
+byte cap but NO wall deadline, so a slow-drip provider could hang forever.
+`read_bounded_owned` bounds bytes (2 MiB non-stream, 4 MiB SSE), checks the
+deadline inside EVERY `chunk().await`, and does NO line parsing, so a
+newline-free SSE line cannot grow an unbounded String. `stream=true` is a
+BUFFERED relay of the provider's own frames, not an incremental stream.
+Retry happens on a connect error, a timeout, or an upstream 401/403/404/408/
+429/5xx: an upstream auth failure means OUR configured credential is wrong,
+not that the caller is unauthenticated, so it fails over and NEVER propagates
+as a caller 401. A 400 validation error returns immediately. There is NO
+retry after the first response byte, so a client is never billed twice; the
+SSE_FIRST_BYTE_NO_RETRY live witness measures provider A posts=1, fallback
+posts=0 and one streamed generation. All tenant-facing failures use FIXED
+safe sentences; the upstream URL, status and body are never forwarded.
 `HIVE_AI_GATEWAY_MAX_INFLIGHT` (default 32) bounds concurrency and answers 503
-`capacity_exhausted` when full; a `Drop` guard releases the per-request slot on
-client disconnect, including the Err path. `copy_bidirectional` and a `select!`
-over a splice are never used.
+`api_error` when full. An `Inflight` guard OWNS the `reqwest::Response`: on
+client disconnect, axum drops the handler future, the guard drops the
+response, the body stream aborts and the socket closes — not just a counter
+decrement. `copy_bidirectional` and a `select!` over a splice are never used.
+`internal_client()` now sets `.no_proxy()`; a live witness with a dead hostile
+`HTTP_PROXY` confirms the loopback provider still receives the request.
 
 ## Injected content and provenance
 
 The ONLY injected system rule is the language rule.
 `HIVE_AI_GATEWAY_SYSTEM_PROMPT` defaults to text that follows the requested
 language and does not reply in Chinese unless the user explicitly asks for
-Chinese. It is added as an extra system message (OpenAI shapes) or the `system`
-field (Anthropic Messages), before the caller system content, bounded to 4096
-bytes and never logged. NO identity-impersonation prompt is injected: the
+Chinese. It is added as an extra system message (Chat Completions), the
+`instructions` field (Responses API) or the `system` field (Anthropic
+Messages), before the caller system content, bounded to 4096 bytes and never
+logged. NO identity-impersonation prompt is injected: the
 platform never claims the model is Anthropic Claude and never presents an
 upstream model to a paying customer under another vendor brand. `GET /v1/models`
 discloses `owned_by` (the real provider), `upstream_model` (the real upstream
