@@ -2093,6 +2093,32 @@ export interface AiGeneration {
   error?: string | null;
 }
 
+/** One bounded web-search result. Every field is optional: an older node, a redacted
+ *  result or a provider that omits a field stays absent ("-") instead of a fabricated value. */
+export interface AiWebSearchResult {
+  title?: string | null;
+  url?: string | null;
+  snippet?: string | null;
+}
+
+/** Platform-specific standalone search response. billable is a measurement, never a
+ *  default: null means the node did not report it. */
+export interface AiWebSearchResponse {
+  object?: string | null;
+  data?: AiWebSearchResult[] | null;
+  billable?: boolean | null;
+  price_per_1000_usd?: string | null;
+  reason?: string | null;
+}
+
+/** Measured-or-absent web-search configuration from /v1/ai/state. */
+export interface AiWebSearchState {
+  configured?: boolean | null;
+  price_per_1000_usd?: string | null;
+  max_results?: number | null;
+  calls?: number | null;
+}
+
 export interface AiGatewayState {
   node?: string | null;
   node_local?: boolean | null;
@@ -2102,8 +2128,12 @@ export interface AiGatewayState {
   pool?: AiPoolEntry[] | null;
   generations?: AiGeneration[] | null;
   charging_enabled?: boolean | null;
+  web_search?: AiWebSearchState | null;
   /** ONE canonical price card; the dashboard reads prices ONLY from here. */
-  rate_card?: { ai_models?: { id?: string; input_per_million_cents?: number; output_per_million_cents?: number; cache_read_per_million_cents?: number }[] } | null;
+  rate_card?: {
+    ai_models?: { id?: string; input_per_million_cents?: number; output_per_million_cents?: number; cache_read_per_million_cents?: number }[];
+    web_search_per_call_usd?: string | null;
+  } | null;
   catalog_as_of?: string | null;
   residuals?: string[] | null;
 }
@@ -2115,4 +2145,16 @@ export async function getAiGatewayState(opts?: { fresh?: boolean }): Promise<AiG
   const d = await apiGet<AiGatewayState>("/v1/ai/state", opts);
   if (!d) throw new ApiError(401, "AI Gateway state needs a signed-in session");
   return d;
+}
+
+/** Platform-specific standalone web search. The query is bounded before any request so a
+ *  client-side overflow is a typed refusal, never a silent truncation. */
+export async function getAiWebSearch(query: string, maxResults?: number): Promise<AiWebSearchResponse> {
+  if (query.length > 512) {
+    throw new ApiError(400, "Web search query must be 512 characters or fewer.");
+  }
+  return apiSend<AiWebSearchResponse>("POST", "/v1/ai/web-search", {
+    query,
+    max_results: maxResults ?? 5,
+  });
 }

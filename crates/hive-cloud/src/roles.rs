@@ -234,6 +234,10 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/responses", Role::Member),
     rule(POST, "/v1/messages", Role::Member),
     rule(GET, "/v1/admin/ai/economics", Role::Admin),
+    // AI gateway web search: the standalone search by a member is LISTED DELIBERATELY
+    // (an unlisted write is ADMIN by default); the tenant still comes from the
+    // verified JWT claim in the handler, never a header.
+    rule(POST, "/v1/ai/web-search", Role::Member),
 ];
 
 /// The routes the workflow World's queue client token may call: enqueue a delayed callback for its

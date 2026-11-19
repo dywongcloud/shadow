@@ -1,6 +1,7 @@
 "use client";
 
-import { usePoll, type AiGatewayState } from "@/lib/api";
+import { useState, type FormEvent } from "react";
+import { usePoll, getAiWebSearch, ApiError, type AiGatewayState, type AiWebSearchResponse, type AiWebSearchResult } from "@/lib/api";
 import { Card, PageHeader, Badge, StateNotice, Stat } from "@/components/ui";
 import { cn } from "@/lib/utils";
 
@@ -61,6 +62,57 @@ export default function AiGatewayView() {
   };
   const credits = data?.credits ?? null;
   const usage = data?.usage ?? null;
+  const webSearch = data?.web_search ?? null;
+  const webConfigured = boolState(webSearch?.configured, "Configured", "Not configured");
+  const webPricePer1000 = shown(webSearch?.price_per_1000_usd);
+  const webMaxResults = fmtMeasured(webSearch?.max_results);
+  const webCalls = fmtMeasured(webSearch?.calls);
+  const webRatePerCall = shown(data?.rate_card?.web_search_per_call_usd);
+
+  const [webQuery, setWebQuery] = useState("");
+  const [webResult, setWebResult] = useState<AiWebSearchResponse | null>(null);
+  const [webError, setWebError] = useState<string | null>(null);
+  const [webBusy, setWebBusy] = useState(false);
+  const webData = webResult?.data ?? null;
+  const webRows: AiWebSearchResult[] | null = Array.isArray(webData) ? webData : null;
+  const webReason = (() => {
+    const reason = webResult?.reason ?? webError;
+    return typeof reason === "string" && reason.trim() !== "" ? reason : null;
+  })();
+  const webBilling = webResult?.billable === false
+    ? "Not billed"
+    : webResult?.billable === true
+      ? shown(webResult?.price_per_1000_usd ?? data?.rate_card?.web_search_per_call_usd)
+      : ABSENT;
+  const webNotice = webError
+    ? (webReason ?? "Web search is unavailable right now.")
+    : webSearch?.configured === false
+      ? (webReason ?? "Web search is not configured on this node.")
+      : webResult && (!webRows || webRows.length === 0)
+        ? (webReason ?? "No results were returned for this query.")
+        : null;
+
+  async function submitWebSearch(e: FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    if (webBusy) return;
+    const q = webQuery.trim();
+    if (!q) {
+      setWebResult(null);
+      setWebError("Enter a search query.");
+      return;
+    }
+    setWebBusy(true);
+    setWebError(null);
+    setWebResult(null);
+    try {
+      const r = await getAiWebSearch(q, 5);
+      setWebResult(r ?? null);
+    } catch (err) {
+      setWebError(err instanceof ApiError && err.message ? err.message : "Web search is unavailable right now.");
+    } finally {
+      setWebBusy(false);
+    }
+  }
 
   const modelsAvailable = (() => {
     if (!models) return ABSENT;
@@ -220,6 +272,61 @@ export default function AiGatewayView() {
             ))}
           </div>
         )}
+      </Card>
+
+      <Card className="mt-4 min-w-0 w-full max-w-full">
+        <h2 className="min-w-0 w-full max-w-full break-words text-lg font-semibold">Web search</h2>
+        <p className="mt-1 min-w-0 w-full max-w-full break-words text-sm text-secondary">
+          Server-side search with measured billing. Missing configuration stays -.
+        </p>
+        <div className="mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-4">
+          <div className={cellClass()}><span className={cellClass("block text-xs text-muted")}>Configured</span><span className={cellClass()}>{webConfigured}</span></div>
+          <div className={cellClass()}><span className={cellClass("block text-xs text-muted")}>Price per 1,000 searches</span><span className={cellClass("tabular-nums")}>{webPricePer1000}</span></div>
+          <div className={cellClass()}><span className={cellClass("block text-xs text-muted")}>Max results</span><span className={cellClass("tabular-nums")}>{webMaxResults}</span></div>
+          <div className={cellClass()}><span className={cellClass("block text-xs text-muted")}>Billable calls</span><span className={cellClass("tabular-nums")}>{webCalls}</span></div>
+        </div>
+        <div className={cellClass("mt-3 text-xs text-secondary")}>Rate card price per call: {webRatePerCall}</div>
+        <form onSubmit={submitWebSearch} className="mt-4 flex min-w-0 w-full max-w-full flex-wrap items-center gap-2">
+          <label htmlFor="ai-web-search-query" className="sr-only">Web search query</label>
+          <input
+            id="ai-web-search-query"
+            type="text"
+            value={webQuery}
+            onChange={(e) => setWebQuery(e.target.value)}
+            maxLength={512}
+            required
+            disabled={webBusy}
+            placeholder="Search the web"
+            className="min-h-[44px] min-w-0 w-full max-w-full flex-1 rounded-md border border-border bg-card px-3 py-2 text-sm"
+          />
+          <button
+            type="submit"
+            disabled={webBusy}
+            className="min-h-[44px] min-w-0 max-w-full rounded-md border border-border px-4 py-2 text-sm"
+          >
+            {webBusy ? "Searching" : "Search"}
+          </button>
+        </form>
+        {webNotice ? (
+          <div className="mt-4"><StateNotice tone="muted" className={cellClass()}>{webNotice}</StateNotice></div>
+        ) : null}
+        {webResult ? (
+          <div className={cellClass("mt-4 text-sm")}>
+            <span className={cellClass("text-xs text-muted")}>Billing </span>
+            <span className={cellClass("tabular-nums")}>{webBilling}</span>
+          </div>
+        ) : null}
+        {webRows && webRows.length > 0 ? (
+          <ul className="mt-4 grid min-w-0 w-full max-w-full grid-cols-1 gap-3">
+            {webRows.map((r, i) => (
+              <li key={String(r?.url ?? r?.title ?? "result") + "-" + i} className={cn("min-h-[44px] min-w-0 w-full max-w-full rounded-lg border border-border p-3 text-sm", "flex min-w-0 w-full max-w-full flex-col gap-2")}>
+                <div className={cellClass()}><span className={cellClass("text-xs text-muted")}>Title </span><span className={cellClass()}>{shown(r?.title)}</span></div>
+                <div className={cellClass()}><span className={cellClass("text-xs text-muted")}>URL </span><span className={cellClass("text-secondary")}>{shown(r?.url)}</span></div>
+                <div className={cellClass()}><span className={cellClass("text-xs text-muted")}>Snippet </span><span className={cellClass("text-secondary")}>{shown(r?.snippet)}</span></div>
+              </li>
+            ))}
+          </ul>
+        ) : null}
       </Card>
     </div>
   );

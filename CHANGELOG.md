@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-19 - AI Gateway web search and relay 5.5 aliases
+
+The AI Gateway executes web search as a SERVER-SIDE tool and mounts one platform-specific standalone route, `POST /v1/ai/web-search`; Vercel has no standalone web-search REST endpoint. Tool shapes detected are `web_search`, `web_search_20250305`/`20260209`/`20260318` and `vercel:*_search`.
+ONE bounded search runs per request before the provider attempt loop; a failed or unconfigured search returns a fixed safe error, never ungrounded inference. The query travels in a POST JSON BODY, never a URL: `Url::set_path` addresses the operator-configured base through `hive_outbound::client()` for public destinations or `hive_outbound::internal_client()` for an operator-configured loopback provider, and `hive_outbound::validate_fetch_url` admits every result URL. Client-defined tools are not forwarded upstream; results are injected as an explicitly untrusted user message, never into the system prompt.
+Config holds env var NAMES only (`HIVE_AI_WEB_SEARCH_URL`, `HIVE_AI_WEB_SEARCH_CREDENTIAL_ENV`, `HIVE_AI_WEB_SEARCH_TIMEOUT_MS`); no credential value enters config, state, logs, responses or the repo.
+
+Tool-driven inference prices a search from the requested model's published `pricing.web_search`; a model with no published price REFUSES the tool. The standalone route uses the published 10 USD per 1,000 tier: 1 cent = 1,000,000 micro-cents per call. A billable call is a SUCCESSFUL search with a NONEMPTY result array; failure, timeout, empty results and an unconfigured provider are NOT billed, and `billable=false` carries a printed reason. `billable_web_search_calls` is a MEASURED integer or `null` when no search was asked for.
+One billable call writes ONE measurement into `UsageKind::AiWebSearchCalls`, `UsageKind::AiPublicMicroCents` and `UsageKind::AiCogsMicroCents`, folded by the ONE `may_act(BillingMeter)` writer; no `UsageTotals` field or `[u64; 19]` array is widened. Charging stays behind the existing `ai_charging_enabled()` gate and is OFF by default, so the operator absorbs the upstream search cost.
+
+The two relay aliases are now Sonnet 5.5 / Haiku 5.5. Canonical ids stay neutral `shadw/relay-sonnet-5-5` and `shadw/relay-haiku-5-5`, `owned_by` stays the real provider, `upstream_model` is hy4/hy4-flash, and provenance states the platform has NOT verified an Anthropic upstream. NO identity-impersonation prompt is injected; the only injected system rule is the language rule, and the OLD ids and OLD aliases remain as LEGACY aliases.
+
+Residuals: one search per request, no model-driven multi-step tool loop, no `pause_turn`, no provider-native `server_tool_use` blocks, no citations or annotations, no dynamic filtering, no WEB FETCH tool and no free Parallel `fast` mode. The printed limitations and the relay provenance are in `docs/ai-gateway.md`.
+Witnesses for this change are PENDING in `docs/PENDING_VALIDATION.md` (three rows); none has run in this lane. Local work only: no push and no roll without the operator word.
+
 ## 2026-11-19 - AI Gateway REST surface, provider pool and dashboard tab
 
 A Vercel-AI-Gateway-shaped REST surface mounts at the documented paths plus `GET /v1/ai/state` for the dashboard. It is NOT a byte-for-byte clone of the Vercel 518-model catalog: no BYOK, OIDC, budgets, embeddings, images, audio, regional hosting or trace drains.

@@ -21,8 +21,9 @@ documented paths:
 | `GET /v1/report` | bounded, node-labelled generation log over an inclusive UTC date range |
 | `GET /v1/admin/ai/economics` | operator-only COGS and margins |
 | `GET /v1/ai/state` | dashboard aggregate, platform-specific, node-labelled |
+| `POST /v1/ai/web-search` | platform-specific standalone bounded web search |
 
-`GET /v1/ai/state` and `/v1/admin/ai/economics` are platform-specific. The five
+`GET /v1/ai/state`, `POST /v1/ai/web-search` and `/v1/admin/ai/economics` are platform-specific. The five
 Vercel REST reference paths are `/v1/models`, `/v1/models/{creator}/{model}/endpoints`,
 `/v1/credits`, `/v1/generation`, `/v1/report`; the three inference POSTs come from
 Vercel's separate SDK/API pages (Chat Completions, Responses/OpenResponses,
@@ -52,7 +53,7 @@ Vercel documents, and carry ONLY static catalog rows (no tenant, no URL, no
 node name). Tenancy on every other route comes from the verified claim, never
 the `x-hive-team` header. POST inference on `POST /v1/chat/completions`,
 `POST /v1/responses` and `POST /v1/messages` is a Member-floor write. Operator
-economics at `GET /v1/admin/ai/economics` is Admin plus `require_operator`. All
+economics at `GET /v1/admin/ai/economics` is Admin plus `require_operator`. `POST /v1/ai/web-search` is a Member-floor write, listed deliberately in `roles::RULES` because an unlisted write is ADMIN by default. All
 tenant-bearing routes fail closed and are NOT added to `is_open_route`; a role
 is decided once by `roles::RULES` through `roles::gate`, and a tenant read never
 fails open on missing auth.
@@ -85,10 +86,12 @@ residual. Nothing is debited from an AI Gateway wallet on this platform, so
 `total_cost`, `gateway_cost`, `usage`, `surcharge_cost` and
 `upstream_inference_cost` are `null`. The measured market price is exposed under
 its own honest name `public_price_usd`, and `market_cost` carries the same
-published list price. `latency` (time-to-first-token), all `native_tokens_*`
-fields and `billable_web_search_calls` are `null` because a buffered relay cannot
-measure provider-native tokenization, TTFT or a feature that is not implemented.
-`generation_time` is the real wall clock. A not-yet-ingested id answers 404 with
+published list price. `latency` (time-to-first-token) and all `native_tokens_*`
+fields are `null` because a buffered relay cannot measure provider-native
+tokenization or TTFT. `billable_web_search_calls` is the MEASURED integer when
+a web-search tool was requested and `null` when no web-search tool was asked
+for; `web_search_status` names `billed`, `empty_results`, `failed`,
+`unconfigured` or `not_requested`. `generation_time` is the real wall clock. A not-yet-ingested id answers 404 with
 the fixed sentence 'Usage event not found'.
 
 `GET /v1/report` REQUIRES `start_date` and `end_date` in YYYY-MM-DD UTC,
@@ -180,6 +183,19 @@ available on this gateway" and is never silently routed. On the plain public
 also appear with `status` and `available: false`, so a programmatic client can
 tell them apart. `model_not_available` is not a Vercel error type.
 
+## Relay model aliases
+
+The two relay request aliases are now Sonnet 5.5 / Haiku 5.5. Canonical ids stay
+NEUTRAL (`shadw/relay-sonnet-5-5` and `shadw/relay-haiku-5-5`), `owned_by` stays
+the real provider (`shadw-relay`), `provider` stays `local-relay`, and
+`upstream_model` is `hy4` / `hy4-flash`. `GET /v1/models` `provenance` states
+that the platform has NOT verified an Anthropic upstream. NO identity-impersonation
+prompt is injected; the ONLY injected system rule is the language rule. The old
+ids and old aliases remain as LEGACY aliases so existing callers keep resolving.
+The relay catalog rows carry the real Sonnet 5.5 / Haiku 5.5 released dates, tags
+and cache prices from the live catalog read; that is a price disclosure, not a
+claim of an Anthropic upstream.
+
 ## Pricing and billing
 
 Public prices are pinned to the published USD/token prices in the Vercel model
@@ -237,6 +253,98 @@ its own 8 declared payload keys; `CONTRACT_VERSION` stays 1 and the legacy
 every existing signed entry still replays. `contract-billing` submits one real
 sample and proves its inclusion.
 
+## Web search
+
+Web search is a SERVER-SIDE tool the platform executes, not a provider-native
+feature. Vercel has NO standalone `POST /v1/web-search` REST endpoint; the
+platform-specific `POST /v1/ai/web-search` is a convenience route for one
+bounded search. Body `{"query":"...","max_results":N}` answers
+`{"object":"list","data":[{"title","url","snippet"}],"billable":bool,
+"price_per_1000_usd":"10.00"}`. Tenant comes from the verified claim, never a
+header. `billable=false` carries a printed reason; failure is never reported as
+a successful search. All tenant-facing errors are FIXED safe sentences; no
+upstream URL, status or body is echoed.
+
+An explicit allowlist is detected in an inference request `tools` array:
+`web_search` (Responses/OpenAI), `web_search_20250305`, `web_search_20260209`
+and `web_search_20260318` (Anthropic Messages), plus the six Vercel built-ins
+`vercel:{perplexity,parallel,exa,browserbase,deepseek,tako}_search`. Every
+built-in runs through the SAME bounded platform provider; none selects a
+separate provider or price. A `vercel:*_fetch` or `web_fetch*` tool is refused
+with a fixed error, because its `config.url` is tenant-controlled. ONE bounded
+search runs BEFORE the provider attempt loop, inside the ONE absolute inference
+deadline. The query comes from an EXPLICIT `config.query` / `config.objective`
+when present, otherwise the LAST user message text; both are bounded and only
+those two config keys are read.
+
+Results are injected as a plain-text, bounded, explicitly UNTRUSTED `user`
+message, NEVER into `system` or `instructions`: untrusted page text must not
+outrank the operator's language rule, and cross-protocol translation flattens
+only plain text. ALL client-defined `tools` and `tool_choice` are removed from
+the upstream payload, so a native upstream server tool cannot bill the operator
+a second time. A failed or unconfigured search returns a fixed Vercel-shaped
+error with a distinct `web_search_status` rather than silently degrading to
+ungrounded inference.
+
+Operator config holds ENV VAR NAMES only: `HIVE_AI_WEB_SEARCH_URL` (trusted
+base), `HIVE_AI_WEB_SEARCH_CREDENTIAL_ENV` (NAME of the env var holding the
+credential, default `HIVE_AI_WEB_SEARCH_TOKEN`), and
+`HIVE_AI_WEB_SEARCH_TIMEOUT_MS`. NO credential value or key literal enters
+config, `state.json`, logs, responses or this repo; the value resolves
+SERVER-SIDE on the node that serves the request. The base is parsed with
+`Url::parse`, userinfo, query and fragment are refused, the path is set with
+`Url::set_path` from the FIXED constant `/v1/web-search`. A public destination
+uses `hive_outbound::client()` (public-only resolver, no redirect, no proxy);
+an operator-configured loopback or self-hosted provider uses
+`hive_outbound::internal_client()` (no redirect, no proxy), the same sanctioned
+surface as `HIVE_AI_GATEWAY_PROVIDERS`. The URL is validated at registration
+AND before every request. NO tenant string ever reaches a URL: the query goes
+in the POST JSON BODY. Every result URL is checked with
+`hive_outbound::validate_fetch_url` before it is returned as text, so
+`javascript:`, userinfo and non-public hosts are refused; result URLs are never
+fetched and never interpolated into HTML or `Location`. Result count, query,
+title, snippet, context and body bytes are bounded and truncated.
+
+Tool-driven inference prices a search from THIS model's own published
+`pricing.web_search` (USD per 1,000 searches). A model with no published
+`web_search` price REFUSES the tool with a fixed error instead of inventing a
+price. The four catalog rows documenting `web_search: "10"` therefore bill
+1 cent = 1,000,000 micro-cents per call. The platform-specific standalone route
+has no model context and uses that same published "10.00" tier. Vercel also
+publishes 1, 2.5, 5, 14 and 35 USD tiers and separate provider-specific
+built-in prices; those per-variant prices are NOT implemented.
+
+A billable call is a SUCCESSFUL search returning a NONEMPTY results array;
+failed requests, timeouts, empty results and an unconfigured provider are NOT
+billed. One billable call writes ONE measurement into the node-local metering
+sidecar: `UsageKind::AiWebSearchCalls` (+1), `UsageKind::AiPublicMicroCents`
+(+price) and `UsageKind::AiCogsMicroCents` (+price times `cogs_bps()/10000`,
+zero when COGS is unset). The ONE `may_act(BillingMeter)` writer folds
+`ai_public_micro_cents`; there is no second fold loop. NO new `UsageTotals`
+fields and NO `[u64; 19]` widening: `billing::RateCard::cost_cents` already
+sums `ai_public_micro_cents`, and `METER_AI_SAMPLE` already declares
+`ai_web_search_calls`. `ai_margin_rows()` gains `ai_web_search_call` with the
+SAME stated-assumption fraction, so `billing::ai_profitable()` covers it without
+being able to switch all AI charging off. Charging stays behind
+`ai_charging_enabled()`, which is OFF by default: with charging off the operator
+absorbs the upstream search cost (shadow mode). The first meter tick zeroes the
+AI baseline, so a search measured before that tick is a measurement, not a
+charge. The generation row reports the MEASURED `billable_web_search_calls` and
+`web_search_status`; `state_value` discloses `web_search.configured`,
+`price_per_1000_usd`, `max_results`, measured calls and
+`rate_card.web_search_per_call_usd`.
+
+Printed web search residuals: ONE search per request, no model-driven multi-step
+tool loop, no `pause_turn` continuation, no provider-native `server_tool_use`
+blocks, no citations or annotations, no dynamic filtering, no WEB FETCH tool,
+no free Parallel `fast` mode, no provider-specific built-in search variants
+(all built-ins share the one platform provider), client-defined tools are not
+forwarded, result URLs are validated but never fetched, and charging OFF by
+default means the operator absorbs the upstream search cost. Tag/user/quota
+reporting attribution, the charged `/v1/report` query, the Hobby/Pro-trial 403
+plan gate and the per-team 429 rate limit remain unimplemented and are
+unchanged by this feature.
+
 ## Held and refused
 
 ChatGPT.com consumer-web automation and residential-proxy scraping are NOT
@@ -290,12 +398,20 @@ chat transcript, so the operator rotates them.
 - `stream=true` is a BUFFERED, deadline-and-byte-bounded SSE relay (not
   incremental); cross-protocol streaming returns a clear 400 and streaming token
   usage is not measured, so the streaming generation row carries `null` costs
-  and tokens. Web search is not implemented and has no meter, rather than a
-  fabricated zero.
+  and tokens.
+- Web search IS implemented as a server-side tool and a platform-specific
+  standalone `POST /v1/ai/web-search` route: ONE bounded search per request,
+  an operator-configured provider named by ENV VAR NAMES only, priced from each
+  model's published `pricing.web_search` (the standalone route uses the 10.00
+  USD per 1,000 tier), billable ONLY on a successful nonempty result, no charge
+  on failure, empty results or an unconfigured provider, gated by the existing
+  `ai_charging_enabled()`, and the MEASURED `billable_web_search_calls`. The
+  printed limitations are in the "Web search" section above.
 - Vercel's three inference APIs require `model` and `messages`/`input` and
   support `providerOptions.gateway`, reporting headers and tool/structured-output
   fields. This gateway validates only `model` and translates plain text messages;
-  tools, structured output, reasoning options and reporting tags are not
+  ONLY the web-search tool shapes are executed server-side (see "Web search");
+  other tools, structured output, reasoning options and reporting tags are not
   implemented.
 - When a provider omits `usage`, streamed token accounting is unavailable; no
   tokens are invented.
@@ -333,3 +449,13 @@ residuals and `rate_card` prices present. The three sub-44px buttons reported
 on the page come from the pre-existing global `ui/components/gitops.tsx` (the
 new view has no `<button>` at all) and `chromeSmall=5` is identical on `/usage`.
 Local commits only: no push and no roll without the operator word.
+
+Web search residuals are listed in the "Web search" section and in Residuals
+above. The witnesses for web search are PENDING, not run: a real
+`target/debug/hive-cloud` against a fresh empty `HIVE_DATA` plus a loopback
+search stub (tool-driven injection, standalone bounded results, one billable
+call recording exactly one `ai_web_search_calls` and +1,000,000 micro-cents,
+empty results with `billable=false` and zero charge, an unconfigured provider
+with a fixed 400, no secret leak, charging OFF by default and relay 5.5 alias
+resolution), a headful six-width production-build browser witness, and the
+three rows in `docs/PENDING_VALIDATION.md`. No web search witness has run here.
