@@ -11,6 +11,9 @@
 //! Freshness is NOT claimed: an inclusion proof says an entry was published, never that the log
 //! still ends there. No consensus, bond, slash or challenge window is modelled here.
 //!
+//! The additive `meter.catalog.sample` is submitted through the SAME real Engine; its seq joins
+//! the pinned-identity inclusion-proof probe, while every legacy `meter.sample` probe is unchanged.
+//!
 //! Usage: `contract-billing [--dir <path>] [--state <path>]`. Exit 0 on RESULT PASS, 1 on FAIL.
 
 use hive_contract::contract::{Caller, Contract, OpError};
@@ -20,7 +23,8 @@ use hive_contract::persist::{read_entries_from, read_signed_entries_from, Persis
 use hive_contract::signing::{CheckpointSigner, KeyedSigner};
 use hive_contract::{
     billing_meter_contract, ledger_row_value, verify, InclusionProof, LogEntry, Op, OpLog,
-    SignedEntry, BILLING_CHECKPOINT, BILLING_LEDGER, METER_SAMPLE, METER_SKUS,
+    SignedEntry, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, METER_CATALOG_SAMPLE,
+    METER_SAMPLE, METER_SKUS,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -41,6 +45,20 @@ fn meter_payload(tenant: &str, end_ms: u64, n: u64) -> BTreeMap<String, String> 
         ("window_end_ms".to_string(), end_ms.to_string()),
     ]);
     for (i, sku) in METER_SKUS.iter().enumerate() {
+        p.insert((*sku).to_string(), (n + i as u64).to_string());
+    }
+    p
+}
+
+/// The additive second sample: ALL nineteen canonical catalog counters, cumulative values in
+/// CATALOG_SKUS order, plus the target and the window. Its own closed payload schema is separate
+/// from meter_payload's twelve legacy keys.
+fn catalog_payload(tenant: &str, end_ms: u64, n: u64) -> BTreeMap<String, String> {
+    let mut p = BTreeMap::from([
+        ("tenant_tag".to_string(), tenant.to_string()),
+        ("window_end_ms".to_string(), end_ms.to_string()),
+    ]);
+    for (i, sku) in CATALOG_SKUS.iter().enumerate() {
         p.insert((*sku).to_string(), (n + i as u64).to_string());
     }
     p
@@ -199,6 +217,29 @@ async fn main() {
         assert!(r.committed, "meter sample refused: {:?}", r.error);
         seqs.push(r.seq);
     }
+    // ONE additive catalog sample. Cumulative values, its own `catalog/` index namespace and the
+    // same attested platform caller as the legacy sample; its seq joins R3's proof set.
+    let catalog = engine
+        .submit(
+            &contract,
+            platform("team-a", true, true),
+            METER_CATALOG_SAMPLE,
+            catalog_payload("team-a", ts + 2, 300),
+            "team-a",
+            ts + 2,
+            Ok(()),
+        )
+        .await
+        .expect("catalog sample");
+    assert!(catalog.committed, "catalog sample refused: {:?}", catalog.error);
+    seqs.push(catalog.seq);
+    // The const payload schema is a COPY of the canonical catalog: prove the copy and its ORDER
+    // still match at runtime, where the Vec-returning counter_keys() is admissible.
+    let catalog_keys_match = CATALOG_SKUS
+        .iter()
+        .copied()
+        .eq(fluid_core::usage::counter_keys());
+    assert!(catalog_keys_match, "catalog SKU order drifted from fluid_core::usage");
     for (i, (id, kind, amount, balance)) in rows.iter().enumerate() {
         let r = engine
             .submit(
@@ -318,6 +359,11 @@ async fn main() {
     println!("node public key     : {}...", &pk[..16.min(pk.len())]);
     println!("state.json bytes    : {state_bytes} ({}; informational, not a pass/fail gate)", if state_bytes > 0 { "real state supplied" } else { "generated evidence set" });
     println!("entries             : {}", entries.len());
+    println!(
+        "RESULT {}: committed={} seq={} catalog_skus={} canonical_order={} index_namespace=catalog",
+        METER_CATALOG_SAMPLE, catalog.committed, catalog.seq, CATALOG_SKUS.len(),
+        catalog_keys_match
+    );
     for (name, ok, detail) in &probes {
         println!("{:<58} {} {}", name, if *ok { "PASS" } else { "FAIL" }, detail);
     }

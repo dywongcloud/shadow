@@ -1087,6 +1087,8 @@ impl CloudState {
             crate::admin::norm(&self.projects.team_of(&ev.project)).to_string()
         };
         self.metrics.record(&ev, &mtenant);
+        fluid_core::usage::record(&mtenant, "cdn_requests", 1);
+        fluid_core::usage::record(&mtenant, "observability_events", 1);
         self.event_log.append(ev);
     }
 

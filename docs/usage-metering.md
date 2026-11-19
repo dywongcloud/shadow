@@ -218,3 +218,40 @@ Dashboard: `ui/lib/api.ts` carries the 11-SKU `RateCard` (five new fields option
 `SkuMargin`, `CostCard`, `UsageSummary`, `UsageEconomics` and `getUsageSummary()`;
 `ui/app/usage/usage-view.tsx` renders the five storage/network SKUs. The existing compute
 section's numbers are untouched.
+
+## The 29-construct catalog (2026-11-18)
+
+`fluid_core::usage::CATALOG` is the ONE index of the billable constructs Vercel exposes,
+minus v0 seats by operator request. It is DATA in the lowest shared crate (fluid-core), not a
+second price list: `billing::RATE_CARD` remains the only public price list and
+`billing::COST_CARD` the only internal cost basis. Both carry a fixed 19-slot catalog array
+indexed by `COUNTER_KEYS`; `cost_cents` and `margin_report` iterate CATALOG, so a price can
+never be paired with the wrong counter. Every priced SKU clears 6000 bps. Charging is NOT
+enabled by this change: the single `may_act(BillingMeter)` writer still gates the fold on
+`resource_charging_enabled()` (operator opt-in AND a profitable card), and a first-tick
+catalog baseline prevents re-billing a restored watermark.
+
+Five states, none of which invents a number: Billed (real counter, price, COGS), Indexed
+(real counter, zero price, never charged), Unmetered (no equivalent measurement, rendered
+"Not metered" with the reason), Subscription (a plan licence, never metered), Legacy (an
+alias of one of the twelve existing counters, never charged twice). Unmetered rows name
+their missing boundary: additional CDN CPU duration, snapshot storage (reflink-shared bytes
+are not attributable per tenant), sandbox network transfer, queue notifications and queue
+visibility changes. `_unattributed` bytes are measured but NEVER billed.
+
+The signed oplog gained a SECOND additive op `meter.catalog.sample` with its own closed
+payload and `{ns}/catalog/{sku}` index namespace. `meter.sample`, its 12 `METER_SKUS` and
+its payload are byte-identical, so existing signed entries still replay. COGS never crosses
+the tenant boundary: `GET /v1/usage/summary` serves `catalog` rows, `usage.skus` and
+`rate_card.catalog` (prices only); `/v1/admin/usage/economics` stays operator-only and adds
+`cost_catalog`. All three new wire fields are optional in the TS types with exact fallbacks.
+
+RESIDUALS (honest, not deferred work): /v1/usage/summary is owner-proxied but serves the
+authority's node-local meter row, same as the five legacy storage SKUs; the BILLING fold uses
+fleet_totals, so a tenant's displayed catalog counters can lag its charged total on a multi-node
+mesh. A CDN cache HIT body has no stored tenant in
+`cached_response`, so it contributes ZERO fast-data-transfer bytes; speed-insights vitals and
+function invocations are not separate counters (invocations are the Legacy `requests` alias);
+build CPU is wall-ms on a pinned 1-vCPU lane, not a sampled CPU clock; queue notifications
+and visibility changes have no primitive on this platform. The catalog says so in each row's
+`source`, and the page prints "Not metered" rather than 0.

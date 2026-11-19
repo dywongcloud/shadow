@@ -1167,6 +1167,9 @@ async fn edge_pipeline_inner(
             })
             .collect();
         cloud.cdn.maybe_store(&cache_key, status, &hdrs, &bytes);
+        if let Some(tenant) = cloud.gw.deployment_for_host(&host).map(|d| d.tenant) {
+            fluid_core::usage::record(&tenant, "fast_data_transfer_bytes", bytes.len() as u64);
+        }
         let mut resp = Response::from_parts(parts, Body::from(bytes));
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-cache", CacheState::Miss.header());

@@ -317,6 +317,10 @@ pub struct RateCard {
     /// Workflow steps executed, cents per million. 1000.0c = $10 per million
     /// steps = $1 per 100K steps, matching Upstash Workflow Pay-as-You-Go.
     pub workflow_steps_per_million_cents: f64,
+    /// Public prices for the catalog cumulative counters, indexed by
+    /// fluid_core::usage::COUNTER_KEYS. Cents per billed unit (the row's per divisor).
+    /// Zero means a counter, not a sale: margin_report skips it rather than dividing by zero.
+    pub catalog: [f64; 19],
 }
 
 pub const RATE_CARD: RateCard = RateCard {
@@ -332,6 +336,30 @@ pub const RATE_CARD: RateCard = RateCard {
     ingress_gb_cents: 0.2,
     egress_gb_cents: 1.0,
     workflow_steps_per_million_cents: 1000.0,
+    // Vercel's published usage prices (operator-supplied usage page, 2026-11-18) where a
+    // charge/usage pair is visible, otherwise the reviewed primitive from this same card.
+    // COUNTER_KEYS order: see fluid_core::usage::COUNTER_KEYS. Each price clears >=6000 bps.
+    catalog: [
+        60.0,   // cdn_requests                    cents / M requests
+        1.0,    // fast_data_transfer_bytes       cents / GB
+        50.0,   // workflow_storage_byte_ms       cents / GB-month
+        6.0,    // fast_origin_transfer_bytes     cents / GB
+        50.0,   // workflow_storage_writes_bytes  cents / GB
+        60.0,   // isr_reads                      cents / M reads
+        500.0,  // image_transformations          cents / 1K transformations
+        400.0,  // image_cache_writes             cents / 1K writes
+        120.0,  // observability_events           cents / M events
+        60.0,   // web_analytics_events           cents / M events
+        4.85,   // build_cpu_ms                   cents / CPU-hour
+        1.5,    // deployment_storage_byte_ms     cents / GB-month
+        1.5,    // function_storage_byte_ms       cents / GB-month
+        1.06,   // sandbox_memory_mb_ms           cents / GB-hour
+        12.8,   // sandbox_active_cpu_ms          cents / CPU-hour
+        0.0,    // sandbox_creations              INDEXED: a counter, not a sale
+        60.0,   // queue_message_sends            cents / M messages
+        60.0,   // queue_message_receives         cents / M messages
+        60.0,   // queue_message_deletes          cents / M messages
+    ],
 };
 
 /// Platform COGS per billed unit, in cents, derived from fetched public infra
@@ -370,6 +398,9 @@ pub struct CostCard {
     pub ingress_gb_cents: f64,
     pub egress_gb_cents: f64,
     pub workflow_steps_per_million_cents: f64,
+    /// Internal COGS for the catalog counters, same index as RateCard::catalog. These never
+    /// cross the tenant boundary: only /v1/admin/usage/economics (operator-only) serves them.
+    pub catalog: [f64; 19],
 }
 
 pub const COST_CARD: CostCard = CostCard {
@@ -385,6 +416,31 @@ pub const COST_CARD: CostCard = CostCard {
     ingress_gb_cents: 0.05,
     egress_gb_cents: 0.2,
     workflow_steps_per_million_cents: 250.0,
+    // COGS from the same fetched public infra rates as the twelve fields above: edge/WAF request
+    // handling 20c/M, Bunny egress 0.2c/GB, Backblaze B2 0.5c/GB-month (3x replicated 1.5),
+    // Fly.io shared CPU 0.3042c/CPU-hour, Fly.io memory 0.0208c/GB-hour. Every price is >=2.5x
+    // its COGS, so every priced catalog SKU clears MIN_GROSS_MARGIN_BPS.
+    catalog: [
+        20.0,    // cdn_requests
+        0.2,     // fast_data_transfer_bytes
+        1.5,     // workflow_storage_byte_ms
+        0.2,     // fast_origin_transfer_bytes
+        0.5,     // workflow_storage_writes_bytes
+        20.0,    // isr_reads
+        100.0,   // image_transformations
+        80.0,    // image_cache_writes
+        20.0,    // observability_events
+        20.0,    // web_analytics_events
+        0.3042,  // build_cpu_ms
+        0.5,     // deployment_storage_byte_ms
+        0.5,     // function_storage_byte_ms
+        0.0208,  // sandbox_memory_mb_ms
+        0.3042,  // sandbox_active_cpu_ms
+        0.0,     // sandbox_creations (INDEXED: no price, no COGS)
+        20.0,    // queue_message_sends
+        20.0,    // queue_message_receives
+        20.0,    // queue_message_deletes
+    ],
 };
 
 /// Minimum gross margin, in basis points, every priced SKU must clear before
@@ -439,13 +495,18 @@ pub struct UsageTotals {
     /// key would make an old snapshot fail to deserialize.
     #[serde(default)]
     pub workflow_steps: u64,
+    /// Cumulative catalog counters, indexed by fluid_core::usage::COUNTER_KEYS.
+    /// serde(default) is load-bearing: UsageTotals is nested in the persisted MeterWatermark,
+    /// so a required key would make a pre-extension snapshot fail to deserialize.
+    #[serde(default)]
+    pub catalog: [u64; 19],
 }
 
 impl RateCard {
     /// Cost in (fractional) cents for a usage delta. A non-finite result (a corrupt
     /// counter or rate) is never a chargeable amount: return 0.0 for the whole sum.
     pub fn cost_cents(&self, u: &UsageTotals) -> f64 {
-        let total = (u.active_cpu_ms as f64 / 3_600_000.0) * self.active_cpu_hr_cents
+        let mut total = (u.active_cpu_ms as f64 / 3_600_000.0) * self.active_cpu_hr_cents
             + (u.mem_gb_hr_milli as f64 / 1000.0) * self.mem_gb_hr_cents
             + (u.requests as f64 / 1_000_000.0) * self.requests_per_million_cents
             + (u.blocked as f64 / 1_000_000.0) * self.waf_per_million_cents
@@ -459,12 +520,24 @@ impl RateCard {
             + (u.ingress_bytes as f64 / 1_000_000_000.0) * self.ingress_gb_cents
             + (u.egress_bytes as f64 / 1_000_000_000.0) * self.egress_gb_cents
             + (u.workflow_steps as f64 / 1_000_000.0) * self.workflow_steps_per_million_cents;
+        // Catalog SKUs: one canonical loop over fluid_core::usage::CATALOG, never a second
+        // hand-written price list. A row with no counter (Legacy/Unmetered/Subscription) has
+        // no cumulative value to price. The per divisor and the array index both come from the
+        // catalog, so a reorder here cannot silently pair a price with the wrong counter.
+        for sku in fluid_core::usage::CATALOG.iter().filter(|s| s.counter.is_some()) {
+            let key = sku.counter.unwrap_or_default();
+            if let Some(i) = fluid_core::usage::counter_index(key) {
+                if let (Some(units), Some(price)) = (u.catalog.get(i), self.catalog.get(i)) {
+                    total += (*units as f64 / sku.per) * price;
+                }
+            }
+        }
         if total.is_finite() { total } else { 0.0 }
     }
 
     /// Price vs COGS per SKU: margin = (price - cogs) / price * 10_000 basis points.
     pub fn margin_report(&self) -> Vec<SkuMargin> {
-        let skus: [(&'static str, f64, f64); 12] = [
+        let mut skus: Vec<(&'static str, f64, f64)> = vec![
             ("active_cpu_hr", self.active_cpu_hr_cents, COST_CARD.active_cpu_hr_cents),
             ("mem_gb_hr", self.mem_gb_hr_cents, COST_CARD.mem_gb_hr_cents),
             ("requests_per_million", self.requests_per_million_cents, COST_CARD.requests_per_million_cents),
@@ -482,6 +555,14 @@ impl RateCard {
                 COST_CARD.workflow_steps_per_million_cents,
             ),
         ];
+        for sku in fluid_core::usage::CATALOG.iter().filter(|s| s.counter.is_some()) {
+            let key = sku.counter.unwrap_or_default();
+            if let Some(i) = fluid_core::usage::counter_index(key) {
+                if let (Some(price), Some(cogs)) = (self.catalog.get(i), COST_CARD.catalog.get(i)) {
+                    skus.push((sku.key, *price, *cogs));
+                }
+            }
+        }
         let mut rows = Vec::with_capacity(skus.len());
         for (sku, price_cents, cogs_cents) in skus {
             // Browser node: no platform resource, deliberately unpriced. A
@@ -531,6 +612,36 @@ pub fn resource_charging_enabled() -> bool {
         })
         .unwrap_or(false);
     opted_in && RATE_CARD.assert_profitable().is_ok()
+}
+
+/// Public catalog prices keyed by the CATALOG row key, for GET /v1/usage/summary.
+/// Prices come ONLY from RATE_CARD; no COGS crosses the tenant boundary.
+pub fn catalog_price_map() -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for sku in fluid_core::usage::CATALOG.iter().filter(|s| s.counter.is_some()) {
+        let key = sku.counter.unwrap_or_default();
+        if let Some(i) = fluid_core::usage::counter_index(key) {
+            if let Some(price) = RATE_CARD.catalog.get(i) {
+                out.insert(sku.key.to_string(), serde_json::json!(*price));
+            }
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// Operator-only counterpart: internal COGS keyed by CATALOG row key. Served only by
+/// /v1/admin/usage/economics behind require_operator, never by the tenant summary.
+pub fn catalog_cogs_map() -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    for sku in fluid_core::usage::CATALOG.iter().filter(|s| s.counter.is_some()) {
+        let key = sku.counter.unwrap_or_default();
+        if let Some(i) = fluid_core::usage::counter_index(key) {
+            if let Some(cogs) = COST_CARD.catalog.get(i) {
+                out.insert(sku.key.to_string(), serde_json::json!(*cogs));
+            }
+        }
+    }
+    serde_json::Value::Object(out)
 }
 
 /// A generated invoice for one billing period (subscription + metered usage).
@@ -760,6 +871,10 @@ struct MeterState {
     /// re-bill usage already charged before the restore. One under-counted tick is the safe
     /// direction, the same rule as a counter reset after a node restart.
     workflow_baseline_done: bool,
+    /// A catalog counter added after a watermark was written has no baseline there. The first
+    /// tick adopts the live cumulative array without charging it, the same safe direction as a
+    /// counter reset after a node restart.
+    catalog_baseline_done: bool,
 }
 
 /// One tenant's meter cursor as it crosses the persistence boundary
@@ -1144,11 +1259,16 @@ impl BillingStore {
                     ingress_bytes: sub(current.ingress_bytes, st.last.ingress_bytes),
                     egress_bytes: sub(current.egress_bytes, st.last.egress_bytes),
                     workflow_steps: sub(current.workflow_steps, st.last.workflow_steps),
+                    catalog: std::array::from_fn(|i| sub(current.catalog[i], st.last.catalog[i])),
                 }
             };
             if !st.workflow_baseline_done {
                 st.workflow_baseline_done = true;
                 delta.workflow_steps = 0;
+            }
+            if !st.catalog_baseline_done {
+                st.catalog_baseline_done = true;
+                delta.catalog = [0u64; 19];
             }
             st.last = current;
             (delta, st.frac_cents)
@@ -1214,7 +1334,24 @@ impl BillingStore {
                 current.workflow_steps.to_string(),
             ),
         ]);
-        Self::enqueue_billing_op(hive_contract::METER_SAMPLE, tenant, payload, outcome);
+        Self::enqueue_billing_op(hive_contract::METER_SAMPLE, tenant, payload, outcome.clone());
+        // A SECOND, additive signed event carries the catalog counters. The legacy
+        // meter.sample payload stays byte-identical so existing signed oplog entries still
+        // replay against their original closed schema; the catalog op has its own declared
+        // payload key set. Both record the same MEASUREMENT read-back, never a constant Ok.
+        let mut catalog_payload = std::collections::BTreeMap::from([
+            ("tenant_tag".to_string(), tenant.to_string()),
+            ("window_end_ms".to_string(), now_ms().to_string()),
+        ]);
+        for (i, key) in fluid_core::usage::COUNTER_KEYS.iter().enumerate() {
+            catalog_payload.insert((*key).to_string(), current.catalog[i].to_string());
+        }
+        Self::enqueue_billing_op(
+            hive_contract::METER_CATALOG_SAMPLE,
+            tenant,
+            catalog_payload,
+            outcome,
+        );
         if whole > 0 {
             self.record_usage(tenant, whole, "Compute usage (metered)");
         }
@@ -1723,6 +1860,7 @@ impl BillingStore {
                         last: w.last,
                         frac_cents: w.frac_cents,
                         workflow_baseline_done: false,
+                        catalog_baseline_done: false,
                     },
                 )
             })

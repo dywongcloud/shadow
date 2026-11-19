@@ -13,7 +13,7 @@ const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.Spark
   loading: () => <div className="h-7 w-full max-w-full animate-pulse rounded bg-subtle" />,
 });
 import { Card } from "@/components/ui";
-import { usePoll, type FunctionStats, type BillingInfo, type Metrics, type UsageSummary } from "@/lib/api";
+import { usePoll, type FunctionStats, type BillingInfo, type Metrics, type UsageCatalogRow, type UsageSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const ABSENT = "-";
@@ -48,6 +48,26 @@ function unitMeasured(n: number | null, digits: number, unit: string): string {
 function moneyMeasured(n: number | null): string {
   const value = measured(n);
   return value === null ? ABSENT : `$${value.toFixed(2)}`;
+}
+
+/** For billed and legacy rows, only rate-card cents become a printed rate; a missing value is "-". */
+function catalogRateMeasured(cents: number | null, unit: string): string {
+  const value = measured(cents);
+  return value === null ? ABSENT : `$${(value / 100).toFixed(3)}/${unit}`;
+}
+
+/** Legacy catalog keys are dynamic wire names; a typed record keeps the dynamic read type-safe. */
+function legacyNumber(source: object | undefined, key: string | null): number | null {
+  const record = source as Record<string, number | null | undefined> | undefined;
+  return measured(key && record ? record[key] : undefined);
+}
+
+/** Catalog charge is measured only when the counter, public rate and divisor are all measured. */
+function catalogCharge(value: number | null, rate: number | null, per: number | null): number | null {
+  const v = measured(value);
+  const r = measured(rate);
+  const p = measured(per);
+  return v === null || r === null || p === null || p <= 0 ? null : (v / p) * r / 100;
 }
 
 function chargeMeasured(units: number | null, cents: number | undefined): number | null {
@@ -214,6 +234,79 @@ export default function UsageView() {
     },
   ];
 
+  const catalog = summary?.catalog;
+  const catalogRows: UsageCatalogRow[] | null = Array.isArray(catalog) ? (catalog as UsageCatalogRow[]) : null;
+  // Legacy catalog rows alias the twelve existing UsageTotals counters. GET /v1/usage/summary
+  // has never served the compute counters (they are node-local fleet stats, not the meter row),
+  // so binding them to summary.usage would print a fabricated 0. Bind them to the SAME measured
+  // sources the compute section above already uses; an absent poll stays absent ("-").
+  const legacyUsage: Record<string, number | null> = {
+    requests: invocations,
+    active_cpu_ms: activeCpuMs,
+    mem_gb_hr_milli: memGbHrs === null ? null : memGbHrs * 1000,
+    workflow_steps: measured(ut?.workflow_steps),
+  };
+  const legacyRates = summary?.rate_card as unknown as Record<string, number | undefined> | undefined;
+  type CatalogView = {
+    key: string;
+    label: string;
+    note: string;
+    usage: string;
+    rate: string;
+    charge: string;
+    muted: boolean;
+  };
+  const catalogGroups: Array<{ name: string; rows: CatalogView[] }> = [];
+  if (catalogRows) {
+    for (const row of catalogRows) {
+      let usageText = ABSENT;
+      let rateText = ABSENT;
+      let chargeText = ABSENT;
+      let muted = true;
+      let note = `${row.unit}. Source: ${row.source}`;
+      const counterValue = measured(row.counter ? summary?.usage?.skus?.[row.counter] : undefined);
+      if (row.state === "billed" || row.state === "legacy") {
+        const value = row.state === "billed"
+          ? counterValue
+          : legacyNumber(legacyUsage, row.legacy);
+        const rate = row.state === "billed"
+          ? measured(summary?.rate_card?.catalog?.[row.key])
+          : legacyNumber(legacyRates, row.legacy_rate);
+        const charge = catalogCharge(value, rate, measured(row.per));
+        usageText = fmtMeasured(value);
+        rateText = catalogRateMeasured(rate, row.unit);
+        chargeText = moneyMeasured(charge);
+        muted = charge === null;
+      } else if (row.state === "indexed") {
+        usageText = fmtMeasured(counterValue);
+        // No public rate exists for an indexed row; this literal is a state label, not a rate card lookup.
+        rateText = "$0.000";
+        // The charge is a known billing state, not a substitute for a missing measurement.
+        chargeText = moneyMeasured(0);
+        muted = false;
+        note = `Counter only, not billed. Source: ${row.source}`;
+      } else if (row.state === "unmetered") {
+        chargeText = "Not metered";
+        note = `${row.unit}. Reason: ${row.source}`;
+      } else if (row.state === "subscription") {
+        chargeText = "Included in plan";
+        note = `${row.unit}. Reason: ${row.source}`;
+      }
+      const view: CatalogView = {
+        key: row.key,
+        label: row.label,
+        note,
+        usage: usageText,
+        rate: rateText,
+        charge: chargeText,
+        muted,
+      };
+      const lastGroup = catalogGroups[catalogGroups.length - 1];
+      if (lastGroup && lastGroup.name === row.group) lastGroup.rows.push(view);
+      else catalogGroups.push({ name: row.group, rows: [view] });
+    }
+  }
+
   const heading = planName === ABSENT ? "Plan Usage" : `${planName} Plan Usage`;
 
   return (
@@ -354,6 +447,49 @@ export default function UsageView() {
                   <span className="text-xs text-secondary sm:hidden">Charge</span>
                   <span className="min-w-0 break-words">{moneyMeasured(r.amount)}</span>
                 </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card className="mt-4 min-w-0 w-full max-w-full">
+        <h2 className="min-w-0 break-words text-lg font-semibold">Billable construct catalog</h2>
+        <p className="mb-4 mt-1 min-w-0 w-full max-w-full break-words text-sm text-secondary">
+          The catalog is the platform&apos;s index of billable constructs; prices come from the rate card.
+        </p>
+        {catalogRows === null || catalogRows.length === 0 ? (
+          <div className="min-w-0 w-full max-w-full break-words rounded-lg border border-dashed border-border px-4 py-8 text-center text-sm text-secondary">
+            This node has not published the usage catalog yet.
+          </div>
+        ) : (
+          <div className="min-w-0 w-full max-w-full overflow-x-auto">
+            <div className="hidden grid-cols-1 gap-2 border-b border-border pb-2 text-xs font-medium uppercase tracking-wide text-muted sm:grid sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
+              <span>SKU</span><span className="text-right">Usage</span><span className="text-right">Rate</span><span className="text-right">Charge</span>
+            </div>
+            {catalogGroups.map((group) => (
+              <div key={group.name} className="min-w-0 w-full max-w-full">
+                <GroupHeader name={group.name} />
+                {group.rows.map((r) => (
+                  <div key={r.key} className="grid grid-cols-1 items-center gap-2 border-b border-border py-3 text-sm min-h-[44px] sm:grid-cols-2 sm:gap-4 lg:grid-cols-4">
+                    <span className="min-w-0 w-full max-w-full">
+                      <span className="block break-words text-fg">{r.label}</span>
+                      <span className={cn("block min-w-0 w-full max-w-full break-words text-xs", r.muted ? "text-muted" : "text-secondary")}>{r.note}</span>
+                    </span>
+                    <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums text-secondary sm:block">
+                      <span className="text-xs text-secondary sm:hidden">Usage</span>
+                      <span className="min-w-0 break-words">{r.usage}</span>
+                    </span>
+                    <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums text-secondary sm:block">
+                      <span className="text-xs text-secondary sm:hidden">Rate</span>
+                      <span className="min-w-0 break-words">{r.rate}</span>
+                    </span>
+                    <span className="flex min-w-0 w-full max-w-full items-center justify-between gap-2 text-right tabular-nums sm:block">
+                      <span className="text-xs text-secondary sm:hidden">Charge</span>
+                      <span className={cn("min-w-0 break-words", r.muted && "text-secondary")}>{r.charge}</span>
+                    </span>
+                  </div>
+                ))}
               </div>
             ))}
           </div>

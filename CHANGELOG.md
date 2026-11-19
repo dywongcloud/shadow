@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-11-18 - one canonical catalog of Vercel's billable usage constructs
+
+The operator-supplied Vercel usage screenshots list 30 billable rows. v0 Seats is excluded by
+request, so the platform now indexes the other 29 in ONE canonical data table,
+fluid-core/src/usage.rs: crates/fluid-core/src/usage.rs. It is the lowest crate that
+fluid-gateway, hive-cloud and hive-contract already share, so no new dependency and no
+cross-crate hook was invented. Each row carries its exact Vercel label, group, unit, the
+raw-units-per-billed-unit divisor, WHERE it is measured, and one of five honest states:
+Billed (real counter, public price, COGS clearing 6000 bps), Indexed (real counter, no price,
+never charged), Unmetered (no equivalent measurement on this platform, rendered "Not metered"
+with the reason, never a fabricated zero), Subscription (a plan licence, never metered), and
+Legacy (an alias of one of the twelve existing UsageTotals counters, so nothing is charged
+twice). Five constructs are Unmetered with named reasons: additional CDN CPU duration,
+snapshot storage (reflink-shared bytes are not attributable per tenant), sandbox network
+transfer, queue notifications, and queue visibility changes.
+
+Real cumulative counters are wired at 20 single-writer boundaries: CDN requests and
+observability events at CloudState::record; fast data transfer at edge_pipeline_inner's
+buffered 200 response; image transformations (cache-MISS only), image cache writes (only
+after a successful rename), function origin bytes and web analytics beacons in fluid-gateway;
+ISR reads in admin::rc_get; queue sends/receives/deletes at the pull, push and retention
+boundaries; world-queue sends and workflow storage writes at enqueue; sandbox creations,
+active CPU and provisioned memory from measured stop deltas; build CPU from
+BuildCompletionGuard::drop wall-ms on the pinned 1-vCPU lane (a stated assumption); and
+deployment/function/workflow storage byte-ms gauges on the bulkhead sampler with bounded
+20,000-entry directory walks. Every tenant comes from a STORED record (Deployment.tenant,
+Queue.tenant, SandboxRecord.tenant_id, ProjectSettings.team, QueueJob.team), never a header.
+Content-addressed build-cache bytes that no record binds to a tenant are measured but land in
+_unattributed and are NEVER billed.
+
+billing::RATE_CARD stays the ONE public price list and COST_CARD the ONE internal cost basis;
+both gain a fixed 19-slot catalog array. cost_cents and margin_report iterate the catalog
+instead of duplicating a price list, and assert_profitable now covers all 18 priced SKUs
+(each clears 6000 bps). Charging is UNCHANGED: the single may_act(BillingMeter) writer still
+gates the fold on resource_charging_enabled(), which needs HIVE_BILLING_METER_RESOURCES=1
+AND a profitable card. A first-tick catalog baseline adoption prevents re-billing a restored
+watermark. UsageTotals and TenantUsage gain serde(default) catalog fields, so a pre-extension
+snapshot loads as honest zeros rather than failing persist::load.
+
+The signed oplog gains a SECOND, additive op meter.catalog.sample with its own closed payload
+(19 keys in fixed order) and its own exec::apply namespace {ns}/catalog/{sku}. The original
+meter.sample op, its 12 METER_SKUS and its payload are byte-identical, so every existing
+signed entry still replays. contract-billing submits a real catalog sample and proves its
+inclusion. GET /v1/usage/summary stays owner-proxied and tenant-scoped; it now returns the
+catalog rows, usage.skus and rate_card.catalog (public prices only, NO COGS).
+/v1/admin/usage/economics stays operator-only and adds cost_catalog plus the full margin
+report. No route, roles::RULES or team-role.ts change, so no binding manifest sync is needed.
+
+The dashboard renders all 29 rows grouped exactly as Vercel groups them. Prices come only from
+rate_card; a missing counter, rate or charge shows "-" rather than an invented zero; a node that
+has not published the catalog shows one explicit empty state. All three new wire fields are
+optional in the TS types, so a fresh UI still works against an older node.
+
 ## 2026-11-18 - two blue light streaks at the top of the landing hero
 
 The Webflow Baseflow template (https://webflow.com/templates/html/baseflow-website-template)

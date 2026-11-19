@@ -946,6 +946,11 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                     .sweep_expired(&queue.queue_id, queue.settings.message_retention_period);
                 if reaped > 0 {
                     tracing::debug!(queue = %queue.queue_id, reaped, "queues: retention sweep reaped expired messages");
+                    fluid_core::usage::record(
+                        crate::admin::record_tenant(&queue.tenant),
+                        "queue_message_deletes",
+                        reaped as u64,
+                    );
                 }
             }
             for consumer in cloud.queues.list_consumers(&queue.queue_id) {
@@ -966,6 +971,11 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                 if due.is_empty() {
                     continue;
                 }
+                fluid_core::usage::record(
+                    crate::admin::record_tenant(&queue.tenant),
+                    "queue_message_receives",
+                    due.len() as u64,
+                );
                 let target = format!(
                     "{}/__hive_queue_consumer",
                     cloud.deploy_url(&delivery_label(&consumer.script_name))
@@ -1005,6 +1015,11 @@ pub async fn spawn_delivery_loop(cloud: Arc<crate::state::CloudState>) {
                     for m in &due {
                         cloud.queues.mark_delivered(&queue.queue_id, &m.id);
                     }
+                    fluid_core::usage::record(
+                        crate::admin::record_tenant(&queue.tenant),
+                        "queue_message_deletes",
+                        due.len() as u64,
+                    );
                 } else {
                     let (exhausted, retriable): (Vec<_>, Vec<_>) = due
                         .into_iter()

@@ -90,12 +90,19 @@ pub struct TenantUsage {
     pub workflow_steps: u64,
     pub first_seen_ms: u64,
     pub last_seen_ms: u64,
+    /// Cumulative catalog counters, indexed by fluid_core::usage::COUNTER_KEYS.
+    /// serde(default) keeps pre-extension sidecar rows loading as honest zeros.
+    #[serde(default)]
+    pub catalog: [u64; 19],
 }
 
 /// The six measurable dimensions. `record` is the ONLY writer; each kind maps to exactly one
 /// field so two kinds can never race onto the same counter.
 #[derive(Clone, Copy, Debug)]
 pub enum UsageKind {
+    /// Index into fluid_core::usage::COUNTER_KEYS. The ONE writer resolves the
+    /// index so a typo or an unknown key can never grow an unbounded map.
+    Catalog(usize),
     DbRowOps,
     DbStorageByteMs,
     ObjectStorageByteMs,
@@ -164,6 +171,11 @@ pub fn record(tenant: &str, kind: UsageKind, delta: u64) {
     let mut state = meter().inner.lock();
     let row = state.tenants.entry(key).or_default();
     match kind {
+        UsageKind::Catalog(i) => {
+            if let Some(slot) = row.catalog.get_mut(i) {
+                *slot = slot.saturating_add(delta);
+            }
+        }
         UsageKind::DbRowOps => row.db_row_ops = row.db_row_ops.saturating_add(delta),
         UsageKind::DbStorageByteMs => {
             row.db_storage_byte_ms = row.db_storage_byte_ms.saturating_add(delta)
@@ -218,6 +230,17 @@ pub fn workflow_step_tenant(tenant: &str) -> &str {
 }
 
 /// This node's own cumulative rows.
+/// Installs the process-global measurement sink at boot. fluid-gateway and the queue/sandbox
+/// lanes call fluid_core::usage::record; this closure is the ONLY path into the meter, so the
+/// node-local cumulative rows still have exactly one writer.
+pub fn install_sink() {
+    let _ = fluid_core::usage::set_sink(std::sync::Arc::new(|tenant, key, delta| {
+        if let Some(i) = fluid_core::usage::counter_index(key) {
+            record(tenant, UsageKind::Catalog(i), delta);
+        }
+    }));
+}
+
 pub fn snapshot() -> BTreeMap<String, TenantUsage> {
     meter().inner.lock().tenants.clone()
 }
@@ -241,6 +264,37 @@ pub fn mesh_local() -> Vec<u8> {
     serde_json::to_vec(&local_view()).unwrap_or_default()
 }
 
+/// Catalog counters as a JSON object keyed by the STABLE counter key, not by array index. An
+/// older peer that omits skus merges as zeros; an unknown future key is dropped, never stored.
+fn skus_json(catalog: &[u64; 19]) -> Value {
+    let mut out = serde_json::Map::new();
+    for (i, key) in fluid_core::usage::COUNTER_KEYS.iter().enumerate() {
+        if let Some(v) = catalog.get(i) {
+            out.insert((*key).to_string(), json!(*v));
+        }
+    }
+    Value::Object(out)
+}
+
+/// Fold one peer's skus object into the fleet array with saturating_add. Keys are resolved by
+/// counter_index, so a peer cannot grow this node's map or shift an index by reordering keys.
+pub(crate) fn merge_skus(fleet: &mut [u64; 19], view: &Value) {
+    let Some(rows) = view.as_object() else {
+        return;
+    };
+    for (key, value) in rows {
+        let Some(i) = fluid_core::usage::counter_index(key) else {
+            continue;
+        };
+        let Some(n) = value.as_u64() else {
+            continue;
+        };
+        if let Some(slot) = fleet.get_mut(i) {
+            *slot = slot.saturating_add(n);
+        }
+    }
+}
+
 /// Tenant rows as a stable, bytes-descending JSON array (all six dimensions plus the
 /// first/last observation timestamps).
 fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
@@ -262,6 +316,7 @@ fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
                 "ingress_bytes": u.ingress_bytes,
                 "egress_bytes": u.egress_bytes,
                 "workflow_steps": u.workflow_steps,
+                "skus": skus_json(&u.catalog),
                 "first_seen_ms": u.first_seen_ms,
                 "last_seen_ms": u.last_seen_ms,
                 "_total": total,
@@ -366,6 +421,7 @@ fn merge_rows(fleet: &mut BTreeMap<String, TenantUsage>, view: &Value) {
         merged.workflow_steps = merged
             .workflow_steps
             .saturating_add(row["workflow_steps"].as_u64().unwrap_or_default());
+        merge_skus(&mut merged.catalog, &row["skus"]);
         let first = row["first_seen_ms"].as_u64().unwrap_or_default();
         if first > 0 && (merged.first_seen_ms == 0 || first < merged.first_seen_ms) {
             merged.first_seen_ms = first;
@@ -577,6 +633,103 @@ async fn sample_once(cloud: &Arc<CloudState>, state: &mut SampleState) {
             );
         }
     }
+
+    // Hop 4: catalog byte-ms storage gauges. These are NODE-LOCAL physical directories, unlike
+    // the fleet-replicated drive mirror above, so each node records only what it physically
+    // holds and fleet_totals' saturating sum is exact. Tenant comes from the STORED project
+    // settings row, never a request header. A checkout is attributed by git::checkout_prefixes,
+    // which covers both roots and both name forms including a renamed project's old names.
+    if let (Some(dep_i), Some(fn_i), Some(wf_i)) = (
+        fluid_core::usage::counter_index("deployment_storage_byte_ms"),
+        fluid_core::usage::counter_index("function_storage_byte_ms"),
+        fluid_core::usage::counter_index("workflow_storage_byte_ms"),
+    ) {
+        let projects = cloud.projects.snapshot();
+        let dep_roots = [crate::git::deploy_root(), crate::git::legacy_deploy_root()];
+        for (project, settings) in &projects {
+            let tenant = crate::admin::record_tenant(&settings.team);
+            let prefixes = crate::git::checkout_prefixes(project);
+            let mut dep_bytes = 0u64;
+            for root in &dep_roots {
+                dep_bytes = dep_bytes.saturating_add(project_dir_bytes(root, &prefixes));
+            }
+            if dep_bytes > 0 {
+                record(tenant, UsageKind::Catalog(dep_i), dep_bytes.saturating_mul(gauge_dt));
+            }
+        }
+        // Build-cache tarballs and runtime artifacts are content-addressed, not project-named:
+        // no stored record binds a byte to a tenant. The bytes are still MEASURED, but they land
+        // in UNATTRIBUTED (observable, NEVER billed) rather than being split evenly across
+        // projects, which would invent an ownership the platform cannot prove.
+        let fn_dirs = [crate::git::cache_root(), crate::persist::data_dir().join("runtime-artifacts-v1")];
+        let fn_bytes: u64 = fn_dirs.iter().map(|d| dir_bytes(d)).fold(0u64, u64::saturating_add);
+        if fn_bytes > 0 {
+            record(UNATTRIBUTED, UsageKind::Catalog(fn_i), fn_bytes.saturating_mul(gauge_dt));
+        }
+        // Workflow run state is held in the in-process WorkflowEngine and persisted wholesale
+        // in state.json; serde_json's encoding length is its real byte size. Attribute by each
+        // run's STORED project field, falling back to the definition it names.
+        let defs = cloud.workflows.defs();
+        for run in cloud.workflows.runs_snapshot() {
+            let project = if run.project.is_empty() {
+                defs.iter().find(|d| d.id == run.def_id).map(|d| d.project.as_str()).unwrap_or("")
+            } else {
+                run.project.as_str()
+            };
+            if project.is_empty() {
+                continue;
+            }
+            let bytes = serde_json::to_vec(&run).map(|v| v.len() as u64).unwrap_or(0);
+            if bytes > 0 {
+                record(
+                    crate::admin::record_tenant(&cloud.projects.team_of(project)),
+                    UsageKind::Catalog(wf_i),
+                    bytes.saturating_mul(gauge_dt),
+                );
+            }
+        }
+    }
+}
+
+/// Bounded recursive byte count for a storage root on the bulkhead runtime. Never walks more
+/// than MAX_GAUGE_ENTRIES entries, so a hostile or corrupt directory cannot stall the meter.
+const MAX_GAUGE_ENTRIES: usize = 20_000;
+fn dir_bytes(root: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            visited = visited.saturating_add(1);
+            if visited > MAX_GAUGE_ENTRIES { return total }
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => stack.push(entry.path()),
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
+/// Bytes under root belonging to ONE project, matched by the git checkout prefixes. The prefixes
+/// are platform-templated, sanitized name components, never a tenant-controlled path.
+fn project_dir_bytes(root: &std::path::Path, prefixes: &[String]) -> u64 {
+    let Ok(rd) = std::fs::read_dir(root) else { return 0 };
+    let mut total = 0u64;
+    for entry in rd.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if prefixes.iter().any(|p| name.starts_with(p)) {
+            match entry.metadata() {
+                Ok(m) if m.is_dir() => total = total.saturating_add(dir_bytes(&entry.path())),
+                Ok(m) => total = total.saturating_add(m.len()),
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 /// Spawns ONE debounced background task on the BULKHEAD runtime: it samples the existing

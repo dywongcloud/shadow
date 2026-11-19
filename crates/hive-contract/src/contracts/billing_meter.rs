@@ -19,6 +19,13 @@
 //! could not be attested, never a prevention of the charge. Charging itself stays behind the
 //! operator opt-in `HIVE_BILLING_METER_RESOURCES` and the single
 //! `leadership::may_act(BillingMeter)` writer; nothing here enables either.
+//!
+//! A second, ADDITIVE sample kind `meter.catalog.sample` records the nineteen cumulative
+//! counters of the ONE canonical `fluid_core::usage` catalog. It is a DIFFERENT op with a
+//! DIFFERENT closed payload schema and a DIFFERENT index namespace: the twelve-key
+//! `meter.sample` entries already signed on live nodes keep replaying byte-for-byte unchanged.
+//! Both kinds are MEASUREMENT only; neither authorizes a charge, and charging stays behind the
+//! operator opt-in.
 
 use crate::contract::{AuthPolicy, Contract, Effect};
 
@@ -26,9 +33,15 @@ use crate::contract::{AuthPolicy, Contract, Effect};
 /// durable log directory and signing stream: billing evidence never competes with a database
 /// write for the same seq space.
 pub const CONTRACT_ID: &str = "hive.billing-meter.v1";
+/// Kept at 1 on purpose: adding an op kind is ADDITIVE. A signed checkpoint already on a live
+/// node carries this contract_version, and the legacy `meter.sample` payload schema is
+/// unchanged, so raising the version would break the replay of entries the nodes already hold.
 pub const CONTRACT_VERSION: u32 = 1;
 
 pub const METER_SAMPLE: &str = "meter.sample";
+/// Second, additive sample kind. FROZEN legacy `meter.sample` entries keep their own op name,
+/// payload schema and `usage/` index namespace; this kind never rewrites them.
+pub const METER_CATALOG_SAMPLE: &str = "meter.catalog.sample";
 pub const BILLING_LEDGER: &str = "billing.ledger";
 pub const BILLING_CHECKPOINT: &str = "billing.checkpoint";
 
@@ -36,9 +49,11 @@ pub const BILLING_CHECKPOINT: &str = "billing.checkpoint";
 /// index namespace and the identity the contract authorized can never be two different strings.
 pub const TENANT_TAG: &str = "tenant_tag";
 
-/// The twelve cumulative usage dimensions, named exactly as `billing::UsageTotals` names them.
-/// A meter sample carries ALL of them: a sample that silently omitted a SKU would be a different
-/// op with a different payload, and `validate` refuses it.
+/// The twelve LEGACY cumulative usage dimensions, named exactly as `billing::UsageTotals`
+/// names them. FROZEN: signed `meter.sample` entries on live nodes replay against this exact
+/// closed set, so no key is added, removed or renamed here. A meter sample carries ALL of
+/// them: a sample that silently omitted a SKU would be a different op with a different
+/// payload, and `validate` refuses it. The canonical catalog counters live in `CATALOG_SKUS`.
 pub const METER_SKUS: &[&str] = &[
     "active_cpu_ms",
     "mem_gb_hr_milli",
@@ -52,6 +67,35 @@ pub const METER_SKUS: &[&str] = &[
     "ingress_bytes",
     "egress_bytes",
     "workflow_steps",
+];
+
+/// The nineteen cumulative counters of the ONE canonical `fluid_core::usage` catalog.
+/// Order MUST equal `fluid_core::usage::COUNTER_KEYS`, which is the fixed order
+/// `fluid_core::usage::counter_keys()` returns: the signed payload key set is part of the
+/// replay contract, so reordering it changes what a historical entry means. This crate cannot
+/// depend on a runtime Vec for a `const` payload schema: `counter_keys()` builds a `Vec` at
+/// runtime, so the literals are repeated here in that exact order and the witness binary checks
+/// the equality live. Never reorder without a version bump.
+pub const CATALOG_SKUS: &[&str] = &[
+    "cdn_requests",
+    "fast_data_transfer_bytes",
+    "workflow_storage_byte_ms",
+    "fast_origin_transfer_bytes",
+    "workflow_storage_writes_bytes",
+    "isr_reads",
+    "image_transformations",
+    "image_cache_writes",
+    "observability_events",
+    "web_analytics_events",
+    "build_cpu_ms",
+    "deployment_storage_byte_ms",
+    "function_storage_byte_ms",
+    "sandbox_memory_mb_ms",
+    "sandbox_active_cpu_ms",
+    "sandbox_creations",
+    "queue_message_sends",
+    "queue_message_receives",
+    "queue_message_deletes",
 ];
 
 /// One row of the contract. `target_key` is always `tenant_tag`, which is always in the payload.
@@ -79,6 +123,33 @@ const METER_SAMPLE_KEYS: &[&str] = &[
     "ingress_bytes",
     "egress_bytes",
     "workflow_steps",
+];
+
+/// Closed payload schema of the additive catalog sample: the target, the window, and ALL
+/// nineteen catalog keys. A missing or extra key is refused by `validate`, so a sample cannot
+/// silently drop a measured counter or smuggle an undeclared one into the signed log.
+const CATALOG_SAMPLE_KEYS: &[&str] = &[
+    "tenant_tag",
+    "window_end_ms",
+    "cdn_requests",
+    "fast_data_transfer_bytes",
+    "workflow_storage_byte_ms",
+    "fast_origin_transfer_bytes",
+    "workflow_storage_writes_bytes",
+    "isr_reads",
+    "image_transformations",
+    "image_cache_writes",
+    "observability_events",
+    "web_analytics_events",
+    "build_cpu_ms",
+    "deployment_storage_byte_ms",
+    "function_storage_byte_ms",
+    "sandbox_memory_mb_ms",
+    "sandbox_active_cpu_ms",
+    "sandbox_creations",
+    "queue_message_sends",
+    "queue_message_receives",
+    "queue_message_deletes",
 ];
 
 const LEDGER_KEYS: &[&str] = &[
@@ -123,6 +194,20 @@ pub const DECLARED_OPS: &[DeclaredOp] = &[
         auth: AuthPolicy::PlatformAttested,
         effect: Effect::StateWrite,
         payload_keys: CHECKPOINT_KEYS,
+        target_key: TENANT_TAG,
+    },
+    // Recording is MEASUREMENT, never authorization: this row only attests counters the platform
+    // already measured, and a REFUSED entry is a record, not a prevention. Charging stays behind
+    // the operator opt-in `HIVE_BILLING_METER_RESOURCES` and the single
+    // `leadership::may_act(BillingMeter)` writer; declaring a second sample kind enables neither.
+    // `PlatformAttested` + `StateWrite` is admissible (only OpenParticipation + StateWrite is
+    // forbidden), and the new kind writes under its own `catalog/` index segment, so a signed
+    // legacy `meter.sample` replay stays byte-identical. CONTRACT_VERSION stays 1: additive.
+    DeclaredOp {
+        kind: METER_CATALOG_SAMPLE,
+        auth: AuthPolicy::PlatformAttested,
+        effect: Effect::StateWrite,
+        payload_keys: CATALOG_SAMPLE_KEYS,
         target_key: TENANT_TAG,
     },
 ];

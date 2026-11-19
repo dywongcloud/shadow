@@ -1613,6 +1613,9 @@ async fn async_main() -> anyhow::Result<()> {
     spawn_disk_refresh(cloud.registry.clone(), runtime_capability_source.clone());
     spawn_memory_pressure_alarm();
 
+    // Install the ONE process-global catalog measurement sink before the serving runtime can
+    // accept a request: every lower-crate record() funnels into usage_metering::record.
+    usage_metering::install_sink();
     usage_metering::spawn_saver(cloud.clone());
     let opted_in = std::env::var("HIVE_BILLING_METER_RESOURCES")
         .map(|raw| {
@@ -5028,6 +5031,14 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                     t.ingress_bytes = t.ingress_bytes.saturating_add(u.ingress_bytes);
                     t.egress_bytes = t.egress_bytes.saturating_add(u.egress_bytes);
                     t.workflow_steps = t.workflow_steps.saturating_add(u.workflow_steps);
+                    // The SAME tick, the SAME map, the SAME gate: catalog counters join the
+                    // cumulative UsageTotals by their fixed COUNTER_KEYS index. No second
+                    // charging loop and no charge while resource charging is disabled.
+                    for (i, v) in u.catalog.iter().enumerate() {
+                        if let Some(slot) = t.catalog.get_mut(i) {
+                            *slot = slot.saturating_add(*v);
+                        }
+                    }
                 }
             }
             let mut charged_any = 0u64;

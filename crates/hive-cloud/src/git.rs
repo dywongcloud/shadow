@@ -465,6 +465,12 @@ impl Drop for BuildCompletionGuard {
                 }
             }
             outcome = crate::project_settings::LastBuild::from_build(b);
+            // Stated assumption: wall time on the pinned 1-vCPU build lane.
+            fluid_core::usage::record(
+                crate::admin::record_tenant(&self.cloud.projects.team_of(&self.slot.project)),
+                "build_cpu_ms",
+                b.finished_ms.unwrap_or(now_ms()).saturating_sub(b.started_ms),
+            );
         });
         if let Some(outcome) = outcome {
             if self.cloud.leader_forward_target().is_none() {

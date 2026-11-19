@@ -2939,7 +2939,15 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             )
                 .into_response();
         }
-        if let Some(resp) = vercel_insights(&parts.method, &path) {
+        let insights_dep = gw.select(host.as_deref());
+        if let Some(resp) = vercel_insights(
+            &parts.method,
+            &path,
+            insights_dep
+                .as_ref()
+                .map(|d| d.tenant.as_str())
+                .unwrap_or(""),
+        ) {
             return resp;
         }
     }
@@ -3547,7 +3555,7 @@ fn path_of_href(href: &str) -> String {
 
 /// Vercel Web Analytics + Speed Insights endpoints: the `script.js` loaders under
 /// `/_vercel/insights/` and `/_vercel/speed-insights/`, and the `view|event`/`vitals` beacon sinks (202).
-fn vercel_insights(method: &Method, path: &str) -> Option<Response> {
+fn vercel_insights(method: &Method, path: &str, tenant: &str) -> Option<Response> {
     const ANALYTICS_JS: &str = r#"(function(){function send(t,d){try{navigator.sendBeacon('/_vercel/insights/'+t,JSON.stringify(d||{}))}catch(e){}}
 function va(){var a=[].slice.call(arguments),k=a[0];if(k==='event')send('event',a[1]||{});else send('view',a[1]||{})}
 var q=window.vaq||[];window.va=va;window.vaq={push:function(args){va.apply(null,args)}};
@@ -3586,8 +3594,11 @@ addEventListener('visibilitychange',function(){if(document.visibilityState==='hi
         (&Method::GET, "/_vercel/insights/script.js") => Some(js(ANALYTICS_JS)),
         (&Method::GET, "/_vercel/speed-insights/script.js") => Some(js(SPEED_JS)),
         (&Method::POST, "/_vercel/insights/view")
-        | (&Method::POST, "/_vercel/insights/event")
-        | (&Method::POST, "/_vercel/speed-insights/vitals") => Some(accepted()),
+        | (&Method::POST, "/_vercel/insights/event") => {
+            fluid_core::usage::record(tenant, "web_analytics_events", 1);
+            Some(accepted())
+        }
+        (&Method::POST, "/_vercel/speed-insights/vitals") => Some(accepted()),
         (_, "/_vercel/image") => None,
         _ => Some((StatusCode::NO_CONTENT, "").into_response()),
     }
@@ -4206,6 +4217,7 @@ async fn serve_optimized_image(
     .await;
     match encoded {
         Ok(Some((out, ctype))) => {
+            fluid_core::usage::record(&dep.tenant, "image_transformations", 1);
             let payload = {
                 let mut v = Vec::with_capacity(ctype.len() + 1 + out.len());
                 v.extend_from_slice(ctype.as_bytes());
@@ -4213,11 +4225,14 @@ async fn serve_optimized_image(
                 v.extend_from_slice(&out);
                 v
             };
+            let tenant = dep.tenant.clone();
             tokio::spawn(async move {
                 if tokio::fs::create_dir_all(&cache_dir).await.is_ok() {
                     let tmp = cache_file.with_extension(format!("{}.tmp", std::process::id()));
                     if tokio::fs::write(&tmp, &payload).await.is_ok() {
-                        let _ = tokio::fs::rename(&tmp, &cache_file).await;
+                        if tokio::fs::rename(&tmp, &cache_file).await.is_ok() {
+                            fluid_core::usage::record(&tenant, "image_cache_writes", 1);
+                        }
                     }
                 }
             });
@@ -4730,6 +4745,7 @@ async fn proxy_function(
     body: Bytes,
 ) -> Response {
     let key = func_key(dep.id.as_str(), name);
+    fluid_core::usage::record(&dep.tenant, "fast_origin_transfer_bytes", body.len() as u64);
 
     let mut hvec: Vec<(String, String)> = headers
         .iter()

@@ -2,6 +2,8 @@
 //! [`FunctionConfig`]s, with [`Route`]s mapping paths to either; the function config carries the
 //! Fluid knobs (`max_concurrency`, `min_instances`, `max_instances`, `idle_ttl_secs`).
 
+pub mod usage;
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;

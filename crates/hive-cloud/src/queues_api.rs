@@ -370,6 +370,7 @@ async fn message_send(
         .queues
         .send(&queue_id, body_str, Value::Null, delay)
         .map_err(|e| err_envelope(StatusCode::BAD_REQUEST, 10005, &e.to_string()))?;
+    fluid_core::usage::record(&queue.tenant, "queue_message_sends", 1);
     Ok(ok_envelope(json!({"id": id})))
 }
 
@@ -408,6 +409,7 @@ async fn messages_pull(
             .pull(&queue_id, batch_size, visibility_timeout_ms)
             .await
     };
+    fluid_core::usage::record(&queue.tenant, "queue_message_receives", leased.len() as u64);
     let (backlog_count, _, _) = c.queues.backlog_stats(&queue_id).await;
     let messages: Vec<Value> = leased
         .into_iter()
@@ -454,9 +456,10 @@ async fn messages_ack(
     Json(req): Json<AckReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if c.queues.get(&t, &queue_id).is_none() {
-        return Err(not_found("queue"));
-    }
+    let queue = c
+        .queues
+        .get(&t, &queue_id)
+        .ok_or_else(|| not_found("queue"))?;
     let mut acked = 0usize;
     let mut retried = 0usize;
     for a in &req.acks {
@@ -464,6 +467,7 @@ async fn messages_ack(
             acked += 1;
         }
     }
+    fluid_core::usage::record(&queue.tenant, "queue_message_deletes", acked as u64);
     for r in &req.retries {
         if c.queues.retry(&queue_id, &r.lease_id, r.delay_seconds) {
             retried += 1;

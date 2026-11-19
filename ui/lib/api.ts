@@ -1760,10 +1760,11 @@ export interface PlanSpec {
   max_members: number;
   features: string[];
 }
-/** The ONE public price list (`billing::RATE_CARD`), cents per billed unit. A new server-derived wire
- *  field is OPTIONAL with an exact fallback: the dashboard rolls independently of the nodes, so the
- *  seven fields added here stay optional and a node that predates them never makes the UI invent a
- *  number. NEVER COGS: that is operator-only (`CostCard`). */
+/** The ONE public price list (`billing::RATE_CARD`), cents per billed unit, plus the optional catalog
+ *  price map. A server-derived wire field is OPTIONAL with an exact fallback: the dashboard rolls
+ *  independently of the nodes, so every scalar price after `waf_per_million_cents` stays optional,
+ *  and a node that predates it makes the usage view print "-" via `measured()`/`moneyMeasured()`,
+ *  never an invented 0. NEVER COGS: that is operator-only (`CostCard`). */
 export interface RateCard {
   active_cpu_hr_cents: number;
   mem_gb_hr_cents: number;
@@ -1776,6 +1777,9 @@ export interface RateCard {
   object_storage_gb_month_cents?: number;
   ingress_gb_cents?: number;
   egress_gb_cents?: number;
+  workflow_steps_per_million_cents?: number;
+  /** Optional per-SKU public prices in cents; an older node omits it. */
+  catalog?: Record<string, number>;
 }
 
 /** One SKU's profitability (`billing::SkuMargin`), operator-only. */
@@ -1786,9 +1790,10 @@ export interface SkuMargin {
   gross_margin_bps: number;
 }
 
-/** `billing::COST_CARD`: COGS in cents per billed unit; the 11 field names mirror `RateCard` so
- *  `margin_report()` pairs price with cost mechanically. Only `GET /v1/admin/usage/economics`
- *  serves it; `/v1/usage/summary` NEVER carries COGS. */
+/** `billing::COST_CARD`: COGS in cents per billed unit; the scalar field names mirror the `RateCard`
+ *  prices so `margin_report()` pairs price with cost mechanically. The workflow-step rate is
+ *  OPTIONAL with the same "-" fallback as the public rate card. Only
+ *  `GET /v1/admin/usage/economics` serves it; `/v1/usage/summary` NEVER carries COGS. */
 export interface CostCard {
   active_cpu_hr_cents: number;
   mem_gb_hr_cents: number;
@@ -1801,11 +1806,14 @@ export interface CostCard {
   object_storage_gb_month_cents: number;
   ingress_gb_cents: number;
   egress_gb_cents: number;
+  workflow_steps_per_million_cents?: number;
 }
 
-/** Cumulative counters from `billing::UsageTotals`. The five new fields are `serde(default)` on the
- *  backend, so a pre-extension snapshot loads them as ZERO, not a deserialize error; they stay
- *  optional here so the view renders absent values as absent, never as a fabricated 0. */
+/** Cumulative counters from `billing::UsageTotals`. The optional scalar fields, including
+ *  `workflow_steps`, are `serde(default)` on the backend, so a pre-extension snapshot loads them as
+ *  ZERO, not a deserialize error; they stay optional here so the view renders absent wire values as
+ *  "-" via `measured()`, never as a fabricated 0. `skus` is the optional catalog counter map,
+ *  keyed by the catalog counter; an older node omits it and its rows print "-". */
 export interface UsageTotals {
   active_cpu_ms: number;
   mem_gb_hr_milli: number;
@@ -1818,11 +1826,31 @@ export interface UsageTotals {
   object_storage_byte_ms?: number;
   ingress_bytes?: number;
   egress_bytes?: number;
+  workflow_steps?: number;
+  skus?: Record<string, number>;
+}
+
+/** One row of the index of billable constructs published with `/v1/usage/summary`. A row carries
+ *  NO price: the view reads prices only from `rate_card.catalog` or a named legacy `RateCard`
+ *  field. The array itself is OPTIONAL; an older node omits it and the view shows one empty
+ *  state instead of inventing a row. */
+export interface UsageCatalogRow {
+  key: string;
+  label: string;
+  group: string;
+  unit: string;
+  per: number;
+  state: "billed" | "indexed" | "unmetered" | "subscription" | "legacy";
+  source: string;
+  counter: string | null;
+  legacy: string | null;
+  legacy_rate: string | null;
 }
 
 /** `GET /v1/usage/summary`: the caller's OWN usage plus the PUBLIC rate card, owner-proxied. The
- *  keys are `usage`, `rate_card`, `included_cents` and `overage_ceiling_cents` (`admin.rs`
- *  `usage_summary_for`); NO COGS, no other tenant, no tenant key. A rejected session (401, or
+ *  base keys are `usage`, `rate_card`, `included_cents` and `overage_ceiling_cents` (`admin.rs`
+ *  `usage_summary_for`); `catalog` is an OPTIONAL server-derived array with the empty-state
+ *  fallback above. NO COGS, no other tenant, no tenant key. A rejected session (401, or
  *  `x-hive-anon: 1` with an empty body when a node answers before the handler) never yields a
  *  payload, so `usePoll` keeps `data === null` and the view seeds NO zeros. */
 export interface UsageSummary {
@@ -1830,6 +1858,7 @@ export interface UsageSummary {
   rate_card: RateCard;
   included_cents: number;
   overage_ceiling_cents: number;
+  catalog?: UsageCatalogRow[];
 }
 
 /** Operator-only `GET /v1/admin/usage/economics`: COGS, margins and the enable gate. */

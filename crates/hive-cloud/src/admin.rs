@@ -10097,11 +10097,17 @@ async fn rc_get(
         return e.into_response();
     }
     match c.runtime_cache.get(&q.scope, &q.key) {
-        Some(v) => (
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            v,
-        )
-            .into_response(),
+        Some(v) => {
+            let project = q.scope.split(':').next().unwrap_or("");
+            if let Some(tenant) = crate::admin::row_holder(&c, &project) {
+                fluid_core::usage::record(&tenant, "isr_reads", 1);
+            }
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+                v,
+            )
+                .into_response()
+        }
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -17034,9 +17040,27 @@ pub(crate) fn usage_summary_for(c: &Arc<CloudState>, t: &str) -> Value {
         ..Default::default()
     };
     let plan = crate::billing::plan_spec(&c.billing.account(t).plan);
+    // The catalog is the ONE index of the 29 Vercel billable constructs (v0 seats excluded).
+    // PRICES come only from RATE_CARD; COGS never crosses this tenant boundary. usage.skus is
+    // the OWNER-PROXIED node-local cumulative view, re-scoped above to exactly this tenant.
+    // All three new wire fields are optional on older nodes; a fresh UI degrades to "-".
+    // Keep the internal catalog array and the public skus object in agreement: a zeroed
+    // array beside non-zero skus would be a misleading measurement for any consumer.
+    let skus = row
+        .map(|r| r["skus"].clone())
+        .filter(|v| v.is_object())
+        .unwrap_or(json!({}));
+    let mut catalog = [0u64; 19];
+    crate::usage_metering::merge_skus(&mut catalog, &skus);
+    let usage = crate::billing::UsageTotals { catalog, ..usage };
+    let mut usage_value = serde_json::to_value(&usage).unwrap_or(json!({}));
+    usage_value["skus"] = skus;
+    let mut rate_value = serde_json::to_value(crate::billing::RATE_CARD).unwrap_or(json!({}));
+    rate_value["catalog"] = crate::billing::catalog_price_map();
     json!({
-        "usage": usage,
-        "rate_card": crate::billing::RATE_CARD,
+        "usage": usage_value,
+        "rate_card": rate_value,
+        "catalog": fluid_core::usage::public_rows(),
         "included_cents": plan.included_cents,
         "overage_ceiling_cents": plan.overage_ceiling_cents,
     })
@@ -17075,7 +17099,9 @@ async fn usage_economics(
     let profitable = crate::billing::RATE_CARD.assert_profitable();
     Ok(Json(json!({
         "cost_card": crate::billing::COST_CARD,
+        "cost_catalog": crate::billing::catalog_cogs_map(),
         "margin_report": crate::billing::RATE_CARD.margin_report(),
+        "catalog": fluid_core::usage::public_rows(),
         "min_gross_margin_bps": crate::billing::MIN_GROSS_MARGIN_BPS,
         "profitable": profitable.is_ok(),
         "unprofitable_skus": profitable.err().unwrap_or_default(),

@@ -141,8 +141,14 @@ impl WorldQueue {
             max_attempts: max_attempts.max(1),
         };
         self.pending.write().insert(id.clone(), job.clone());
+        fluid_core::usage::record(&job.team, "queue_message_sends", 1);
         let key = guardian_key(&job.team, &job.id);
         if let Ok(bytes) = serde_json::to_vec(&job) {
+            fluid_core::usage::record_bytes(
+                &job.team,
+                "workflow_storage_writes_bytes",
+                bytes.len() as u64,
+            );
             tokio::spawn(async move { crate::guardian::put(&key, bytes).await });
         }
         Ok(id)

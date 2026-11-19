@@ -590,6 +590,7 @@ impl PlatformSandboxProvider {
             rec.last_started_at = Some(now);
             w.push(rec.clone());
         }
+        fluid_core::usage::record(&rec.tenant_id, "sandbox_creations", 1);
         tracing::info!(sandbox = %rec.id, node = %self.node_name, backend = self.backend_name().unwrap_or("none"), "sandbox cell provisioned");
         Ok(rec)
     }
@@ -760,6 +761,16 @@ impl SandboxProvider for PlatformSandboxProvider {
                 .last_stopped_at
                 .unwrap_or(started)
                 .saturating_sub(started);
+            let duration_delta_ms = rec
+                .last_stopped_at
+                .unwrap_or(started)
+                .saturating_sub(started);
+            fluid_core::usage::record(&rec.tenant_id, "sandbox_active_cpu_ms", duration_delta_ms);
+            fluid_core::usage::record(
+                &rec.tenant_id,
+                "sandbox_memory_mb_ms",
+                (rec.memory_mb as u64).saturating_mul(duration_delta_ms),
+            );
         }
         Ok(rec.clone())
     }

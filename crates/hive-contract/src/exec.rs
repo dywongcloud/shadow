@@ -11,7 +11,8 @@
 
 use crate::contract::{AuthPolicy, Contract, Effect};
 use crate::contracts::billing_meter::{
-    BILLING_CHECKPOINT, BILLING_LEDGER, METER_SAMPLE, METER_SKUS,
+    BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, METER_CATALOG_SAMPLE, METER_SAMPLE,
+    METER_SKUS,
 };
 use crate::oplog::{canonical_fields, canonical_map, Ack, LogEntry, Op, OpLog, INDEX_DOMAIN};
 use std::collections::BTreeMap;
@@ -89,6 +90,7 @@ pub fn apply(index: &Index, op: &Op) -> Vec<Mutation> {
             out
         }
         METER_SAMPLE => meter_sample_mutations(&ns, op),
+        METER_CATALOG_SAMPLE => catalog_sample_mutations(&ns, op),
         BILLING_LEDGER => vec![Mutation::Put {
             key: format!("{ns}/ledger/{}", escape_component(&field(op, "entry_id"))),
             value: ledger_row_value(op),
@@ -146,6 +148,27 @@ fn meter_sample_mutations(ns: &str, op: &Op) -> Vec<Mutation> {
     for sku in METER_SKUS {
         out.push(Mutation::Put {
             key: format!("{ns}/usage/{sku}"),
+            value: field(op, sku),
+        });
+    }
+    out
+}
+
+/// One catalog sample: the cumulative value of each of the nineteen canonical catalog counters
+/// plus the window it was measured at. Cumulative values, NOT deltas, so replay can compare the
+/// contract index against the meter's own persisted row without re-deriving a baseline.
+///
+/// The `catalog/` segment is deliberately DIFFERENT from the legacy `usage/` segment: replay of
+/// a signed `meter.sample` already on a live node produces byte-identical keys and values, and
+/// the two samples cannot overwrite one another.
+fn catalog_sample_mutations(ns: &str, op: &Op) -> Vec<Mutation> {
+    let mut out = vec![Mutation::Put {
+        key: format!("{ns}/catalog/window_end_ms"),
+        value: field(op, "window_end_ms"),
+    }];
+    for sku in CATALOG_SKUS {
+        out.push(Mutation::Put {
+            key: format!("{ns}/catalog/{sku}"),
             value: field(op, sku),
         });
     }
