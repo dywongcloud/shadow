@@ -257,6 +257,17 @@ chat transcript, so the operator rotates them.
 - Provider reachability is not probed on a request path, so `pool[].available`
   is `null` rather than a config check relabelled as availability. The dashboard
   reads prices only from the `rate_card` wire field.
+- `internal_client()` now sets `.no_proxy()` so ambient `HTTP_PROXY`/`ALL_PROXY`
+  cannot route an operator-configured loopback provider bearer to a third party.
+  This fixes the shared primitive for ALL fleet-internal callers, not just AI.
+- The mesh `GOSSIP_GET` arms inherit the pre-existing `mesh_tenant()` rolling-
+  upgrade fallback: under enforcement, a peer hop with NO signed `tok` param
+  falls back to a raw `?team=` value with only a WARN. This is NOT introduced by
+  the AI gateway, is bounded to holders of a mesh trunk, and is gated on the
+  real fleet by `HIVE_PEER_TRUST=1` + `HIVE_TRUSTED_NODE_IDS`. HTTP AI routes do
+  NOT use this path: they read only the verified `Claims.tenant`. The comment on
+  the AI arms referring to `mesh_tenant()` as "never a raw team" is inaccurate;
+  the accurate statement is above.
 - The generation record ring is node-local and bounded by
   `HIVE_AI_GATEWAY_MAX_GENERATIONS` (default 512); it is NOT replicated.
 - `GET /v1/generation` and `GET /v1/report` fan out to healthy peers with

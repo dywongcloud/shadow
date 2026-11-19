@@ -1762,13 +1762,18 @@ async fn dispatch_verified(
                 jb(axum::Json(crate::admin::usage_summary_for(cloud, &tenant)))
             }
         }
-        // AI gateway mesh reads: the tenant is the VERIFIED delegation claim (mesh_tenant),
-        // never a raw tenant query parameter; an empty tenant is an EMPTY body. ?local=true means serve only
-        // THIS node's own rows, so a peer hop never proxies again. Query values go through
-        // reqwest::Url::query_pairs() on a trusted base, never a hand split. Exact path guards
-        // keep these arms longest-prefix-first ahead of the bare /v1/billing arm, and the
-        // terminal _ => Vec::new() stays last. /v1/models and its endpoints are PUBLIC and
-        // deliberately have no tenant-gated gossip arm here.
+        // AI gateway mesh reads: `mesh_tenant(p)` PREFERS a verified signed
+        // delegation (`tok`) but INHERITS the pre-existing rolling-upgrade
+        // fallback to a raw `?team=` when `tok` is absent under enforcement.
+        // That fallback is not introduced here; the real fleet gates it with
+        // HIVE_PEER_TRUST=1 + HIVE_TRUSTED_NODE_IDS. HTTP AI routes never use
+        // it: they read only the verified Claims.tenant. An empty tenant is an
+        // EMPTY body. ?local=true means serve only THIS node's own rows, so a
+        // peer hop never proxies again. Query values go through
+        // reqwest::Url::query_pairs() on a trusted base, never a hand split.
+        // Exact path guards keep these arms longest-prefix-first ahead of the
+        // bare /v1/billing arm; the terminal _ => Vec::new() stays last.
+        // /v1/models and its endpoints are PUBLIC with no tenant-gated arm.
         p if method == hive_p2p::GOSSIP_GET
             && (p == "/v1/ai/state" || p.starts_with("/v1/ai/state?")) =>
         {

@@ -302,13 +302,18 @@ pub fn same_origin_client() -> reqwest::Client {
         .clone()
 }
 
-/// The client for the fleet's own calls (peers, providers): never follows a redirect.
+/// The client for the fleet's own calls (peers, providers): never follows a redirect
+/// and NEVER honours ambient `HTTP_PROXY`/`ALL_PROXY`. Without `.no_proxy()` an
+/// operator-configured loopback provider URL carrying an `Authorization` bearer
+/// could be sent to a third-party proxy, and an opaque peer URL would leak its
+/// CONNECT target. Fleet-internal targets are addressed directly by construction.
 pub fn internal_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
                 .redirect(Policy::none())
+                .no_proxy()
                 .build()
                 .expect("the internal HTTP client builds")
         })
