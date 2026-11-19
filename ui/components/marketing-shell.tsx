@@ -4,9 +4,10 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Menu, X } from "lucide-react";
+import { ArrowRight, Menu, X } from "lucide-react";
 import Image from "next/image";
 import { HalftoneHorizon } from "@/components/landing/halftone-horizon";
+import { HeroStreaks } from "@/components/landing/hero-streaks";
 import "@/components/landing/landing.css";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
@@ -93,7 +94,7 @@ function useForcedDarkRoot() {
 }
 
 /** `lead` is rendered right after the skip link, so a control that must be a first Tab stop (the landing's Pause) is one. */
-export function MarketingShell({ children, lead }: { children: React.ReactNode; lead?: React.ReactNode }) {
+export function MarketingShell({ children, lead, streaks = false }: { children: React.ReactNode; lead?: React.ReactNode; streaks?: boolean }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
@@ -102,6 +103,17 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
   const [menuOpen, setMenuOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
+  const headerRef = useRef<HTMLElement>(null);
+  // The streak hero's navbar is transparent at the top so the corner beams reach
+  // y=0. Once the page scrolls, an opaque plate keeps the same links legible
+  // over arbitrary content; toggling a class avoids a state update per scroll.
+  useEffect(() => {
+    if (!streaks) return;
+    const sync = () => headerRef.current?.classList.toggle("lp-streak-nav--scrolled", window.scrollY > 8);
+    sync();
+    window.addEventListener("scroll", sync, { passive: true });
+    return () => window.removeEventListener("scroll", sync);
+  }, [streaks]);
   // eslint-disable-next-line react-hooks/set-state-in-effect -- resets menu-open state whenever the route changes, a derived-reset-on-change sync
   useEffect(() => setMenuOpen(false), [pathname]);
   // An open menu is a dialog: focus moves into it (it is appended to <body>, 23 Tab stops away otherwise), the page behind is `inert`, Tab wraps
@@ -139,6 +151,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
       className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-x-clip bg-[#000000] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
+      {streaks && <HeroStreaks />}
       <a
         href="#lp-content"
         className="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-4 focus:z-[300] focus:rounded-md focus:bg-white focus:px-4 focus:py-2 focus:text-[14px] focus:text-black"
@@ -146,9 +159,13 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
         Skip to content
       </a>
       {lead}
-      <header className="sticky top-0 z-40 border-b border-white/10 bg-black/85 backdrop-blur-xl">
+      <header ref={headerRef} className={streaks
+        ? "lp-streak-nav sticky top-0 z-40 bg-transparent"
+        : "sticky top-0 z-40 border-b border-white/10 bg-black/85 backdrop-blur-xl"}>
         <div className="mx-auto grid max-w-[1500px] grid-cols-[1fr_auto_1fr] items-center gap-6 px-6 py-3 lg:px-10">
-          <Link href="/" className="inline-flex min-h-[44px] shrink-0 items-center justify-self-start">
+          <Link href="/" className={streaks
+            ? "lp-streak-plate inline-flex min-h-[44px] shrink-0 items-center justify-self-start rounded-full px-4"
+            : "inline-flex min-h-[44px] shrink-0 items-center justify-self-start"}>
             <Logo className="h-6 sm:h-8" />
           </Link>
           <nav aria-label="Primary" className="col-start-2 hidden min-w-0 items-center gap-5 text-[13px] uppercase tracking-[0.18em] text-zinc-300 lg:flex xl:gap-10">
@@ -157,7 +174,7 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
                 key={n.href}
                 href={n.href}
                 aria-current={active(n.href) ? "page" : undefined}
-                className={`relative py-[13px] transition-colors hover:text-white after:absolute after:inset-x-0 after:bottom-[5px] after:h-px after:bg-gradient-to-r after:from-transparent after:via-[#a853ba] after:to-transparent after:transition-opacity ${
+                className={`relative inline-flex min-h-[44px] items-center transition-colors hover:text-white after:absolute after:inset-x-0 after:bottom-[5px] after:h-px after:bg-gradient-to-r after:from-transparent after:via-[#a853ba] after:to-transparent after:transition-opacity ${
                   active(n.href) ? "text-white after:opacity-100" : "after:opacity-0 hover:after:opacity-60"
                 }`}
               >
@@ -168,15 +185,19 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
           <div className="col-start-3 flex min-w-0 items-center gap-2 justify-self-end sm:gap-3">
             <Link
               href="/sign-in"
-              className="hidden rounded-full px-4 py-[13px] text-[13px] uppercase tracking-[0.18em] text-zinc-300 transition-colors hover:text-white lg:inline-flex"
+              className={streaks
+                ? "lp-streak-plate hidden min-h-[44px] items-center rounded-full px-4 text-[13px] uppercase tracking-[0.18em] text-zinc-300 transition-colors hover:text-white lg:inline-flex"
+                : "hidden rounded-full px-4 py-[13px] text-[13px] uppercase tracking-[0.18em] text-zinc-300 transition-colors hover:text-white lg:inline-flex"}
             >
               Sign in
             </Link>
             <Link
               href="/sign-up"
-              className="hidden rounded-full border border-transparent bg-white px-5 py-[11px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(168, 83, 186,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"
+              className={streaks
+                ? "lp-streak-cta hidden min-h-[44px] items-center gap-2 rounded-full px-5 text-[13px] font-semibold uppercase tracking-[0.14em] text-white transition-transform hover:scale-[1.04] lg:inline-flex"
+                : "hidden rounded-full border border-transparent bg-white px-5 py-[11px] text-[13px] font-semibold uppercase tracking-[0.14em] text-black shadow-[0_0_0_1px_rgba(255,255,255,0.6),0_8px_30px_-8px_rgba(168, 83, 186,0.75)] transition-transform hover:scale-[1.04] lg:inline-flex"}
             >
-              Get started
+              {streaks ? <>Start building <ArrowRight className="h-[15px] w-[15px]" /></> : "Get started"}
             </Link>
             <button
               ref={toggleRef}
@@ -190,11 +211,11 @@ export function MarketingShell({ children, lead }: { children: React.ReactNode; 
             </button>
           </div>
         </div>
-        <div
+        {!streaks && <div
           aria-hidden="true"
           className="pointer-events-none absolute inset-x-0 -bottom-px h-px"
           style={{ background: "linear-gradient(90deg, transparent, rgba(168, 83, 186,0.6) 28%, rgba(42, 138, 246,0.5) 72%, transparent)" }}
-        />
+        />}
       </header>
 
       {menuOpen &&

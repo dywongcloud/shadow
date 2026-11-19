@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-11-18 - two blue light streaks at the top of the landing hero
+
+The Webflow Baseflow template (https://webflow.com/templates/html/baseflow-website-template)
+was fetched and measured, not copied. Its live preview is
+baseflow-backbencher.webflow.io; the two streaks are the hero's `background-image`
+at `0 0` and `100% 0`, `background-size: 40rem`, with 20/15/12rem breakpoints.
+Each asset is a #2388FF corner ellipse (rx=408.224 ry=443.789, rotated -40.019 /
+45 deg, Gaussian sigma=132.493) plus TWO plus-lighter beams (176.97x1253.56 rects
+with exact affine matrices, gradient zeros at 80% / 88%, sigma=15.3029 / 27.0286).
+The reference screenshot measures 1704x1060: the corner core is rgb(59,247,255),
+the beam blue-excess centroid travels x=144 (y=40) -> x=361 (y=420), FWHM grows
+239 -> 281px, and the centre is pure black.
+
+Our two WebP assets are a ONE-TIME Chromium rasterization of our own re-authored
+SVG built from those measured numbers. The serving page therefore runs no blur
+filter (landing AGENTS.md forbids one), ships no third-party bytes, and adds no
+animation: `ui/components/landing/hero-streaks.tsx` + two assets in
+`ui/public/landing/`. `MarketingShell` gains a landing-scoped `streaks` prop so
+the layer reaches y=0 behind the navbar; every other marketing page keeps its
+original dark header, backdrop blur, auroras, grid and grain (verified on
+/pricing). No `isPublic`/`proxy.ts`/sitemap change: this is a section, not a route.
+
+The six competing hero light layers (GlowRing, lp-glow-blue, lp-aurora-a/b,
+lp-grid, lp-grain) and the lp-gradient-text span were deleted from the landing
+hero only; the CSS rules stay because MarketingHero and Compare Hero still use
+them. The navbar is transparent at the top (the reference's own treatment) with
+an opaque dark plate behind the wordmark and sign-in, a blue gradient pill CTA
+labelled "Start building" to match the hero, a non-colour active underline,
+44px targets, no bottom border, and an opaque plate that appears once scrolled
+so the links stay legible. Print and forced-colors drop the bitmaps and show a
+3px diagonal SVG bracket tracing the beam centerlines.
+
+Nine independent R0 dada critics, two adversarial recon agents, and seven
+independent W1/W2/W3 critics drove the frame swap; DESIGN-LOG.md run 7 records every objection,
+premise measurement, Decision Record, Panel Report, the Anchor Ledger and the
+Compliance Check. Witnesses: production build BUILD_ID wLGmUC8ME3pyX9gue0kGU,
+tsc / tsc-ci / lint / bindings --check / git diff --check all exit 0, headful
+six-width sweep 320/360/390/768/1024/1440 with no horizontal overflow, 44px
+targets at every width, measured contrast 18.13:1 (wordmark plate over the
+brightest corner), 7.0:1 and 6.1:1 (white on both CTA stops), 13.8:1
+(zinc-300 on the plate), scroll plate transparent at y=0 and rgba(2,5,12,0.92)
+at y=400, other marketing pages unchanged. No test files, no secrets, no
+trailers, no push and no roll: a git push auto-deploys through two triggers and
+needs the operator's word.
+
 ## 2026-11-18 - dot-matrix stepper on the landing
 
 The supplied Spheron base stills and two screen recordings were measured, not

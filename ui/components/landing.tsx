@@ -24,7 +24,7 @@ export function Landing() {
   const root = useRef<HTMLDivElement>(null);
   useReveal(root);
   return (
-    <MarketingShell lead={<PauseSkip />}>
+    <MarketingShell lead={<PauseSkip />} streaks>
       <IntroLoader />
       <div ref={root} className="lp">
         <Hero />
