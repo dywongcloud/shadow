@@ -5,6 +5,7 @@
 
 mod acme;
 mod admin;
+mod ai_gateway;
 mod apikeys;
 mod app_discovery;
 mod audit;
@@ -1737,6 +1738,7 @@ async fn async_main() -> anyhow::Result<()> {
     let admin_router = admin::router(cloud.clone())
         .merge(crate::guardian::routes().with_state(cloud.clone()))
         .merge(crate::usage_metering::routes().with_state(cloud.clone()))
+        .merge(crate::ai_gateway::routes().with_state(cloud.clone()))
         .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn_with_state(
             cloud.clone(),
@@ -1982,6 +1984,27 @@ fn owner_routed(path: &str) -> bool {
         || (path.starts_with("/v1/projects/") && path.ends_with("/browser-db/rest-mesh"))
         || path.starts_with("/v1/runtime-artifact-transfer/v1/")
         || path.starts_with("/v1/internal/sandboxes/")
+        // AI gateway: inference POSTs are mutations, and admin_ingress forwards every mutation
+        // to the control-plane leader, but the upstream relay is loopback-only on ONE Mac;
+        // forwarding inference (or a read over node-local AI rows) makes it unreachable.
+        || path.starts_with("/v1/ai/")
+        || path == "/v1/models"
+        || path.starts_with("/v1/models/")
+        || path.starts_with("/v1/models?")
+        || path == "/v1/chat/completions"
+        || path.starts_with("/v1/chat/completions?")
+        || path == "/v1/responses"
+        || path.starts_with("/v1/responses?")
+        || path == "/v1/messages"
+        || path.starts_with("/v1/messages?")
+        || path == "/v1/credits"
+        || path.starts_with("/v1/credits?")
+        || path == "/v1/generation"
+        || path.starts_with("/v1/generation?")
+        || path == "/v1/report"
+        || path.starts_with("/v1/report?")
+        || path == "/v1/admin/ai/economics"
+        || path.starts_with("/v1/admin/ai/economics?")
 }
 
 /// Whether the request mutates state (POST/PUT/DELETE/PATCH), the only kind that serializes through
@@ -5038,6 +5061,26 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                         if let Some(slot) = t.catalog.get_mut(i) {
                             *slot = slot.saturating_add(*v);
                         }
+                    }
+                    // AI counters are MEASURED on every node, but chargeable ONLY under the
+                    // AI-specific opt-in: cost_cents adds the AI term unconditionally, so folding
+                    // them under resource charging alone would silently bill AI usage the
+                    // operator never opted into. Still ONE may_act(BillingMeter) writer, ONE
+                    // fleet_totals loop and ONE meter_usage call per tenant.
+                    if crate::ai_gateway::ai_charging_enabled() {
+                        t.ai_public_micro_cents = t
+                            .ai_public_micro_cents
+                            .saturating_add(u.ai_public_micro_cents);
+                        t.ai_cogs_micro_cents = t
+                            .ai_cogs_micro_cents
+                            .saturating_add(u.ai_cogs_micro_cents);
+                        t.ai_input_tokens = t.ai_input_tokens.saturating_add(u.ai_input_tokens);
+                        t.ai_output_tokens =
+                            t.ai_output_tokens.saturating_add(u.ai_output_tokens);
+                        t.ai_requests = t.ai_requests.saturating_add(u.ai_requests);
+                        t.ai_web_search_calls = t
+                            .ai_web_search_calls
+                            .saturating_add(u.ai_web_search_calls);
                     }
                 }
             }

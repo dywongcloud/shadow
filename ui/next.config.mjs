@@ -93,6 +93,7 @@ const nextConfig = {
       "/network/:path*",
       "/deployments/:path*",
       "/billing/:path*",
+      "/ai-gateway/:path*",
       "/admin/:path*",
       "/projects/:project/settings/:path*",
       "/projects/:project",
@@ -167,7 +168,7 @@ const nextConfig = {
       ...publicPaths.map((source) => ({ source, headers: cc(PUBLIC_CACHE) })),
       {
         source:
-          "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|compare|blog|case-studies|contact|privacy|tips|docs|status|cloud|api|_next|sign-in|sign-up|workflows|wfc|assets)[^.]*)",
+          "/((?!account|settings|teams|network|deployments|billing|admin|ai-gateway|product|solutions|features|pricing|compare|blog|case-studies|contact|privacy|tips|docs|status|cloud|api|_next|sign-in|sign-up|workflows|wfc|assets)[^.]*)",
         headers: cc(PRIVATE_CACHE),
       },
       { source: "/", headers: cc(LANDING_CACHE) },

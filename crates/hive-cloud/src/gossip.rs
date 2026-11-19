@@ -1762,6 +1762,80 @@ async fn dispatch_verified(
                 jb(axum::Json(crate::admin::usage_summary_for(cloud, &tenant)))
             }
         }
+        // AI gateway mesh reads: the tenant is the VERIFIED delegation claim (mesh_tenant),
+        // never a raw tenant query parameter; an empty tenant is an EMPTY body. ?local=true means serve only
+        // THIS node's own rows, so a peer hop never proxies again. Query values go through
+        // reqwest::Url::query_pairs() on a trusted base, never a hand split. Exact path guards
+        // keep these arms longest-prefix-first ahead of the bare /v1/billing arm, and the
+        // terminal _ => Vec::new() stays last. /v1/models and its endpoints are PUBLIC and
+        // deliberately have no tenant-gated gossip arm here.
+        p if method == hive_p2p::GOSSIP_GET
+            && (p == "/v1/ai/state" || p.starts_with("/v1/ai/state?")) =>
+        {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                let q = ai_mesh_query(p);
+                jb(axum::Json(crate::ai_gateway::ai_mesh_state(
+                    cloud, &tenant, q.local,
+                )))
+            }
+        }
+        p if method == hive_p2p::GOSSIP_GET
+            && (p == "/v1/credits" || p.starts_with("/v1/credits?")) =>
+        {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                jb(axum::Json(crate::ai_gateway::ai_mesh_credits(
+                    cloud, &tenant,
+                )))
+            }
+        }
+        p if method == hive_p2p::GOSSIP_GET
+            && (p == "/v1/generation" || p.starts_with("/v1/generation?")) =>
+        {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                let q = ai_mesh_query(p);
+                jb(axum::Json(crate::ai_gateway::ai_mesh_generation(
+                    cloud, &tenant, &q.id, q.local,
+                )))
+            }
+        }
+        p if method == hive_p2p::GOSSIP_GET
+            && (p == "/v1/report" || p.starts_with("/v1/report?")) =>
+        {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                let q = ai_mesh_query(p);
+                // Strict UTC YYYY-MM-DD bounds, an ordered window and a bounded row cap: a
+                // malformed or reversed window is refused with an EMPTY body rather than
+                // answered for a different range.
+                if !ai_mesh_date(&q.start_date)
+                    || !ai_mesh_date(&q.end_date)
+                    || q.end_date < q.start_date
+                {
+                    return Vec::new();
+                }
+                let mut v = crate::ai_gateway::ai_mesh_report(
+                    cloud,
+                    &tenant,
+                    &q.start_date,
+                    &q.end_date,
+                    &q.group_by,
+                    q.local,
+                );
+                ai_mesh_cap_rows(&mut v, q.limit);
+                jb(axum::Json(v))
+            }
+        }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => jb(
             crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await,
         ),
@@ -1848,6 +1922,102 @@ fn mesh_tenant(path: &str) -> String {
             }
         })
         .unwrap_or_default()
+}
+
+/// Bounded query for the AI mesh reads. reqwest::Url joins a TRUSTED base with the dispatched
+/// path, and query_pairs() percent-decodes every parameter; no hand split of ?/&. A peer's
+/// ?local=true serves only THIS node's rows. limit is capped at 512 and is used only to bound
+/// the report's result rows, never as a report filter.
+struct AiMeshQuery {
+    id: String,
+    local: bool,
+    start_date: String,
+    end_date: String,
+    group_by: String,
+    limit: usize,
+}
+
+const AI_MESH_MAX_LIMIT: usize = 512;
+
+fn ai_mesh_query(path: &str) -> AiMeshQuery {
+    let mut q = AiMeshQuery {
+        id: String::new(),
+        local: false,
+        start_date: String::new(),
+        end_date: String::new(),
+        group_by: String::new(),
+        limit: AI_MESH_MAX_LIMIT,
+    };
+    let Ok(base) = reqwest::Url::parse("http://mesh.invalid/") else {
+        return q;
+    };
+    // //host is an authority: the same-origin check keeps a caller-controlled path from
+    // turning the join into a different host.
+    let Ok(url) = base.join(path) else {
+        return q;
+    };
+    if url.host_str() != Some("mesh.invalid") {
+        return q;
+    }
+    for (k, v) in url.query_pairs() {
+        let v = v.as_ref();
+        match k.as_ref() {
+            "id" => q.id = v.chars().take(128).collect(),
+            "local" => q.local = v == "true" || v == "1",
+            "start_date" => q.start_date = v.chars().take(64).collect(),
+            "end_date" => q.end_date = v.chars().take(64).collect(),
+            "group_by" => {
+                q.group_by = v
+                    .chars()
+                    .take(64)
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == ',' || *c == '_' || *c == '-')
+                    .collect();
+            }
+            "limit" => {
+                q.limit = v
+                    .parse::<usize>()
+                    .map(|n| n.min(AI_MESH_MAX_LIMIT))
+                    .unwrap_or(AI_MESH_MAX_LIMIT);
+            }
+            _ => {}
+        }
+    }
+    q
+}
+
+/// Strict UTC YYYY-MM-DD: exactly 10 ASCII bytes, real month and day. Fixed width makes a
+/// lexical compare a valid before/after check for the inclusive report window.
+fn ai_mesh_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !b
+            .iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    {
+        return false;
+    }
+    let month = u32::from(b[5] - b'0') * 10 + u32::from(b[6] - b'0');
+    let day = u32::from(b[8] - b'0') * 10 + u32::from(b[9] - b'0');
+    (1..=12).contains(&month) && (1..=31).contains(&day)
+}
+
+/// A bounded report never grows with a peer's query: cap every row array the report carries,
+/// whether it is the top-level value or a field of the response object.
+fn ai_mesh_cap_rows(v: &mut serde_json::Value, max: usize) {
+    if let Some(rows) = v.as_array_mut() {
+        rows.truncate(max);
+        return;
+    }
+    if let Some(obj) = v.as_object_mut() {
+        for (_, value) in obj.iter_mut() {
+            if let Some(rows) = value.as_array_mut() {
+                rows.truncate(max);
+            }
+        }
+    }
 }
 
 /// Headers for an in-process call into a handler gated by `require_operator_or_internal` or

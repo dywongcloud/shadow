@@ -1992,3 +1992,127 @@ export interface RoutingConfig {
   redirects: RouteRedirect[];
   rewrites: RouteRewrite[];
 }
+
+/** AI Gateway dashboard wire shape. Every field is optional: a fresh dashboard can reach an older
+ *  node that has not published the catalog, credits, pool or generation records yet. Null numeric
+ *  values are unmeasured, not zero. The default 2 s GET cache is already short enough for a 30 s
+ *  poll, so no PATH_TTL row is added for /v1/ai/state.
+ */
+export interface AiPricing {
+  input?: string | null;
+  output?: string | null;
+  input_cache_read?: string | null;
+  input_cache_write?: string | null;
+  web_search?: string | null;
+}
+
+export interface AiTokenPass {
+  remaining?: string | null;
+  resets_at?: string | null;
+}
+
+export interface AiCredits {
+  balance?: string | null;
+  total_used?: string | null;
+  currency?: string | null;
+  token_pass?: AiTokenPass | null;
+}
+
+export interface AiUsage {
+  ai_requests?: number | null;
+  ai_input_tokens?: number | null;
+  ai_output_tokens?: number | null;
+  ai_public_micro_cents?: number | null;
+  ai_cogs_micro_cents?: number | null;
+  ai_web_search_calls?: number | null;
+}
+
+export interface AiPoolEntry {
+  name?: string | null;
+  protocol?: string | null;
+  configured?: boolean | null;
+  available?: boolean | null;
+  reason?: string | null;
+  model_count?: number | null;
+  node?: string | null;
+  priority?: number | null;
+  timeout_ms?: number | null;
+}
+
+export interface AiModel {
+  id?: string | null;
+  object?: string | null;
+  created?: string | number | null;
+  released?: string | number | null;
+  owned_by?: string | null;
+  name?: string | null;
+  description?: string | null;
+  context_window?: number | null;
+  max_tokens?: number | null;
+  type?: string | null;
+  tags?: string[] | null;
+  /** Vercel emits an OBJECT {input:string[], output:string[]}, not an array. */
+  modalities?: { input?: string[]; output?: string[] } | null;
+  supported_parameters?: string[] | null;
+  upstream_model?: string | null;
+  provider?: string | null;
+  provenance?: string | null;
+  status?: string | null;
+  available?: boolean | null;
+  aliases?: string[] | null;
+  pricing?: AiPricing | null;
+}
+
+export interface AiGeneration {
+  id?: string | null;
+  object?: string | null;
+  created_at?: string | null;
+  created_ms?: number | null;
+  tenant?: string | null;
+  model?: string | null;
+  upstream_model?: string | null;
+  provider_name?: string | null;
+  is_byok?: boolean | null;
+  streamed?: boolean | null;
+  finish_reason?: string | null;
+  tokens_prompt?: number | null;
+  tokens_completion?: number | null;
+  total_cost?: number | null;
+  market_cost?: number | null;
+  surcharge_cost?: number | null;
+  gateway_cost?: number | null;
+  upstream_inference_cost?: number | null;
+  /** Vercel `usage` is a NUMBER (USD), not an object. */
+  usage?: number | null;
+  public_price_usd?: number | null;
+  latency?: number | null;
+  generation_time?: number | null;
+  latency_ms?: number | null;
+  generation_time_ms?: number | null;
+  billable_web_search_calls?: number | null;
+  error?: string | null;
+}
+
+export interface AiGatewayState {
+  node?: string | null;
+  node_local?: boolean | null;
+  models?: AiModel[] | null;
+  credits?: AiCredits | null;
+  usage?: AiUsage | null;
+  pool?: AiPoolEntry[] | null;
+  generations?: AiGeneration[] | null;
+  charging_enabled?: boolean | null;
+  /** ONE canonical price card; the dashboard reads prices ONLY from here. */
+  rate_card?: { ai_models?: { id?: string; input_per_million_cents?: number; output_per_million_cents?: number; cache_read_per_million_cents?: number }[] } | null;
+  catalog_as_of?: string | null;
+  residuals?: string[] | null;
+}
+
+/** One-shot reader for the node-labelled AI Gateway aggregate. A null body is a 401, never an
+ *  empty data set: the signed-in session is missing, not measured as zero usage.
+ */
+export async function getAiGatewayState(opts?: { fresh?: boolean }): Promise<AiGatewayState> {
+  const d = await apiGet<AiGatewayState>("/v1/ai/state", opts);
+  if (!d) throw new ApiError(401, "AI Gateway state needs a signed-in session");
+  return d;
+}

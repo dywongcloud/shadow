@@ -500,6 +500,21 @@ pub struct UsageTotals {
     /// so a required key would make a pre-extension snapshot fail to deserialize.
     #[serde(default)]
     pub catalog: [u64; 19],
+    /// AI Gateway cumulative meters. serde(default) is load-bearing: UsageTotals is nested in
+    /// the persisted MeterWatermark, so a required key would make a pre-AI snapshot fail to
+    /// deserialize. Measurement always runs; charging is a separate operator opt-in.
+    #[serde(default)]
+    pub ai_public_micro_cents: u64,
+    #[serde(default)]
+    pub ai_cogs_micro_cents: u64,
+    #[serde(default)]
+    pub ai_input_tokens: u64,
+    #[serde(default)]
+    pub ai_output_tokens: u64,
+    #[serde(default)]
+    pub ai_requests: u64,
+    #[serde(default)]
+    pub ai_web_search_calls: u64,
 }
 
 impl RateCard {
@@ -519,7 +534,13 @@ impl RateCard {
                 * self.object_storage_gb_month_cents
             + (u.ingress_bytes as f64 / 1_000_000_000.0) * self.ingress_gb_cents
             + (u.egress_bytes as f64 / 1_000_000_000.0) * self.egress_gb_cents
-            + (u.workflow_steps as f64 / 1_000_000.0) * self.workflow_steps_per_million_cents;
+            + (u.workflow_steps as f64 / 1_000_000.0) * self.workflow_steps_per_million_cents
+            // Micro-cents are fixed point. Clamp BEFORE the division: an unclamped
+            // saturated u64 is ~1.8e13 cents, above MAX_AMOUNT_CENTS, which would make
+            // meter_usage refuse the WHOLE cost sum after the cursor already advanced
+            // and permanently lose every other charge for this tenant.
+            + u.ai_public_micro_cents.min(MAX_AMOUNT_CENTS.saturating_mul(1_000_000)) as f64
+                / 1_000_000.0;
         // Catalog SKUs: one canonical loop over fluid_core::usage::CATALOG, never a second
         // hand-written price list. A row with no counter (Legacy/Unmetered/Subscription) has
         // no cumulative value to price. The per divisor and the array index both come from the
@@ -612,6 +633,31 @@ pub fn resource_charging_enabled() -> bool {
         })
         .unwrap_or(false);
     opted_in && RATE_CARD.assert_profitable().is_ok()
+}
+
+/// AI charging gate, SEPARATE from `RATE_CARD::assert_profitable()`. That gate feeds
+/// `resource_charging_enabled()`, the ONE money switch for every non-AI SKU, so a bad
+/// AI COGS input must never turn CPU/requests/GPU/storage charging off fleet-wide.
+/// Uses the SAME i64 margin formula as `margin_report()` so the two cannot disagree
+/// about a basis point. An empty or wholly unpriced row set fails closed: COGS unset
+/// (or unmeasured) never enables a real-money AI charge.
+pub fn ai_profitable() -> bool {
+    let rows = crate::ai_gateway::ai_margin_rows();
+    let mut priced = 0usize;
+    for (_, price_cents, cogs_cents) in rows {
+        if price_cents == 0.0 && cogs_cents == 0.0 {
+            continue;
+        }
+        if !price_cents.is_finite() || !cogs_cents.is_finite() || price_cents == 0.0 {
+            return false;
+        }
+        priced += 1;
+        let gross_margin_bps = ((price_cents - cogs_cents) / price_cents * 10_000.0) as i64;
+        if gross_margin_bps < MIN_GROSS_MARGIN_BPS as i64 {
+            return false;
+        }
+    }
+    priced > 0
 }
 
 /// Public catalog prices keyed by the CATALOG row key, for GET /v1/usage/summary.
@@ -875,6 +921,10 @@ struct MeterState {
     /// tick adopts the live cumulative array without charging it, the same safe direction as a
     /// counter reset after a node restart.
     catalog_baseline_done: bool,
+    /// AI meters added after a watermark was written have no baseline there. The first tick
+    /// adopts the live cumulative AI row without charging it. In-process only, like the two
+    /// baselines above: MeterWatermark keeps NO new field, so an old snapshot still loads.
+    ai_baseline_done: bool,
 }
 
 /// One tenant's meter cursor as it crosses the persistence boundary
@@ -1260,6 +1310,12 @@ impl BillingStore {
                     egress_bytes: sub(current.egress_bytes, st.last.egress_bytes),
                     workflow_steps: sub(current.workflow_steps, st.last.workflow_steps),
                     catalog: std::array::from_fn(|i| sub(current.catalog[i], st.last.catalog[i])),
+                    ai_public_micro_cents: sub(current.ai_public_micro_cents, st.last.ai_public_micro_cents),
+                    ai_cogs_micro_cents: sub(current.ai_cogs_micro_cents, st.last.ai_cogs_micro_cents),
+                    ai_input_tokens: sub(current.ai_input_tokens, st.last.ai_input_tokens),
+                    ai_output_tokens: sub(current.ai_output_tokens, st.last.ai_output_tokens),
+                    ai_requests: sub(current.ai_requests, st.last.ai_requests),
+                    ai_web_search_calls: sub(current.ai_web_search_calls, st.last.ai_web_search_calls),
                 }
             };
             if !st.workflow_baseline_done {
@@ -1269,6 +1325,22 @@ impl BillingStore {
             if !st.catalog_baseline_done {
                 st.catalog_baseline_done = true;
                 delta.catalog = [0u64; 19];
+            }
+            if !st.ai_baseline_done {
+                st.ai_baseline_done = true;
+                delta.ai_public_micro_cents = 0;
+                delta.ai_cogs_micro_cents = 0;
+                delta.ai_input_tokens = 0;
+                delta.ai_output_tokens = 0;
+                delta.ai_requests = 0;
+                delta.ai_web_search_calls = 0;
+            }
+            // Defence in depth: cost_cents adds the AI term unconditionally, so without
+            // this guard HIVE_BILLING_METER_RESOURCES=1 alone would charge AI usage that
+            // was never opted in. ai_charging_enabled() is the ONE gate; measurement in
+            // usage_metering still runs regardless of it.
+            if !crate::ai_gateway::ai_charging_enabled() {
+                delta.ai_public_micro_cents = 0;
             }
             st.last = current;
             (delta, st.frac_cents)
@@ -1350,6 +1422,30 @@ impl BillingStore {
             hive_contract::METER_CATALOG_SAMPLE,
             tenant,
             catalog_payload,
+            outcome.clone(),
+        );
+        // A THIRD, additive signed event attests the six AI Gateway meters. The legacy
+        // meter.sample and meter.catalog.sample payloads stay byte-identical, so entries
+        // already signed on live nodes keep replaying against their original schemas.
+        // The values come from the ACTUAL node-local measurement, NOT from the
+        // chargeable delta, which is deliberately zero when AI charging is off: a
+        // signed op attesting zeros while the meter is non-zero would be a lie.
+        // All three ops record the SAME measurement read-back, never a constant Ok(()).
+        let ai = crate::usage_metering::ai_row(tenant);
+        let ai_payload = std::collections::BTreeMap::from([
+            ("tenant_tag".to_string(), tenant.to_string()),
+            ("window_end_ms".to_string(), now_ms().to_string()),
+            ("ai_public_micro_cents".to_string(), ai.ai_public_micro_cents.to_string()),
+            ("ai_cogs_micro_cents".to_string(), ai.ai_cogs_micro_cents.to_string()),
+            ("ai_input_tokens".to_string(), ai.ai_input_tokens.to_string()),
+            ("ai_output_tokens".to_string(), ai.ai_output_tokens.to_string()),
+            ("ai_requests".to_string(), ai.ai_requests.to_string()),
+            ("ai_web_search_calls".to_string(), ai.ai_web_search_calls.to_string()),
+        ]);
+        Self::enqueue_billing_op(
+            hive_contract::METER_AI_SAMPLE,
+            tenant,
+            ai_payload,
             outcome,
         );
         if whole > 0 {
@@ -1861,6 +1957,7 @@ impl BillingStore {
                         frac_cents: w.frac_cents,
                         workflow_baseline_done: false,
                         catalog_baseline_done: false,
+                        ai_baseline_done: false,
                     },
                 )
             })

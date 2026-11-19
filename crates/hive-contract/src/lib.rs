@@ -48,9 +48,8 @@ pub use checkpoint::{
 };
 pub use contract::{record_tenant, AuthPolicy, Caller, Contract, Effect, OpError, OpSpec};
 pub use contracts::billing_meter::{
-    billing_meter_contract, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS,
-    CONTRACT_ID as BILLING_CONTRACT_ID, DECLARED_OPS as BILLING_DECLARED_OPS,
-    METER_CATALOG_SAMPLE, METER_SAMPLE, METER_SKUS, TENANT_TAG,
+    billing_meter_contract, AI_SAMPLE_KEYS, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, CONTRACT_ID as BILLING_CONTRACT_ID, DECLARED_OPS as BILLING_DECLARED_OPS,
+    METER_AI_SAMPLE, METER_CATALOG_SAMPLE, METER_SAMPLE, METER_SKUS, TENANT_TAG,
 };
 pub use contracts::journal::billing_journal_contract;
 pub use contracts::managed_db_contract;

@@ -11,8 +11,8 @@
 
 use crate::contract::{AuthPolicy, Contract, Effect};
 use crate::contracts::billing_meter::{
-    BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, METER_CATALOG_SAMPLE, METER_SAMPLE,
-    METER_SKUS,
+    AI_SAMPLE_KEYS, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, METER_AI_SAMPLE,
+    METER_CATALOG_SAMPLE, METER_SAMPLE, METER_SKUS,
 };
 use crate::oplog::{canonical_fields, canonical_map, Ack, LogEntry, Op, OpLog, INDEX_DOMAIN};
 use std::collections::BTreeMap;
@@ -91,6 +91,7 @@ pub fn apply(index: &Index, op: &Op) -> Vec<Mutation> {
         }
         METER_SAMPLE => meter_sample_mutations(&ns, op),
         METER_CATALOG_SAMPLE => catalog_sample_mutations(&ns, op),
+        METER_AI_SAMPLE => ai_sample_mutations(&ns, op),
         BILLING_LEDGER => vec![Mutation::Put {
             key: format!("{ns}/ledger/{}", escape_component(&field(op, "entry_id"))),
             value: ledger_row_value(op),
@@ -169,6 +170,28 @@ fn catalog_sample_mutations(ns: &str, op: &Op) -> Vec<Mutation> {
     for sku in CATALOG_SKUS {
         out.push(Mutation::Put {
             key: format!("{ns}/catalog/{sku}"),
+            value: field(op, sku),
+        });
+    }
+    out
+}
+
+/// One AI sample: the cumulative value of each of the six AI Gateway meters plus
+/// the window it was measured at. Cumulative values, NOT deltas, so replay compares
+/// the contract index against the meter's own persisted row without re-deriving a
+/// baseline. The `ai/` segment is deliberately DIFFERENT from both the legacy
+/// `usage/` segment and the additive `catalog/` segment: neither older sample kind
+/// can overwrite an AI row, and replay of a signed older entry is byte-identical.
+/// AI_SAMPLE_KEYS carries the target and the window first, so the six meters are
+/// its trailing keys; the index rows use the SAME declared list, not a second copy.
+fn ai_sample_mutations(ns: &str, op: &Op) -> Vec<Mutation> {
+    let mut out = vec![Mutation::Put {
+        key: format!("{ns}/ai/window_end_ms"),
+        value: field(op, "window_end_ms"),
+    }];
+    for sku in AI_SAMPLE_KEYS.iter().skip(2) {
+        out.push(Mutation::Put {
+            key: format!("{ns}/ai/{sku}"),
             value: field(op, sku),
         });
     }

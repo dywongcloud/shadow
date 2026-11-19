@@ -30,6 +30,7 @@ const teamTabs = [
   { href: "/firewall", label: "Firewall" },
   { href: "/network", label: "Constellation" },
   { href: "/usage", label: "Usage" },
+  { href: "/ai-gateway", label: "AI Gateway" },
   { href: "/billing", label: "Billing" },
   { href: "/settings", label: "Settings" },
 ];

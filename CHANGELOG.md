@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-18 - AI Gateway REST surface, provider pool and dashboard tab
+
+A Vercel-AI-Gateway-shaped REST surface mounts at the documented paths plus `GET /v1/ai/state` for the dashboard. It is NOT a byte-for-byte clone of the Vercel 518-model catalog: no BYOK, OIDC, budgets, embeddings, images, audio, regional hosting or trace drains.
+Auth is a platform JWT or tenant API key in `Authorization: Bearer`, never `x-hive-team`; POST inference is Member floor, economics is Admin plus `require_operator`, and no route joins `is_open_route`. `GET /v1/models` discloses `owned_by`, `upstream_model`, `provider` and `provenance`; NO identity-impersonation prompt is injected. The ONLY injected system rule is the language rule.
+
+`HIVE_AI_GATEWAY_PROVIDERS` holds env var NAMES resolved server-side, never credential values in config, `state.json`, logs, responses or the repo. The loopback relay at 127.0.0.1:8792 runs on ONE Mac, so fleet nodes report it unavailable and fail over through `internal_client()` with no redirects, never `HIVE_OUTBOUND_ALLOW_PRIVATE` on an enforced node.
+Failover is bounded, retries only connect/timeout/429/5xx, never after a streamed byte, and a `Drop` guard releases the in-flight slot. Public prices are pinned to Vercel published USD/token from `GET https://ai-gateway.vercel.sh/v1/models` fetched 2026-11-18.
+
+Vercel public pricing states no token markup or platform fee, which CONFLICTS with the operator request for a profitable markup; the resolution is a Vercel-parity PUBLIC price, a documented operator COGS assumption and opt-in charging. No claim is made that the platform undercuts or matches the Vercel margin model.
+COGS is a STATED assumption via `HIVE_AI_GATEWAY_COGS_BPS`. Charging is OFF by default: `ai_charging_enabled()` needs `HIVE_BILLING_METER_RESOURCES=1`, `HIVE_AI_GATEWAY_CHARGING=1`, a cogs bps in 0..=4000 and `RATE_CARD.assert_profitable()` under the ONE `may_act(BillingMeter)` writer. Six additive named meters never widen `[u64; 19]`; `meter.ai.sample` is a third additive signed op with `CONTRACT_VERSION` still 1 and legacy payloads byte-identical.
+
+ChatGPT.com consumer-web automation and residential-proxy scraping are REFUSED; `openai/gpt-6-sol` stays HELD with a printed reason, and an operator may add a legitimate API provider. The two keys pasted into the request are NOT stored, printed or committed; the operator rotates them because they appeared in chat.
+Residuals: node-local bounded generation ring, 3 s get/report fanout labelled `partial`, SSE passthrough only for matching shapes, `token_pass` always null, `GET /v1/credits` maps to the platform prepaid BILLING balance, no streaming token accounting without provider usage, and COGS until the operator supplies a measured figure. The witnesses and full residuals are in `docs/ai-gateway.md`.
+
 ## 2026-11-18 - one canonical catalog of Vercel's billable usage constructs
 
 The operator-supplied Vercel usage screenshots list 30 billable rows. v0 Seats is excluded by

@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   Search, ArrowRight, Plus, LayoutGrid, Boxes, Database, Activity, Globe2,
   ShieldHalf, Plug, Network, BarChart3, CreditCard, Settings, Users, User,
-  BookOpen, Triangle, CornerDownLeft,
+  BookOpen, Triangle, CornerDownLeft, Sparkles,
 } from "lucide-react";
 import { loadProjectNames } from "@/lib/projects";
 import { useIsPlatformOwner } from "@/lib/owner";
@@ -78,6 +78,7 @@ export function CommandBar() {
       ["Firewall", "/firewall", <ShieldHalf key="f" className={ic} />],
       ["Constellation", "/network", <Network key="n" className={ic} />],
       ["Usage", "/usage", <BarChart3 key="u" className={ic} />],
+      ["AI Gateway", "/ai-gateway", <Sparkles key="ag" className={ic} />],
       ["Billing", "/billing", <CreditCard key="b" className={ic} />],
       ["Settings", "/settings", <Settings key="se" className={ic} />],
       ["Teams", "/teams", <Users key="t" className={ic} />],

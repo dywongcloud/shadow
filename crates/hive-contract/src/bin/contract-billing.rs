@@ -23,8 +23,8 @@ use hive_contract::persist::{read_entries_from, read_signed_entries_from, Persis
 use hive_contract::signing::{CheckpointSigner, KeyedSigner};
 use hive_contract::{
     billing_meter_contract, ledger_row_value, verify, InclusionProof, LogEntry, Op, OpLog,
-    SignedEntry, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS, METER_CATALOG_SAMPLE,
-    METER_SAMPLE, METER_SKUS,
+    SignedEntry, AI_SAMPLE_KEYS, BILLING_CHECKPOINT, BILLING_LEDGER, CATALOG_SKUS,
+    METER_AI_SAMPLE, METER_CATALOG_SAMPLE, METER_SAMPLE, METER_SKUS,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -59,6 +59,20 @@ fn catalog_payload(tenant: &str, end_ms: u64, n: u64) -> BTreeMap<String, String
         ("window_end_ms".to_string(), end_ms.to_string()),
     ]);
     for (i, sku) in CATALOG_SKUS.iter().enumerate() {
+        p.insert((*sku).to_string(), (n + i as u64).to_string());
+    }
+    p
+}
+
+/// The additive third sample: the target, the window, and ALL six AI meters named by
+/// AI_SAMPLE_KEYS. Building the payload from the declared key set is the witness that
+/// no declared key is silently omitted; `validate` refuses a missing or extra key.
+fn ai_payload(tenant: &str, end_ms: u64, n: u64) -> BTreeMap<String, String> {
+    let mut p = BTreeMap::from([
+        ("tenant_tag".to_string(), tenant.to_string()),
+        ("window_end_ms".to_string(), end_ms.to_string()),
+    ]);
+    for (i, sku) in AI_SAMPLE_KEYS.iter().skip(2).enumerate() {
         p.insert((*sku).to_string(), (n + i as u64).to_string());
     }
     p
@@ -233,6 +247,29 @@ async fn main() {
         .expect("catalog sample");
     assert!(catalog.committed, "catalog sample refused: {:?}", catalog.error);
     seqs.push(catalog.seq);
+    // ONE additive AI sample. Its own `ai/` index namespace, the same attested
+    // platform caller, and ALL eight declared keys; its seq joins R3's proof set
+    // so inclusion is proved against a PINNED identity, not merely asserted.
+    let ai_rows = ai_payload("team-a", ts + 3, 400);
+    let ai_keys_match = ai_rows.len() == 8
+        && AI_SAMPLE_KEYS.len() == 8
+        && ai_rows.keys().all(|k| AI_SAMPLE_KEYS.contains(&k.as_str()))
+        && AI_SAMPLE_KEYS.iter().all(|k| ai_rows.contains_key(*k));
+    let ai = engine
+        .submit(
+            &contract,
+            platform("team-a", true, true),
+            METER_AI_SAMPLE,
+            ai_rows,
+            "team-a",
+            ts + 3,
+            Ok(()),
+        )
+        .await;
+    let ai_committed = matches!(&ai, Ok(r) if r.committed);
+    if let Ok(r) = &ai {
+        seqs.push(r.seq);
+    }
     // The const payload schema is a COPY of the canonical catalog: prove the copy and its ORDER
     // still match at runtime, where the Vec-returning counter_keys() is admissible.
     let catalog_keys_match = CATALOG_SKUS
@@ -314,7 +351,9 @@ async fn main() {
     probes.push(("R2 every entry is Ed25519-signed by the node", r2, format!("signed={}", signed.len())));
 
     // R3: inclusion proofs verify against a PINNED identity, and a foreign key is refused.
-    let mut proofs_ok = true;
+    // ai_committed/ai_keys_match gate here so the AI sample is a real PASS condition, not
+    // merely a line of output; its seq is already in `seqs`, so its proof is checked too.
+    let mut proofs_ok = ai_committed && ai_keys_match;
     for seq in &seqs {
         let p: Option<InclusionProof> = engine.inclusion_proof(&contract, *seq).await;
         proofs_ok &= p.as_ref().is_some_and(|p| p.verify(&contract, Some(&pk)).is_ok());
@@ -363,6 +402,10 @@ async fn main() {
         "RESULT {}: committed={} seq={} catalog_skus={} canonical_order={} index_namespace=catalog",
         METER_CATALOG_SAMPLE, catalog.committed, catalog.seq, CATALOG_SKUS.len(),
         catalog_keys_match
+    );
+    println!(
+        "RESULT {}: committed={} ai_keys={} keys_match={} index_namespace=ai",
+        METER_AI_SAMPLE, ai_committed, AI_SAMPLE_KEYS.len(), ai_keys_match
     );
     for (name, ok, detail) in &probes {
         println!("{:<58} {} {}", name, if *ok { "PASS" } else { "FAIL" }, detail);

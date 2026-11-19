@@ -42,6 +42,9 @@ pub const METER_SAMPLE: &str = "meter.sample";
 /// Second, additive sample kind. FROZEN legacy `meter.sample` entries keep their own op name,
 /// payload schema and `usage/` index namespace; this kind never rewrites them.
 pub const METER_CATALOG_SAMPLE: &str = "meter.catalog.sample";
+/// Third, additive sample kind: the six AI Gateway meters. Its own closed payload schema
+/// and its own `ai/` index namespace, so neither of the two older kinds is rewritten.
+pub const METER_AI_SAMPLE: &str = "meter.ai.sample";
 pub const BILLING_LEDGER: &str = "billing.ledger";
 pub const BILLING_CHECKPOINT: &str = "billing.checkpoint";
 
@@ -174,6 +177,20 @@ const CHECKPOINT_KEYS: &[&str] = &[
     "commitment",
 ];
 
+/// Closed payload schema of the additive AI sample: the target, the window, and ALL
+/// six AI meters. The `ai/` index segment is separate from `usage/` and `catalog/`,
+/// so a signed legacy or catalog sample replay stays byte-identical.
+pub const AI_SAMPLE_KEYS: &[&str] = &[
+    "tenant_tag",
+    "window_end_ms",
+    "ai_public_micro_cents",
+    "ai_cogs_micro_cents",
+    "ai_input_tokens",
+    "ai_output_tokens",
+    "ai_requests",
+    "ai_web_search_calls",
+];
+
 pub const DECLARED_OPS: &[DeclaredOp] = &[
     DeclaredOp {
         kind: METER_SAMPLE,
@@ -208,6 +225,18 @@ pub const DECLARED_OPS: &[DeclaredOp] = &[
         auth: AuthPolicy::PlatformAttested,
         effect: Effect::StateWrite,
         payload_keys: CATALOG_SAMPLE_KEYS,
+        target_key: TENANT_TAG,
+    },
+    // Third ADDITIVE sample kind: the six AI Gateway meters. Recording is MEASUREMENT,
+    // never authorization and never a charge: it attests the node-local meter even when
+    // AI charging is off and the chargeable delta is zero. PlatformAttested + StateWrite
+    // is admissible; the `ai/` index segment keeps both older kinds byte-identical on
+    // replay. CONTRACT_VERSION stays 1: no signed payload schema is changed.
+    DeclaredOp {
+        kind: METER_AI_SAMPLE,
+        auth: AuthPolicy::PlatformAttested,
+        effect: Effect::StateWrite,
+        payload_keys: AI_SAMPLE_KEYS,
         target_key: TENANT_TAG,
     },
 ];

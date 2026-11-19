@@ -54,6 +54,7 @@ const NO_STORE = [
   /^\/network(\/|$)/,
   /^\/deployments(\/|$)/,
   /^\/billing(\/|$)/,
+  /^\/ai-gateway(\/|$)/,
   /^\/admin(\/|$)/,
   /^\/projects\/[^/]+\/settings(\/|$)/,
   /^\/projects\/[^/]+$/,

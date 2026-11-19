@@ -224,6 +224,16 @@ const RULES: &[Rule] = &[
     rule(POST, "/v1/wqueue/enqueue", Role::Member),
     rule(POST, "/v1/apikeys", Role::Member),
     rule(POST, "/v1/teams", Role::Member),
+    // AI gateway inference: a member's inference is LISTED DELIBERATELY (an unlisted write is
+    // ADMIN by default); the tenant still comes from the verified JWT claim in the handler,
+    // never a header. Operator AI economics exposes COGS/margins: an unlisted read would be
+    // viewer, so list it at an ADMIN floor; require_operator in the handler makes the effective
+    // access operator-only. roles::gate short-circuits for platform_admin, so the floor never
+    // blocks the operator (the same pattern as /v1/admin/usage/economics).
+    rule(POST, "/v1/chat/completions", Role::Member),
+    rule(POST, "/v1/responses", Role::Member),
+    rule(POST, "/v1/messages", Role::Member),
+    rule(GET, "/v1/admin/ai/economics", Role::Admin),
 ];
 
 /// The routes the workflow World's queue client token may call: enqueue a delayed callback for its

@@ -94,10 +94,26 @@ pub struct TenantUsage {
     /// serde(default) keeps pre-extension sidecar rows loading as honest zeros.
     #[serde(default)]
     pub catalog: [u64; 19],
+    /// AI Gateway cumulative meters. Measurement always runs; charging is a
+    /// separate operator opt-in. serde(default) keeps pre-AI persisted rows, and
+    /// an older peer's local slice, loading as honest zeros.
+    #[serde(default)]
+    pub ai_public_micro_cents: u64,
+    #[serde(default)]
+    pub ai_cogs_micro_cents: u64,
+    #[serde(default)]
+    pub ai_input_tokens: u64,
+    #[serde(default)]
+    pub ai_output_tokens: u64,
+    #[serde(default)]
+    pub ai_requests: u64,
+    #[serde(default)]
+    pub ai_web_search_calls: u64,
 }
 
-/// The six measurable dimensions. `record` is the ONLY writer; each kind maps to exactly one
-/// field so two kinds can never race onto the same counter.
+/// The measurable dimensions: six resource dimensions plus six AI Gateway meters.
+/// `record` is the ONLY writer; each kind maps to exactly one field so two kinds
+/// can never race onto the same counter.
 #[derive(Clone, Copy, Debug)]
 pub enum UsageKind {
     /// Index into fluid_core::usage::COUNTER_KEYS. The ONE writer resolves the
@@ -109,6 +125,12 @@ pub enum UsageKind {
     IngressBytes,
     EgressBytes,
     WorkflowSteps,
+    AiPublicMicroCents,
+    AiCogsMicroCents,
+    AiInputTokens,
+    AiOutputTokens,
+    AiRequests,
+    AiWebSearchCalls,
 }
 
 #[derive(Default)]
@@ -186,6 +208,22 @@ pub fn record(tenant: &str, kind: UsageKind, delta: u64) {
         UsageKind::IngressBytes => row.ingress_bytes = row.ingress_bytes.saturating_add(delta),
         UsageKind::EgressBytes => row.egress_bytes = row.egress_bytes.saturating_add(delta),
         UsageKind::WorkflowSteps => row.workflow_steps = row.workflow_steps.saturating_add(delta),
+        UsageKind::AiPublicMicroCents => {
+            row.ai_public_micro_cents = row.ai_public_micro_cents.saturating_add(delta)
+        }
+        UsageKind::AiCogsMicroCents => {
+            row.ai_cogs_micro_cents = row.ai_cogs_micro_cents.saturating_add(delta)
+        }
+        UsageKind::AiInputTokens => {
+            row.ai_input_tokens = row.ai_input_tokens.saturating_add(delta)
+        }
+        UsageKind::AiOutputTokens => {
+            row.ai_output_tokens = row.ai_output_tokens.saturating_add(delta)
+        }
+        UsageKind::AiRequests => row.ai_requests = row.ai_requests.saturating_add(delta),
+        UsageKind::AiWebSearchCalls => {
+            row.ai_web_search_calls = row.ai_web_search_calls.saturating_add(delta)
+        }
     }
     if row.first_seen_ms == 0 {
         row.first_seen_ms = now;
@@ -243,6 +281,19 @@ pub fn install_sink() {
 
 pub fn snapshot() -> BTreeMap<String, TenantUsage> {
     meter().inner.lock().tenants.clone()
+}
+
+/// ONE tenant's measured AI Gateway row on THIS node, without cloning the whole map.
+/// The signed `meter.ai.sample` op attests the ACTUAL measurement, never the
+/// chargeable `UsageTotals` delta (which is deliberately zero when AI charging is off).
+/// A tenant with no row measures honest zeros, not a fabricated reading.
+pub fn ai_row(tenant: &str) -> TenantUsage {
+    let key = resolve_tenant(tenant);
+    let state = meter().inner.lock();
+    match state.tenants.get(key) {
+        Some(row) => *row,
+        None => TenantUsage::default(),
+    }
 }
 
 /// The flat LOCAL slice, shared by `mesh_local()`, the `?local=true` HTTP guard and the
@@ -317,6 +368,12 @@ fn tenants_json(tenants: BTreeMap<String, TenantUsage>) -> Vec<Value> {
                 "egress_bytes": u.egress_bytes,
                 "workflow_steps": u.workflow_steps,
                 "skus": skus_json(&u.catalog),
+                "ai_public_micro_cents": u.ai_public_micro_cents,
+                "ai_cogs_micro_cents": u.ai_cogs_micro_cents,
+                "ai_input_tokens": u.ai_input_tokens,
+                "ai_output_tokens": u.ai_output_tokens,
+                "ai_requests": u.ai_requests,
+                "ai_web_search_calls": u.ai_web_search_calls,
                 "first_seen_ms": u.first_seen_ms,
                 "last_seen_ms": u.last_seen_ms,
                 "_total": total,
@@ -421,6 +478,24 @@ fn merge_rows(fleet: &mut BTreeMap<String, TenantUsage>, view: &Value) {
         merged.workflow_steps = merged
             .workflow_steps
             .saturating_add(row["workflow_steps"].as_u64().unwrap_or_default());
+        merged.ai_public_micro_cents = merged
+            .ai_public_micro_cents
+            .saturating_add(row["ai_public_micro_cents"].as_u64().unwrap_or_default());
+        merged.ai_cogs_micro_cents = merged
+            .ai_cogs_micro_cents
+            .saturating_add(row["ai_cogs_micro_cents"].as_u64().unwrap_or_default());
+        merged.ai_input_tokens = merged
+            .ai_input_tokens
+            .saturating_add(row["ai_input_tokens"].as_u64().unwrap_or_default());
+        merged.ai_output_tokens = merged
+            .ai_output_tokens
+            .saturating_add(row["ai_output_tokens"].as_u64().unwrap_or_default());
+        merged.ai_requests = merged
+            .ai_requests
+            .saturating_add(row["ai_requests"].as_u64().unwrap_or_default());
+        merged.ai_web_search_calls = merged
+            .ai_web_search_calls
+            .saturating_add(row["ai_web_search_calls"].as_u64().unwrap_or_default());
         merge_skus(&mut merged.catalog, &row["skus"]);
         let first = row["first_seen_ms"].as_u64().unwrap_or_default();
         if first > 0 && (merged.first_seen_ms == 0 || first < merged.first_seen_ms) {

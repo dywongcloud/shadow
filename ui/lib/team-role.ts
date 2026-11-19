@@ -39,6 +39,8 @@ export const TEAM_ACTIONS = {
   "database.console.destructive": { floor: "admin", routes: ["POST /v1/databases/:id/console"] },
   "usage.summary": { floor: "viewer", routes: ["GET /v1/usage/summary"] },
   "usage.economics": { floor: "admin", routes: ["GET /v1/admin/usage/economics"] },
+  "ai.infer": { floor: "member", routes: ["POST /v1/chat/completions", "POST /v1/responses", "POST /v1/messages"] },
+  "ai.economics": { floor: "admin", routes: ["GET /v1/admin/ai/economics"] },
   "soc2.evidence": { floor: "viewer", routes: ["GET /v1/admin/soc2/evidence"] },
   /** Node-local contract oplog: raw entries carry tenant tags and refusal reasons, so the backend
    *  RULES row is ADMIN (plus `admin::require_operator`), never the viewer floor of the SOC 2 report. */
