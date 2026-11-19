@@ -2068,7 +2068,7 @@ Mode field: Advanced pole = a traveling swirl that bends the lattice; Acceptable
 | horizon dot pitch | 7 px | 7 px | inert (first attempt aliased DOT_SPACING=8; reverted before render) |
 | horizon intensity formula | 1.35*sqrt(lum)-0.14 | identical, imported | inert |
 | horizon colour bands | inline ternary | `dotColor` | inert |
-| horizon rendered lit pixels | 26,671 (prior run) | re-measured at R1 | see 2g |
+| horizon rendered lit pixels | 26,671 (prior run, different viewport) | 25,280 still / 28,285 shimmer at 1440 px dpr 2, canvas 2880x536 | inert at the source: pitch, formula and colour bands all unchanged. Final-state row added to 2g. |
 
 ### Move M2: bracketed stepper (KEEP-THE-RULE)
 Depends on: M1.
@@ -2087,7 +2087,7 @@ Formal argument: claim, displacement not just brightness; grounds, frame-to-fram
 Alternatives rejected: (a) shimmer only (the horizon already does this, measured identical centroids) -- would not reproduce the recordings; (b) CSS filter blur -- forbidden by AGENTS.md.
 Consequence: 30 fps canvas loop, gated by visibility, IntersectionObserver, prefers-reduced-motion and `html.lp-paused`; a still frame is drawn when motion is off.
 Fence: the grid rule exists so the picture stays legible; the swirl falls off with `exp(-r^2/2sigma^2)` so far dots keep their lattice.
-Measured: pumped the REAL rAF callback on the live page at t+1000/+2600/+4200 ms -> three distinct canvas hashes f68cd312 / e60a7d78 / b1fd169a, lit pixels 92,308 / 96,777 / 92,626. Chrome throttles rAF in a background tab to 0 calls in 2.2 s, so the interception is the witness; with `document.hidden` the loop correctly stops.
+Measured at M3 (superseded by M6/2g, recorded as evidence of that moment only): pumped the REAL rAF callback on the live page at t+1000/+2600/+4200 ms -> three distinct canvas hashes f68cd312 / e60a7d78 / b1fd169a, lit pixels 92,308 / 96,777 / 92,626. Chrome throttles rAF in a background tab to 0 calls in 2.2 s, so the interception is the witness; with `document.hidden` the loop correctly stops. M6 later removed the idle path, so the FINAL state's pointer-driven frames are in Step 2g, not here.
 Mode field: Advanced = the break; Acceptable = one pause state and a still halftone.
 
 ### Move M4: ADAPT -- named step tabs and a shapecued legend (KEEP-THE-RULE)
@@ -2206,7 +2206,7 @@ Statements of meaning: on re-reading the artifact still says four visitor-chosen
 Artist questions: can an unchanged artifact manufacture a new finding; does repetition return a device to automatism.
 Critic questions: does any new exclusion, number-like ink or formal objection appear.
 Opinions: withheld until after the artist questions.
-Andon pulled: no new Andon; Shklovsky's W3 OBJECT is resolved below.
+Andon pulled: yes, by Shklovsky (one OBJECT). Resolved below as OVERRULE with a measurement; no move was spent, no dependent was reopened. The objection stays in the log.
 
 ### W3 OBJECT resolution: OVERRULE (Shklovsky)
 Premise measured BEFORE the resolution: headful DOM geometry on the final build puts the pictorial stage at y 2786-3206 and the caption at y 3227-3248, i.e. the caption is OUTSIDE the pictorial field (`captionInsidePictorialField: false`, `captionInFrameFoot: true`). It does not sit on the dots; it is the plain-language route that Holmes, Mace and Krug each require, and AGENTS.md requires outcome-led copy that the code backs. Deleting it would break MAYA's Acceptable pole and the Inclusion/Usability/USABILITY seats that returned PASS. Reason: the governing criterion of Adaptive mode plus the measurement above; the objection stays in the log unmerged.
@@ -2250,14 +2250,15 @@ Every figure THIS LOG displays, re-measured after M7 on the final build:
 | vortex max displacement 79.8 -> 115.0 px | transpile dot-matrix.ts, sample 42x112 cells | 79.8 / 115.0 | reproducible |
 | displaced cells 3,140 -> 3,417 | same grid | 3,140 / 3,417 | reproducible |
 | six-width no overflow | headful bsk at 320/360/390/768/1024/1440 | all false | reproducible |
-| print/forced-colors fallback | built CSS + class-scoped simulation | frame none, 4 black-text li | reproducible |
+| print/forced-colors fallback | read the built CSS rules on the final build; class-scoped simulation on the same, unchanged CSS | 3 rules present (print, forced-colors, both), 4 fallback li | reproducible; M7 changed only dot-matrix-steps.tsx, not landing.css |
 | idle-swirl pumped frames 92,308 / 96,777 / 92,626 | earlier build, before M6 removed the idle path | DELETED from the claim set | no idle loop exists on the final build |
-Figures in CHANGELOG.md that were written BEFORE M5/M6/M7 and drifted are corrected in the CHANGELOG's own final-state paragraph by this log; the earlier CHANGELOG numbers are left as historical evidence of the measurement moment, with this 2g table as the final authority.
+| horizon lit pixels (M1 residual diff) | count alpha>0 on `.lp-horizon-canvas` at 1440 px dpr 2 | 25,280 paused / 28,285 shimmer | reproducible on the final build; the M1 row's 26,671 came from a different viewport and is superseded |
+The CHANGELOG.md and docs/PENDING_VALIDATION.md figures that were written BEFORE M5/M6/M7 were EDITED IN PLACE in this run to the settled final values; no stale figure is left in either file. Step 2g is the final authority.
 
 ### Stop test
 - **S1.** Frontier: all items TAKEN or DEFERRED with a recorded reason (see below). **MET.**
 - **S2.** W2 returned PASS from all seven required critics with no Andon. **MET.**
-- **S3.** W2 produced no ADAPT/SCRAP/REOPEN/new OPEN item; W3 produced one new OBJECT (Shklovsky), resolved as OVERRULE with a measurement and no move spent. Saturation is **NOT MET**: two consecutive WHOLE rounds did not both come back clean. Resume point: W4 and W5 WHOLE rounds on the unchanged artifact after adding the `Saturation vs Ostranenie` tension node below.
+- **S3.** The contract's literal condition (two consecutive WHOLE rounds with no ADAPT, SCRAP, REOPEN or new OPEN Frontier item) is arguably satisfied by W2 + W3, since W3's OBJECT was OVERRULED with a measurement and its Frontier row is DEFERRED with a reason, not OPEN. I do NOT claim that: W3 was not a clean PASS round, W4/W5 saturation rounds were not run, and the retrospective records below are an admitted compliance miss. **Reported as NOT MET** under the stricter reading. Resume point: W4 and W5 WHOLE rounds on the unchanged artifact after adding the `Saturation vs Ostranenie` tension node below.
 - **S4.** Ambition push: escalated the Breaker's twist from 1.05 to 1.55; measured max dot displacement 79.8 px -> 115.0 px and displaced cells 3,140 -> 3,417 at the same grid/timestamps. **MET.**
 - **S5.** Every dotted edge from a used anchor: `maya -.->|bounds the break of| samBreak` applied (M2/M3: vortex falloff preserves the far lattice; MAYA bounds the break). `maya -.->|tempers strangeness of| shklovsky` applied (no numeral, no badge). `kleon -.->|popularizes| young` applied (M1 reuse of the existing renderer). `maya -.->|acceptability limit on| carson` DECLINED: no expressive typography break is in scope; the brief asks for a legible outcome-led marketing page, and the acceptable pole (Krug/Holmes/Mace all PASS) requires it. `wcag -.->|contrast floor constrains| albers` DECLINED: no colour-interaction study is in scope; the dot colours are the existing horizon's three bands, unchanged. `crit_prov_debord -.->|attacks smoothness favored by| crit_use_krug` applied (the panel's dotted pair). **MET** with two DECLINED edges recorded with reasons.
 
@@ -2295,14 +2296,14 @@ The criterion did not fail: MAYA's dual pole explained every disagreement. The p
 ### Compliance Check
 - [x] Tooling inventory done; tool used for each job or "none available": Step 0 table (ffmpeg/ffprobe, Node+sharp, gm verbs, Agent tool, bsk; no graph renderer).
 - [x] Mode stated with the reason: Adaptive, public marketing page + approachability constraint. Traversal Plan.
-- [x] Seed with exact labels including a dotted-edge counterpoint, and a living Frontier: Traversal Plan, Frontier tables updated after every round.
-- [x] At least one BREAK move taken (M3, M5); no quota used as a stopping rule: Decision Records M1-M7; five panel rounds.
-- [x] A Decision Record written before each move, with all fields: M1-M7 (Intent, Formal argument, Alternatives rejected, Consequence, Fence, Frontier effect, Mode field, dependencies).
-- [x] A Panel Report per round from a panel meeting the mode's composition rule, each critic citing something OBSERVABLE: R0 (7 seats), R1 (7 seats), W1/W2/W3 (7 seats each). Debord/Krug dotted pair present in every round.
-- [x] Every OBJECT resolved as ADAPT, SCRAP or OVERRULE: R0 ADAPTs M4; R1 ADAPTs M5/M6 plus OVERRULEs for Greenberg's globe deletion, Krug's Pause/Play, Tufte's stale counters, Shklovsky's retained brackets. W1 ADAPTs M5/M6. W3 OVERRULE with measurement. All objections stay in the log.
+- [x] Seed with exact labels including a dotted-edge counterpoint, and a living Frontier: Traversal Plan. Frontier tables exist after R0/M1-M4 and at the end; they were NOT rewritten after every panel round, which is a miss.
+- [x] At least one BREAK move taken (M3, M5); no quota used as a stopping rule: Decision Records M1-M7; four WHOLE panel reports in run 6 (R0, W1, W2, W3).
+- [ ] A Decision Record written BEFORE each move: **M1-M4 were written before their moves; M5-M7 were reconstructed from the witness receipts AFTER the code had landed.** This is a real miss, not a rounding of the wording. The records carry all fields, but three of them are retrospective.
+- [ ] A Panel Report per round: R0, W1, W2 and W3 each have a seven-seat table with observable evidence in run 6. The intermediate rendered checks that produced R1-final.png / R2-final.png and their agents' verdicts have NO per-seat report in this log. Those rounds are named in the skipped list.
+- [x] Every OBJECT recorded in run 6 resolved as ADAPT, SCRAP or OVERRULE: R0 premise OVERRULEs (Greenberg's globe deletion, Krug's Pause/Play, Tufte's stale counters, Shklovsky's retained brackets) and ADAPT M4; W1 ADAPTs M5/M6; W3 OVERRULE with measurement. Objections stay in the log.
 - [x] WHOLE rounds run; S1-S5 each shown met or NOT MET, with where: Stop test above. S3 is NOT MET; the run is incomplete by its own stop test.
-- [x] Every figure the artifact displays re-measured at the final state with a reproducing procedure: Step 2g table; drifted figures corrected; two pre-M5 figures DELETED from the claim set.
-- [x] Anchor Ledger complete and the live graph updated: R0 ledger + W1/W2/W3 status columns above; Mermaid text with `visited` class in the Traversal Plan. No graph renderer was available, so the marked Mermaid text is the live graph.
+- [x] Every figure the artifact displays re-measured at the final state with a reproducing procedure: Step 2g table; drifted figures corrected in CHANGELOG.md, docs/PENDING_VALIDATION.md and this log; one idle-swirl triplet DELETED from the claim set.
+- [ ] Anchor Ledger complete and the live graph updated after EVERY panel round: the R0 ledger has 13 rows and the Mermaid text with `visited` is in the Traversal Plan, but no post-R0 ledger rows and no `kept`/`adapted`/`scrapped` class update were written. No graph renderer was available. The W1/W2/W3 verdict tables are evidence, not a ledger update. This is a miss.
 - [x] Double-loop paragraph written: above, with Graph amendments.
 - [x] Final reply states mode, tools, stop conditions and everything skipped: see the reply.
 
@@ -2312,6 +2313,9 @@ The criterion did not fail: MAYA's dual pole explained every disagreement. The p
 - W3 produced one OBJECT (Shklovsky) which was OVERRULED with a measurement rather than ADAPTed; no move was spent on it. The objection remains in the log.
 - Phase B of the gm skill (push + install) was NOT run: a `git push` auto-deploys through two triggers and needs the operator's word, which this brief did not give. No push, no roll, no deploy.
 - W4 and W5 WHOLE saturation rounds were NOT run, so S3 is not met and the dada run is INCOMPLETE by its own stop test. The Open frontier item and the resume point are recorded above.
+- The Decision Records for M5/M6/M7 and the W1/W2/W3 Panel Reports were written into this log AFTER those moves and rounds happened, reconstructed from their witness receipts. The contract asks for each Decision Record BEFORE its move; that ordering was not followed for three moves.
+- The intermediate rendered checks (R1-final.png, R2-final.png and their seven-seat agent verdicts) have screenshots and receipts but no per-seat Panel Report in this log; the Contract's "one report per round" was therefore not met for them.
+- The Anchor Ledger and the live Mermaid graph were not updated after R0; no post-R0 status classes were applied. The Frontier was not rewritten after every round (only after R0/M1-M4 and at the end).
 - The supplied Spheron base stills and recordings were used as ANALYSIS references only; they are NOT shipped. The three base images carry NVIDIA/PyTorch badges and rival artwork; our four luminance scenes are painted in code.
 - No test files were created. No secrets, no graphical symbols and no unchecked panics are in the diff.
 
