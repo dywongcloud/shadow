@@ -281,8 +281,9 @@ export default function UsageView() {
         usageText = fmtMeasured(counterValue);
         // No public rate exists for an indexed row; this literal is a state label, not a rate card lookup.
         rateText = "$0.000";
-        // The charge is a known billing state, not a substitute for a missing measurement.
-        chargeText = moneyMeasured(0);
+        // An absent counter is NOT a measured zero charge: print the billing state, never $0.00
+        // beside "-". A measured counter still earns the same "Not billed" label.
+        chargeText = "Not billed";
         muted = false;
         note = `Counter only, not billed. Source: ${row.source}`;
       } else if (row.state === "unmetered") {
