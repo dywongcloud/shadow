@@ -1,6 +1,6 @@
 # Changelog
 
-## 2026-11-18 - AI Gateway REST surface, provider pool and dashboard tab
+## 2026-11-19 - AI Gateway REST surface, provider pool and dashboard tab
 
 A Vercel-AI-Gateway-shaped REST surface mounts at the documented paths plus `GET /v1/ai/state` for the dashboard. It is NOT a byte-for-byte clone of the Vercel 518-model catalog: no BYOK, OIDC, budgets, embeddings, images, audio, regional hosting or trace drains.
 Tenant-bearing routes require a platform JWT or tenant API key in `Authorization: Bearer`, never `x-hive-team`; the two public catalog reads are unauthenticated like Vercel. POST inference is Member floor, economics is Admin plus `require_operator`, and no route joins `is_open_route`. `GET /v1/models` discloses `owned_by`, `upstream_model`, `provider` and `provenance`; NO identity-impersonation prompt is injected. The ONLY injected system rule is the language rule.

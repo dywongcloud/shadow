@@ -154,7 +154,7 @@ safe sentences; the upstream URL, status and body are never forwarded.
 `HIVE_AI_GATEWAY_MAX_INFLIGHT` (default 32) bounds concurrency and answers 503
 `api_error` when full. An `Inflight` guard OWNS the `reqwest::Response`: on
 client disconnect, axum drops the handler future, the guard drops the
-response, the body stream aborts and the socket closes — not just a counter
+response, the body stream aborts and the socket closes, not just a counter
 decrement. `copy_bidirectional` and a `select!` over a splice are never used.
 `internal_client()` now sets `.no_proxy()`; a live witness with a dead hostile
 `HTTP_PROXY` confirms the loopback provider still receives the request.
@@ -323,7 +323,13 @@ The witnesses recorded in `.gm/witness-log.md` and
 11. Headful Chromium at 320/360/390/768/1024/1440 on a production build of a
     scratch copy served at `http://localhost:PORT` (never 127.0.0.1).
 
-The first nine, the contract replay (`contract-billing`: probes=11,
-replay_ok=true, signed=11, proofs=9) and witness 10 are recorded with their run
-identities in `.gm/witness-log.md`. Witness 11 is recorded when it completes.
+The eleven witnesses are recorded with their run identities in
+`.gm/witness-log.md`. The headful six-width witness passed via an independent
+raw-CDP driver after the `bsk` CLI refused every DOM action with
+`cooperation_sync_required`; that first attempt is recorded as NOT WITNESSED,
+not as a pass. Measured at 320/360/390/768/1024/1440: `overflow=0`,
+`clippedCount=0`, zero console errors, `h1="AI Gateway"`, provider pool,
+residuals and `rate_card` prices present. The three sub-44px buttons reported
+on the page come from the pre-existing global `ui/components/gitops.tsx` (the
+new view has no `<button>` at all) and `chromeSmall=5` is identical on `/usage`.
 Local commits only: no push and no roll without the operator word.
