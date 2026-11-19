@@ -48,6 +48,7 @@ export function DotMatrixSteps() {
     if (!srcCtx || !gridCtx) return;
 
     let cols = COLS; let rows = 0; let width = 0; let height = 0; let dpr = 1;
+    let current = 0;
     let intensity = new Float32Array(0);
     let frame = 0; let last = 0; let born = 0;
     let visible = false; let disposed = false;
@@ -139,7 +140,7 @@ export function DotMatrixSteps() {
       dpr = Math.min(window.devicePixelRatio || 1, 2);
       canvas.width = Math.round(width * dpr);
       canvas.height = Math.round(height * dpr);
-      repaint(0); draw(0);
+      repaint(current); draw(0);
     };
 
     const tick = (time: number) => {
@@ -192,7 +193,7 @@ export function DotMatrixSteps() {
     const mo = new MutationObserver(sync);
     mo.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
 
-    repaintRef.current = (next: number) => { repaint(next); draw(0); };
+    repaintRef.current = (next: number) => { current = next; repaint(next); draw(0); };
     resize(); sync();
 
     return () => {
