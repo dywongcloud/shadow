@@ -43,3 +43,22 @@ Read this file before Step 1 of any later dada run on this project.
 | A View All ghost pill can add a table view without hiding returned rows; accessibility labels can grow while every original label stays. | aria-label strings 24 -> 35, role="tab" 1 -> 4, role="meter" 3 -> 3, ariaMissing empty. | M2. |
 | Source counts are not rendered evidence. A measured source delta does not satisfy S4 when the browser is unrendered. | Step S4 source delta 25 -> 1, 41 -> 0, 25 -> 0; F3 remains OPEN with no computed CSS or pixel witness. | Run declared INCOMPLETE at S1-S5. |
 | A second hardcoded palette lives outside the analytics write surface in db-chart.tsx:7-27 and db-log-table.tsx:146; leaving it makes sibling database charts non-cohesive. | Exhaustive read-only refuter report, no edit made. | F4 DEFERRED to orchestrator. |
+
+## Run 6 additions (2026-11-18, dot-matrix steps)
+
+| Fact | Measurement that established it | Move it changed |
+| --- | --- | --- |
+| landing.css loads after Tailwind, so a class there setting position/margin/padding beats the utility on the same element | computed-style probe on the prior horizon task | M-horizon CSS |
+| A layout <wbr> inside an identifier that must be copied byte-exactly is invisible in textContent but inserts a pause in the accessibility tree | /tips six-width DOM sweep, run 5 | M12 SCRAP |
+| Turbopack artifacts are per-build: a preview server left running across a rebuild serves stale chunks until its service worker and caches are cleared | hydration failure reproduced in the /tips task | preview rebuild protocol |
+
+## Run 6 final additions (Step 2g, measured on the final build)
+
+| Fact | Measurement that established it | Move it changed |
+| --- | --- | --- |
+| Chrome throttles requestAnimationFrame to 0 calls in 2.2 s for a bsk background tab (`document.visibilityState === "hidden"`); an animation loop cannot be witnessed by waiting. Intercept the real rAF callback and pump controlled timestamps. | rafCalls 0 / 2168 ms in the hidden tab; pumping the real `tick` on the final visible build gave 3 distinct frames (5fea2072 / 51be9cf4 / 383af09). | M3, Step 2g. |
+| Painting a 1200x680 luminance source directly into a 118-column grid makes 1-3 px strokes vanish; paint at full resolution and downsample. | first render had bright shapes only and no fine lattice; full-res paint + `drawImage` produced the ASCII texture. | M1/M3. |
+| A CSS pseudo-element bracket tick can be replaced by a dot cluster drawn from the same lattice, so the frame becomes the picture's own medium. | headful DOM: 0 dash elements, `::before` content "none"; 4x4 clusters drawn from `intensity` at the four corners. | M5. |
+| ResizeObserver delivery is suspended in a hidden tab, so a canvas backing store can stay at a stale 2316x840 while the CSS stage is 333x300. Re-read the box inside `draw` and resize when it differs. | headful: canvas 2316x840 vs stage 333x300 before the box check; after it, 556x600 at 320 px and 2316x840 at 1440 px. | M7 and the six-width witness. |
+| A canvas pixel hash is only reproducible from a SETTLED frame: hard reload, scrollIntoView, 2000 ms idle, then click each tab 400 ms apart. Measuring immediately after reload gives a different, unreproducible hash for the same step. | two consecutive settled runs both gave 7d1ba8dc / b4e275ba / e458a3db / f6d3a5c4; the unsettled run gave 3dffd930 / d96ec98b for the first two steps. | Step 2g corrected the CHANGELOG and PENDING_VALIDATION figures. |
+| A service worker scoped to the preview origin keeps chunk URLs from an older BUILD_ID after a rebuild; unregister it and delete caches before believing a hydration failure. | local preview served stale chunks until 1 registration and 1 cache were cleared; a hard reload then served the final BUILD_ID gMDpG54iebiJuenOKVu6R. | preview rebuild protocol. |

@@ -38,13 +38,20 @@ label and NO status claim. No third-party asset and no new dependency.
 
 Witnessed on a clean production build of a scratch copy at
 320/360/390/768/1024/1440 px: no horizontal overflow, all tabs 44 px, frame
-opacity 1 at rest. Four clicks produce four distinct canvas hashes (lit pixels
-97,284 / 147,964 / 105,117 / 168,725). Pumping the real rAF callback yields
-three distinct canvas hashes and lit counts 92,308 / 96,777 / 92,626; the
-traveling vortex's max dot displacement was escalated 79.8 px -> 115.0 px
-(displaced cells 3,140 -> 3,417). Pointer-driven swirl gives three distinct
-position signatures (max displacement 62.2 / 114.9 / 129.2 px). tsc, tsconfig.ci.json,
-npm run lint, check-contract-bindings.py --check and git diff --check all exit 0.
+opacity 1 at rest, and a backing store that matches the stage (556x600 at
+320 px through 2316x840 at 1440 px). With the frame scrolled into view and
+2000 ms of idle, four clicks produce four distinct canvas hashes (lit pixels
+112,469 / 160,254 / 107,146 / 170,754); a forced resize keeps the chosen
+step's hash (f6d3a5c4, 170,754) and its own label. With an active pointer,
+pumping the real rAF callback yields three distinct frames (lit 142,956 /
+135,477 / 138,632) that settle back to the still halftone after the 1.6 s
+idle. The traveling vortex's max dot displacement was escalated 79.8 px ->
+115.0 px (displaced cells 3,140 -> 3,417); transpiled `vortex` gives three
+distinct position signatures (max displacement 62.2 / 114.9 / 129.2 px).
+tsc, tsconfig.ci.json, npm run lint, check-contract-bindings.py --check and
+git diff --check all exit 0. Earlier figures from pre-frame-swap and
+unsettled-canvas builds are superseded by this final-state measurement;
+DESIGN-LOG.md run 6 Step 2g is the authority.
 
 See DESIGN-LOG.md run 6 for the dada panel, Decision Records, frame swaps and
 Compliance Check. No push and no roll: a `git push` auto-deploys through two
