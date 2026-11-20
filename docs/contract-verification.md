@@ -46,18 +46,21 @@ surface.
 
 ## 2. What `--state` actually reads
 
-SIX binaries accept `--state`; each reads a real `state.json` snapshot but NOT
-its secrets. The three `RealDb` readers (audit/reconcile/replicate) take
-id/project/team/kind/status/region/created_ms only. `connection` is deliberately absent from every
-`RealDb` struct (`contract-audit.rs:9`, `:31-45`; `contract-reconcile.rs:11`;
+SIX binaries accept `--state`. The three `RealDb` readers (audit/reconcile/replicate)
+take id/project/team/kind/status/region/created_ms only, so they never deserialize a
+credential. `connection` is deliberately absent from every `RealDb` struct
+(`contract-audit.rs:9`, `:31-45`; `contract-reconcile.rs:11`;
 `contract-replicate.rs:11`). `contract-reconcile` additionally reads `database_tombstones` and
 `database_data.write_plane`; `contract-replicate` reads tombstones. `contract-persist::targets()`
 reads only `databases[].id` and falls back to synthetic `db_witness_####` names when parsing fails
-(`contract-persist.rs:74-96`).
+(`contract-persist.rs:74-96`). `contract-billing` reports only the file's byte count.
+`contract-double-entry` deserializes a FULL `PlatformSnapshot` for its S1 serde gate, so the
+claim above does not cover it; the harness prints no field of that snapshot.
 
 Copying a real `state.json` off a node remains an operator action: it is the canonical state file
-and may carry other material. Never print it wholesale. The verification binaries only need the
-fields above; a hand-built fixture with those fields is a valid input.
+and may carry other material. Never print it wholesale. The three `RealDb` readers need only the
+fields above; a hand-built fixture with those fields is a valid input for them. The S1 gate in
+`contract-double-entry` is the exception: it needs a full `PlatformSnapshot`.
 
 ## 3. On-disk format
 
