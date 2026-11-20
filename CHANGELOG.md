@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-11-19 - additive SSH key under the incident assumption
+
+A fresh ed25519 key (SHA256:nGj5iEyY/UeovJBSqTIb8CHhGrSlBjlKlsqcrdb6qxg)
+is appended in a marked block to authorized_keys on all six Linux nodes:
+root for va/va3/sj/sj7/phx and sysadmin for fc-orlando. Every host kept
+mode 0600, gained exactly one fingerprint and an existing key was left
+untouched; a live login with the new key passed 6/6. This is ADDITIVE
+preparation, not an eviction: the five pre-existing keys (including the
+RSA 2048 key shared by five hosts) remain authorized. Operator chose
+"add new key from here" knowing that a compromise of this control host
+would expose the new private key. Mac nodes are excluded by the operator.
+
+Live containment is the 107.181.252.0/24 nft drop on input+forward,
+witnessed with a two-arm netns test (unblocked source replied, blocked
+source dropped, counter 0 -> 1). The sshd journal evidence is 1705/1510/979
+ACCEPTED logins from one IP in the /24 on sj7/va/va3 during Oct 21-24,
+with none after; CHANGELOG 2026-11-06 held the question of whether that
+IP is operator-owned, now resolved as hostile by the operator word.
+
+Fleet shared tokens and HIVE_SECRET_KEY rotation are HELD, not performed:
+they need a coordinated six-node restart including the chain head, and
+the at-rest key must keep its old value in HIVE_SECRET_KEY_OLD. No vault
+file, unit, env-local, password, log or running service was changed.
+No push: a push would auto-deploy the 18 unpushed commits.
 ## 2026-11-19 - incident containment: additive block of 107.181.252.0/24
 
 CHANGELOG.md 2026-11-06 records 107.181.252.214 as an unattributed
