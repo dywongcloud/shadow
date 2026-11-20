@@ -87,3 +87,16 @@ Row: redeploy-transport-failure-is-bounded. Files: ui/lib/gitops-server.ts, ui/a
 
 HELD (world-scoped one-way door): NO push, NO roll. A git push auto-deploys through the webhook and git::spawn_git_poll_reconcile, and a backend roll is a production change that needs the operator's word. The running fleet binaries are unchanged, so los-angeles placement is NOT live yet. The out-of-inventory macOS Mock peers also need the new binary.
 Row: region-save-rollback-visible. File: ui/app/projects/[project]/settings/functions/functions-settings-client.tsx. Witness needed + run: headful Chrome (headless:false, own profile) at six widths 320/360/390/768/1024/1440 against a shaped admin whose PUT /functions returns 503. After clicking Los Angeles the [role=alert] banner reads "Could not save region settings: ...", the LA button reverts to unmarked, and the chip stays "1/5 regions selected". RESULT PASS (BROWSER_WITNESS_REAL_EXIT=0, BANNER_WITNESS_EXIT=0); no overflow at any width.
+
+## 2026-11-20 - Space Computer / Orbitport KMS custody research
+
+Row: non-custodial-sensitive-tenant-data. File: docs/research-space-computer-kms.md.
+Witness needed: a re-evaluation only after the vendor ships Phase 2 threshold
+cryptography with the tenant as an independent share holder, caller-verifiable
+attestation per RPC result, GA durability/availability/key-recoverability, an
+import/export exit path, credits off the decrypt path, and an independent audit
+of the deployed system. RESULT this pass: HOLD on primary-source reading
+(docs.spacecomputer.io/docs/how-to/kms, /authentication, /concepts/*,
+llms-full.txt 133,418 chars, spacecomputer.io) and this repo's secrets.rs,
+project_settings.rs, docs/compliance-controls.md, docs/soc2-evidence-report.md.
+No code change, no integration, no push, no roll.

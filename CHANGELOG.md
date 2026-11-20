@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-11-20 - Space Computer KMS: not non-custodial for tenant data
+
+Research memo at docs/research-space-computer-kms.md. Verdict: HOLD. The
+current Orbitport KMS is custodial (provider-side key creation and crypto,
+tenant holds a bearer token), explicitly experimental with a "do not use it to
+protect production data" warning and no durability, availability or key
+recoverability guarantees. Orbital hardware, attestation and threshold
+cryptography are roadmap, not deployed. Adopting it would invert this repo's
+fail-closed self-hosted key resolution (secrets.rs) and put a credit-metered,
+intermittently available RPC on the decrypt path. No integration, no push,
+no roll. The supplied account credential was not decoded, stored or used;
+operator must rotate it at the accounts portal because it is now exposed.
+
 ## 2026-11-20 - explicit region pin honored; no-cache redeploy no longer a bare 500
 
 Operator report: changing project openwebcontainer from san-jose to los-angeles
