@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-11-19 - incident containment: additive block of 107.181.252.0/24
+
+CHANGELOG.md 2026-11-06 records 107.181.252.214 as an unattributed
+privileged SSH source on fc-orlando (116 root pubkey logins, ~2,200
+sysadmin password logins with a second key and an atltech wheel
+account). A read-only sweep on 2026-11-19 found 1,735 / 1,543 / 1,006
+sshd journal hits from that /24 on sj7 / va / va3 in the prior 30 days,
+zero current connections and zero fail2ban bans. No live fleet, private
+VPC or operator egress address falls in the range.
+
+scripts/hive-lockdown.sh gains BLOCKED_CIDRS="107.181.252.0/24" with a
+drop emitted FIRST, ahead of the established/related accept, in the nft
+branch, the iptables branch and the strict table. gen-hive-lockdown.sh
+rewrites only PEERS/PRIVATE_PEERS, so the deny survives regeneration.
+Live containment is a separate dedicated inet table at priority -300
+(raw) on input+forward, installed on all six Linux hosts by an additive
+oneshot unit. It owns only its own table: no existing firewall rule,
+key, log, account or service is removed, and it is reversible with one
+nft delete table command. Mac nodes are NOT touched (excluded by the
+operator; macOS pf, not in the ansible inventory, one needs physical
+access). Cloud security groups, fail2ban enrollment and an app-layer
+edge deny are HELD: the Tencent account is shared, fc-orlando is not
+enrolled in fail2ban, and an edge deny needs a backend roll that would
+ship 16 unpushed commits.
+
+Credential rotation is HELD and NOT performed. This control machine
+holds the SSH key, .vault_pass and vault secrets, so generating new
+secrets here while "assume everything had been compromised" is in
+force does not evict an attacker who holds this host. Revoking old
+keys without a verified new key path has no in-band recovery.
+
 ## 2026-11-19 - undo blue streak run and the deployment stepper
 
 The two blue corner light streaks, the transparent-at-top navbar with its dark wordmark and sign-in plates, the blue gradient pill CTA and the scrolled plate are REMOVED from the signed-out landing page. The hero shows its six competing light layers again (GlowRing, lp-glow-blue, lp-aurora-a/b, lp-grid, lp-grain) and the h1 uses the gradient text span. MarketingShell has no streaks prop and the two streak WebP assets and hero-streaks.tsx are deleted. Every other marketing page keeps its original dark header, backdrop blur and bottom hairline.

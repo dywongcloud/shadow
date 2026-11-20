@@ -39,6 +39,12 @@ PRIVATE_PEERS="10.0.0.8 10.0.0.10 10.0.0.12 10.0.0.14"
 # range token works verbatim for iptables --dport; the nft branch converts
 # it to nft's dash form.
 LOCKED_PORTS="8787 9090 3000 7799 7800 7801 7802 7803 7804 50052 50100:50999"
+# Incident 2026-11-19: unattributed privileged SSH source (CHANGELOG.md
+# 2026-11-06). Range contains NO fleet peer, private VPC, or operator
+# egress address; confirmed against hosts.ini before adding. Kept as a
+# variable so gen-hive-lockdown.sh (which rewrites only PEERS and
+# PRIVATE_PEERS) never drops it. Empty string disables the deny.
+BLOCKED_CIDRS="107.181.252.0/24"
 
 # nft FIRST, iptables only as a fallback for a host that has no nft at all.
 # Reordered 2026-10-09 after fc-orlando: that host ships BOTH binaries, and
@@ -73,6 +79,13 @@ if command -v nft >/dev/null 2>&1; then
   # (/etc/sysctl.d/60-hive-reserved-ports.conf), which stops the kernel ever
   # allocating those ports automatically; this rule also covers a process that
   # binds one explicitly.
+  # FIRST, before the established/related accept: a live session from a
+  # blocked source must be dropped, not grandfathered by conntrack.
+  if [ -n "$BLOCKED_CIDRS" ]; then
+    for c in $BLOCKED_CIDRS; do
+      nft add rule inet hive_lockdown input ip saddr "$c" counter drop
+    done
+  fi
   nft add rule inet hive_lockdown input ct state established,related accept
   nft add rule inet hive_lockdown input iif lo accept
   nft add rule inet hive_lockdown input ip saddr "{ $PEERS_NFT }" accept
@@ -104,6 +117,12 @@ elif command -v iptables >/dev/null 2>&1; then
   # Same reason as the nft branch above (see the comment there): reply packets
   # of locally-originated connections are never the thing this chain protects
   # against, so they RETURN before the dport drops see them.
+  # FIRST, before the established RETURN (same reason as the nft branch).
+  if [ -n "$BLOCKED_CIDRS" ]; then
+    for c in $BLOCKED_CIDRS; do
+      iptables -A HIVE_LOCKDOWN -s "$c" -j DROP
+    done
+  fi
   iptables -A HIVE_LOCKDOWN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
   iptables -A HIVE_LOCKDOWN -i lo -j RETURN
   for p in $PEERS; do iptables -A HIVE_LOCKDOWN -s "$p" -j RETURN; done
@@ -141,12 +160,18 @@ if [ -f "$STRICT_FLAG" ]; then
   WAN_IF="$(ip -o route show default | awk '{for (i = 1; i <= NF; i++) if ($i == "dev") { print $(i + 1); exit }}')"
   [ -n "$WAN_IF" ] || { echo "ERROR: strict lockdown: no default-route interface found" >&2; exit 1; }
   STRICT_PEERS="$(echo $PEERS $PRIVATE_PEERS | tr ' ' ',')"
+  # Empty when disabled; an empty heredoc line is harmless.
+  BLOCKED_STRICT_RULE=""
+  if [ -n "$BLOCKED_CIDRS" ]; then
+    BLOCKED_STRICT_RULE="ip saddr { $(echo $BLOCKED_CIDRS | tr ' ' ',') } counter drop"
+  fi
   TCP_PUBLIC="$(echo "$STRICT_PUBLIC_TCP" | tr ' :' ',-')"
   UDP_PUBLIC="$(echo "$STRICT_PUBLIC_UDP" | tr ' :' ',-')"
   nft -f - <<NFT || { echo "ERROR: strict lockdown ruleset failed to load" >&2; exit 1; }
 table inet hive_strict {
   chain input {
     type filter hook input priority -90; policy accept;
+    $BLOCKED_STRICT_RULE
     iifname != "$WAN_IF" accept
     ct state established,related accept
     ct state invalid drop
