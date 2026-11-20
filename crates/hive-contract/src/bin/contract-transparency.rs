@@ -13,7 +13,10 @@
 //!   * T6    -- does a breach notice carry the publisher's signature, so a monitor cannot convict an
 //!              honest executor by writing an ack itself (2.6)?
 //!
-//! Usage: `contract-transparency [--dir <path>]`
+//! Usage: `contract-transparency` (parses NO arguments)
+//! The run directory is fixed at `/private/tmp/hive-contract-transparency-<pid>`; it is removed and
+//! recreated on each run, so a caller cannot point the deletion at an arbitrary path. `--state` is
+//! not accepted here: this harness generates its own keypair and store.
 //! Exit 0 only when every guarantee holds and every forgery is refused.
 
 use hive_contract::appendonly::{

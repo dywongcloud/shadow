@@ -100,3 +100,26 @@ of the deployed system. RESULT this pass: HOLD on primary-source reading
 llms-full.txt 133,418 chars, spacecomputer.io) and this repo's secrets.rs,
 project_settings.rs, docs/compliance-controls.md, docs/soc2-evidence-report.md.
 No code change, no integration, no push, no roll.
+
+## 2026-11-20 - contract verification CLI + checkpoint write race
+
+Row: contract-cli-documented-flags-unimplemented. Files:
+crates/hive-contract/src/bin/contract-adversary.rs, contract-transparency.rs,
+contract-forge.rs, contract-cost.rs, crates/hive-contract/src/persist.rs,
+docs/contract-verification.md, docs/README.md, CHANGELOG.md.
+Witness needed + run: every documented flag parsed or its documentation
+corrected; contract-cost nonzero on RESULT FAIL; runbook names the exact real
+args. RESULT: four-bin live run (adversary/transparency/forge all exit 0 with
+RESULT: ALL PROBES PASSED); contract-cost default/small/large windows all exit 0
+with RESULT PASS; deterministic divergence (--ops 0 + a pre-seeded valid 24-op
+log under the same signing key) prints RESULT FAIL with exit 1. The first
+four-bin witness exposed persist::write_atomic's fixed .tmp sibling ENOENT
+race; six fresh contract-cost runs after the fix are 6/6 exit 0. RESULT:
+cargo check -p hive-contract --bins --locked --offline PASS;
+cargo test -p hive-contract --locked --offline PASS (0 tests, doc-tests ok);
+cargo test --workspace --locked EXIT 0;
+cargo build -p hive-contract --bins --locked --offline PASS;
+scripts/cli-acceptance.sh 35 passed / 0 failed, CLI_ACCEPT_EXIT=0;
+check-contract-bindings.py --check RESULT PASS bindings=34 layers=4 gates=35
+fail_open=4 secrets_clean=1; git diff --check EXIT 0. NO_TEST_FILES. No push and no roll: a push auto-deploys
+through two SHA-deduping triggers and the running fleet binaries are unchanged.

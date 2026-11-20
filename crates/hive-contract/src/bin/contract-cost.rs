@@ -4,12 +4,16 @@
 //! Durability is not free and this harness is the instrument that says what it costs. Everything it
 //! reports is measured by running the real `Engine` against a real directory: no model, no estimate.
 //!
-//!   * **In-memory (`--mode fast`).** `Engine::new` -- the shape the platform ran before: an op is
-//!     validated, committed and acked, and nothing touches the disk.
-//!   * **Durable (`--mode slow`).** `Engine::open` -- the same op plus one append and one
-//!     `sync_data` of a single JSON line, inside the contract's shard write lock.
+//! It measures THREE configurations, always in this order, against the same op stream:
 //!
-//! Both run the SAME op stream, sequentially, which is the shape a request path actually has: one
+//!   * **In-memory.** `Engine::new` -- the shape the platform ran before: an op is
+//!     validated, committed and acked, and nothing touches the disk.
+//!   * **Durable, per-entry sync.** `Engine::open` -- the same op plus one append and one
+//!     `sync_data` of a single JSON line, inside the contract's shard write lock.
+//!   * **Durable, deferred sync.** The mode the platform actually runs: the entry is still written
+//!     before `submit` returns, and the segment is synced before each window closes.
+//!
+//! All three run sequentially, which is the shape a request path actually has: one
 //! contract, one shard lock, one op at a time. Percentiles are reported rather than a mean alone,
 //! because a request path is hurt by the tail, not by the average.
 //!
@@ -18,6 +22,8 @@
 //! per boot rather than per op.
 //!
 //! Usage: `contract-cost [--dir <path>] [--ops N] [--window N]`
+//! `--mode` is NOT an argument; all three configurations are measured on every run. `--state` is
+//! not accepted. Exit 0 on `RESULT PASS`, 1 on `RESULT FAIL`.
 //!
 //! The signing key is generated into the run directory (0600) on first use; the library never mints
 //! one itself.
@@ -212,14 +218,15 @@ async fn main() {
     let reopen_us = started.elapsed().as_micros();
     let reopened_hash = reopened.index_hash(&contract.id).await.unwrap_or_default();
     let live_hash = slow.index_hash(&contract.id).await.unwrap_or_default();
+    let index_matches = reopened_hash == live_hash;
     println!(
         "COST restart reopen_us={} index_match={} index_hash={}",
         reopen_us,
-        reopened_hash == live_hash,
+        index_matches,
         live_hash
     );
-    println!(
-        "RESULT {}",
-        if reopened_hash == live_hash { "PASS" } else { "FAIL" }
-    );
+    println!("RESULT {}", if index_matches { "PASS" } else { "FAIL" });
+    if !index_matches {
+        std::process::exit(1);
+    }
 }

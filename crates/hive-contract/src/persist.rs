@@ -40,6 +40,7 @@ use crate::oplog::{Ack, LogEntry, OpLog};
 use crate::signing::{verify_ed25519, CheckpointSigner};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 
@@ -500,10 +501,19 @@ pub async fn read_window(
     Ok(out)
 }
 
+/// Two engines can hold the SAME log directory at once (a cold reopen while the live engine's
+/// background close-drain is still running, as `contract-cost` does). A temp name derived only from
+/// the checkpoint name makes both writers open the SAME `.tmp` file: one renames it away and the
+/// other's `rename` fails with ENOENT. Each write therefore owns a temp name no other writer can
+/// derive. `parse_checkpoint_name` requires a `.json` suffix, so a temp is never mistaken for a
+/// published checkpoint; a crash mid-write leaves an inert temp and the previous checkpoint intact.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Write `bytes` to `path` so a crash cannot leave a partial file where the real one was: write a
-/// sibling `.tmp`, sync it, then rename over the target and sync the directory.
+/// private sibling temp, sync it, then rename over the target and sync the directory.
 async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    let tmp = path.with_extension("tmp");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     {
         let mut f = tokio::fs::File::create(&tmp)
             .await
@@ -511,9 +521,10 @@ async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         f.write_all(bytes).await.map_err(io("write temp checkpoint"))?;
         f.sync_data().await.map_err(io("sync temp checkpoint"))?;
     }
-    tokio::fs::rename(&tmp, path)
-        .await
-        .map_err(io("rename checkpoint"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, path).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(io("rename checkpoint")(e));
+    }
     // The rename is only durable once the directory entry is: without this, a crash can leave the
     // old file and no new one even though the write itself completed.
     sync_dir(path.parent().unwrap_or(Path::new(".")))

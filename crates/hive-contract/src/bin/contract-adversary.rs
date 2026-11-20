@@ -15,7 +15,10 @@
 //! Not a test file and not a mock: real `Engine`, real `Store`, real `KeyedSigner`, real filesystem,
 //! real `adjudicate` / `adjudicate_equivocation`.
 //!
-//! Usage: `contract-adversary [--dir <path>]`
+//! Usage: `contract-adversary` (parses NO arguments)
+//! The run directory is fixed at `/private/tmp/hive-contract-adversary-<pid>`; it is removed and
+//! recreated on each run, so a caller cannot point the deletion at an arbitrary path. `--state`
+//! is not accepted here: this harness mints its own node and attacker keys.
 //! Exit 0 when every fabrication is refused and every genuine proof still verifies; 1 otherwise.
 
 use hive_contract::contract::Caller;

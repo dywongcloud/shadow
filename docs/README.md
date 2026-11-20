@@ -17,9 +17,11 @@ Read in this order:
 3. `docs/contract-platform-seam.md` - how `crates/hive-cloud/src/db_contract.rs` records writes:
    mutate FIRST / record AFTER, measurement outcomes, unattributed REFUSED writes, and where real
    authorization lives. Read this before claiming the contract prevents anything.
-4. `docs/contract-verification.md` - the eight `contract-*` binaries, exact arguments, the
-   `$HIVE_DATA/contract-oplog` on-disk format, environment knobs and the runbook. Note that
-   `--state` is accepted by only four of eight binaries and is optional in all four.
+4. `docs/contract-verification.md` - the TEN `contract-*` binaries, exact arguments, the
+   `$HIVE_DATA/contract-oplog` on-disk format, environment knobs and the runbook. `--state` is
+   accepted by SIX of the ten binaries and is optional in all six; the other four do not accept
+   `--state` (adversary and transparency parse no arguments, forge parses `--dir`, cost parses
+   `--dir`/`--ops`/`--window`).
 
 Do not confuse with `docs/browser-db-contract.md`, which is a written SPECIFICATION for the
 browser-replicated cr-sqlite database (ownership, ACL, caps, retention, naming); it is not an

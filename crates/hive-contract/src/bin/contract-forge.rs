@@ -14,7 +14,9 @@
 //! `attacker` is a second, freshly minted Ed25519 keypair -- the one thing an attacker needs in order
 //! to produce a checkpoint that is internally consistent and correctly signed by SOMEBODY.
 //!
-//! Usage: `contract-forge [--dir <path>] [--ops N] [--window N] [--retain N]`
+//! Usage: `contract-forge [--dir <path>]`
+//! `--ops`, `--window` and `--retain` are NOT arguments: the probe counts and checkpoint geometry
+//! are fixed compile-time constants (`OPS`, `WINDOW`, `RETAIN`). `--state` is not accepted here.
 //! Exit 0 only when every control holds and every forgery is refused.
 
 use hive_contract::audit::{adjudicate, Dispute, Verdict};

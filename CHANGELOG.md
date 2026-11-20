@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-11-20 - contract verification CLI names its real arguments; checkpoint writes are race-safe
+
+Row `contract-cli-documented-flags-unimplemented`. Four harnesses documented
+flags they never parsed. `contract-adversary` and `contract-transparency` now
+state they take NO arguments and that their run directories are fixed under
+/private/tmp (a caller cannot point the deletion at an arbitrary path);
+`contract-forge` states `--ops`/`--window`/`--retain` are compile-time
+constants; `contract-cost` states `--mode` is NOT an argument. `contract-cost`
+now exits 1 on `RESULT FAIL` instead of always exiting 0. The verification
+runbook's table, interpretation, section-5 commands and the docs index name
+the exact real arguments, the correct FOUR-of-ten `RESULT:` count, and SIX
+`--state` binaries (of TEN), not eight/four.
+
+A live four-binary witness exposed a second defect at the shared primitive:
+`persist::write_atomic` derived its temp name from the checkpoint name alone,
+so two engines holding the SAME log directory (a cold reopen while the live
+engine's background close-drain runs) opened the SAME `.tmp` file; one
+`rename` won and the other failed with ENOENT. Each write now owns a
+`tmp.<pid>.<seq>` sibling, which `parse_checkpoint_name` can never mistake for
+a published checkpoint (`.json` suffix), and removes its own temp on a failed
+rename. Six fresh `contract-cost` runs after the fix: 6/6 exit 0 with
+`RESULT PASS`; `RESULT FAIL` now exits 1 with a live divergent-index witness.
+No test files. No push and no roll.
+
 ## 2026-11-20 - Space Computer KMS: not non-custodial for tenant data
 
 Research memo at docs/research-space-computer-kms.md. Verdict: HOLD. The
