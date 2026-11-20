@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-11-20 - explicit region pin honored; no-cache redeploy no longer a bare 500
+
+Operator report: changing project openwebcontainer from san-jose to los-angeles
+left the build in san-jose, and a no-cache POST /api/projects/openwebcontainer/redeploy
+returned a bare 500. The region change DID persist: read-only GET on all five Linux
+hosts returns functions.regions=["los-angeles"]; the catalog token is exactly los-angeles.
+GET /v1/admin/placement?region=los-angeles&runtime_artifact=1 reported
+placeable_in_region=0 with blockers "no runtime-artifact v1" on every host; every observed
+los-angeles peer is a healthy macOS Mock node advertising runtime_artifact_protocol=null,
+no public_ip, and a relay-bearing iroh_addr. GET /v1/builds/dpl-cf8d0641cd log line 1 is
+"Running build in san-jose - san-jose" and line 13 "Build cache bypassed".
+
+Cause 1: schedule::runtime_artifact_capable required an ADVERTISED protocol v1 for every
+source build. A Mock backend has no guest rootfs to advertise, yet MockBackend implements
+deliver_build + runtime_artifact_identity with SealedRuntimeArtifact::identity() (v1) and
+FluidCompute marks delivery required for ALL backends. capable() already admits healthy Mock
+nodes for non-container builds, so a mock-only region could place ZERO source-build targets.
+place() returned empty; with no targets, run_build skipped both refusals and the fanout and
+fell through to the coordinator's own local san-jose build without a word about the region.
+Fix: runtime_artifact_capable admits Mock for the artifact need (eligible() is unchanged, so
+Mock is still NOT isolated). build_toolchain_rank, when no package manager is named, prefers a
+peer that PROBED a JS toolchain so a python3-only macOS peer no longer wins on free disk alone.
+run_build now refuses to silently ignore an explicit region list: with zero in-region targets it
+dispatches the same bounded out-of-region fallbacks with an explicit warning, or logs loudly that
+it built on the coordinator OUTSIDE the configured region when no remote fallback exists.
+
+Cause 2: ui/lib/gitops-server.ts backend() aborted at 20 s with an unhandled AbortError
+DOMException while admin_ingress forwarded the mutation to the control-plane leader (whose own
+client has a 30 s budget plus retries). The redeploy route had no catch, so Next rendered a bare
+500 with no body. Fix: transport failures are bounded to a 502 carrying one fixed tenant-facing
+sentence (no internal URL, header, token or raw error text); mutations get a 45 s budget that
+contains one leader round trip; both deploy routes clear their token-lookup timer and bound
+r.text(); and the region control no longer lies: a refused PUT rolls the optimistic face back
+and shows a visible error instead of displaying a region the control plane never stored.
+
+Witnesses on this tree: cargo check -p hive-cloud --locked --offline PASS; cargo test
+-p hive-cloud --locked --offline "263 passed; 0 failed; 5 ignored"; cli-acceptance.sh
+"35 passed, 0 failed" CLI_REAL_EXIT=0; check-contract-bindings.py --check PASS bindings=34
+gates=35; ui npx tsc --noEmit PASS and npm run lint PASS; git diff --check PASS. Live Next 16
+route witness on http://localhost:3197: stalled admin -> POST redeploy use_cache:false returns
+502 application/json, 132 bytes, 46.7 s, the fixed sentence, server log "[backend] transport
+failure (AbortError)" and no bare 500; responding admin -> both /redeploy and /api/git/deploy
+return 200 with the admin body passed through unchanged.
+
+NO push, NO roll. A git push auto-deploys through the webhook and git::spawn_git_poll_reconcile,
+and a backend roll is a production change needing the operator's word. The running fleet binary
+is unchanged, so los-angeles placement is NOT live yet. The out-of-inventory macOS Mock peers
+also need the new binary. See docs/PENDING_VALIDATION.md 2026-11-20.
+
 ## 2026-11-19 - additive SSH key under the incident assumption
 
 A fresh ed25519 key (SHA256:nGj5iEyY/UeovJBSqTIb8CHhGrSlBjlKlsqcrdb6qxg)

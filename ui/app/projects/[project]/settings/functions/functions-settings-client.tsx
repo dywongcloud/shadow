@@ -18,6 +18,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
   const [plan, setPlan] = useState("hobby");
 
   const [err, setErr] = useState("");
+  const [saveErr, setSaveErr] = useState("");
 
   const rank = planRank(plan);
   const planMaxDurationSecs = rank >= planRank("enterprise") ? 3600 : rank >= planRank("pro") ? 800 : 300;
@@ -53,8 +54,18 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
   }, [load]);
 
   async function save(next: FunctionSettings) {
+    const previous = fs;
+    setSaveErr("");
     setFs(next);
-    await apiSend("PUT", `/v1/projects/${project}/functions`, next);
+    try {
+      await apiSend("PUT", `/v1/projects/${project}/functions`, next);
+    } catch (e) {
+      // Never leave the control showing a region the control plane refused: an
+      // optimistic face would make a region change look saved while the next
+      // deploy still places in the old region.
+      setFs(previous);
+      setSaveErr(String(e));
+    }
   }
 
   if (err) return <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-sm text-red-500">Failed to load function settings: {err}</div>;
@@ -82,6 +93,11 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
 
   return (
     <div className="flex flex-col gap-6">
+      {saveErr && (
+        <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-500" role="alert">
+          Could not save region settings: {saveErr}
+        </div>
+      )}
       <SettingCard
         title="Fluid Compute"
         desc="Enable Fluid compute for your functions to automatically manage concurrency and optimize performance. OpenEdge handles the defaults to ensure the best experience for your workload."

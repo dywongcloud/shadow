@@ -6,13 +6,41 @@ import { teamRoleOf, type TeamRole } from "@/lib/team-role";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const BACKEND_TIMEOUT_MS = 20_000;
+/** `admin_ingress` forwards MUTATIONS to the control-plane leader, whose own client has a 30 s
+ *  request budget plus candidate retries; the browser waits 60 s. A deploy POST needs a budget
+ *  long enough to contain one leader round trip, and a BOUNDED answer when that budget is spent —
+ *  never a raw DOMException that Next renders as a bare 500 with no body. */
+const MUTATION_BACKEND_TIMEOUT_MS = 45_000;
+/** One fixed tenant-facing sentence: no internal URL, header, token or raw error text is echoed.
+ *  A timed-out MUTATION may already have started a build, so the copy never claims it did not. */
+export const BACKEND_UNAVAILABLE_MESSAGE =
+  "The control plane did not answer in time. Check the deployment list before retrying; the build may already have started.";
+const BACKEND_UNAVAILABLE_HEADER = "x-hive-backend-unavailable";
+
+function backendUnavailable(): Response {
+  return new Response(JSON.stringify({ error: BACKEND_UNAVAILABLE_MESSAGE }), {
+    status: 502,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+      [BACKEND_UNAVAILABLE_HEADER]: "1",
+    },
+  });
+}
 
 /** Calls the backend admin API scoped to a tenant. `authToken` is REQUIRED so no call site can forget it: pass the caller's platform JWT (forwarded as
  *  `Authorization: Bearer`; a Next route's server->backend `fetch()` does not carry the browser's `hive_jwt` cookie, and the backend derives the tenant from
- *  the JWT claim, not `x-hive-team`), or an explicit `null` only where an anonymous read is intended (an auth-enforced node answers it as the empty anonymous tenant). */
-export async function backend(path: string, team: string, authToken: string | null, init?: RequestInit) {
+ *  the JWT claim, not `x-hive-team`), or an explicit `null` only where an anonymous read is intended (an auth-enforced node answers it as the empty anonymous tenant).
+ *  A mutation passes `MUTATION_TIMEOUT` so it can outlive one leader forward. Every transport failure is a bounded 502: callers already gate on `status`/`ok`. */
+export async function backend(
+  path: string,
+  team: string,
+  authToken: string | null,
+  init?: RequestInit,
+  timeoutMs: number = BACKEND_TIMEOUT_MS,
+) {
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS);
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     return await fetch(`${ADMIN}${path}`, {
       ...init,
@@ -25,9 +53,17 @@ export async function backend(path: string, team: string, authToken: string | nu
       cache: "no-store",
       signal: ctrl.signal,
     });
+  } catch (error) {
+    console.error(`[backend] transport failure (${error instanceof Error ? error.name : "unknown"})`);
+    return backendUnavailable();
   } finally {
     clearTimeout(t);
   }
+}
+
+export const MUTATION_TIMEOUT = MUTATION_BACKEND_TIMEOUT_MS;
+export function backendUnanswered(r: Response): boolean {
+  return r.headers.get(BACKEND_UNAVAILABLE_HEADER) === "1";
 }
 
 /** Extract the caller's platform JWT from a Next request (httpOnly `hive_jwt`
@@ -72,6 +108,9 @@ export async function gitopsCallerProof(
     const read = backend("/v1/gitops", team, authToken);
     const bound = new Promise<null>((res) => (timer = setTimeout(() => res(null), 3000)));
     const r = await Promise.race([read, bound]);
+    if (r && backendUnanswered(r)) {
+      return { ok: false, error: "The platform could not verify your session; retry." };
+    }
     if (!r || !r.ok || r.headers.get("x-hive-anon") === "1") {
       return { ok: false, error: "Your session was not accepted — sign in again." };
     }

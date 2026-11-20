@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
-import { authTokenFrom, backend } from "@/lib/gitops-server";
+import { authTokenFrom, backend, BACKEND_UNAVAILABLE_MESSAGE, MUTATION_TIMEOUT } from "@/lib/gitops-server";
 
 const GITHUB_TOKEN_LOOKUP_DEADLINE_MS = 8_000;
 
@@ -11,6 +11,7 @@ export async function POST(req: NextRequest) {
   const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
   const team = String((body.team as string) || req.headers.get("x-hive-team") || "personal");
   const repoUrl = typeof body.repo_url === "string" ? body.repo_url : "";
+  let lookupTimer: ReturnType<typeof setTimeout> | undefined;
   if (repoUrl.startsWith("https://github.com/")) {
     const token = await Promise.race([
       (async () => {
@@ -20,12 +21,20 @@ export async function POST(req: NextRequest) {
           return null;
         }
       })(),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), GITHUB_TOKEN_LOOKUP_DEADLINE_MS)),
+      new Promise<null>((resolve) => {
+        lookupTimer = setTimeout(() => resolve(null), GITHUB_TOKEN_LOOKUP_DEADLINE_MS);
+      }),
     ]);
+    if (lookupTimer) clearTimeout(lookupTimer);
     if (token) body.git_token = token;
   }
-  const r = await backend("/v1/git/deploy", team, authTokenFrom(req), { method: "POST", body: JSON.stringify(body) });
-  const text = await r.text();
+  let r: Response;
+  try {
+    r = await backend("/v1/git/deploy", team, authTokenFrom(req), { method: "POST", body: JSON.stringify(body) }, MUTATION_TIMEOUT);
+  } catch {
+    return NextResponse.json({ error: BACKEND_UNAVAILABLE_MESSAGE }, { status: 502 });
+  }
+  const text = await r.text().catch(() => JSON.stringify({ error: BACKEND_UNAVAILABLE_MESSAGE }));
   return new NextResponse(text, {
     status: r.status,
     headers: { "content-type": r.headers.get("content-type") || "application/json" },

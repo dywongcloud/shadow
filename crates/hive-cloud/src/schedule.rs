@@ -152,11 +152,22 @@ impl From<bool> for InterpreterNeeds {
     }
 }
 
-/// A source-built function needs a node advertising runtime-artifact protocol v1 (the split
-/// host-static-root / guest-workdir contract); a pre-upgrade peer reads it differently, so
-/// placement and lease stickiness fail closed.
+/// A source-built function needs a node that can consume the v1 sealed runtime artifact.
+/// An isolated guest proves it by ADVERTISING protocol v1 from its exact-image rootfs; a
+/// pre-upgrade peer reads the split host-static-root / guest-workdir contract differently,
+/// so that case stays fail-closed. A Mock backend has no guest rootfs to prove:
+/// `FluidCompute::runtime_artifact_paths` marks delivery required for every backend,
+/// and `MockBackend` implements `deliver_build` + `runtime_artifact_identity` with
+/// `SealedRuntimeArtifact::identity()` (protocol v1), the exact identity `git.rs`
+/// re-reads and verifies after delivery. Requiring an advertised protocol from Mock
+/// made every macOS/mock-only region (los-angeles) place ZERO targets for a source
+/// build. `eligible` still refuses to call Mock isolated, so this cannot weaken
+/// isolation. ONE predicate shared by `place`, lease stickiness, `dispatch_fallbacks`
+/// and `placement_blocker`.
 pub fn runtime_artifact_capable(n: &NodeInfo, needed: bool) -> bool {
-    !needed || n.runtime_artifact_protocol == Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION)
+    !needed
+        || n.runtime_artifact_protocol == Some(hive_core::RUNTIME_ARTIFACT_PROTOCOL_VERSION)
+        || is_mock_backend(n)
 }
 
 /// May `n`'s build lane run a build whose package manager is `manager`? Unlike `wasm_capable`, an
@@ -192,7 +203,26 @@ const TOOLCHAIN_CANNOT_BUILD: u8 = 2;
 /// refusing a deploy that would succeed degraded. See [`build_toolchain_capable`].
 pub fn build_toolchain_rank(n: &NodeInfo, manager: Option<&str>) -> u8 {
     let Some(manager) = manager else {
-        return TOOLCHAIN_EXACT;
+        // No package manager is named in the saved install/build commands: the
+        // framework auto-detects one at build time (Vite -> pnpm/npm). Ranking
+        // every node EXACT let free disk decide, so a python3-only macOS peer
+        // beat a JS-capable one and the generated pnpm command could not run.
+        // Prefer a peer that PROBED a JavaScript toolchain, WITHOUT refusing an
+        // unreported peer (`None` = unknown, admitted by `build_toolchain_capable`).
+        // This is an ordering preference, never a gate: a degraded node can still
+        // be placed, and the build lane's own probe/substitute path stays the
+        // authority. An explicit command still ranks by its named manager below.
+        return match n.build_toolchains.as_deref() {
+            None => TOOLCHAIN_EXACT,
+            Some(have)
+                if have
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "node" | "npm" | "pnpm" | "yarn" | "bun")) =>
+            {
+                TOOLCHAIN_EXACT
+            }
+            Some(_) => TOOLCHAIN_SUBSTITUTE_OR_UNREPORTED,
+        };
     };
     // Same NO-SUBSTITUTE rule as `build_toolchain_capable`: npm is never a stand-in for a
     // compiler, and an unreported node is not preferred for a Rust build.

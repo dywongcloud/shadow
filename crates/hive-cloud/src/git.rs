@@ -2533,7 +2533,7 @@ async fn run_build(
                 .then_some("cargo")
         });
         let needs_build_isolation = !known_container;
-        let targets = crate::schedule::place_for_project(
+        let mut targets = crate::schedule::place_for_project(
             cloud,
             &project,
             &regions,
@@ -2626,6 +2626,57 @@ async fn run_build(
                     "deploy refused: no placeable node for this repository build"
                 );
                 return Err(anyhow::anyhow!(msg));
+            }
+        }
+        // An explicit region list is a placement REQUEST. When `place()` returns no
+        // target, every in-region node failed a hard capability, health or
+        // reachability check. Falling through to the local build below would
+        // silently deploy in the COORDINATOR's own region (the reported bug: a
+        // project pinned to los-angeles building in san-jose). Dispatch the same
+        // bounded out-of-region fallbacks with an explicit warning instead; when
+        // no remote fallback exists, say out loud that the pin was not honored.
+        if !regions.is_empty() && targets.is_empty() {
+            let fallbacks = crate::schedule::dispatch_fallbacks(
+                cloud,
+                &regions,
+                known_container,
+                needs_gpu,
+                crate::schedule::InterpreterNeeds {
+                    wasm: known_wasm,
+                    bun: known_bun,
+                },
+                !known_container,
+                needs_build_isolation,
+                known_build_toolchain,
+                &[],
+            );
+            if let Some(first) = fallbacks.first() {
+                log(format!(
+                    "Placement: no healthy, capable node in the configured region(s) ({}). Dispatching outside them to {}; the configured region is a preference, not a fence, and the next deploy re-evaluates placement.",
+                    regions.join(", "),
+                    first.node
+                ));
+                tracing::warn!(
+                    project = %project,
+                    regions = ?regions,
+                    fallback = %first.node,
+                    "placement: configured region(s) have no capable node, dispatching out of region"
+                );
+                targets = vec![first.clone()];
+            } else {
+                // No remote fallback exists (a single-node dev mesh, or the whole
+                // fleet is unreachable). Keep the documented "empty placement hosts
+                // locally" behaviour, but say out loud that the configured region
+                // was NOT honored instead of silently building in a different one.
+                log(format!(
+                    "Placement: no healthy, capable node in the configured region(s) ({}) and no dispatch fallback; building on this coordinator OUTSIDE the configured region(s). The next deploy re-evaluates placement.",
+                    regions.join(", ")
+                ));
+                tracing::warn!(
+                    project = %project,
+                    regions = ?regions,
+                    "placement: configured region(s) have no capable node and no fallback, building out of region locally"
+                );
             }
         }
         let auto_chosen_regions_to_surface = regions.is_empty() && !targets.is_empty();
