@@ -2158,3 +2158,75 @@ export async function getAiWebSearch(query: string, maxResults?: number): Promis
     max_results: maxResults ?? 5,
   });
 }
+
+/** The firewall state is NODE-LOCAL and every wire field is OPTIONAL: a fresh dashboard talks to
+ *  older nodes, so an absent field is rendered absent, never as a measured zero. */
+export interface FwAttackMode {
+  enabled?: boolean | null;
+  active_until_ms?: number | null;
+  updated_ms?: number | null;
+  duration_secs?: number | null;
+  hours_left?: number | null;
+}
+
+export interface FwEvent {
+  ts_ms?: number | null;
+  path?: string | null;
+  status?: number | null;
+  action?: string | null;
+  reason?: string | null;
+}
+
+export interface FwVerifiedBot {
+  name?: string | null;
+  ua?: string | null;
+  verification_method?: string | null;
+  spoofable?: boolean | null;
+}
+
+export interface FwState {
+  node_local?: boolean | null;
+  attack_mode?: FwAttackMode | null;
+  events?: {
+    node_local?: boolean | null;
+    count?: number | null;
+    by_action?: Record<string, number> | null;
+    recent?: FwEvent[] | null;
+  } | null;
+  verified_bots?: {
+    count?: number | null;
+    spoofable?: boolean | null;
+    rows?: FwVerifiedBot[] | null;
+  } | null;
+  integrity?: {
+    detection_only?: boolean | null;
+    scripts_reported?: number | null;
+    mismatches?: number | null;
+  } | null;
+  residuals?: string[] | null;
+  project?: string | null;
+}
+
+/** A null body is a missing signed-in session, never an empty firewall state. */
+export async function getFirewallState(project?: string): Promise<FwState> {
+  const d = await apiGet<FwState>(
+    "/v1/firewall/state" + (project ? "?project=" + encodeURIComponent(project) : ""),
+  );
+  if (!d) throw new ApiError(401, "Firewall state needs a signed-in session");
+  return d;
+}
+
+/** Project and duration are bounded before any request: a client-side overflow is a typed
+ *  refusal, never a silent truncation on the wire. The server owns the actual admission. */
+export async function setFirewallAttackMode(project: string, enabled: boolean, hours: number): Promise<FwState> {
+  if (project.length > 128) throw new ApiError(400, "Project must be 128 characters or fewer.");
+  if (project.trim() === "") throw new ApiError(400, "Enter a project name.");
+  if (hours !== 1 && hours !== 6 && hours !== 24) {
+    throw new ApiError(400, "Attack challenge mode duration must be 1, 6 or 24 hours.");
+  }
+  return apiSend<FwState>(
+    "PUT",
+    "/v1/projects/" + encodeURIComponent(project) + "/firewall/attack-mode",
+    { enabled, hours },
+  );
+}

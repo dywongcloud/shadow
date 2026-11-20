@@ -129,6 +129,10 @@ const RULES: &[Rule] = &[
     rule(DELETE, "/v1/databases/:id", Role::Admin),
     rule(POST, "/v1/databases/:id/rotate", Role::Admin),
     rule(WRITES, "/v1/waf/*", Role::Admin),
+    // Firewall attack mode is a project-wide destructive security control: one toggle changes
+    // admission for EVERY route on the project, so it sits at the admin floor like WAF rules.
+    rule(WRITES, "/v1/firewall/*", Role::Admin),
+    rule(WRITES, "/v1/projects/:project/firewall/*", Role::Admin),
     rule(WRITES, "/v1/ratelimit", Role::Admin),
     rule(WRITES, "/v1/bot", Role::Admin),
     rule(WRITES, "/v1/push/sms-direct-mx", Role::Admin),

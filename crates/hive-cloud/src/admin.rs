@@ -3524,7 +3524,7 @@ fn renamed_away_refusal(name: &str, renamed_to: &str) -> (StatusCode, String) {
 /// (`ProjectStore::claim_team`): an untagged row is claimed, the owner's own claim is a no-op, and a
 /// row another team holds is never taken (a claim used to `set_team` unconditionally, so a team a
 /// project had been transferred away from took it back with its next env write).
-fn require_project_claiming_row(
+pub(crate) fn require_project_claiming_row(
     c: &Arc<CloudState>,
     h: &HeaderMap,
     claims: Option<&crate::auth::Claims>,

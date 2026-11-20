@@ -6,6 +6,7 @@
 mod acme;
 mod admin;
 mod ai_gateway;
+mod firewall;
 mod apikeys;
 mod app_discovery;
 mod audit;
@@ -1739,6 +1740,7 @@ async fn async_main() -> anyhow::Result<()> {
         .merge(crate::guardian::routes().with_state(cloud.clone()))
         .merge(crate::usage_metering::routes().with_state(cloud.clone()))
         .merge(crate::ai_gateway::routes().with_state(cloud.clone()))
+        .merge(crate::firewall::routes().with_state(cloud.clone()))
         .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn_with_state(
             cloud.clone(),
@@ -1988,6 +1990,9 @@ fn owner_routed(path: &str) -> bool {
         // to the control-plane leader, but the upstream relay is loopback-only on ONE Mac;
         // forwarding inference (or a read over node-local AI rows) makes it unreachable.
         || path.starts_with("/v1/ai/")
+        // Firewall state/events are NODE-LOCAL and explicitly labelled as
+        // such; serve them on the receiving node rather than forwarding.
+        || path.starts_with("/v1/firewall/")
         || path == "/v1/models"
         || path.starts_with("/v1/models/")
         || path.starts_with("/v1/models?")

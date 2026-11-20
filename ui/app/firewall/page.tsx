@@ -1,9 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Card, Badge, Button, Input, Switch, PageHeader, Table, Th, Td } from "@/components/ui";
+import { Card, Badge, Button, Input, Switch, PageHeader, StateNotice, Table, Th, Td } from "@/components/ui";
 import { RoleGate } from "@/components/role-gate";
-import { apiSend, usePoll, type WafRule } from "@/lib/api";
+import { ApiError, apiSend, setFirewallAttackMode, usePoll, type FwState, type WafRule } from "@/lib/api";
 
 type BotAction = "allow" | "log" | "block";
 interface WafConfig { managed: boolean; rules: WafRule[] }
@@ -21,6 +21,34 @@ const AI_CATEGORIES: { key: keyof BotPolicy; name: string; desc: string; example
   { key: "ai_agent", name: "AI Agents", desc: "Act autonomously on a user's behalf (browse, click, transact). Can mutate state.", examples: "ChatGPT-Agent · Operator" },
 ];
 
+const ABSENT = "-";
+
+/** Each firewall value is measured or absent: an older node, a refused poll or a missing
+ *  optional field renders "-", never an invented zero or an invented status. */
+function shown(v: unknown): string {
+  if (v === null || v === undefined || v === "") return ABSENT;
+  if (typeof v === "number" && !Number.isFinite(v)) return ABSENT;
+  return String(v);
+}
+
+function fmtMeasured(v: number | null | undefined): string {
+  return typeof v === "number" && Number.isFinite(v) ? v.toLocaleString("en-US") : ABSENT;
+}
+
+/** Every new element stays inside its column: a long path or residual never scrolls the page. */
+function cell(extra?: string): string {
+  return extra ? "min-w-0 w-full max-w-full break-words " + extra : "min-w-0 w-full max-w-full break-words";
+}
+
+function FwField({ label, value }: { label: string; value: string }) {
+  return (
+    <div className={cell()}>
+      <span className={cell("block text-xs text-muted")}>{label}</span>
+      <span className={cell()}>{value}</span>
+    </div>
+  );
+}
+
 export default function FirewallPage() {
   const { data: waf, refresh } = usePoll<WafConfig>("/v1/waf", 4000);
   const { data: bot, refresh: refreshBot } = usePoll<BotPolicy>("/v1/bot", 4000);
@@ -30,6 +58,47 @@ export default function FirewallPage() {
   const [contains, setContains] = useState("");
   const [ip, setIp] = useState("");
   const [err, setErr] = useState("");
+
+  const { data: fw, error: fwError, refresh: refreshFw } = usePoll<FwState>("/v1/firewall/state", 5000);
+  const [fwProject, setFwProject] = useState("");
+  const [fwHours, setFwHours] = useState<1 | 6 | 24>(1);
+  const [fwBusy, setFwBusy] = useState(false);
+  const [fwWriteError, setFwWriteError] = useState<string | null>(null);
+
+  const fwMode = fw?.attack_mode ?? null;
+  const fwEvents = fw?.events ?? null;
+  const fwBots = fw?.verified_bots ?? null;
+  const fwIntegrity = fw?.integrity ?? null;
+  const fwResidualRows = fw?.residuals ?? null;
+  const fwResiduals = Array.isArray(fwResidualRows) ? fwResidualRows : null;
+  const fwByActionMap = fwEvents?.by_action ?? null;
+  const fwByAction = fwByActionMap && typeof fwByActionMap === "object"
+    ? Object.entries(fwByActionMap).slice(0, 8)
+    : [];
+  const fwRecentRows = fwEvents?.recent ?? null;
+  const fwRecent = Array.isArray(fwRecentRows) ? fwRecentRows.slice(0, 8) : [];
+  const fwBotRowsAll = fwBots?.rows ?? null;
+  const fwBotRows = Array.isArray(fwBotRowsAll) ? fwBotRowsAll : [];
+  const fwModeText = fwMode?.enabled === true ? "On" : fwMode?.enabled === false ? "Off" : ABSENT;
+
+  /** One write of the node-local toggle. A typed refusal or a poll failure is shown inline by
+   *  StateNotice; the server remains the authority on who may change it. */
+  async function setAttackMode(enable: boolean) {
+    if (fwBusy) return;
+    setFwWriteError(null);
+    setFwBusy(true);
+    try {
+      await setFirewallAttackMode(fwProject.trim(), enable, fwHours);
+      refreshFw();
+    } catch (e) {
+      setFwWriteError(
+        e instanceof ApiError && e.message ? e.message : "Attack challenge mode could not be changed on this node.",
+      );
+    } finally {
+      setFwBusy(false);
+    }
+  }
+
 
   /** Runs one write of the edge rules: a refusal (a role refusal already reads "Your role can't do this. Ask a team admin.") shows above the cards, never as an unhandled rejection. */
   async function write(change: () => Promise<unknown>) {
@@ -155,6 +224,140 @@ export default function FirewallPage() {
           {!waf?.rules?.length && <tr><Td className="text-muted">No custom rules — the managed ruleset is active.</Td></tr>}
         </tbody>
       </Table>
+
+      <Card className={cell("mb-4")}>
+        <h2 className={cell("text-sm font-medium text-fg")}>Attack Challenge Mode</h2>
+        <p className={cell("mt-1 text-xs text-secondary")}>
+          This is node-local config: the toggle changes only the node that answers this request, and
+          fleet-wide propagation is not implemented.
+        </p>
+        <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3")}>
+          <FwField label="Measured mode" value={fwModeText} />
+          <FwField label="Active until (ms)" value={fmtMeasured(fwMode?.active_until_ms)} />
+          <FwField label="Updated (ms)" value={fmtMeasured(fwMode?.updated_ms)} />
+          <FwField label="Duration (secs)" value={fmtMeasured(fwMode?.duration_secs)} />
+          <FwField label="Hours left" value={fmtMeasured(fwMode?.hours_left)} />
+          <FwField label="Reported project" value={shown(fw?.project)} />
+        </div>
+        <div className={cell("mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center")}>
+          <Input
+            aria-label="Project name"
+            placeholder="Project name"
+            maxLength={128}
+            value={fwProject}
+            onChange={(e) => setFwProject(e.target.value)}
+            className={cell("min-h-[44px]")}
+          />
+          <select
+            aria-label="Duration"
+            value={fwHours}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (n === 1 || n === 6 || n === 24) setFwHours(n);
+            }}
+            className={cell("min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-sm text-fg")}
+          >
+            <option value="1">1 hour</option>
+            <option value="6">6 hours</option>
+            <option value="24">24 hours</option>
+          </select>
+          <Button
+            className={cell("min-h-[44px] sm:w-auto")}
+            disabled={fwBusy}
+            onClick={() => setAttackMode(fwMode?.enabled !== true)}
+          >
+            {fwBusy ? "Applying" : fwMode?.enabled === true ? "Turn off" : "Turn on"}
+          </Button>
+        </div>
+        {fwWriteError || fwError ? (
+          <div className={cell("mt-3")}>
+            <StateNotice className={cell()}>
+              {fwWriteError ? fwWriteError : "Could not load firewall state: " + shown(fwError)}
+            </StateNotice>
+          </div>
+        ) : null}
+        <div className={cell("mt-3 text-xs text-secondary")}>
+          <span className={cell("block")}>Reported residuals</span>
+          {fwResiduals && fwResiduals.length > 0 ? (
+            <ul className={cell("mt-1 list-none space-y-1")}>
+              {fwResiduals.map((r, i) => (
+                <li key={"fw-residual-" + i} className={cell()}>{shown(r)}</li>
+              ))}
+            </ul>
+          ) : (
+            <span className={cell("block")}>{ABSENT}</span>
+          )}
+        </div>
+      </Card>
+
+      <Card className={cell("mb-4")}>
+        <h2 className={cell("text-sm font-medium text-fg")}>Firewall events</h2>
+        <p className={cell("mt-1 text-xs text-secondary")}>
+          Node-local event ring: events node_local {shown(fwEvents?.node_local)}. A different node
+          may answer with a different set of events; nothing here is a fleet-wide log.
+        </p>
+        <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2")}>
+          <FwField label="Measured event count" value={fmtMeasured(fwEvents?.count)} />
+          <FwField label="State node_local" value={shown(fw?.node_local)} />
+        </div>
+        <div className={cell("mt-3 text-xs text-secondary")}>By action</div>
+        <div className={cell("mt-1 flex flex-col divide-y divide-border")}>
+          {fwByAction.length > 0 ? fwByAction.map(([k, v]) => (
+            <div key={k} className={cell("flex min-h-[44px] flex-col gap-1 py-2 text-sm sm:flex-row sm:justify-between")}>
+              <span className={cell()}>{shown(k)}</span>
+              <span className={cell("tabular-nums")}>{fmtMeasured(v)}</span>
+            </div>
+          )) : <div className={cell("py-2 text-sm")}>{ABSENT}</div>}
+        </div>
+        <div className={cell("mt-3 text-xs text-secondary")}>Recent events</div>
+        <div className={cell("mt-1 flex flex-col divide-y divide-border")}>
+          {fwRecent.length > 0 ? fwRecent.map((ev, i) => (
+            <div key={"fw-event-" + i} className={cell("py-2 text-sm")}>
+              <div className={cell("grid grid-cols-1 gap-1 sm:grid-cols-2")}>
+                <FwField label="Time (ms)" value={fmtMeasured(ev?.ts_ms)} />
+                <FwField label="Status" value={fmtMeasured(ev?.status)} />
+                <FwField label="Action" value={shown(ev?.action)} />
+                <FwField label="Reason" value={shown(ev?.reason)} />
+              </div>
+              <div className={cell("mt-1")}><FwField label="Path (text only)" value={shown(ev?.path)} /></div>
+            </div>
+          )) : <div className={cell("py-2 text-sm")}>{ABSENT}</div>}
+        </div>
+      </Card>
+
+      <Card className={cell("mb-4")}>
+        <h2 className={cell("text-sm font-medium text-fg")}>Verified bots</h2>
+        <p className={cell("mt-1 text-xs text-secondary")}>
+          User-agent matching alone is spoofable. These rows are not reverse-DNS verified and carry
+          no bot score and no TLS fingerprint; a client can claim any of these strings.
+        </p>
+        <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2")}>
+          <FwField label="Measured bot count" value={fmtMeasured(fwBots?.count)} />
+          <FwField label="Reported spoofable" value={shown(fwBots?.spoofable)} />
+        </div>
+        <div className={cell("mt-3 flex flex-col divide-y divide-border")}>
+          {fwBotRows.length > 0 ? fwBotRows.map((b, i) => (
+            <div key={"fw-bot-" + i} className={cell("grid grid-cols-1 gap-1 py-2 text-sm sm:grid-cols-3")}>
+              <FwField label="Name" value={shown(b?.name)} />
+              <FwField label="User agent (text only)" value={shown(b?.ua)} />
+              <FwField label="Verification method" value={shown(b?.verification_method)} />
+            </div>
+          )) : <div className={cell("py-2 text-sm")}>{ABSENT}</div>}
+        </div>
+      </Card>
+
+      <Card className={cell("mb-4")}>
+        <h2 className={cell("text-sm font-medium text-fg")}>Page integrity</h2>
+        <p className={cell("mt-1 text-xs text-secondary")}>
+          Detection only: this node reports script mismatches but does not enforce a script policy
+          and does not inject nonces into served pages.
+        </p>
+        <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-3")}>
+          <FwField label="Detection only" value={shown(fwIntegrity?.detection_only)} />
+          <FwField label="Scripts reported" value={fmtMeasured(fwIntegrity?.scripts_reported)} />
+          <FwField label="Mismatches" value={fmtMeasured(fwIntegrity?.mismatches)} />
+        </div>
+      </Card>
       </RoleGate>
     </div>
   );

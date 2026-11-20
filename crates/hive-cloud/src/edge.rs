@@ -122,6 +122,22 @@ async fn edge_pipeline_inner(
     let ip = peer.ip().to_string();
     let region = cloud.region.clone();
 
+    // ONE edge firewall chokepoint. Runs BEFORE ACME, BEFORE any canonical or
+    // project-rename redirect and BEFORE the rate limiter, so a credential-
+    // harvest probe can never be answered with a 307 or a 404 (the geniee
+    // incident). It reuses the existing WAF/Bot/RateLimiter primitives below.
+    if let Some(resp) = crate::firewall::edge_gate(
+        &cloud,
+        &method,
+        &path,
+        &host,
+        &headers_vec,
+        &ua,
+        &region,
+    ) {
+        return resp;
+    }
+
     if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
         if let Some(body) = cloud.acme_http01.lookup(token) {
             return (
@@ -1840,7 +1856,7 @@ fn preview_gate(
 
 /// A host that is this machine itself: `localhost`, any `*.localhost`, or a loopback address
 /// (a port is ignored). Only a plain-http dev node is reached this way.
-fn is_loopback_host(host: &str) -> bool {
+pub(crate) fn is_loopback_host(host: &str) -> bool {
     let host = host.trim().to_ascii_lowercase();
     let name = match host.rsplit_once(':') {
         Some((name, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
@@ -1880,7 +1896,7 @@ fn unlock_cookie_header(token: &str, host: &str, headers: &[(String, String)]) -
 }
 
 /// Extract one cookie value by name from the request headers.
-fn cookie_value(headers: &[(String, String)], name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &[(String, String)], name: &str) -> Option<String> {
     let cookie = header(headers, "cookie")?;
     let prefix = format!("{name}=");
     cookie
@@ -1898,7 +1914,7 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 }
 
 /// Escapes text for an HTML text node or a quoted attribute value.
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

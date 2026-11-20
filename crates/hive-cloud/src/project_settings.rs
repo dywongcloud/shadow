@@ -233,6 +233,27 @@ pub struct BrowserDbRestToken {
     pub created_ms: u64,
 }
 
+/// Project-scoped Attack Challenge Mode. Additive and #[serde(default)]: an
+/// older node's row without this key still deserializes, and the existing
+/// projects MERGE_STORES per-row updated_ms merge carries it fleet-wide.
+/// Auto-off is LAZY (checked against active_until_ms on every request), so
+/// there is no timer and no second background loop.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttackMode {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub active_until_ms: u64,
+    #[serde(default)]
+    pub updated_ms: u64,
+    #[serde(default)]
+    pub duration_secs: u64,
+    /// Opt-in ONLY. UA matching is spoofable; a verified-bot bypass is a
+    /// measurement, never an attestation. Default false.
+    #[serde(default)]
+    pub verified_bot_bypass: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -324,6 +345,9 @@ pub struct ProjectSettings {
     /// advancing their schedule: Vercel's project-level Cron Jobs kill switch. Default true.
     #[serde(default = "default_true")]
     pub cron_enabled: bool,
+    /// Attack Challenge Mode (see AttackMode). Default OFF.
+    #[serde(default)]
+    pub attack_mode: AttackMode,
     /// Outcome of the auto-CI install attempted after the first git import
     /// (`/api/gitops/project-ci`): whether a GitHub webhook or the Actions-workflow fallback was
     /// installed on the source repo. Persisted so the dashboard can surface a project that got
@@ -452,6 +476,7 @@ impl Default for ProjectSettings {
             preview_protection: true,
             sandbox_allow_sudo: false,
             cron_enabled: true,
+            attack_mode: AttackMode::default(),
             git_ci: None,
             last_build: None,
             last_build_id: String::new(),
@@ -2081,6 +2106,22 @@ impl ProjectStore {
         on: bool,
     ) -> Result<(), ProjectIncarnationError> {
         self.mutate_exact(project, expected, |row| row.preview_protection = on)
+    }
+
+    /// Every write funnels through touch so the per-row freshness key advances
+    /// and MERGE_STORES carries the new value to the other nodes.
+    pub fn set_attack_mode(&self, project: &str, mode: AttackMode) {
+        let mut m = self.map.write();
+        self.touch(&mut m, project).attack_mode = mode;
+    }
+
+    /// An unknown/never-configured project is OFF (never challenged by default).
+    pub fn attack_mode(&self, project: &str) -> AttackMode {
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.attack_mode)
+            .unwrap_or_default()
     }
 
     pub fn set_cron_enabled(&self, project: &str, on: bool) {

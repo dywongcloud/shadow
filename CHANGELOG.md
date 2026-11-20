@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-19 - Firewall attack challenge mode, sensitive-path denial and bot management
+
+The edge gate runs at the TOP of the edge pipeline before ACME, host or canonical redirects, so the geniee 307/404 probes are refused, not redirected.
+Project-scoped Attack Challenge Mode stays OFF by default, has 1/6/24 h auto-off and issues a server-sealed cookie; the challenge is a JS-capability gate, not browser attestation.
+The gate reuses the existing Waf/BotManager/RateLimiter primitives with no new loop and no new crypto primitive.
+Sensitive-path denial normalizes the path with a bounded double percent-decode and fixes the deny body; an always-bypass list keeps health checks, static assets, well-known paths and webhooks reachable. It is an ALWAYS-ON system mitigation, independent of Attack Challenge Mode.
+A node-local bounded firewall event ring and a measured-or-absent dashboard report only observed decisions.
+A verified-bot directory carries a spoofability disclosure: UA-substring matching is a measurement, not reverse-DNS verification or a bot score.
+Page integrity is DETECTION only, with no CSP script-src enforcement and no nonce injection.
+Residuals are explicit: L3/L4 anycast absorption, proprietary bot-signal network, reverse-DNS verified-bot registry, JA4, CSP enforcement network and automatic attack detection are not implemented; there is no 1:1 / BotID claim.
+Witnessed 2026-11-19: all seven CI-equivalent gates, contract replay, a live corpus replay of the real binary (79/79 production 307/404 gaps closed, 29/29 checks PASS) and a headful six-width production browser witness (CONSOLE_ERRORS 0). See `docs/PENDING_VALIDATION.md` and `.gm/witness-log.md`. Local work only, no push and no roll.
+
 ## 2026-11-19 - AI Gateway web search and relay 5.5 aliases
 
 The AI Gateway executes web search as a SERVER-SIDE tool and mounts one platform-specific standalone route, `POST /v1/ai/web-search`; Vercel has no standalone web-search REST endpoint. Tool shapes detected are `web_search`, `web_search_20250305`/`20260209`/`20260318` and `vercel:*_search`.

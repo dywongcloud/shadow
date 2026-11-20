@@ -47,6 +47,7 @@ export const TEAM_ACTIONS = {
    *  RULES row is ADMIN (plus `admin::require_operator`), never the viewer floor of the SOC 2 report. */
   "contract.explorer": { floor: "admin", routes: ["GET /v1/admin/contract/explorer"] },
   "edge.security": { floor: "admin", routes: ["POST /v1/waf/rules", "DELETE /v1/waf/rules/:id", "PUT /v1/waf/managed", "PUT /v1/ratelimit", "PUT /v1/bot"] },
+  "fw.attack_mode": { floor: "admin", routes: ["PUT /v1/projects/:project/firewall/attack-mode", "PUT /v1/firewall/attack-mode"] },
   "sms.provider": { floor: "admin", routes: ["POST /v1/push/sms-key", "POST /v1/push/sms-direct-mx", "POST /v1/push/sms-relay"] },
   "repo.link": { floor: "admin", routes: ["PUT /v1/gitops", "DELETE /v1/gitops"] },
   "enterprise.config": {
