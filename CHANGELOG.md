@@ -6,7 +6,9 @@ CHANGELOG.md 2026-11-06 records 107.181.252.214 as an unattributed
 privileged SSH source on fc-orlando (116 root pubkey logins, ~2,200
 sysadmin password logins with a second key and an atltech wheel
 account). A read-only sweep on 2026-11-19 found 1,735 / 1,543 / 1,006
-sshd journal hits from that /24 on sj7 / va / va3 in the prior 30 days,
+ACCEPTED sshd logins from that /24 on sj7 / va / va3 in the prior 30 days
+(1705 / 1510 / 979, one distinct source IP, all Oct 21-24, zero Failed
+password and zero authentication-failure lines),
 zero current connections and zero fail2ban bans. No live fleet, private
 VPC or operator egress address falls in the range.
 
