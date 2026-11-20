@@ -74,15 +74,17 @@ contract-oplog/<contract-id>/seg-000000000256.jsonl
 contract-oplog/<contract-id>/cp-000000000256.json
 ```
 
-`segment_name(base)` = `seg-{base:012}.jsonl` (`persist.rs:224-226`);
-`checkpoint_name(end)` = `cp-{end:012}.json` (`:229-231`). Each JSONL line is a `SegmentLine`
-(`{"entry": <LogEntry>, "sig": "<hex Ed25519>"}`, `persist.rs:202-207`, verified by
-`verify_line` at `:421-444`). The signed preimage is `entry_sig_preimage(entry_hash, ack)`
-(`persist.rs:215-221`), which folds `Ack::canonical()` in - see `docs/verifiable-database.md`
-section 3. Checkpoint files are pretty-JSON `SignedCheckpoint` (`:970-973`).
+`segment_name(base)` = `seg-{base:012}.jsonl` (`persist.rs:230-233`);
+`checkpoint_name(end)` = `cp-{end:012}.json` (`:235-238`). Each JSONL line is a `SegmentLine`
+(`{"entry": <LogEntry>, "sig": "<hex Ed25519>"}`, `persist.rs:209-214`, verified by
+`verify_line` at `:428-451`). The signed preimage is `entry_sig_preimage(entry_hash, ack)`
+(`persist.rs:216-228`), which folds `Ack::canonical()` in - see `docs/verifiable-database.md`
+section 3. `parse_checkpoint_name` (`:240-243`) requires the `.json` suffix and
+`parse_segment_name` (`:245-248`) the `.jsonl` suffix, so a `tmp.<pid>.<seq>` sibling is
+never adopted. Checkpoint files are pretty-JSON `SignedCheckpoint` (`:988-993`).
 
-Defaults: `DEFAULT_CHECKPOINT_EVERY = 256` (`persist.rs:49`), `DEFAULT_RETAIN_CHECKPOINTS = 4`
-(`:54`). `DEFAULT_SHARDS` is exported from `engine.rs` and used by `Engine::open`
+Defaults: `DEFAULT_CHECKPOINT_EVERY = 256` (`persist.rs:50`), `DEFAULT_RETAIN_CHECKPOINTS = 4`
+(`:55`). `DEFAULT_SHARDS` is exported from `engine.rs` and used by `Engine::open`
 (`crates/hive-cloud/src/state.rs:902`).
 
 ## 4. Environment knobs
