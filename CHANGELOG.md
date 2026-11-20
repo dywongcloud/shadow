@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-19 - undo blue streak run and the deployment stepper
+
+The two blue corner light streaks, the transparent-at-top navbar with its dark wordmark and sign-in plates, the blue gradient pill CTA and the scrolled plate are REMOVED from the signed-out landing page. The hero shows its six competing light layers again (GlowRing, lp-glow-blue, lp-aurora-a/b, lp-grid, lp-grain) and the h1 uses the gradient text span. MarketingShell has no streaks prop and the two streak WebP assets and hero-streaks.tsx are deleted. Every other marketing page keeps its original dark header, backdrop blur and bottom hairline.
+The "From one repository / One push, every step in view / Choose a step to see the build, the preview, the domain and the logs" section is REMOVED, together with its component dot-matrix-steps.tsx and the lp-dots CSS. The shared dot-matrix.ts primitive and the footer halftone horizon stay: they render a different section. Its two now-unused exports vortex and paintScene are KEPT: the fleet UI roll syncs ui/ with delete: false, so a build host keeps its old dot-matrix-steps.tsx and next build typechecks every ts/tsx file; removing them produced two measured TS2305 errors. Earlier sections below this one record the runs that added these elements and are historical; their present-tense claims are superseded.
+The landing page is back to the state before the blue-streak run except for the dot-matrix stepper, which is also removed. Witnesses are in docs/PENDING_VALIDATION.md and .gm/witness-log.md; their rows marked WITNESSED for the two removed runs describe the state at the time, not the page now. A headful six-width production witness (final BUILD_ID EZ9pJlY8d6GHoShVEAkgX) measures no horizontal scroll, zero console errors and a still-painted footer horizon at 320/360/390/768/1024/1440. The first headful attempt is recorded as a FAIL; its driver and harness, not the page, were corrected. The operator word for this roll/deploy is in the request; it is not carried over from an earlier task.
+
 ## 2026-11-19 - Firewall attack challenge mode, sensitive-path denial and bot management
 
 The edge gate runs at the TOP of the edge pipeline before ACME, host or canonical redirects, so the geniee 307/404 probes are refused, not redirected.

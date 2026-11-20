@@ -1,8 +1,14 @@
 /* One dot-matrix primitive for the landing. The horizon band above the footer
- * and the interactive stepper both sample a painted luminance field into a grid
- * of dots; neither ever shows the source. All geometry is ours (blue node
- * squares, arcs, dashed orbits, plates, a dotted globe), never a third-party
- * badge or a rival artwork. Sizes are px: the dashboard root scales rem. */
+ * samples a painted luminance field into a grid of dots; it never shows the
+ * source. All geometry is ours (blue node squares, arcs, dashed orbits,
+ * plates, a dotted globe), never a third-party badge or a rival artwork.
+ * Sizes are px: the dashboard root scales rem.
+ *
+ * vortex and paintScene have no live caller: the deployment stepper was
+ * removed. They stay because the fleet UI roll syncs ui/ with delete:false,
+ * so a build host keeps its old dot-matrix-steps.tsx, and next build
+ * typechecks every ts/tsx file. Removing these exports makes that stale file
+ * fail TS2305 and the whole roll fails to build. Measured 2026-11-19. */
 
 export const DOT_SPACING = 8;
 export const DOT_FLOOR = 0.14;

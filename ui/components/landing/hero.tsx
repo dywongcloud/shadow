@@ -4,24 +4,32 @@ import { GlobeWireframe } from "@/components/globe-wireframe";
 import { DeployTerminal } from "./deploy-terminal";
 import { DomeLight } from "./dome-light";
 import { PreviewCard } from "./preview-card";
+import { GlowRing } from "./glow-ring";
 import { delay } from "./lp-utils";
 
 /** What the cards need below the globe from the `lg` breakpoint up: the finished terminal's height (about 375 px in a 974 px dome, 309 px in a 1160 px one)
  *  less the 54 % of the globe's height it overlaps, fitted as a line in the dome's width because a padding percentage is a share of the width. */
 const CARDS_OVERHANG = "max(0px, calc(725px - 55.6%))";
 
-/** The hero: two corner light streaks (rendered by MarketingShell so they reach
- *  the very top of the page) are its only ambient light. The dome, terminal and
- *  preview below are product art, not competing glows. The dome prints no count
- *  and names no region. */
+/** The hero: one dominant luminous object (the globe dome under its tracers) with the product shown doing its job in two glass panels. The dome is
+ *  art: it prints no count and names no region. */
 export function Hero() {
   return (
     <section className="lp-hero pb-14 lg:pb-24">
+      <div className="lp-bg" aria-hidden="true">
+        <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
+        <div className="lp-glow-blue" />
+        <div className="lp-aurora-a" />
+        <div className="lp-aurora-b" />
+        <div className="lp-grid" />
+        <div className="lp-grain" />
+      </div>
+
       <div className="relative z-10 mx-auto max-w-[1100px] px-6 pt-12 sm:pt-[60px]">
         <h1 className="lp-h1 lp-rise mt-7" style={delay(90)}>
           Push to Git.
           <br />
-          <span>Get a live URL.</span>
+          <span className="lp-gradient-text">Get a live URL.</span>
         </h1>
         {/* the standfirst is desktop-only: on a phone it pushed the headline and the calls to action off the first screen */}
         <p className="lp-sub lp-rise mx-auto mt-6 max-w-[640px] max-sm:hidden" style={delay(180)}>
