@@ -1,5 +1,61 @@
 # Changelog
 
+## 2026-11-20 - push and backend roll; CI blocked by GitHub billing
+
+At the operator's word (`push and roll`). `git push` landed `c66ae302` on
+`origin/main` (verified via `origin/main` after fetch and `ci-status`
+`sha_on_remote=true`). `git_push` reported `push_verification_failed` because
+its verifier compared against the stray local `refs/heads/origin/main`
+(10bebf34, a Sept 1 WIP commit marked "Not for push or rollout"); the real
+remote-tracking ref advanced to our HEAD. A bare `origin/main` remains
+ambiguous: count via `refs/remotes/origin/main..HEAD` (31 ahead, 0 behind).
+
+CI has NO verdict on the pushed SHA. All 11 jobs failed in 1-2 seconds with
+`runner_id=0`, zero steps and zero billable ms; a manual `workflow_dispatch`
+reproduced it. The check-run annotation gives the cause verbatim: "The job was
+not started because recent account payments have failed or your spending limit
+needs to be increased. Please check the 'Billing & plans' section in your
+settings". `.github/workflows/` is unchanged since the last green run
+(f82a6351); this is GitHub BILLING, needing the operator's account fix, not a
+code fix. Local gates were green before the push: `cli-acceptance.sh` 35/0,
+`check-contract-bindings.py --check` PASS bindings=34 gates=35,
+`audit-secret-keys.sh` 6/6 hosts clean, `git diff --check` clean. The full
+`cargo test --workspace --locked` layer was NOT run locally (build cache wiped,
+disk at 2.6 GiB); CI is the gate that normally runs it.
+
+The chain head fc-sanjose was at 2.0T / 0 bytes free, which would fail the
+artifact push (`push.yml` writes /tmp on EVERY host; the verify play is
+`any_errors_fatal`). At the operator's chosen "Guarded reclaim, then roll":
+a bounded reclaim on fc-sanjose removed 26 DANGLING podman image IDs via
+explicit `podman rmi`, with a blast-radius guard (keep-set 38 image IDs
+non-empty, no dangling/keep overlap, reap budget capped at 150 of 993 = 15%,
+stop at 12 GiB free). `RESULT PASS removed=26 free_before=3950346240
+free_after=13856321536 keep_intact=38 running_intact=65
+volumes_untouched=1`; df then showed 7.9 GiB available. Only dangling images
+were touched: never `podman volume prune`, never `podman image prune`, no
+container removed, no hive data deleted. 853 dangling images remain.
+
+Backend roll: `ansible-playbook playbooks/parallel-deploy.yml --tags backend
+--limit 'fc-orlando:va:va3:sj:sj7:phx'`, default serial 1 (no
+`deploy_serial_backend` override), the live-only limit used by prior operator
+rolls. FIRST detached attempt died mid-push when its launching task ended;
+no restart play ran, so no mixed-binary fleet. Relaunched as its own session
+leader; `ROLL_EXIT=0`, PLAY RECAP `failed=0` on all 6 hosts. Playbook
+verification: `BACKEND VERIFIED: 6/6 hosts run the controller and install
+the cell agent built in this run`, controllers `399e903fbe29`, cell agents
+`d15d323d8b10`, content changed on 5 hosts. Independent proof after the roll:
+`strings -a /proc/<MainPID>/exe | grep -c 'sensitive-always-bad'` returns 1 on
+all 6, and the running exe sha is `399e903fbe295233` on all 6. fc-orlando's
+`hive-devhub.service` stayed active throughout. Re-kicks converged
+(fc-orlando 4/4, va 3/3, va3 3/3 visible healthy peers). NO_TEST_FILES.
+
+HELD: the `ui/` changes in the pushed range are NOT deployed. Per
+`ansible/AGENTS.md` a roll is `--tags backend`; the dashboard is a separate
+`--tags ui` roll needing its own operator word. No IP deny set was applied:
+`scripts/honeypot-blocklist.py` still needs operator-supplied page snapshots
+and `--operator-confirm` on each node. No SSH port change, no host bloat
+deletion beyond the 26 dangling images above.
+
 ## 2026-11-20 - guarded, expiring IP deny for Project Honey Pot pages
 
 `scripts/honeypot-blocklist.py` generates a TTL-bounded nft deny set from the

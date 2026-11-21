@@ -209,3 +209,38 @@ no SSH allowlist, no port change, no hyperssh daemon, no host deletion; all
 are one-way doors. Read-only fc-sanjose disk analysis recorded (100% full,
 596.8GB images / 591GB reclaimable) with reclaim gated on gc_rootfs_images.
 No push, no roll, no fail2ban apply.
+
+## 2026-11-20 - push and backend roll (operator word given)
+
+Row: push-and-backend-roll. Files: CHANGELOG.md, docs/PENDING_VALIDATION.md,
+scripts/honeypot-blocklist.py (not applied). Witness needed + run: push the
+local commits, then roll the backend binary to the live fleet without leaving
+a mixed fleet. RESULT: push landed c66ae302 on origin/main (verified via
+origin/main after fetch and ci-status sha_on_remote=true). Local gates before
+the push: cli-acceptance.sh 35 passed / 0 failed; check-contract-bindings.py
+--check PASS bindings=34 gates=35; audit-secret-keys.sh 6/6 hosts clean; git
+diff --check clean. cargo test --workspace --locked was NOT run locally
+(build cache wiped, disk at 2.6 GiB); CI has NO verdict: all 11 jobs
+runner_id=0, steps=0, billable total_ms=0; check-run annotation says "The job
+was not started because recent account payments have failed or your spending
+limit needs to be increased. Please check the 'Billing & plans' section in
+your settings". .github/workflows unchanged since last green f82a6351.
+GitHub BILLING, needs the operator account fix, not a code fix. Reclaim
+result (fc-sanjose only, bounded, guarded): RESULT PASS removed=26
+free_before=3950346240 free_after=13856321536 keep_intact=38
+running_intact=65 volumes_untouched=1; only dangling podman images via
+explicit podman rmi; never volume prune/image prune; no container removed.
+Roll: ansible-playbook playbooks/parallel-deploy.yml --tags backend --limit
+'fc-orlando:va:va3:sj:sj7:phx', default serial 1, no deploy_serial_backend
+override. First detached attempt died mid-push when its launching task ended;
+NO restart play ran, so no mixed-binary fleet. Relaunched as own session
+leader. ROLL_EXIT=0; PLAY RECAP failed=0 on all 6 hosts; playbook verification
+BACKEND VERIFIED: 6/6 hosts, controllers 399e903fbe29, cell agents
+d15d323d8b10, content changed on 5 hosts. Independent proof after the roll:
+strings -a /proc/<MainPID>/exe | grep -c 'sensitive-always-bad' returns 1 on
+all 6 hosts; running exe sha 399e903fbe295233 on all 6. fc-orlando
+hive-devhub.service stayed active. Re-kicks converged (fc-orlando 4/4, va
+3/3, va3 3/3 visible healthy peers). NO_TEST_FILES. HELD: the ui/ changes in
+the pushed range are NOT deployed; the dashboard is a separate --tags ui roll
+needing its own operator word. No IP deny set applied (needs operator-supplied
+snapshots and --operator-confirm on each node). No SSH port change.
