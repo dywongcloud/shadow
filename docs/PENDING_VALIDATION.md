@@ -168,3 +168,21 @@ layers=4 gates=35. NO_TEST_FILES. Residuals named in the index doc: raw
 TCP/UDP raw_ports carry no path; LFI/RFI query probes and WordPress user
 enumeration are deliberately not denied. HELD: no push and no roll -- both
 need the operator's word, and the running fleet binaries are unchanged.
+
+## 2026-11-20 - SSH/hyperssh decision (no production change)
+
+Row: ssh-access-hyperssh-decision. File: docs/ssh-access-decision.md,
+CHANGELOG.md. Witness needed + run: decide whether turning off sshd on port
+22 and running hyperssh on every node reduces login attacks without creating
+a lockout. RESULT: the entire upstream README (1350 bytes, fetched raw from
+master, truncated:false) read; `hypertele-server --seed SEED -l 22` is a
+local-port forward to sshd, so the proposed combination is self-contradictory.
+Live config reads: prerequisites/tasks/main.yml:129-164 has no Port directive
+and sets PasswordAuthentication no; scripts/hive-lockdown.sh leaves 22 open
+by omission, generates PEERS/PRIVATE_PEERS, and carries a targeted
+BLOCKED_CIDRS deny. Exhaustive literal scan over 2024 source files
+(exhaustive:true) finds no existing hyperssh reference in the tree. Decision:
+no SSH allowlist, no port change, no hyperssh daemon, no host deletion; all
+are one-way doors. Read-only fc-sanjose disk analysis recorded (100% full,
+596.8GB images / 591GB reclaimable) with reclaim gated on gc_rootfs_images.
+No push, no roll, no fail2ban apply.

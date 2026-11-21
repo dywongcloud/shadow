@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-11-20 - SSH stays on 22; hyperssh is not an sshd replacement
+
+Evaluated the exploration "turn off ssh (port 22) unless it comes from this
+ip address and use hyperssh p2p on every node". The full upstream hyperssh
+README (1350 bytes, read whole) gives `hypertele-server --seed SEED -l 22`:
+`-l 22` is the LOCAL sshd port the DHT proxy forwards to, so hyperssh replaces
+the address used to reach sshd, not sshd itself. Turning off port 22 would
+break the replacement. The README states nothing about authentication,
+authorization, ACLs, MFA, key algorithms, bootstrap/recovery, out-of-band
+console or availability; identity is delegated to an external link. Announcing
+a peer key on a public DHT widens the discoverable SSH surface instead of
+closing it, and a UDP-holepunch path with no documented recovery would become
+the fleet's only access path. Decision recorded in
+`docs/ssh-access-decision.md`: keep sshd on 22 with key-only auth, keep the
+inventory-generated ignoreip, keep `sshd-slow`, keep generated BLOCKED_CIDRS.
+Do not turn off SSH, move the port as a standalone change, or add a hyperssh
+daemon. No SSH allowlist, no port change, no daemon, no host data deletion:
+each is a production one-way door needing the operator's word. Read-only
+fc-sanjose analysis found / at 100% with 5424 podman images (94 active),
+596.8GB / 591GB reclaimable, 820 deploys entries and one litebox-cache entry
+at 573863 MB; reclaim stays gated on `gc_rootfs_images` blast-radius guards,
+never `podman volume prune`.
+
 ## 2026-11-20 - edge denies scanner-only secret paths, keeps developer routes reachable
 
 A geniee.site probe corpus (151 requests, 150 unique normalized paths) was
