@@ -30,7 +30,9 @@ These name a private key, a secret-bearing tool config, a framework-internal
 installer/debug/log endpoint. No legitimate tenant route needs them. Exact
 normalized paths, not stems: a stem deny on `auth` would also kill `/auth.js`,
 which is a real asset. Adding these as EXACT paths cannot prohibit a developer
-from exposing any route they might reasonably want.
+from exposing any route they might reasonably want. The first 17 rows are from
+the corpus; the last two (`/actuator/env`, `/actuator/heapdump`) are generated
+from the same Spring scanner family, not log-derived.
 
 | normalized path | why always bad |
 | --- | --- |
