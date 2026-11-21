@@ -169,6 +169,29 @@ TCP/UDP raw_ports carry no path; LFI/RFI query probes and WordPress user
 enumeration are deliberately not denied. HELD: no push and no roll -- both
 need the operator's word, and the running fleet binaries are unchanged.
 
+## 2026-11-20 - guarded expiring deny for Project Honey Pot IPs
+
+Row: honeypot-ip-deny. File: scripts/honeypot-blocklist.py,
+docs/honeypot-ip-deny.md, CHANGELOG.md. Witness needed + run: generate a deny
+set for the three linked list_of_ips.php pages without reproducing the
+site's content or breaking shared-infrastructure traffic. RESULT PASS
+(dispatch 1795233416446-5238-9a11d6dfbf63a9c4): the three HTML pages fetched
+live, each read whole (25 unique IPs each, 42 union); ?rss=1 feeds expose 50
+items each (91 union, 49 beyond the pages); terms_of_use.php and
+httpbl_api.php read live. Generated ruleset asserted to contain the -105
+table, 7d timeout, the drop rule, and to exclude Google/Googlebot, GCP
+ephemeral, Cloudflare and Tor-exit addresses. Default denied=22
+excluded=20; --no-ptr denied=39; RSS included with unreviewed excluded keeps
+the deny set unchanged; explicit opt-in reaches 91; custom TTL honored.
+All 8 refusal guards (fleet-peer collision, private address, empty dir,
+unparsable payload, over-cap, TTL out of range, apply and remove without
+--operator-confirm) return exit 2. py_compile PASS;
+check-contract-bindings.py --check PASS bindings=34 gates=35. NO_TEST_FILES.
+HELD: no IP is blocked. nft is absent on this macOS host, so `nft -c -f`,
+`nft -f` and `nft list set` were NOT executed; `apply` performs them on the
+node after --operator-confirm. No apply, no push, no roll, no lockdown tag:
+all need the operator's word.
+
 ## 2026-11-20 - SSH/hyperssh decision (no production change)
 
 Row: ssh-access-hyperssh-decision. File: docs/ssh-access-decision.md,

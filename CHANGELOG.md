@@ -1,5 +1,49 @@
 # Changelog
 
+## 2026-11-20 - guarded, expiring IP deny for Project Honey Pot pages
+
+`scripts/honeypot-blocklist.py` generates a TTL-bounded nft deny set from the
+three operator-supplied `list_of_ips.php` snapshots. It makes NO request to
+projecthoneypot.org: their terms prohibit reproduction of the site's content
+and restrict automated access, so no copy of their list is committed and no
+fleet node, boot path or request path scrapes the site. The supported machine
+interface is http:BL, which needs an operator-held Access Key and must not
+add a DNS lookup to the request path.
+
+The three pages are rotating "Top 25 | By Last Bad Event" leaderboards, not a
+blocklist: 25 unique addresses each, 42 in the HTML union, 91 across the
+`?rss=1` feeds. A committed snapshot would go stale within hours and
+permanently deny reassigned addresses, so every element carries an nft
+timeout (default 7d). Live reverse DNS found 20 of the 42 are shared or
+ephemeral egress (15 GCP `bc.googleusercontent.com` VMs, Google/Googlebot
+`1e100.net`, Cloudflare `104.16.0.0/12`, a Tor exit, shared mail relays); a
+flat deny would drop Googlebot from `shadw.cloud` and every `*.shadw.app`
+deployment and break CDN-fronted tenant traffic. Default result: 22 denied,
+20 excluded. `--include-shared-infra` is an explicit opt-in.
+
+The set lives in a separate `inet honeypot_deny` table at hook priority -105,
+BEFORE hive_lockdown (-100), strict (-90) and fail2ban (-1): a DROP is
+terminal, so no later accept can rescue the source. `scripts/hive-lockdown.sh`,
+the sole host firewall and boot path, is untouched; remove is one nft command.
+Fail-closed guards refuse empty/unparsable snapshots, non-global addresses,
+any address colliding with `PEERS`/`PRIVATE_PEERS`/`BLOCKED_CIDRS` (fleet
+lockout), RSS-only unreviewed addresses, over-cap sets, invalid TTLs and any
+`apply`/`remove` without `--operator-confirm`. `apply` runs `nft -c -f` first,
+re-creates the table idempotently and lists the set back.
+
+Live witness (dispatch 1795233416446-5238-9a11d6dfbf63a9c4): RESULT PASS with
+default reviewed pages denied=22 excluded=20, `--no-ptr` denied=39, RSS
+included but unreviewed excluded (deny set unchanged at 39), explicit opt-in
+to all 91, custom TTL honored, and all 8 refusal guards returning exit 2.
+`py_compile` and `check-contract-bindings.py --check` PASS. NO_TEST_FILES.
+`nft` is absent on this macOS host, so `nft -c -f`/`nft -f`/`nft list set`
+were not executed here; `apply` performs them on the node.
+
+HELD: no IP is blocked. No apply, no push, no roll, no lockdown tag. All are
+production one-way doors needing the operator's word. `fail2ban` and the
+`sshd-slow` jail remain the behaviour-based defence. Decision and residuals:
+`docs/honeypot-ip-deny.md`.
+
 ## 2026-11-20 - SSH stays on 22; hyperssh is not an sshd replacement
 
 Evaluated the exploration "turn off ssh (port 22) unless it comes from this

@@ -71,6 +71,14 @@ backups/
 /1
 /wqall
 /error.txt_*
+# Project Honey Pot snapshots are operator-supplied copies of a third-party
+# page. Their Terms of Website Use prohibit reproduction of the site's
+# content, so a snapshot must never ride a commit: the generator reads it
+# from a local dir and ships no copy of the list.
+**/honeypot-snapshots/
+**/honeypot-*.nft
+**/honeypot-*.html
+
 # Agent session transcripts/digests — local-only, may contain live credentials
 # captured during sessions (a bulk `git add -A` once swept these into a commit
 # and GitHub push protection blocked the push on real secrets).
