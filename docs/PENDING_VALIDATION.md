@@ -123,3 +123,48 @@ scripts/cli-acceptance.sh 35 passed / 0 failed, CLI_ACCEPT_EXIT=0;
 check-contract-bindings.py --check RESULT PASS bindings=34 layers=4 gates=35
 fail_open=4 secrets_clean=1; git diff --check EXIT 0. NO_TEST_FILES. No push and no roll: a push auto-deploys
 through two SHA-deduping triggers and the running fleet binaries are unchanged.
+
+## 2026-11-20 - fail2ban sshd-slow jail (login-attack hardening)
+
+Row: fail2ban-slow-brute-force-jail. File: ansible/roles/fail2ban/tasks/main.yml.
+Witness needed + run: add an sshd-slow jail that catches low-and-slow distributed
+SSH brute force without weakening the inventory-generated ignoreip. Read-only
+live evidence on fc-sanjose-7: CWPP "password cracking" source 10.0.0.12 is
+fc-sanjose (a private fleet peer in ignoreip), sshd has password auth disabled,
+and /var/log/secure shows penalty drops plus ACCEPTED PUBLICKEY logins at the
+alert time -- a false positive. The real exposure is 41798 total sshd failures
+/ 1615 bans with ~40 invalid-user attempts per external source spread over
+hours, so findtime=600 / maxretry=5 never fires. RESULT: yaml.safe_load parses
+28 tasks; rendered jail.local parses as INI with sections sshd, sshd-slow,
+recidive; sshd-slow inherits ignoreip, bantime.increment and bantime.maxtime;
+live `fail2ban-client get sshd findtime|maxretry|bantime` returns bare integers
+and `get ... ignoreip` returns a multiline block (asserts written for those
+formats); `fail2ban-regex /var/log/secure "sshd[mode=aggressive]"` parses and
+matches on the live host; `ansible-playbook playbooks/site.yml --syntax-check
+--tags fail2ban` passes from ansible/; git diff --check PASS. NO_TEST_FILES.
+HELD: no `site.yml --tags fail2ban` apply -- the role's own fail-closed asserts
+require `hive_fail2ban_sshd_authorized_keys_confirmed=true` and
+`hive_fail2ban_selinux_policy_installed=true` from the operator inventory, and
+only `hive_fail2ban_ignoreip_extra` is currently defined. No push.
+
+## 2026-11-20 - edge exact-path deny for scanner-only secrets
+
+Row: firewall-exact-path-deny. File: crates/hive-cloud/src/firewall.rs,
+docs/firewall-deny-index.md. Witness needed + run: the 151-line geniee.site
+probe corpus classified against the real sensitive_rule/normalize_path: 99
+already denied, 52 missed (51 unique), 17 always-bad, 34 DX-prohibitive
+left served. RESULT: the real std-only source slice (hex_digit through
+sensitive_rule) compiled with `rustc --edition 2021 -O` and executed,
+`RESULT PASS exact=36 variants=6 dx_safe=19 earlier_rules=4`, exit 0
+(dispatch 1795226859162-5368-5c4e1a004eebefa8). Asserts every exact path is
+denied, six matrix/traversal/double-encoded variants collapse onto a deny,
+19 DX-safe neighbours (/actuator/health, /wp-admin/admin-ajax.php, /auth.js,
+/config.js, /env.js, /metrics, /wp-json/wp/v2/users, ...) are NOT denied, and
+four earlier rule families still fire. One assertion was corrected by the
+live run: /wp-config.php.bak is denied by sensitive-secret-file BEFORE the
+backup branch; /config.php.bak reaches sensitive-backup.
+`scripts/check-contract-bindings.py --check` RESULT PASS bindings=34
+layers=4 gates=35. NO_TEST_FILES. Residuals named in the index doc: raw
+TCP/UDP raw_ports carry no path; LFI/RFI query probes and WordPress user
+enumeration are deliberately not denied. HELD: no push and no roll -- both
+need the operator's word, and the running fleet binaries are unchanged.

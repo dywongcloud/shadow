@@ -1,5 +1,66 @@
 # Changelog
 
+## 2026-11-20 - edge denies scanner-only secret paths, keeps developer routes reachable
+
+A geniee.site probe corpus (151 requests, 150 unique normalized paths) was
+classified against the real `firewall::sensitive_rule`/`normalize_path`:
+99 requests were already denied, 52 were missed (51 unique). Of those, 17 name
+a private key, a secret-bearing tool config or a framework-internal
+installer/debug/log endpoint and are always bad; 34 are DX-ambiguous (public
+runtime-config JS, static bundles, publishable manifests, `/metrics`,
+`/wp-json/wp/v2/users`) and must stay served because a tenant may want them
+exposed. `crates/hive-cloud/src/firewall.rs` adds `ALWAYS_BAD_EXACT`, 36 exact
+normalized paths: 17 from the corpus, 2 generated Spring actuator dumps and
+17 generated scanner-family paths the log did not contain. The check is EXACT,
+before the dot-segment branch, so `normalize_path` collapsing a matrix-param,
+traversal or double-encoded variant lands on the same deny; it is deliberately
+NOT a stem or prefix match, so `/actuator/health`,
+`/wp-admin/admin-ajax.php`, `/auth.js`, `/config.js` and `/env.js` stay
+reachable. `edge_gate` calls `sensitive_rule` before the bypass list, ACME and
+host redirects, and `dedicated_ipv4_listener.rs` reuses the same router, so the
+deny covers `shadw.cloud` and every `*.shadw.app` deployment including
+dedicated-IP requests. Raw TCP/UDP `raw_ports` carry no path and are out of
+scope; LFI/RFI query probes (`?file=`, `?cmd=`) and WordPress user enumeration
+are recorded as residuals in `docs/firewall-deny-index.md`, not denied.
+
+Live witness: the real std-only slice of `firewall.rs` (`hex_digit` through
+`sensitive_rule`) was compiled with `rustc --edition 2021 -O` and executed:
+`RESULT PASS exact=36 variants=6 dx_safe=19 earlier_rules=4`, exit 0. It
+asserts every exact path is denied, six matrix/traversal/double-encoded
+variants collapse onto a deny, 19 DX-safe neighbours are NOT denied, and the
+four earlier rule families still fire. One witness assertion was corrected by
+that run: `/wp-config.php.bak` is denied by `sensitive-secret-file` (stem
+`wp-config`) BEFORE the backup branch, not by `sensitive-backup`;
+`/config.php.bak` reaches the backup branch. `scripts/check-contract-bindings.py
+--check` returns `RESULT PASS bindings=34 layers=4 gates=35`. NO_TEST_FILES.
+No push and no roll: both need the operator's word, and the running fleet
+binaries are unchanged.
+
+## 2026-11-20 - fail2ban gains a long-window jail for slow distributed SSH brute force
+
+A CWPP "password cracking" report on fc-sanjose-7 (10.0.0.14) named source
+10.0.0.12 with 13 attempts. Read-only live evidence: 10.0.0.12 is fc-sanjose
+(the control-plane chain head) per inventory `hive_private_ip`; sshd -T shows
+passwordauthentication no, kbdinteractiveauthentication no,
+permitrootlogin without-password; /var/log/secure at the alert time shows
+"drop connection ... penalty: connections without attempting authentication"
+followed by "Accepted publickey for root from 10.0.0.12". The 13 events are
+fleet automation probes and successful key logins, not cracking; the source is
+a private peer in fail2ban's generated ignoreip, so CWPP correctly did not
+block it. No password was cracked and no credential rotation is warranted.
+
+The real exposure is a slow distributed brute force: on fc-sanjose-7 the sshd
+jail reports 41798 total failures and 1615 bans, and the last 3000 secure
+lines carry ~40 invalid-user attempts each from 2.57.121.25, 139.19.117.130,
+80.94.95.116, 138.226.239.233/234, 193.46.255.86 and 2.57.121.112 -- spread
+over hours, so `findtime=600 / maxretry=5` never fires for them. `recidive`
+catches only repeat offenders. `ansible/roles/fail2ban/tasks/main.yml` now
+adds an `sshd-slow` jail on the same `/var/log/secure` filter with a 24 h
+findtime, maxretry 12 and a 7-day nftables-allports ban, inheriting the
+inventory-generated ignoreip. Verification tasks fail loud if the jail is
+absent, inert, has no ignoreip, or its findtime/maxretry drift. Config change
+only: no `site.yml --tags fail2ban` apply and no push.
+
 ## 2026-11-20 - contract verification CLI names its real arguments; checkpoint writes are race-safe
 
 Row `contract-cli-documented-flags-unimplemented`. Four harnesses documented

@@ -150,7 +150,47 @@ const SENSITIVE_PREFIXES: &[&str] = &[
     "app/etc/", "sites/default/settings.php",
 ];
 
+/// ALWAYS-BAD exact normalized paths, derived from the geniee.site probe corpus
+/// plus the generated scanner families indexed in `docs/firewall-deny-index.md`.
+/// Each names a private key, a secret-bearing tool config, or a framework
+/// installer/debug/log endpoint that no tenant route plausibly needs. EXACT
+/// match on purpose: a stem/prefix deny would also kill DX-legitimate assets
+/// such as /actuator/health, /wp-admin/admin-ajax.php and /auth.js. Dot-segment
+/// probes (/.git/config, /.aws/credentials, /wp-config.php.bak, /.env.*) are
+/// already denied above by `sensitive-dotfile` and the suffix/backup rules.
+/// Traversal variants collapse to these exact strings in `normalize_path`.
+const ALWAYS_BAD_EXACT: &[&str] = &[
+    // From the corpus: 17 paths the earlier rules missed. The two actuator
+    // dumps at the end of this group are generated, not log-derived.
+    "/service-account-key.json", "/service_account.json",
+    "/sendgrid.env", "/sentry.properties", "/auth.json",
+    "/claude_desktop_config.json", "/aider.conf.yml",
+    "/oai_config_list.json", "/oai_config_list",
+    "/litellm.yaml", "/litellm/config.yaml",
+    "/config/custom-environment-variables.json",
+    "/storage/logs/laravel.log", "/wp-content/debug.log",
+    "/wp-admin/install.php", "/server-info", "/telescope/requests",
+    "/actuator/env", "/actuator/heapdump",
+    // Generated scanner-family paths, not present in the log.
+    "/actuator/configprops", "/actuator/mappings", "/actuator/beans",
+    "/actuator/httptrace", "/actuator/threaddump", "/actuator/loggers",
+    "/actuator/jolokia", "/wp-admin/setup-config.php", "/wp-admin/upgrade.php",
+    "/phpinfo.php", "/info.php", "/adminer.php", "/phpmyadmin/index.php",
+    "/trace.axd", "/debug/vars", "/etc/passwd", "/proc/self/environ",
+];
+
 pub fn sensitive_rule(norm: &str) -> Option<&'static str> {
+    // Exact always-bad paths first, so a matrix-param or doubly encoded
+    // variant that `normalize_path` collapses to one of them is denied by the
+    // same rule instead of reaching the segment rules below. Deliberately NOT
+    // a stem or prefix match: /actuator/health, /wp-admin/admin-ajax.php and
+    // /auth.js must stay reachable. NEVER widen this list to a bare "config"
+    // or "env" stem: /config.js and /env.js are public runtime-config assets
+    // a real tenant serves. When in doubt, leave the path to the
+    // challenge/rate-limit path and record the residual.
+    if ALWAYS_BAD_EXACT.contains(&norm) {
+        return Some("sensitive-always-bad");
+    }
     let segs: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
     if segs.is_empty() {
         return None;

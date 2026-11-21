@@ -231,6 +231,25 @@
       enabled = true
       mode = aggressive
 
+      # Low-and-slow distributed brute force. Live-witnessed on fc-sanjose-7:
+      # ~40 invalid-user attempts per source IP spread over hours, so the
+      # default findtime=600 / maxretry=5 NEVER fires for them (41,798 total
+      # failures, 1,615 bans, nearly all from recidive). A 24 h window with a
+      # 12-failure threshold catches that shape without touching the fast jail.
+      # ignoreip is inherited from [DEFAULT] and covers every fleet peer plus
+      # the operator recovery addresses, so this cannot self-ban the fleet.
+      [sshd-slow]
+      enabled = true
+      filter = sshd
+      mode = aggressive
+      port = ssh
+      logpath = /var/log/secure
+      backend = auto
+      findtime = 86400
+      maxretry = 12
+      bantime = 604800
+      banaction = nftables-allports
+
       [recidive]
       enabled = true
       logpath = /var/log/fail2ban.log
@@ -290,11 +309,12 @@
   changed_when: false
   failed_when: "'ERROR' in f2b_jail_status.stdout or 'ERROR' in f2b_jail_status.stderr"
 
-- name: Verify bans use nftables and both jails are up (fail loud)
+- name: Verify bans use nftables and all three jails are up (fail loud)
   ansible.builtin.shell: |
     set -e
     for _ in 1 2 3 4 5 6 7 8 9 10; do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
     fail2ban-client status | grep -q 'sshd'
+    fail2ban-client status | grep -q 'sshd-slow'
     fail2ban-client status | grep -q 'recidive'
     fail2ban-client get sshd actions | grep -q 'nftables'
   changed_when: false
@@ -326,4 +346,46 @@
       echo "INERT recidive jail: /var/log/fail2ban.log is empty -- fail2ban is not writing ban events, so recidive can never ban" >&2
       exit 1
     }
+  changed_when: false
+
+- name: Verify sshd-slow is attached to the real auth log and can ban (an inert
+    long-window jail is exactly the silent no-op the CWPP report would miss)
+  ansible.builtin.shell: |
+    set -eu
+    status=$(fail2ban-client status sshd-slow 2>&1)
+    printf '%s\n' "$status" | grep -q 'File list:.*secure' || {
+      echo "INERT sshd-slow jail: no monitored sshd log attached" >&2
+      printf '%s\n' "$status" >&2
+      exit 1
+    }
+    printf '%s\n' "$status" | grep -q 'Currently banned:' || {
+      echo "INERT sshd-slow jail: no Actions section" >&2
+      exit 1
+    }
+    fail2ban-client get sshd-slow actions | grep -q 'nftables' || {
+      echo "INERT sshd-slow jail: banaction is not nftables -- bans would not land" >&2
+      exit 1
+    }
+    # A slow jail with no ignoreip inherited would eventually ban a fleet peer
+    # whose automation probes ssh without authenticating (the CWPP false
+    # positive). Loopback alone is NOT enough: a drifted ignoreip that keeps
+    # only 127.0.0.0/8 would still pass a non-empty check. Assert every address
+    # the role rendered from the inventory is present in the LIVE jail config.
+    # python3 is required by prerequisites; tokenise the multiline reply so
+    # 10.0.0.12 cannot be "found" inside 10.0.0.120. fail2ban canonicalises the
+    # rendered 127.0.0.1/8 to 127.0.0.0/8, so skip loopback by its /8 suffix.
+    python3 -c 'import subprocess,sys,os; live=subprocess.check_output(["fail2ban-client","get","sshd-slow","ignoreip"],text=True); toks={t for line in live.splitlines() for t in line.replace("|"," ").replace("`"," ").replace("-"," ").split()}; missing=[ip for ip in os.environ["F2B_EXPECTED_IGNOREIP"].split() if not ip.startswith("127.0.0") and ip not in toks]; sys.stderr.write("sshd-slow ignoreip MISSING %s -- would self-ban a fleet peer\n%s\n" % (", ".join(missing),live)) if missing else None; sys.exit(1) if missing else None; print("sshd-slow ignoreip covers all rendered addresses")'
+  environment:
+    F2B_EXPECTED_IGNOREIP: "{{ hive_fail2ban_ignoreip }}"
+  changed_when: false
+
+- name: Assert the slow jail's 24h window and threshold actually took effect
+  ansible.builtin.shell: |
+    set -eu
+    ft=$(fail2ban-client get sshd-slow findtime)
+    mr=$(fail2ban-client get sshd-slow maxretry)
+    bt=$(fail2ban-client get sshd-slow bantime)
+    echo "sshd-slow findtime=$ft maxretry=$mr bantime=$bt"
+    [ "$ft" = "86400" ] || { echo "sshd-slow findtime drifted: $ft" >&2; exit 1; }
+    [ "$mr" = "12" ] || { echo "sshd-slow maxretry drifted: $mr" >&2; exit 1; }
   changed_when: false
