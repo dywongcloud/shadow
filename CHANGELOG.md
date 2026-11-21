@@ -20,8 +20,11 @@ settings". `.github/workflows/` is unchanged since the last green run
 code fix. Local gates were green before the push: `cli-acceptance.sh` 35/0,
 `check-contract-bindings.py --check` PASS bindings=34 gates=35,
 `audit-secret-keys.sh` 6/6 hosts clean, `git diff --check` clean. The full
-`cargo test --workspace --locked` layer was NOT run locally (build cache wiped,
-disk at 2.6 GiB); CI is the gate that normally runs it.
+`cargo test --workspace --locked` layer was NOT run before the push (build
+cache wiped, disk at 2.6 GiB). After disk recovered to 117 GiB it was run
+locally against the same tree: `TEST_EXIT=0`, 444 passed, 0 failed,
+7 ignored. GitHub CI still has no verdict from the billing block; the local
+run is a substitute witness, not a CI verdict.
 
 The chain head fc-sanjose was at 2.0T / 0 bytes free, which would fail the
 artifact push (`push.yml` writes /tmp on EVERY host; the verify play is

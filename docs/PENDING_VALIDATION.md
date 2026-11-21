@@ -219,8 +219,10 @@ a mixed fleet. RESULT: push landed c66ae302 on origin/main (verified via
 origin/main after fetch and ci-status sha_on_remote=true). Local gates before
 the push: cli-acceptance.sh 35 passed / 0 failed; check-contract-bindings.py
 --check PASS bindings=34 gates=35; audit-secret-keys.sh 6/6 hosts clean; git
-diff --check clean. cargo test --workspace --locked was NOT run locally
-(build cache wiped, disk at 2.6 GiB); CI has NO verdict: all 11 jobs
+diff --check clean. cargo test --workspace --locked was NOT run before the
+push (build cache wiped, disk at 2.6 GiB); after disk recovered to 117 GiB it
+was run locally against the same tree: TEST_EXIT=0, 444 passed, 0 failed,
+7 ignored. CI has NO verdict: all 11 jobs
 runner_id=0, steps=0, billable total_ms=0; check-run annotation says "The job
 was not started because recent account payments have failed or your spending
 limit needs to be increased. Please check the 'Billing & plans' section in
