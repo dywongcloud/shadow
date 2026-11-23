@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-11-23 - UI roll and fail2ban apply
+
+At the operator's word (`proceed with the UI roll, fail2ban apply`), two
+production changes landed. No `git push`: a push auto-deploys through the
+webhook and `git::spawn_git_poll_reconcile` and still needs its own word.
+
+Fail2ban: `ansible-playbook playbooks/site.yml --tags fail2ban --limit
+va:va3:sj:sj7:phx -e hive_fail2ban_sshd_authorized_keys_confirmed=true`
+exited 0 with `failed=0` on all five enrolled hosts (fc-orlando is not
+enrolled). No gate was weakened: the read-only `audit-secret-keys.sh` passed
+6/6, all five hosts already had fail2ban active (so the operator-pinned
+`fail2ban_tarball_sha256` assert was skipped by its own `when`), all five
+report SELinux Disabled (so the SELinux policy assert was skipped), each had
+2-4 keys in `/root/.ssh/authorized_keys`, and a live lockout check proved our
+ssh egress address is inside the rendered `ignoreip` on every host. The one
+run-scoped extra var records that verified key path; no inventory or vault
+file changed. Independent post-apply witness: `sshd-slow` live on all five
+with `findtime=86400`, `maxretry=12`, `bantime=604800` and
+`nftables-allports`, alongside `sshd` (`nftables-multiport`) and `recidive`.
+
+UI: `parallel-deploy.yml --tags ui` with the live-only limit exited 0,
+`UI VERIFIED: 6/6 hosts serving BUILD_ID 7S08zWBE_kUO100ORg6j7`, `failed=0`
+on all six. Independent witness from a fleet vantage: uniform BUILD_ID and
+wf-console md5 on all six, node-local `/` and `/tips` 200, `hive-node`,
+`hive-ui` and fc-orlando's `hive-devhub.service` active, and
+`https://shadw.cloud/` and `/tips` 200 from `sj`. Before the roll, rendering
+`env.local.j2` proved its 17 keys match the 17 live `.env.local` keys exactly,
+so the wholesale overwrite wipes nothing. `vault_hive_github_auth_config_id`
+is empty, but `HIVE_GITHUB_AUTH_CONFIG_ID` was already empty on all six hosts;
+that is a pre-existing condition, not a roll regression.
+
+`sj` (the elected UI build host and chain head) had 0 bytes free on `/`.
+Headroom came from a bounded, blast-radius-guarded `npm cache clean --force`
+on that host only: 11.8 GiB free, a regenerable build cache, with podman
+images 1023, containers 76 and volumes 76 unchanged before and after. No
+image, volume, container, `deploys`, `litebox-cache` or tenant data deletion;
+the 908 dangling images and the guarded rootfs-image reclaim remain a
+separate operator decision. Both npm registries answered 200 for cold-install
+tarballs, and `npm ci` + the canonical build succeeded on `sj`.
+
+GitHub CI still has NO verdict from the 2026-11-20 billing block; that needs
+an operator account fix. HELD without a new operator word: any push, the
+honeypot IP deny apply (needs operator-supplied page snapshots and
+`--operator-confirm` per node), an SSH port change or allowlist, host bloat
+deletion, and a `--tags backend` roll. `docs/PENDING_VALIDATION.md` and
+`docs/ssh-access-decision.md` record the witnesses and the remaining doors.
+
 ## 2026-11-20 - push and backend roll; CI blocked by GitHub billing
 
 At the operator's word (`push and roll`). `git push` landed `c66ae302` on
@@ -58,6 +105,9 @@ HELD: the `ui/` changes in the pushed range are NOT deployed. Per
 `scripts/honeypot-blocklist.py` still needs operator-supplied page snapshots
 and `--operator-confirm` on each node. No SSH port change, no host bloat
 deletion beyond the 26 dangling images above.
+SUPERSEDED 2026-11-23 for the UI half: the `--tags ui` roll ran at the
+operator's word (see the 2026-11-23 entry). The IP deny and SSH items remain
+HELD.
 
 ## 2026-11-20 - guarded, expiring IP deny for Project Honey Pot pages
 

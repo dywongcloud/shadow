@@ -102,7 +102,21 @@ and the edge path deny in `crates/hive-cloud/src/firewall.rs`.
   sets `hive_fail2ban_sshd_authorized_keys_confirmed=true` and
   `hive_fail2ban_selinux_policy_installed=true` in inventory. Only
   `hive_fail2ban_ignoreip_extra` is defined.
-- No push, no roll: a push auto-deploys through two SHA-deduping triggers.
+  APPLIED 2026-11-23 at the operator's word: `site.yml --tags fail2ban
+  --limit va:va3:sj:sj7:phx` exited 0 with `failed=0` on all five enrolled
+  hosts. No gate was weakened. `fail2ban_tarball_sha256` was not needed
+  because all five already ran fail2ban (the assert is skipped by its own
+  `when: f2b_active.stdout != "active"`); the SELinux policy assert was
+  skipped because all five report `getenforce=Disabled`. The one remaining
+  assert was satisfied with a run-scoped
+  `-e hive_fail2ban_sshd_authorized_keys_confirmed=true` after live evidence:
+  2-4 keys in `/root/.ssh/authorized_keys` per host and
+  `f2b-lockout-check.py LOCKOUT_SAFE True` (our ssh egress inside ignoreip).
+  `sshd-slow` is live at 86400 / 12 / 604800 with `nftables-allports`.
+  fc-orlando is still NOT enrolled. See `CHANGELOG.md` 2026-11-23.
+- No push: a push auto-deploys through two SHA-deduping triggers and still
+  needs its own operator word. The 2026-11-23 UI roll is a separate ansible
+  roll, not a push.
 - No SSH allowlist, no port change, no hyperssh daemon: production one-way
   doors with fleet-lockout risk and no operator word.
 - No host data deletion. Read-only analysis of fc-sanjose (170.106.158.151)
@@ -114,4 +128,8 @@ and the edge path deny in `crates/hive-cloud/src/firewall.rs`.
   `HIVE_GC_MAX_REAP_FRACTION`); `podman volume prune` is never allowed, and
   volumes are reclaimed only when `is_anonymous_volume` AND `dangling=true`.
   Deleting 591GB of images on a 100%-full chain head needs the operator's word
-  and a live keep-set, not an aggregate-size judgement.
+  and a live keep-set, not an aggregate-size judgement. The 2026-11-23 UI roll
+  made headroom without any of that: a bounded `npm cache clean --force` on sj
+  only freed 11.8 GiB of regenerable build cache, with podman images 1023,
+  containers 76 and volumes 76 unchanged. No image, volume, container,
+  `deploys`, `litebox-cache` or tenant data was deleted.

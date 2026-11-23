@@ -146,6 +146,8 @@ HELD: no `site.yml --tags fail2ban` apply -- the role's own fail-closed asserts
 require `hive_fail2ban_sshd_authorized_keys_confirmed=true` and
 `hive_fail2ban_selinux_policy_installed=true` from the operator inventory, and
 only `hive_fail2ban_ignoreip_extra` is currently defined. No push.
+SUPERSEDED 2026-11-23: the apply ran at the operator's word; see the
+2026-11-23 section below and `.gm/witness-log.md`.
 
 ## 2026-11-20 - edge exact-path deny for scanner-only secrets
 
@@ -209,6 +211,8 @@ no SSH allowlist, no port change, no hyperssh daemon, no host deletion; all
 are one-way doors. Read-only fc-sanjose disk analysis recorded (100% full,
 596.8GB images / 591GB reclaimable) with reclaim gated on gc_rootfs_images.
 No push, no roll, no fail2ban apply.
+APPLIED 2026-11-23 at the operator's word: both the `--tags ui` roll and the
+`--tags fail2ban` apply ran; see the 2026-11-23 section. No push.
 
 ## 2026-11-20 - push and backend roll (operator word given)
 
@@ -246,3 +250,50 @@ hive-devhub.service stayed active. Re-kicks converged (fc-orlando 4/4, va
 the pushed range are NOT deployed; the dashboard is a separate --tags ui roll
 needing its own operator word. No IP deny set applied (needs operator-supplied
 snapshots and --operator-confirm on each node). No SSH port change.
+SUPERSEDED 2026-11-23 for the UI half: `--tags ui` ran at the operator's word;
+see the 2026-11-23 section below. The IP deny and SSH items remain HELD.
+
+## 2026-11-23 - UI roll and fail2ban apply
+
+Rows: `push-and-backend-roll`, `fail2ban-slow-brute-force-jail`,
+`chain-head-disk-full-blocks-ui-roll`. Files: `ansible/playbooks/site.yml`,
+`ansible/roles/fail2ban/tasks/main.yml`,
+`ansible/playbooks/parallel-deploy.yml`,
+`ansible/roles/hive_ui_fanout/tasks/{build,push,restart,verify}.yml`.
+Witnesses, all live executions at the operator's word `proceed with the UI
+roll, fail2ban apply`, logs under `/private/tmp/hive-gm-witness/`:
+
+- `roll-preflight.log`: `--tags ui` and `--tags fail2ban` syntax-check exit 0;
+  `audit-secret-keys.sh` 6/6 hosts clean; vault pass + ssh key present.
+- `f2b-lockout-check.py`: `LOCKOUT_SAFE True`, our ssh egress inside the
+  rendered ignoreip on all five enrolled hosts.
+- `f2b-apply.log`: `F2B_APPLY_EXIT=0`, PLAY RECAP `failed=0` on va, va3, sj,
+  sj7, phx (fc-orlando excluded, not enrolled).
+- `f2b-verify.log`: all five `JAILS=recidive, sshd, sshd-slow`;
+  `SLOW_FINDTIME=86400 SLOW_MAXRETRY=12 SLOW_BANTIME=604800`,
+  `nftables-allports`; recidive ban list present; services active.
+- `ui-env-render.log` + `ui-env-live.log`: rendered `env.local.j2` key set
+  (17 keys) equals the live `.env.local` key set on all six; no key wiped.
+  `HIVE_GITHUB_AUTH_CONFIG_ID` is empty in the render and already empty on
+  all six hosts before the roll.
+- `ui-roll-preflight.log`: UID 0 + rsync on all six; control host 250 GiB
+  free; npm mirror served 9/9 cold-install tarballs.
+- `ui-headroom.log` + `ui-headroom-verify.log`: bounded `npm cache clean
+  --force` on sj only, `RESULT PASS ui_build_headroom` free 11.8 GiB,
+  `podman_untouched=1` (images 1023, containers 76, volumes 76 unchanged),
+  services active. No image/volume/container/data deletion.
+- `ui-roll.log`: `UI_ROLL_EXIT=0`, `UI VERIFIED: 6/6 hosts serving BUILD_ID
+  7S08zWBE_kUO100ORg6j7 (canonical 7S08zWBE_kUO100ORg6j7)`, `failed=0` on
+  all six, default serial 3.
+- `ui-verify.log` + `ui-fleet-http.log`: uniform BUILD_ID and wf-console md5
+  `2a98abf0ec9539ebbf1afba84d2c46d1` on all six; node-local `/` and `/tips`
+  200; `hive-node`, `hive-ui`, fc-orlando `hive-devhub.service` active; from
+  a fleet vantage (curl on sj, never the laptop) `https://shadw.cloud/`,
+  `https://www.shadw.cloud/` and `https://shadw.cloud/tips` all 200.
+
+NO_TEST_FILES. HELD without a new operator word: any push (auto-deploys twice),
+honeypot IP deny apply (needs operator-supplied page snapshots and
+`--operator-confirm` per node), SSH port change or allowlist, host bloat
+deletion (908 dangling images / guarded rootfs-image reclaim), a `--tags
+backend` roll, and GitHub CI verdict (billing block needs an operator account
+fix). No inventory, vault, or `hosts.ini` file was edited; no secrets printed.
