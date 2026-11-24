@@ -25,8 +25,13 @@ canonical hashes; no `--sync` was run.
 Witnessed live with CLT installed but disabled (`xcode-select -p` =
 `/nonexistent`): clean `cargo build -p hive-cloud --features zkauth --locked`
 through the committed lane, `BUILD_EXIT=0`; `--verify` `VERIFY_EXIT=0`,
-`macho_loads=10 security_framework=1 dupes=0 eager_bind=0`, Mach-O arm64,
-`--help` with empty stderr. `docs/macos-xcodefree.md` records the refuted
+`macho=1 security_framework=1 eager_bind=0`, Mach-O arm64, `--help` with
+empty stderr. A simulated bare fleet Mac (zig/python/git pointed at
+nonexistent paths) still passes `--verify`; binaries missing the
+Security.framework link or carrying a duplicate `LC_LOAD_DYLIB` are refused.
+`bindings --check` PASS, `git diff --check` 0, `bash -n` 0,
+`cargo test --workspace --locked` 444 passed / 0 failed.
+`docs/macos-xcodefree.md` records the refuted
 substitutes (Homebrew clang's hardcoded CLT SDK, rust-lld, `dyld_info`), the
 residuals (x86_64 lane, release profile, CLT-free launchd boot, prebuilt
 artifact source) and the operator-supplied pieces. Phase A local only:

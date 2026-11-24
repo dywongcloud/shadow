@@ -36,18 +36,22 @@ Two were refuted by live execution, not by inspection:
 
 `scripts/macos-xcodefree.sh` is one shared lane with three modes:
 
-- `--preflight` fails closed unless the host is Darwin, `/nonexistent` does
-  not exist, and zig, Homebrew `python3`, `git`, `llvm-ar` and
-  `llvm-ranlib` are all present outside `/usr/bin`. It also asserts
-  `xcode-select -p` no longer names a real developer directory.
-- `--verify <binary>` runs the binary with `DYLD_BIND_AT_LAUNCH=1` under
-  `DEVELOPER_DIR=/nonexistent`, then parses the Mach-O load commands with
-  the pinned Python: no duplicate `LC_LOAD_*`, and `Security.framework`
-  must be present (the SEP signer / TLS verifier link).
-- `<command> [args...]` runs preflight, sets `DEVELOPER_DIR=/nonexistent`,
-  unsets `SDKROOT` and `MACOSX_DEPLOYMENT_TARGET`, prepends Homebrew to the
-  user's PATH, and exports both Darwin target linkers, both `CC_*` vars,
-  `AR` and `RANLIB` before exec'ing the command.
+- `--preflight` (build mode) fails closed unless the host is Darwin,
+  `/nonexistent` does not exist, and zig, Homebrew `python3`, `git`,
+  `llvm-ar` and `llvm-ranlib` are all present outside `/usr/bin`. It also
+  asserts `xcode-select -p` no longer names a real developer directory.
+- `--verify <binary>` uses ONLY base macOS: `od` for the Mach-O magic,
+  `grep -a` for the `Security.framework` load command, and
+  `DYLD_BIND_AT_LAUNCH=1` under `DEVELOPER_DIR=/nonexistent` so dyld binds
+  every deferred symbol at launch and aborts on a duplicate `LC_LOAD_DYLIB`
+  or a missing framework. It deliberately has no zig/LLVM/git/Python
+  dependency: a fleet Mac consuming a prebuilt binary has no toolchain.
+  It shares only the common preflight (Darwin + sentinel + `xcode-select`).
+- `<command> [args...]` runs the build preflight, sets
+  `DEVELOPER_DIR=/nonexistent`, unsets `SDKROOT` and
+  `MACOSX_DEPLOYMENT_TARGET`, prepends Homebrew to the user's PATH, and
+  exports both Darwin target linkers, both `CC_*` vars, `AR` and `RANLIB`
+  before exec'ing the command.
 
 `scripts/macos-xcodefree/cc` is the zig-only compiler/linker shim. It adds a
 checked-in stub sysroot, normalizes Apple target triples to zig's spelling,
@@ -98,17 +102,28 @@ CARGO_TARGET_DIR=/private/tmp/hive-gm-witness/xcode-probe/target-repo \
 ./scripts/macos-xcodefree.sh --verify <binary>
 ```
 
-`BUILD_EXIT=0` (8m 21s), `VERIFY_EXIT=0`, `macho_loads=10`,
-`security_framework=1`, `dupes=0`, `eager_bind=0`, Mach-O 64-bit arm64,
-`--help` printed with empty stderr. The 10 load commands include
+`BUILD_EXIT=0` (8m 21s), `VERIFY_EXIT=0`, `macho=1`,
+`security_framework=1`, `eager_bind=0`, Mach-O 64-bit arm64, `--help`
+printed with empty stderr. The load commands include
 `Security.framework/Versions/A/Security` and
 `Foundation.framework/Versions/C/Foundation`.
+
+Two more witnesses on the final tree. First, a simulated bare fleet Mac
+(`HIVE_ZIG=/nonexistent/zig HIVE_PY3=/nonexistent/python3
+HIVE_GIT=/nonexistent/git`) still gets `RESULT PASS xcodefree_verify
+macho=1 security_framework=1 eager_bind=0` — the prebuilt path needs no
+toolchain. Second, two negative binaries fail closed: one with no
+`Security.framework` link is refused with `FATAL: Security.framework link
+missing`, and one with a duplicate `LC_LOAD_DYLIB` is refused by dyld's
+`duplicate linked dylib` abort during eager bind. Both exit 1.
 
 Failures found and fixed at the shared primitive, each by live execution:
 `-liconv` unresolved (added a minimal stub), `-lobjc` unresolved (added a
 minimal stub), missing `SystemConfiguration`/`IOKit` framework stubs,
-duplicate `libobjc.A.dylib` load command (flag dedupe), and the
-`Foundation` `Versions/A` install-name (corrected to `Versions/C`).
+duplicate `libobjc.A.dylib` load command (flag dedupe), the `Foundation`
+`Versions/A` install-name (corrected to `Versions/C`), and `--verify`
+wrongly requiring the full build toolchain (split into a common preflight
+plus a build-only preflight; Mach-O checks reduced to base-OS `od`/`grep`).
 
 ## Residuals (not witnessed, do not claim otherwise)
 

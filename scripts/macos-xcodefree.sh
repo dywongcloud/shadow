@@ -26,9 +26,24 @@ DEV_DIR=/nonexistent
 
 fail() { echo "FATAL: $*" >&2; exit 1; }
 
-preflight() {
+# Everything --verify needs on a bare fleet Mac: base macOS only. A prebuilt
+# deployment has no compiler, so it must NOT require zig/LLVM/git/Homebrew
+# python to be present.
+preflight_common() {
   [ "$(uname -s)" = Darwin ] || fail "Darwin only"
   [ ! -e "$DEV_DIR" ] || fail "DEVELOPER_DIR sentinel $DEV_DIR must not exist"
+  active="$(DEVELOPER_DIR="$DEV_DIR" xcode-select -p 2>/dev/null || true)"
+  case "$active" in
+    "$DEV_DIR"|"") ;;
+    *) fail "active developer dir is still $active" ;;
+  esac
+  echo "RESULT PASS xcodefree_preflight dev_dir=$DEV_DIR clt_active=0"
+}
+
+# The build lane additionally needs the Homebrew toolchain. Only --preflight
+# and command mode call this.
+preflight_build() {
+  preflight_common
   [ -x "$ZIG" ] || fail "missing $ZIG (brew install zig)"
   [ -x "$PY3" ] || fail "missing $PY3 (brew install python)"
   [ -x "$GIT" ] || fail "missing $GIT (brew install git)"
@@ -39,56 +54,38 @@ preflight() {
   for t in "$ZIG" "$PY3" "$GIT" "$LLVM_BIN/llvm-ar" "$LLVM_BIN/llvm-ranlib"; do
     case "$t" in /usr/bin/*) fail "$t is a CLT shim" ;; esac
   done
-  active="$(DEVELOPER_DIR="$DEV_DIR" xcode-select -p 2>/dev/null || true)"
-  case "$active" in
-    "$DEV_DIR"|"") ;;
-    *) fail "active developer dir is still $active" ;;
-  esac
-  echo "RESULT PASS xcodefree_preflight dev_dir=$DEV_DIR clt_active=0"
+  echo "RESULT PASS xcodefree_build_tools clt_active=0"
 }
 
 verify() {
   bin="$1"
   [ -x "$bin" ] || fail "not executable: $bin"
+  # Mach-O magic, load-command check and eager bind use only base-OS tools;
+  # no interpreter is required on the CLT-free fleet Mac. dyld itself aborts
+  # on a duplicate LC_LOAD_DYLIB, seen live as "duplicate linked dylib".
+  magic="$(od -An -tx1 -N4 "$bin" | tr -d ' \n')"
+  case "$magic" in
+    cffaedfe|cefaedfe|cafebabe) ;;
+    *) fail "not a Mach-O binary (magic=$magic)" ;;
+  esac
+  LC_ALL=C grep -a -q 'Security.framework/Versions/A/Security' "$bin" \
+    || fail "Security.framework link missing (SEP signer / TLS)"
   err="$(mktemp /private/tmp/hive-xcodefree-verify.XXXXXX)"
   DEVELOPER_DIR="$DEV_DIR" DYLD_BIND_AT_LAUNCH=1 "$bin" --help >/dev/null 2>"$err"
   rc=$?
-  if [ "$rc" -ne 0 ] || [ -s "$err" ]; then
-    errtext="$(cat "$err")"
-    case "$errtext" in
-      *"dyld["*|*"Library not loaded"*|*"Symbol not found"*)
-        printf '%s\n' "$errtext" >&2; rm -f "$err"
-        fail "dyld diagnostic during eager bind" ;;
-    esac
-  fi
+  errtext="$(cat "$err")"
+  case "$errtext" in
+    *"dyld["*|*"Library not loaded"*|*"Symbol not found"*)
+      printf '%s\n' "$errtext" >&2; rm -f "$err"
+      fail "dyld diagnostic during eager bind" ;;
+  esac
   if [ "$rc" -ne 0 ]; then
-    tail -20 "$err" >&2
+    printf '%s\n' "$errtext" >&2
     rm -f "$err"
     fail "eager symbol bind failed (exit $rc)"
   fi
   rm -f "$err"
-  if ! "$PY3" -I - "$bin" <<'PY'
-import collections, struct, sys
-d = open(sys.argv[1], "rb").read()
-if d[:4] not in (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xca\xfe\xba\xbe"):
-    sys.exit("FATAL: not a Mach-O binary")
-ncmds = struct.unpack_from("<I", d, 16)[0]
-off, names = 32, []
-for _ in range(ncmds):
-    cmd, size = struct.unpack_from("<II", d, off)
-    if cmd in (0xC, 0x80000018, 0x8000001F, 0x20):
-        o = struct.unpack_from("<I", d, off + 8)[0]
-        names.append(d[off + o:off + size].split(b"\0")[0].decode())
-    off += size
-dupes = [k for k, v in collections.Counter(names).items() if v > 1]
-if dupes:
-    sys.exit("FATAL: duplicate load commands: %r" % dupes)
-if not any("Security.framework" in x for x in names):
-    sys.exit("FATAL: Security.framework link missing (SEP signer / TLS)")
-print("RESULT PASS macho_loads=%d security_framework=1 dupes=0" % len(names))
-PY
-  then fail "Mach-O load-command check failed"; fi
-  echo "RESULT PASS xcodefree_verify eager_bind=0 security_framework=1"
+  echo "RESULT PASS xcodefree_verify macho=1 security_framework=1 eager_bind=0"
 }
 
 run_command() {
@@ -108,16 +105,16 @@ run_command() {
 }
 
 case "${1:-}" in
-  --preflight) preflight ;;
+  --preflight) preflight_build ;;
   --verify)
     shift
     [ "$#" -eq 1 ] || fail "--verify needs exactly one binary path"
-    preflight
+    preflight_common
     verify "$1"
     ;;
   --help|-h)
     echo "usage: $0 --preflight | --verify <binary> | <command> [args...]"
     ;;
   '') fail "no command given (try --preflight or --help)" ;;
-  *) preflight; run_command "$@" ;;
+  *) preflight_build; run_command "$@" ;;
 esac
