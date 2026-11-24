@@ -2167,6 +2167,20 @@ export interface FwAttackMode {
   updated_ms?: number | null;
   duration_secs?: number | null;
   hours_left?: number | null;
+  /** An enabled mode has NO timer. These are measurements from the node, never a client-side
+   *  deadline: an absent field renders absent. The expires flag is false while indefinite. */
+  indefinite?: boolean | null;
+  expires?: boolean | string | number | null;
+}
+
+/** One row of the tenant-scoped answer listing projects with attack challenge mode on. */
+export interface FwAttackProject {
+  project?: string | null;
+  enabled?: boolean | null;
+  updated_ms?: number | null;
+  indefinite?: boolean | null;
+  expires?: boolean | string | number | null;
+  node_local?: boolean | null;
 }
 
 export interface FwEvent {
@@ -2187,6 +2201,8 @@ export interface FwVerifiedBot {
 export interface FwState {
   node_local?: boolean | null;
   attack_mode?: FwAttackMode | null;
+  attack_projects?: FwAttackProject[] | null;
+  count?: number | null;
   events?: {
     node_local?: boolean | null;
     count?: number | null;
@@ -2216,17 +2232,60 @@ export async function getFirewallState(project?: string): Promise<FwState> {
   return d;
 }
 
-/** Project and duration are bounded before any request: a client-side overflow is a typed
- *  refusal, never a silent truncation on the wire. The server owns the actual admission. */
-export async function setFirewallAttackMode(project: string, enabled: boolean, hours: number): Promise<FwState> {
+/** The project name is bounded before any request: an overflow or an empty name is a typed
+ *  refusal, never a silent truncation on the wire. The server owns the actual admission, and
+ *  the mode is on or off indefinitely: there is no duration choice to send. */
+export async function setFirewallAttackMode(project: string, enabled: boolean): Promise<FwState> {
   if (project.length > 128) throw new ApiError(400, "Project must be 128 characters or fewer.");
   if (project.trim() === "") throw new ApiError(400, "Enter a project name.");
-  if (hours !== 1 && hours !== 6 && hours !== 24) {
-    throw new ApiError(400, "Attack challenge mode duration must be 1, 6 or 24 hours.");
-  }
   return apiSend<FwState>(
     "PUT",
     "/v1/projects/" + encodeURIComponent(project) + "/firewall/attack-mode",
-    { enabled, hours },
+    { enabled },
   );
+}
+
+/** The one tenant-scoped enumeration of projects with attack challenge mode on. */
+export const ATTACK_MODE_PROJECTS_PATH = "/v1/firewall/attack-mode/projects";
+
+/** The GET answers a measured object: projects is the row list, count its size and node_local
+ *  the provenance flag. A bare array is tolerated from an older node, and the state view may
+ *  carry the same rows under attack_projects. An absent list is never a zero-row measurement. */
+export interface FwAttackProjectsList {
+  projects?: FwAttackProject[] | null;
+  count?: number | null;
+  node_local?: boolean | null;
+}
+
+export type FwAttackProjectsBody = FwAttackProject[] | FwAttackProjectsList | FwState | null;
+
+function attackProjectRows(d: FwAttackProjectsBody): FwAttackProject[] {
+  if (!d) return [];
+  if (Array.isArray(d)) return d;
+  const rows = "projects" in d ? d.projects : "attack_projects" in d ? d.attack_projects : null;
+  return Array.isArray(rows) ? rows : [];
+}
+
+async function fetchAttackProjects(path: string, opts?: { fresh?: boolean }): Promise<FwAttackProject[]> {
+  const d = await apiGet<FwAttackProjectsBody>(path, opts);
+  /** A null body is a missing signed-in session, never an empty list: getFirewallState refuses
+   *  the same way, so the section shows a refusal instead of claiming nothing is on. */
+  if (!d) throw new ApiError(401, "Attack challenge projects need a signed-in session");
+  return attackProjectRows(d);
+}
+
+/** One-shot read of the same list, for surfaces that do not poll. A null list field reads as no
+ *  rows; a null body never does. */
+export async function getAttackModeProjects(): Promise<FwAttackProject[]> {
+  return fetchAttackProjects(ATTACK_MODE_PROJECTS_PATH);
+}
+
+const attackProjectsFetcher: Fetcher = <T>(path: string, opts?: { fresh?: boolean }): Promise<T> =>
+  fetchAttackProjects(path, opts) as unknown as Promise<T>;
+
+/** The polling view of getAttackModeProjects, through the ONE shared usePollWith loop: a hidden
+ *  tab never polls, a team switch clears the rows and refetches, and refresh() re-reads after a
+ *  write. */
+export function useAttackModeProjects(intervalMs = 5000) {
+  return usePollWith<FwAttackProject[]>(attackProjectsFetcher, ATTACK_MODE_PROJECTS_PATH, intervalMs, true, null);
 }

@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { Card, Badge, Button, Input, Switch, PageHeader, StateNotice, Table, Th, Td } from "@/components/ui";
 import { RoleGate } from "@/components/role-gate";
-import { ApiError, apiSend, setFirewallAttackMode, usePoll, type FwState, type WafRule } from "@/lib/api";
+import { ApiError, apiSend, setFirewallAttackMode, useAttackModeProjects, usePoll, type FwState, type WafRule } from "@/lib/api";
+import { useProjectNames } from "@/lib/projects";
 
 type BotAction = "allow" | "log" | "block";
 interface WafConfig { managed: boolean; rules: WafRule[] }
@@ -35,6 +36,17 @@ function fmtMeasured(v: number | null | undefined): string {
   return typeof v === "number" && Number.isFinite(v) ? v.toLocaleString("en-US") : ABSENT;
 }
 
+/** An enabled mode has no timer: only a measured indefinite/expires field answers this row, and
+ *  an absent one renders absent rather than a fabricated deadline or a fleet-wide claim. */
+function expiresText(indefinite: boolean | null | undefined, expires: boolean | string | number | null | undefined): string {
+  /** The node answers indefinite: true and expires: false: neither one is a countdown. An
+   *  expiry time is printed only when one was actually measured, never as a fabricated number. */
+  if (indefinite === true || expires === false) return "Never while on";
+  if (typeof expires === "number") return fmtMeasured(expires);
+  if (typeof expires === "string") return shown(expires);
+  return ABSENT;
+}
+
 /** Every new element stays inside its column: a long path or residual never scrolls the page. */
 function cell(extra?: string): string {
   return extra ? "min-w-0 w-full max-w-full break-words " + extra : "min-w-0 w-full max-w-full break-words";
@@ -59,11 +71,21 @@ export default function FirewallPage() {
   const [ip, setIp] = useState("");
   const [err, setErr] = useState("");
 
-  const { data: fw, error: fwError, refresh: refreshFw } = usePoll<FwState>("/v1/firewall/state", 5000);
   const [fwProject, setFwProject] = useState("");
-  const [fwHours, setFwHours] = useState<1 | 6 | 24>(1);
+  const [fwSearch, setFwSearch] = useState("");
   const [fwBusy, setFwBusy] = useState(false);
   const [fwWriteError, setFwWriteError] = useState<string | null>(null);
+  const [fwTurningOff, setFwTurningOff] = useState<string | null>(null);
+  const projectNames = useProjectNames();
+  const filteredProjectNames = projectNames.filter((name) => name.toLowerCase().includes(fwSearch.trim().toLowerCase()));
+  /** A selection hidden by the search text is NOT actionable: no write goes to a project the
+   *  picker is not showing. */
+  const fwSelectedProject = filteredProjectNames.includes(fwProject) ? fwProject : "";
+  const fwStatePath = fwSelectedProject
+    ? "/v1/firewall/state?project=" + encodeURIComponent(fwSelectedProject)
+    : "/v1/firewall/state";
+  const { data: fw, error: fwError, refresh: refreshFw } = usePoll<FwState>(fwStatePath, 5000);
+  const { data: attackProjects, error: attackProjectsError, refresh: refreshAttackProjects } = useAttackModeProjects(5000);
 
   const fwMode = fw?.attack_mode ?? null;
   const fwEvents = fw?.events ?? null;
@@ -80,22 +102,31 @@ export default function FirewallPage() {
   const fwBotRowsAll = fwBots?.rows ?? null;
   const fwBotRows = Array.isArray(fwBotRowsAll) ? fwBotRowsAll : [];
   const fwModeText = fwMode?.enabled === true ? "On" : fwMode?.enabled === false ? "Off" : ABSENT;
+  const fwExpiresText = expiresText(fwMode?.indefinite, fwMode?.expires);
 
-  /** One write of the node-local toggle. A typed refusal or a poll failure is shown inline by
-   *  StateNotice; the server remains the authority on who may change it. */
-  async function setAttackMode(enable: boolean) {
+  /** One write of the node-local toggle, for the picker or one listed row. A typed refusal or a
+   *  poll failure is shown inline by StateNotice; the server remains the authority on who may
+   *  change it. Only a name from the tenant picker or the tenant-scoped list is sent. */
+  async function setAttackMode(enable: boolean, project?: string) {
     if (fwBusy) return;
+    const name = (project ?? fwProject).trim();
+    if (!name) {
+      setFwWriteError("Choose a project first.");
+      return;
+    }
     setFwWriteError(null);
     setFwBusy(true);
+    setFwTurningOff(enable ? null : name);
     try {
-      await setFirewallAttackMode(fwProject.trim(), enable, fwHours);
-      refreshFw();
+      await setFirewallAttackMode(name, enable);
+      await Promise.all([refreshFw(), refreshAttackProjects()]);
     } catch (e) {
       setFwWriteError(
         e instanceof ApiError && e.message ? e.message : "Attack challenge mode could not be changed on this node.",
       );
     } finally {
       setFwBusy(false);
+      setFwTurningOff(null);
     }
   }
 
@@ -228,47 +259,49 @@ export default function FirewallPage() {
       <Card className={cell("mb-4")}>
         <h2 className={cell("text-sm font-medium text-fg")}>Attack Challenge Mode</h2>
         <p className={cell("mt-1 text-xs text-secondary")}>
-          This is node-local config: the toggle changes only the node that answers this request, and
-          fleet-wide propagation is not implemented.
+          Attack challenge stays on until you turn it off. This is node-local config: the toggle
+          changes only the node that answers this request, and fleet-wide propagation is not
+          implemented.
         </p>
         <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3")}>
           <FwField label="Measured mode" value={fwModeText} />
-          <FwField label="Active until (ms)" value={fmtMeasured(fwMode?.active_until_ms)} />
+          <FwField label="Expires" value={fwExpiresText} />
           <FwField label="Updated (ms)" value={fmtMeasured(fwMode?.updated_ms)} />
-          <FwField label="Duration (secs)" value={fmtMeasured(fwMode?.duration_secs)} />
-          <FwField label="Hours left" value={fmtMeasured(fwMode?.hours_left)} />
           <FwField label="Reported project" value={shown(fw?.project)} />
         </div>
         <div className={cell("mt-4 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center")}>
           <Input
-            aria-label="Project name"
-            placeholder="Project name"
+            aria-label="Search projects"
+            placeholder="Search projects"
             maxLength={128}
-            value={fwProject}
-            onChange={(e) => setFwProject(e.target.value)}
+            value={fwSearch}
+            onChange={(e) => setFwSearch(e.target.value)}
             className={cell("min-h-[44px]")}
           />
           <select
-            aria-label="Duration"
-            value={fwHours}
-            onChange={(e) => {
-              const n = Number(e.target.value);
-              if (n === 1 || n === 6 || n === 24) setFwHours(n);
-            }}
+            aria-label="Project"
+            value={fwSelectedProject}
+            onChange={(e) => setFwProject(e.target.value)}
             className={cell("min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-sm text-fg")}
           >
-            <option value="1">1 hour</option>
-            <option value="6">6 hours</option>
-            <option value="24">24 hours</option>
+            <option value="">Select a project</option>
+            {filteredProjectNames.map((name) => (
+              <option key={name} value={name}>{name}</option>
+            ))}
           </select>
           <Button
             className={cell("min-h-[44px] sm:w-auto")}
-            disabled={fwBusy}
-            onClick={() => setAttackMode(fwMode?.enabled !== true)}
+            disabled={fwBusy || !fwSelectedProject}
+            onClick={() => setAttackMode(fwMode?.enabled !== true, fwSelectedProject)}
           >
             {fwBusy ? "Applying" : fwMode?.enabled === true ? "Turn off" : "Turn on"}
           </Button>
         </div>
+        {projectNames.length === 0 ? (
+          <p className={cell("mt-3 text-xs text-secondary")}>No projects are available for this tenant.</p>
+        ) : filteredProjectNames.length === 0 ? (
+          <p className={cell("mt-3 text-xs text-secondary")}>No project names match that search.</p>
+        ) : null}
         {fwWriteError || fwError ? (
           <div className={cell("mt-3")}>
             <StateNotice className={cell()}>
@@ -287,6 +320,48 @@ export default function FirewallPage() {
           ) : (
             <span className={cell("block")}>{ABSENT}</span>
           )}
+        </div>
+      </Card>
+
+      <Card className={cell("mb-4")}>
+        <h2 className={cell("text-sm font-medium text-fg")}>Projects with attack challenge mode on</h2>
+        <p className={cell("mt-1 text-xs text-secondary")}>
+          Each row comes only from the tenant-scoped list for the signed-in session; no other
+          project source is merged here. Tenancy is read from the verified session claim, never a
+          team header, and a row is never inferred from a total.
+        </p>
+        {attackProjectsError ? (
+          <div className={cell("mt-3")}>
+            <StateNotice className={cell()}>Could not load the list: {shown(attackProjectsError)}</StateNotice>
+          </div>
+        ) : null}
+        {fwWriteError ? <p className={cell("mt-3 text-sm text-red-500")}>{fwWriteError}</p> : null}
+        <div className={cell("mt-3 flex flex-col divide-y divide-border")}>
+          {attackProjects === null ? (
+            <div className={cell("py-3 text-sm")}>{ABSENT}</div>
+          ) : attackProjects.length === 0 ? (
+            <div className={cell("py-3 text-sm text-muted")}>No projects have attack challenge mode on.</div>
+          ) : attackProjects.map((row, i) => {
+            const name = typeof row?.project === "string" ? row.project.trim() : "";
+            return (
+              <div key={"fw-attack-project-" + i} className={cell("flex min-h-[44px] flex-col gap-2 py-3 sm:flex-row sm:items-center sm:justify-between")}>
+                <div className={cell("grid grid-cols-1 gap-1 sm:grid-cols-2")}>
+                  <FwField label="Project" value={shown(row?.project)} />
+                  <FwField label="Status" value={row?.enabled === true ? "On" : row?.enabled === false ? "Off" : ABSENT} />
+                  <FwField label="Expires" value={expiresText(row?.indefinite, row?.expires)} />
+                  <FwField label="Updated (ms)" value={fmtMeasured(row?.updated_ms)} />
+                </div>
+                <Button
+                  variant="danger"
+                  className={cell("min-h-[44px] sm:w-auto")}
+                  disabled={fwBusy || !name}
+                  onClick={() => setAttackMode(false, name)}
+                >
+                  {fwTurningOff === name ? "Turning off" : "Turn off"}
+                </Button>
+              </div>
+            );
+          })}
         </div>
       </Card>
 
