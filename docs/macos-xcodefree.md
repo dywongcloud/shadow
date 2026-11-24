@@ -138,8 +138,11 @@ plus a build-only preflight; Mach-O checks reduced to base-OS `od`/`grep`).
   fleet Macs. Recorded, not silently changed.
 - `-undefined,dynamic_lookup` defers symbol resolution to load time; the
   mandatory `--verify` with `DYLD_BIND_AT_LAUNCH=1` is what makes a missing
-  symbol fail the build. A symbol reached only on a rarely used code path
-  is not exercised by `--help`.
+  symbol fail the build. A symbol reached only on a rarely used code path is
+  not exercised by `--help`. Deferred lookup also uses the flat namespace, so
+  a fleet binary should be codesigned (base-OS `codesign`, available with
+  Xcode disabled) with the hardened runtime before deployment; that signing
+  step is operator-supplied and was NOT added or witnessed here.
 - The stub sysroot is install-name-only. A future crate that links a new
   Apple framework needs one more `.tbd`; the failure is a loud linker
   error naming the missing framework, not a silent misbuild.
