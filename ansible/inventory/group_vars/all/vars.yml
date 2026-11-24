@@ -45,6 +45,26 @@ hive_expected_node_ids: >-
 
 hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
 
+# Live deploy roster. hosts.ini still NAMES the deleted hosts (bkk, hk, va2,
+# sp, fr) inside glibc/browser/litebox groups with NO definition line, and marks
+# released instances hive_retired=true. A roll must contact neither: a released
+# IP may already belong to a stranger (fail2ban excludes them for that reason).
+# Computed from inventory so a newly defined host joins the roll immediately.
+hive_glibc239_build_host: >-
+  {{ groups['glibc239'] | default([])
+     | map('extract', hostvars)
+     | rejectattr('hive_retired', 'defined')
+     | selectattr('ansible_host', 'defined')
+     | map(attribute='inventory_hostname')
+     | list | first | default('') }}
+hive_glibc238_build_host: >-
+  {{ groups['glibc238'] | default([])
+     | map('extract', hostvars)
+     | rejectattr('hive_retired', 'defined')
+     | selectattr('ansible_host', 'defined')
+     | map(attribute='inventory_hostname')
+     | list | first | default('') }}
+
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode
 hive_platform_domain: "shadw.cloud"
 hive_apps_domain: "shadw.app"

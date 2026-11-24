@@ -12,33 +12,52 @@
 #   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # MUST also include each represented glibc group's BUILD host
 #   ansible-playbook playbooks/parallel-deploy.yml -e allow_noop_deploy=true   # permit a run that changes no host's binary
 
-- name: Elect build hosts and stage the shared artifact directory
+- name: Elect the live fleet roster (dead/retired hosts never enter a roll)
   hosts: platform
   gather_facts: false
   tags: [always]
   tasks:
-    - name: Elect the first host of each glibc group as its build host
+    - name: Partition live and retired hosts
       ansible.builtin.group_by:
-        key: "{{ 'glibc239_builder' if inventory_hostname == groups['glibc239'][0] else ('glibc238_builder' if inventory_hostname == groups['glibc238'][0] else 'glibc_follower') }}"
+        key: "{{ 'hive_live' if (hive_retired is not defined and ansible_host is defined) else 'hive_retired_hosts' }}"
 
-    - name: Assert each represented glibc group's build host is in this run
+    - name: Report the live roster for this run
+      ansible.builtin.debug:
+        msg: >-
+          live={{ groups['hive_live'] | sort | join(',') }}
+          retired_or_dead={{ groups['hive_retired_hosts'] | length }}
+      run_once: true
+
+- name: Elect build hosts and stage the shared artifact directory
+  hosts: hive_live
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Elect the first LIVE host of each glibc group as its build host
+      ansible.builtin.group_by:
+        key: "{{ 'glibc239_builder' if inventory_hostname == hive_glibc239_build_host else ('glibc238_builder' if inventory_hostname == hive_glibc238_build_host else 'glibc_follower') }}"
+
+    - name: Assert each live glibc group's build host is in this run
       delegate_to: localhost
       become: false
       run_once: true
       ansible.builtin.assert:
         that:
-          - (ansible_play_hosts_all | intersect(groups['glibc239'] | default([])) | length == 0)
-            or (groups['glibc239'][0] in ansible_play_hosts_all)
-          - (ansible_play_hosts_all | intersect(groups['glibc238'] | default([])) | length == 0)
-            or (groups['glibc238'][0] in ansible_play_hosts_all)
+          - (groups['hive_live'] | default([]) | length) > 0
+          - hive_glibc239_build_host != ''
+          - hive_glibc239_build_host in ansible_play_hosts_all
+          - hive_glibc238_build_host == '' or hive_glibc238_build_host in ansible_play_hosts_all
         fail_msg: >-
-          This run includes hosts from a glibc group without that group's BUILD
-          host, so nothing would be built for them and the push would fail later
-          with an opaque controller-path error. Add the builder to --limit:
-          glibc239 builds on '{{ groups['glibc239'][0] | default('?') }}',
-          glibc238 builds on '{{ groups['glibc238'][0] | default('?') }}'.
+          This run has no LIVE build host for a represented glibc group, so
+          nothing would be built and the push would fail with an opaque
+          controller-path error. Deleted hosts (bkk, hk, va2, sp, fr) have no
+          definition line and hive_retired=true hosts have released IPs; both
+          are excluded from the roster. A --limit must still include each
+          group's elected builder.
+          glibc239 builds on '{{ hive_glibc239_build_host | default('?') }}',
+          glibc238 builds on '{{ hive_glibc238_build_host | default('(no live member)') }}'.
           This run has: {{ ansible_play_hosts_all | join(',') }}.
-        success_msg: "build hosts present for every represented glibc group"
+        success_msg: "live build hosts present for every represented glibc group"
 
     - name: Elect the control-plane leader as the UI build host
       ansible.builtin.group_by:
@@ -53,6 +72,7 @@
       connection: local
       run_once: true
       register: _artifact_tmp
+      check_mode: false
 
     - name: Publish the artifact root to every host's facts
       ansible.builtin.set_fact:
@@ -68,7 +88,7 @@
         hive_deploy_epoch: "{{ _deploy_epoch.stdout | int }}"
 
 - name: Backend build (parallel, one host per glibc group)
-  hosts: glibc239_builder:glibc238_builder
+  hosts: glibc239_builder
   become: true
   strategy: free
   tags: [backend]
@@ -83,52 +103,52 @@
         tasks_from: build
 
 - name: Backend push (parallel, all platform hosts)
-  hosts: platform
+  hosts: hive_live
   become: true
   strategy: free
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
-    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+    hive_group_build_host: "{{ hive_glibc239_build_host if hive_glibc_group == 'glibc239' else hive_glibc238_build_host }}"
   tasks:
     - ansible.builtin.include_role:
         name: hive_platform_fanout
         tasks_from: push
 
 - name: Backend restart (serial -- mesh quorum safety)
-  hosts: "platform:!sj"
+  hosts: "hive_live:!sj"
   become: true
   serial: "{{ deploy_serial_backend | default(deploy_serial | default(1)) }}"
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
-    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+    hive_group_build_host: "{{ hive_glibc239_build_host if hive_glibc_group == 'glibc239' else hive_glibc238_build_host }}"
   tasks:
     - ansible.builtin.include_role:
         name: hive_platform_fanout
         tasks_from: restart
 
 - name: Backend restart (control-plane chain head, deliberately last)
-  hosts: sj
+  hosts: "hive_live:&sj"
   become: true
   serial: 1
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
-    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+    hive_group_build_host: "{{ hive_glibc239_build_host if hive_glibc_group == 'glibc239' else hive_glibc238_build_host }}"
   tasks:
     - ansible.builtin.include_role:
         name: hive_platform_fanout
         tasks_from: restart
 
 - name: Backend verification (artifact CONTENT, every host)
-  hosts: platform
+  hosts: hive_live
   become: true
   any_errors_fatal: true
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
-    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+    hive_group_build_host: "{{ hive_glibc239_build_host if hive_glibc_group == 'glibc239' else hive_glibc238_build_host }}"
   tasks:
     - ansible.builtin.include_role:
         name: hive_platform_fanout
@@ -178,8 +198,12 @@
       become: false
 
 - name: Re-kick the earliest-restarted nodes (trunks re-form against the settled fleet)
-  hosts: "{{ groups['platform'][0:3] | join(':') }}"
+  hosts: hive_live
   serial: 1
+  pre_tasks:
+    - name: Re-kick only the earliest three live hosts
+      ansible.builtin.meta: end_host
+      when: (groups['hive_live'].index(inventory_hostname) | int) >= 3
   become: true
   tags: [backend]
   tasks:
@@ -223,7 +247,7 @@
         tasks_from: build
 
 - name: UI push (parallel, all platform hosts)
-  hosts: platform
+  hosts: hive_live
   become: true
   strategy: free
   tags: [ui]
@@ -235,7 +259,7 @@
         tasks_from: push
 
 - name: UI restart (serial -- dashboard never down fleet-wide)
-  hosts: platform
+  hosts: hive_live
   become: true
   serial: "{{ deploy_serial_ui | default(deploy_serial | default(3)) }}"
   tags: [ui]
@@ -248,7 +272,7 @@
         tasks_from: restart
 
 - name: UI verification (bundle CONTENT, every host)
-  hosts: platform
+  hosts: hive_live
   become: true
   any_errors_fatal: true
   tags: [ui]
@@ -297,6 +321,6 @@
         path: "{{ _root }}"
         state: absent
       vars:
-        _root: "{{ hostvars[groups['platform'][0]]['hive_artifact_root'] | default('') }}"
+        _root: "{{ groups['hive_live'] | map('extract', hostvars) | selectattr('hive_artifact_root', 'defined') | map(attribute='hive_artifact_root') | first | default('') }}"
       when: _root | length > 0
       run_once: true

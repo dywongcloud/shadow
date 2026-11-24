@@ -6,8 +6,24 @@
 # Usage:
 #   ansible-playbook playbooks/platform-only.yml
 #   ansible-playbook playbooks/platform-only.yml --limit fc_pvm
-- name: Redeploy the hive controller + cell-agent release pair
+- name: Elect the live fleet roster (dead/retired hosts never enter a roll)
   hosts: platform
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Partition live and retired hosts
+      ansible.builtin.group_by:
+        key: "{{ 'hive_live' if (hive_retired is not defined and ansible_host is defined) else 'hive_retired_hosts' }}"
+
+    - name: Report the live roster for this run
+      ansible.builtin.debug:
+        msg: >-
+          live={{ groups['hive_live'] | sort | join(',') }}
+          retired_or_dead={{ groups['hive_retired_hosts'] | length }}
+      run_once: true
+
+- name: Redeploy the hive controller + cell-agent release pair
+  hosts: hive_live
   become: true
   serial: 1
   roles:

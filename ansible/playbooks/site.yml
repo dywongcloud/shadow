@@ -8,8 +8,24 @@
 #   ansible-playbook playbooks/site.yml --tags hive_platform   # redeploy code only (see also playbooks/platform-only.yml)
 #   ansible-playbook playbooks/site.yml --tags pvm_firecracker -e pvm_reboot=false
 
-- name: Base OS prerequisites
+- name: Elect the live fleet roster (dead/retired hosts never enter a roll)
   hosts: platform
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Partition live and retired hosts
+      ansible.builtin.group_by:
+        key: "{{ 'hive_live' if (hive_retired is not defined and ansible_host is defined) else 'hive_retired_hosts' }}"
+
+    - name: Report the live roster for this run
+      ansible.builtin.debug:
+        msg: >-
+          live={{ groups['hive_live'] | sort | join(',') }}
+          retired_or_dead={{ groups['hive_retired_hosts'] | length }}
+      run_once: true
+
+- name: Base OS prerequisites
+  hosts: hive_live
   become: true
   gather_facts: true
   roles:
@@ -19,14 +35,14 @@
       tags: [fail2ban]
 
 - name: Firecracker (real hardware KVM)
-  hosts: fc_kvm
+  hosts: "hive_live:&fc_kvm"
   become: true
   roles:
     - role: firecracker_kvm
       tags: [firecracker, firecracker_kvm]
 
 - name: Firecracker (PVM, no hardware KVM)
-  hosts: fc_pvm
+  hosts: "hive_live:&fc_pvm"
   become: true
   serial: 1
   roles:
@@ -34,35 +50,35 @@
       tags: [firecracker, pvm_firecracker]
 
 - name: hive-cloud platform binary + service
-  hosts: platform
+  hosts: hive_live
   become: true
   roles:
     - role: hive_platform
       tags: [hive_platform, platform]
 
 - name: Litebox syscall-sandbox backend (nodes where no microVM path is safe)
-  hosts: litebox
+  hosts: "hive_live:&litebox"
   become: true
   roles:
     - role: litebox
       tags: [litebox]
 
 - name: Platform dashboard UI (Next.js on loopback :3002)
-  hosts: platform
+  hosts: hive_live
   become: true
   roles:
     - role: hive_ui
       tags: [hive_ui, ui]
 
 - name: Mesh trust configuration
-  hosts: platform
+  hosts: hive_live
   become: true
   roles:
     - role: mesh_bootstrap
       tags: [mesh_bootstrap, mesh]
 
 - name: DNS / TLS ingress (Vercel)
-  hosts: platform
+  hosts: hive_live
   become: true
   roles:
     - role: dns_vercel
