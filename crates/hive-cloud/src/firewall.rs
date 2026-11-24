@@ -378,14 +378,51 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 /// `.catch` covers a fetch that never resolves, which otherwise stalls on
 /// "Security check" with no message. A manual retry mints a fresh nonce.
 /// This is a JavaScript-capability gate, NOT browser attestation.
+/// The shadw wordmark is an inline data URI: no dashboard asset path is reachable on a tenant host.
 const CHALLENGE_PAGE: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Security check</title>
-<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;line-height:1.6}button{font:inherit;margin-top:.5rem;padding:.5rem .9rem}</style>
-</head><body><h1>Security check</h1>
-<p id="hive-fw-status" role="status">Checking that this request comes from a browser. You will continue automatically.</p>
+<title>Security check - shadw</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fafafa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0a0a0a" media="(prefers-color-scheme: dark)">
+<style>
+:root{color-scheme:light dark;--bg:hsl(0 0% 98%);--card:hsl(0 0% 100%);--fg:hsl(0 0% 4%);--secondary:hsl(0 0% 40%);--border:hsl(0 0% 92%);--border-strong:hsl(0 0% 80%);--link:hsl(212 100% 47%);--accent:hsl(0 0% 4%);--accent-fg:hsl(0 0% 100%);--top-light:rgba(255,255,255,.95);--glow:rgba(0,0,0,.035)}
+@media (prefers-color-scheme:dark){:root{--bg:hsl(0 0% 4%);--card:hsl(0 0% 7%);--fg:hsl(0 0% 93%);--secondary:hsl(0 0% 63%);--border:hsl(0 0% 16%);--border-strong:hsl(0 0% 28%);--link:hsl(212 100% 62%);--accent:hsl(0 0% 100%);--accent-fg:hsl(0 0% 4%);--top-light:rgba(255,255,255,.12);--glow:rgba(255,255,255,.045)}}
+@media (prefers-contrast:more){:root{--secondary:hsl(0 0% 20%);--border-strong:hsl(0 0% 40%)}@media (prefers-color-scheme:dark){:root{--secondary:hsl(0 0% 85%);--border-strong:hsl(0 0% 60%)}}}
+*{box-sizing:border-box}
+html,body{margin:0;min-height:100%}
+body{background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.6;display:flex;align-items:center;justify-content:center;padding:24px;-webkit-font-smoothing:antialiased;background-image:radial-gradient(120% 60% at 50% -18%,var(--glow),transparent 70%)}
+.wrap{width:100%;max-width:360px}
+.card{position:relative;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:28px;box-shadow:0 24px 60px -32px rgba(0,0,0,.4)}
+.card:before{content:"";position:absolute;inset:0 0 auto 0;height:1px;background:linear-gradient(90deg,transparent,var(--top-light),transparent)}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:24px}
+.brand img{display:block;height:28px;width:auto}
+@media (prefers-color-scheme:light){.brand img{filter:invert(1)}}
+.tag{font:10px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;letter-spacing:.12em;text-transform:uppercase;color:var(--secondary);border:1px solid var(--border);border-radius:999px;padding:6px 9px;white-space:nowrap}
+h1{font-size:20px;line-height:1.3;letter-spacing:-.02em;font-weight:600;margin:0 0 8px}
+.sub{font-size:13px;line-height:1.6;color:var(--secondary);margin:0 0 20px}
+.status{margin:0;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg);font-size:14px;line-height:1.55}
+.status:before{content:"";display:inline-block;width:6px;height:6px;margin-right:9px;border-radius:50%;background:var(--link);vertical-align:middle}
+.trace{font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--secondary);margin:12px 0 0;letter-spacing:.02em}.trace span{display:block}
+#hive-fw-retry{display:block;width:100%;min-height:44px;margin-top:18px;background:var(--accent);color:var(--accent-fg);border:0;border-radius:8px;padding:10px 14px;font:inherit;font-size:14px;font-weight:600;cursor:pointer}
+#hive-fw-retry:hover{opacity:.9}
+#hive-fw-retry:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+[hidden]{display:none!important}
+.noscript{margin:14px 0 0;padding:12px 14px;border:1px solid var(--border);border-radius:8px;background:var(--bg);font-size:13px;color:var(--secondary)}
+.foot{margin-top:20px;padding-top:16px;border-top:1px solid var(--border);font-size:11px;color:var(--secondary);text-align:center;letter-spacing:.04em}
+@media (prefers-reduced-motion:no-preference){.card{animation:rise .35s ease-out both}.trace span{animation:settle .5s ease-out both}.trace span:nth-child(2){animation-delay:.22s}.trace span:nth-child(3){animation-delay:.44s}@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}@keyframes settle{from{letter-spacing:.16em}to{letter-spacing:.02em}}}
+@media (max-width:380px){.card{padding:20px}}
+</style>
+</head><body><main class="wrap"><section class="card" aria-labelledby="hive-fw-title">
+<header class="brand"><img src="data:image/png;base64,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" width="274" height="91" alt="shadw"><span class="tag">Attack challenge</span></header>
+<h1 id="hive-fw-title">Security check</h1>
+<p class="sub">shadw is checking that this request can complete a short browser script. A sealed, short-lived cookie proves the check finished; if that cookie cannot be kept, the request is refused. This check is scoped to this site, retries are bounded, and it does not identify you. It is a capability check, not an attestation.</p>
+<p class="status" id="hive-fw-status" role="status" aria-live="polite">Running a short browser script. You will continue automatically.</p>
+<p class="trace"><span>a script runs</span><span>a cookie is sealed</span><span>the request is checked again</span></p>
 <button type="button" id="hive-fw-retry" hidden>Try again</button>
-<noscript><p>JavaScript is required to complete this check. Enable it and reload the page.</p></noscript>
+<noscript><p class="noscript">JavaScript is required to complete this check. Enable it in your browser, then reload this page. No retry is possible while scripts are disabled.</p></noscript>
+<footer class="foot">shadw edge protection - this check is scoped to this site</footer>
+</section></main>
 <script>
 (function(){
   var status=document.getElementById('hive-fw-status');
