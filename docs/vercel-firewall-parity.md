@@ -6,14 +6,25 @@ are live on the edge request path. This is NOT a 1:1 Vercel Firewall clone.
 
 ## Attack Challenge Mode
 
-`PUT /v1/projects/:project/firewall/attack-mode` with
-`{"enabled":true,"hours":1|6|24}`. The setting is an additive
-`#[serde(default)]` `AttackMode` field on the replicated `ProjectSettings`
-row, written through `touch`, so the existing per-row `MERGE_STORES` merge
-carries it to every node. Auto-off is LAZY against `active_until_ms`; there
-is no timer and no second background loop. The handler asserts
+`PUT /v1/projects/:project/firewall/attack-mode` with `{"enabled":true}`.
+The setting is an additive `#[serde(default)]` `AttackMode` field on the
+replicated `ProjectSettings` row, written through `touch`, so the existing
+per-row `MERGE_STORES` merge carries it to every node. Mode is INDEFINITE:
+`enabled` alone decides admission, with no duration options, no lazy auto-off,
+no timer and no second background loop. The legacy `active_until_ms` and
+`duration_secs` keys are KEPT for persisted-state compatibility (`#[serde(default)]`)
+but zeroed on every write and never consulted. The handler asserts
 `has_explicit_caller_identity` BEFORE resolving any tenant, then binds the
 row with `require_project_claiming_row`. Roles floor is Admin.
+
+`GET /v1/firewall/attack-mode/projects` lists every project with the mode ON
+for the caller's tenant. It reads the REPLICATED ProjectSettings rows through
+the same `rows_for_tenant` stored-tag scope as `project_inventory::summary`,
+never the node-local event ring, so a GET answered locally behind round-robin
+DNS names the same projects. Tenancy comes ONLY from the verified JWT claim;
+`x-hive-team` is never read. An asserted identity is mandatory and an
+anonymous GET is refused. The `roles::RULES` row sets an Admin floor (an
+unlisted read would default to Viewer) and `ui/lib/team-role.ts` mirrors it.
 
 While active, all traffic (including legitimate users, as Vercel documents)
 receives a bounded JavaScript-capability challenge; non-idempotent methods
@@ -21,7 +32,7 @@ receives a bounded JavaScript-capability challenge; non-idempotent methods
 never silently loses a request body. EventSource/SSE clients cannot execute
 the challenge and are covered by the same refusal. The page has NO form
 action, NO caller-controlled HTML and NO Location. A sealed short-lived
-nonce in the page is re-fetched on the SAME path via the
+nonce in the page is sent on a nonce-scoped solve URL via the
 `x-hive-challenge` header; solving it sets a server-sealed `hive_fw` cookie
 (`v1.<expiry_ms>.<HMAC>`, HttpOnly, SameSite=Lax, Secure unless plain-http
 loopback). Cookies are bound to (project, host, mode generation, expiry) with
@@ -30,17 +41,28 @@ with `admin::ct_eq`. A `verified_bot_bypass` opt-in is OFF by default.
 
 The solve handshake is TERMINAL, not a reload loop. A solve is accepted only
 on the `x-hive-firewall-action: challenge-solved` response (or its exact
-`verified` body); a rejected nonce, a redirect, a 403, a cached page or a
-service-worker answer shows a visible failure with a manual retry instead of
-calling `location.reload()`. Before reloading, a second `cache: no-store`
-request proves the sealed cookie actually landed, so a browser that refuses
-cookies or a CDN replaying the solve body cannot restart the challenge.
-`.catch` reports a fetch that never resolves, and automatic attempts are
-bounded to three within 30 seconds. There is a `<noscript>` fallback. The
-solve response carries `Cache-Control: no-store` because it holds a
-`Set-Cookie` on the page's own URL. Rejected cookies and nonces emit the
-`challenge-failed` action in the node-local event ring; they used to fall
-through to a fresh 200 challenge page with no record of the rejection.
+`verified` body). Solve and probe use TWO DISTINCT URLs built from a trusted
+`new URL(location.href)` base with `searchParams.set`: `__hive_fw_solve` and
+`__hive_fw_probe`, both `cache: 'no-store'` and both carrying the server-minted
+nonce. A service-worker or Cache-Storage replay of a `verified` solve body
+therefore cannot satisfy the second request that proves the cookie landed,
+and the extra query is stripped by `normalize_path` before any gate decision.
+A rejected nonce, a redirect, a 403, a cached page or a service-worker answer
+shows a visible failure with a manual retry instead of calling
+`location.reload()`. `reset()` runs ONLY on that manual retry; no automatic
+outcome clears the attempt counter, so three page loads inside 30 seconds reach
+a terminal failure and a cached challenge page cannot drive an unbounded reload
+loop. The reported "clear application storage" wedge is instead fixed at its
+root: a cookie that fails verification is deleted by the server, so the next
+solve seals a fresh one and the challenge page stops being served. The counter
+self-expires after 30 seconds. `.catch` reports a fetch that never resolves.
+There is a `<noscript>` fallback.
+The solve response carries `Cache-Control: no-store` because it holds a
+`Set-Cookie`, and a REJECTED cookie is cleared with an empty `Max-Age=0`
+`Set-Cookie` using the same HttpOnly/SameSite/Secure/Host-only rule, so a
+cookie retained across a mode epoch change cannot be replayed forever.
+Rejected cookies and nonces emit the `challenge-failed` action in the
+node-local event ring.
 
 ## Sensitive-path denial (always-on system mitigation)
 

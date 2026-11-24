@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-11-24 - Attack Challenge is indefinite and self-healing
+
+Attack Challenge Mode no longer expires. `PUT
+/v1/projects/:project/firewall/attack-mode` takes only `{"enabled":true|false}`
+and `GET /v1/firewall/state` reports `indefinite: true` instead of a
+countdown. The legacy `active_until_ms` and `duration_secs` persisted keys are
+KEPT with `#[serde(default)]` for state compatibility but zeroed on every
+write and never consulted. The console replaces the free-text project input
+with a searchable `useProjectNames()` picker, drops the 1/6/24 hour selector,
+and adds a "Projects with attack challenge mode on" section with a per-row
+Turn off action backed by `GET /v1/firewall/attack-mode/projects`. That route
+reads the REPLICATED ProjectSettings rows through `rows_for_tenant` (the same
+stored-tag scope as the project inventory), sets `node_local: false`, refuses
+an anonymous or unasserted caller, and has an Admin `roles::RULES` row mirrored
+row-for-row in `ui/lib/team-role.ts`. The node-local event ring is still
+reported as node-local and never printed as a fleet total.
+
+The reported cookie bug is fixed at the shared primitive. A `hive_fw` cookie
+retained across a mode toggle or epoch change was HMAC-bound to
+`AttackMode.updated_ms`; `edge_gate` rejected it but only logged, so every GET
+(including the client probe) got a fresh challenge page, `probe()` reported
+"This browser did not keep the security cookie", and `fail()` left the
+sessionStorage attempt counter wedged until application storage was cleared.
+Now a rejected cookie is cleared with an empty `Max-Age=0` Set-Cookie using
+the same HttpOnly/SameSite/Secure/host-only rule as the solve; solve and probe
+use two DISTINCT nonce-scoped, no-store URLs built with `new
+URL(location.href)` + `searchParams.set`, so a service-worker replay of a
+`verified` solve body cannot stand in for the cookie proof. `reset()` runs ONLY
+on a manual retry, so the three-attempts-in-30-seconds bound still holds and a
+cached challenge page cannot drive an unbounded reload loop; the wedge is
+broken at its root by the server deleting the rejected cookie. `GET
+/v1/firewall/state` and `GET /v1/firewall/events` now refuse an anonymous read
+on an enforced node, resolve tenancy from the verified JWT claim only, and
+filter the node-local event ring to the caller's own stored-tag projects, so a
+forged `?project=` or `x-hive-team` cannot read another tenant's mode or
+event rows. The four fixed failure strings, the strict `__HIVE_NONCE__`
+allowlist, `admin::ct_eq`, `Cache-Control: no-store`, the explicit
+`challenge-solved` action and the no-form/no-Location page are unchanged.
+
+## 2026-11-24 - Region failover: configured regions stop being a fence
+
+Configured `FunctionSettings.regions` were a HARD FENCE on the request path:
+`order_candidates_with_cold` retained only configured regions, and a
+`container_owner` replaced the candidate list with ONE pinned node, so a
+downed owner yielded PEER_UNREACHABLE. Regions are now an ORDERING preference
+and the lease owner is FIRST among successors rather than the only candidate.
+A platform no-deployment response from a healthy node is a MISS that continues
+the candidate loop instead of being returned as success. BOUNDED RESIDUAL:
+routing cannot conjure a cell on a node that holds no deployment. Making a
+deployment genuinely multi-homed needs `HIVE_IMMUTABLE_GENERATION_FANOUT=1`
+and an operator roll; neither is enabled here. No leader-only gate, no
+`health::demote` ownership and no self-heal default were weakened.
+
 ## 2026-11-24 - Attack Challenge page carries the shadw brand
 
 The Rust-edge "Security check" page was an unbranded transparent
