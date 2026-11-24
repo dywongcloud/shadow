@@ -133,6 +133,10 @@ const RULES: &[Rule] = &[
     // admission for EVERY route on the project, so it sits at the admin floor like WAF rules.
     rule(WRITES, "/v1/firewall/*", Role::Admin),
     rule(WRITES, "/v1/projects/:project/firewall/*", Role::Admin),
+    // Every enabled Attack Challenge Mode row is a security-control enumeration, not a metric:
+    // an unlisted read would default to VIEWER. List it at ADMIN so the console section and the
+    // backing GET agree; the handler additionally scopes rows to the caller's own tenant.
+    rule(GET, "/v1/firewall/attack-mode/projects", Role::Admin),
     rule(WRITES, "/v1/ratelimit", Role::Admin),
     rule(WRITES, "/v1/bot", Role::Admin),
     rule(WRITES, "/v1/push/sms-direct-mx", Role::Admin),

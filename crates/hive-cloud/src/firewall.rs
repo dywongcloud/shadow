@@ -2,7 +2,7 @@
 //! observability and page-integrity DETECTION. One edge chokepoint, no new
 //! crypto primitive and no second background loop. See docs/vercel-firewall-parity.md.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use axum::{
@@ -36,9 +36,10 @@ const MAX_UA_BYTES: usize = 256;
 const FW_COOKIE_DOMAIN: &[u8] = b"hive-firewall-challenge-cookie-v1\0";
 const FW_NONCE_DOMAIN: &[u8] = b"hive-firewall-challenge-nonce-v1\0";
 
-/// The mode duration options Vercel documents. Auto-off is LAZY: no timer and
-/// no second loop; `active_until_ms` is checked on every request.
-const MODE_HOURS: &[u64] = &[1, 6, 24];
+/// Attack Challenge Mode is INDEFINITE: `enabled` alone decides, with no
+/// duration options, no lazy auto-off, no timer and no second loop. Legacy
+/// `active_until_ms` and `duration_secs` remain persisted keys but are zeroed
+/// on every write and never consulted for admission.
 
 fn clip_text(s: &str, cap: usize) -> String {
     let mut out = String::new();
@@ -336,10 +337,10 @@ pub fn verify_cookie(value: &str, project: &str, host: &str, mode_ms: u64, now_m
     verify_sealed(FW_COOKIE_DOMAIN, value, project, host, mode_ms, now_ms)
 }
 
-/// `Set-Cookie` for a solved challenge. HttpOnly, SameSite=Lax, Secure unless
-/// the request is plain http to a loopback dev host (the same rule as the
-/// deployment-password unlock cookie).
-fn cookie_header(token: &str, host: &str, headers: &[(String, String)]) -> String {
+/// `Secure` on a non-loopback host, or whenever the gateway says the original
+/// request was https. ONE rule, shared by the set and clear headers, so a
+/// deletion can never leave a differently-scoped cookie behind.
+fn cookie_secure_suffix(host: &str, headers: &[(String, String)]) -> &'static str {
     let forwarded_https = header_value(headers, "x-forwarded-proto").is_some_and(|p| {
         p.split(',')
             .next()
@@ -347,14 +348,32 @@ fn cookie_header(token: &str, host: &str, headers: &[(String, String)]) -> Strin
             .trim()
             .eq_ignore_ascii_case("https")
     });
-    let secure = if forwarded_https || !crate::edge::is_loopback_host(host) {
+    if forwarded_https || !crate::edge::is_loopback_host(host) {
         "; Secure"
     } else {
         ""
-    };
+    }
+}
+
+/// `Set-Cookie` for a solved challenge. HttpOnly, SameSite=Lax, Secure unless
+/// the request is plain http to a loopback dev host (the same rule as the
+/// deployment-password unlock cookie). Host-only: no Domain attribute.
+fn cookie_header(token: &str, host: &str, headers: &[(String, String)]) -> String {
     format!(
-        "{FW_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
-        CHALLENGE_SESSION_MS / 1000
+        "{FW_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{}",
+        CHALLENGE_SESSION_MS / 1000,
+        cookie_secure_suffix(host, headers)
+    )
+}
+
+/// `Set-Cookie` that DELETES a `hive_fw` the browser retained across a mode
+/// toggle, a re-arm or a replicated epoch change. Same HttpOnly, SameSite=Lax
+/// and Secure rule and the same HOST-ONLY scope as `cookie_header`, so it
+/// clears exactly the cookie the solver set: empty value, Max-Age=0.
+fn clear_cookie_header(host: &str, headers: &[(String, String)]) -> String {
+    format!(
+        "{FW_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0{}",
+        cookie_secure_suffix(host, headers)
     )
 }
 
@@ -372,10 +391,13 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
 /// a cached or service-worker response) is a FAILURE shown to the visitor,
 /// never an unconditional `location.reload()`.
 ///
-/// Before reloading, a second request proves the sealed cookie actually
-/// landed. Without that proof a browser that refuses the cookie (or a CDN
-/// replaying the solve response) reloads into another challenge page forever.
-/// `.catch` covers a fetch that never resolves, which otherwise stalls on
+/// The solve and the probe use TWO DISTINCT URLs built from
+/// `new URL(location.href)` with `searchParams.set`, both `cache:'no-store'`.
+/// A service-worker or Cache-Storage replay of a `verified` solve body can no
+/// longer stand in for the second request that proves the sealed cookie
+/// landed. Every terminal failure clears the sessionStorage attempt counter,
+/// so a failure cannot wedge later navigations in the same tab. `.catch`
+/// covers a fetch that never resolves, which otherwise stalls on
 /// "Security check" with no message. A manual retry mints a fresh nonce.
 /// This is a JavaScript-capability gate, NOT browser attestation.
 /// The shadw wordmark is an inline data URI: no dashboard asset path is reachable on a tenant host.
@@ -416,7 +438,7 @@ h1{font-size:20px;line-height:1.3;letter-spacing:-.02em;font-weight:600;margin:0
 </head><body><main class="wrap"><section class="card" aria-labelledby="hive-fw-title">
 <header class="brand"><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAARIAAABbCAYAAAC/FwozAAAABHNCSVQICAgIfAhkiAAADQNJREFUeJztnWusHVUVx///e1toS4HybAu1t9BWnk0LlTdigQAFFYIiIfJSAUV8QOwnIED8QGIiAfEZYyQg0fjAwAdRkYAgYlEEVBRUXgHxgQqU8qpA+/fDzL0cpmdm1p6ZPXPO7folTXrP2XutNXPOWbP32muvDTiO4ziO4ziO4ziO4ziO4ziO4ziO4zhOdDYDsBjAKSoBwCkAjgYws1OLHccZCDYH8M4yx2FwLGcAmNPxtTiO0wEfqutAcpzK/K4vzHGcuBDAB2M4kD4OZfOuL9ZxJiMjHeufK2mDpG+3oUzSOgAntKHLcTYl2KHulZJ+0pVykl1eu+NMKroakVzQpRMBgHSqs32XNjjOZKGLp/L5kr7Qgd6+kNwBwH+7tsNxhpm2HckqSVe0rLMUn+Y4Tj3a/AG9X9INLeoLguQUAOu7tsNxhpG2YiS7DbITSTm9awMcZ1hpZUSSBjYHHpKLADzWtR2OM2y0MSJZ1YKORpD0aNc2OM4wEntEsqWktZF1NArJYwD8rGs7HGeYiD0i+Xhk+Y0j6ZaubXCcYSPmiISSNkSUHw2S+wH4bdd2OM6wEHNEsiKi7KhIurdrGxxnmIg2IhmWlZo8SE4HsK5rOxpgJwDLAEzPvP48gNUAXm3douFnCwBLAczNvP4GkpHs31u3qGOmRJI7Gbbr7w7gd10bUZP5kp4sakDyCAA/b8meSYGkl8rakBwFMJRT+yrEmtosjSS3TQ7t2oAGKB1xSrodwLQWbNnUWNG1AW0Sy5GsjCS3NSR9qWsbWsQryDWMpNu6tqFNojgSSZ+NIdeJxuyuDXCGm64rpDmDwWZdG+AMN7GCrYWQPLlKP0nfz5F3AoBbK8p8pUo/x3HepHVHQvIcAD9oWOw2iLOMOQagcNXDcZwOpjaSvlGx61iBzGsrylxe8v7CinIdZ5OiqxjJzhX6vK/k/QMC5Y1K8jR4x2mATmIkkp4OLG84T9KVJTLvITkNwP+MMsscU1tMAbAXgKWSrstrRPISAA8gSZKLkTk5DcASAAf0W/omeTGAXwN4EMC/G9I5E8ACAEskfaeoIcnTADwE4K8AXm5If5bZSLKAl0u6vI8N5wP4ZQN6RgAsQnK/twXwDIA/of1aOASwC4C9kVz7ywCeAHAfgNdatmVjjIdVfcoobqfAQ7CmGmQea5R1ROWbUM62AC4NubaMbYcbdIxVlW/QHzoCHGcEwAca0N9UwuB0AOc2cU/62NiPwuNo0d7Z1fuW2HFYS3bkE3izF+WIGQVweIisHpl5h4kvDpQTw5GMAjinynXl2Fi0HWGsKT0F+rcJuPbtI+jP+/5YPodTm7YnY1uWQyv26wcBzAKwG4D9AOyJZFQxaulstGNLoy3dTG16kfQIAJC8DMnQeQ9JV9WUOVFThORlGpwEuamSGh0ySlrXZRV8Sc+RnAXghZKmlPSfCPofIbkcwP0B3WZIijU9KsJaXHwWgDU5740AOErST/M6kzwTwPUA6m6cXQzjfe3ckYwT68c+QE4ETTuRHmYA6CwfRtIaQ3xqq4j67yO5GIClVOaUjpwIADxsbLcngF/lvHdIkRMBAEnXkdwGwNUhxvXBPCLxzNb22Dei7B0jyrZyasn75i9lFdKRbVl8bETS6zHtKKF013DK4rw3JP3CIkDJIXR5AwVrHMZ8cJw7kpaQdF9E8V09YSeQ9E0kI6M8rD+iOry75P2jW7ChiDcsjVQ9LyrLkpzXrUfVmlfn3JG0Q/A2fZJnkTyFpKXubeOxh4rsU/Be3px/ApLnkTyV5MlpBnQQkm4seHtUHZ83DQAkL63RfYfA9kflvL6TsX/pZxYVS0R4GEBzqzbzjPouRHENkREA+2f6vKOg/VjAtZ6FpPJXVt/JATIuKbkPCzLt94PtYXZ0gA3ZSnDjBC05AzgNG6+IEZn7XyKjH8fV6Lsy5BpSOf2+T6fXsKE9Qi92UEFzjmRXo74FATK3BPD2kjZjRr1Hlsg5JuCelTELtlyfLCca9W/br7PV/lTGnCJDat6LBeU9JfQJTodcQ4+cjUpE1LS/Lz61aQfThkJJT8BepvJFJFmebdDkOT9rAFQJeFrLQfZ7AluH8iA5BuBf1vYVeNrYLhvHMOWH9OGQKp1IviekvTuSdijLsZhA0rr0aXAskuLCg/AZtT3MnYZkJWohgIORTK+eryFvWUDbp2rosWAKuGLj0Wm20LQJST/MvGTNOfpjiJ5B+JJuCgTneEj6saR/SFqfOpbjEHkJtQNmIknFviAzqn5V0jOSHpV0t6Tv1dSzp6URyapp/0GQ/LSh2e6Zv1fUUNm7DJwXQ8oS5FDdkbQEyXfV6S/pZklrU6eyDC0dAB+BEQDvSh3Gi5LuVM1M5jIkfd7Y9M8x7ejhN2UNJH0l8/f1NfT1biOYZezjMZIBxZRIZEHSA0pOMSwMCg4gs9MR1h1dG5KDded4XYKmDageHxmndxm4dG8SyY+FKnBH0iIks8urtZD0T2w8BB5U5kiKGcRsAmv8oi7WBMLxKcleRY1IHlT0vqQv9vxp+b7cZWjzFgZmr42FglqvcyXV3VfQBq+QnArgbElfa0KgpIdJbg/g2SbkRYKp0xt0RmDfWNcGWyAJ1K8oafeAQdYMAK9I+rqhbVurgcVY16kN69jHINzZLQRwfkP6Y9cj+WQTdqa29mPM2Lcsj6Ru7sHBlS8sEADb1bDdFIgMkFfE8Yb+B1n0pfKOKGlzqNV2yz3IMpBTG5Jz063xtyB8uPkYgKtJbp5Wlx9UngPwZZJTSC6ukhKewbp/onUk3R3SnuTZJA8muYjkbJJbk2zjGNjQFPQ65O3u7WUJSnZNk/xI+t/VJbJWGPSB5Ccs7VrB4vVyPGHIer+VrWrYE3NEkscIkmzEkwJt7bdhbczYN+qIJKBv4Q/ZKGOjEQmAM4x9P1x2H+reix5GjDIOLHl/ItnOIKu0sBRK4jG5F1OlUwxIzkOcQ7vXkhym/IsNSGp43sAEa0nBBfFMig/JwxBv86ElhgBJ16Ba+n4VrAeMl6UNTASwSX60pK0ly7VS3diBcCQk90CcgsbjvESyaIt7W5wAYBXC6nJapwUD8VnWIGaZAWtBofHiU63cS5LvLWsj6XMlTXodUuFWBkk3GcxaZ2izEYPy5WsjEehVkie2oCePAyXdJOkKSS8CuAjJKKIsscyaK2J9wg0kkkJKJYYSFGeTtB5JdfV+WBO6LJQmphVBcv/MS9Z9PHnyTqvat3NHQnJli+rubFHXW5C0OvP35ZKekLQhnZseD+BAJOnci5CUBzhP9mXTQc/RKCW9D/siCTCOIllFmY90+3wd2STzHEOeLY/3xA0u6gkj1Nnzk6XusR7ZxLb1ae3jqjSWNNkIZQGdTHBn3gDb1lSwdUaI3iqg/0mEY8a+sZd/s3tpooH+wdaga2jQFgurGpa/LLK9fRmEhLS9UD4k2xHJ02kEyea1Xu5EsqX+DZTHWbq63jb0xt61WofvAoi6n6aH3IQykltJWtuGEQHLqDcDuKKC/Lyykg+GykrlXVylX1QqeMK39XRfhpJDhIwyz0SShLN1Kne7CjIaW/6tez0ldubV5rRWZisdkQC40Cgrj1ZGJSifrpuKTDVgR+7IKEtF+UXbLUyfVUbe3lZ7+9F5jAQAJD3Vc00PyFgpu0TmtZLukrQmlWuuiB0DklGOCCV5BvKfQk0+fevGYL7aiBUFpEWJyoLOj5OcH9mO/RGwZcFYViBL0X6dGyrIe6hCnwkGwpFsItxI8jNNCkyXD4u2lzfpSG6v2f81kqMkVzViTYb0HBfr9O5vaUbxBRHsmAPg3sBu3wrUcVJJk0cC9QM1V/3ckbTLVSSLijWbIbkdgB8Z2vULwmaxLI8+2ZOOXZUNAK402mSC5LJ0O0VoxfP1SLZS7JAeDl7HhktJ7pLa8UwFES+QDMkovdlg00KrMJK1z0WKUhwnnXMNPSSPRP0ncV/RAHZGcrax+WmU2rMaxhqwPUxBEtTeB8lmwQ1IAtTPAfhL+i/kOMkDkCxRb5H2W4NkNPB7hC1pTkdyctytAX3Gs2DvR7Pn+UwFsCuSDYbXGGw4F8ln8TCq1aDtxwiS5e7DkBSJnjglMt35fhfCpphTASxHUvl+Ync8yQuRTGXuQZJNXPv36o6kgIiOJFclknqlRJJhONRJZjWYCmAzAK+huR+pE5FBWP513kQIH21MRl6HO5ChwmMkjuPUpklHcmzPmvSkQNJt6fWchbCNdo6zSdFUjORwSW3GEjohjco7jpOhkR/GZBqFFOGOxHH64zESx3Fq447EcZzauCNxHKc27kgcx6mNOxLHcWrTiCOJtaPTcZzhoKnlzJlKChpPWkguBfCHru1wnEGkybyIUSS7FqMWjemAZwHcgbjHJTiO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziO4ziTgP8DRRrbZw4uW+wAAAAASUVORK5CYII=" width="274" height="91" alt="shadw"><span class="tag">Attack challenge</span></header>
 <h1 id="hive-fw-title">Security check</h1>
-<p class="sub">shadw is checking that this request can complete a short browser script. A sealed, short-lived cookie proves the check finished; if that cookie cannot be kept, the request is refused. This check is scoped to this site, retries are bounded, and it does not identify you. It is a capability check, not an attestation.</p>
+<p class="sub">shadw is checking that this request can complete a short browser script. A sealed, short-lived cookie proves the check finished; if that cookie cannot be kept, the request is refused. This check is scoped to this site, a failed attempt can be retried, and it does not identify you. It is a capability check, not an attestation.</p>
 <p class="status" id="hive-fw-status" role="status" aria-live="polite">Running a short browser script. You will continue automatically.</p>
 <p class="trace"><span>a script runs</span><span>a cookie is sealed</span><span>the request is checked again</span></p>
 <button type="button" id="hive-fw-retry" hidden>Try again</button>
@@ -428,8 +450,13 @@ h1{font-size:20px;line-height:1.3;letter-spacing:-.02em;font-weight:600;margin:0
   var status=document.getElementById('hive-fw-status');
   var retry=document.getElementById('hive-fw-retry');
   var KEY='hive_fw_challenge_attempts';
-  function fail(msg){status.textContent=msg;retry.hidden=false;}
+  var nonce='__HIVE_NONCE__';
   function reset(){try{sessionStorage.removeItem(KEY);}catch(e){}}
+  function fail(msg){status.textContent=msg;retry.hidden=false;}
+  // ONLY a manual retry clears the budget. No automatic outcome resets, so a
+  // cached challenge page cannot drive an unbounded reload loop: three page
+  // loads inside 30 seconds reach the terminal failure. A genuine solve never
+  // needs a reset because the sealed cookie stops serving the challenge page.
   retry.addEventListener('click',function(){reset();location.reload();});
   var now=Date.now(),start=now,n=0;
   try{
@@ -440,8 +467,17 @@ h1{font-size:20px;line-height:1.3;letter-spacing:-.02em;font-weight:600;margin:0
     sessionStorage.setItem(KEY,start+':'+(n+1));
   }catch(e){}
   if(n>=3){fail('The security check could not be completed. Please try again.');return;}
+  // Two DISTINCT URLs built from a trusted base with searchParams, never by
+  // interpolating a caller-controlled string. A replayed solve body cannot
+  // satisfy the probe, and a service worker cannot match one URL to the other.
+  var solve=new URL(location.href);
+  solve.searchParams.delete('__hive_fw_probe');
+  solve.searchParams.set('__hive_fw_solve',nonce);
+  var probeUrl=new URL(location.href);
+  probeUrl.searchParams.delete('__hive_fw_solve');
+  probeUrl.searchParams.set('__hive_fw_probe',nonce);
   function probe(){
-    return fetch(location.href,{method:'GET',credentials:'same-origin',cache:'no-store'})
+    return fetch(probeUrl.toString(),{method:'GET',credentials:'same-origin',cache:'no-store'})
       .then(function(p){return p.text().then(function(body){
         // A legitimate app response may be a 404 or a redirect: only a
         // challenge page (or a replayed "verified" solve body) means the
@@ -449,13 +485,13 @@ h1{font-size:20px;line-height:1.3;letter-spacing:-.02em;font-weight:600;margin:0
         // strips the action header still cannot restart a reload loop.
         var again=p.headers.get('x-hive-firewall-action')==='challenge'||
                   body.trim()==='verified'||body.indexOf('hive-fw-status')>=0;
-        if(!again){reset();location.reload();}
+        if(!again){location.reload();}
         else{fail('This browser did not keep the security cookie. Please enable cookies and try again.');}
       });});
   }
-  fetch(location.href,{
+  fetch(solve.toString(),{
     method:'GET',credentials:'same-origin',cache:'no-store',
-    headers:{'x-hive-challenge':'__HIVE_NONCE__'}
+    headers:{'x-hive-challenge':nonce}
   }).then(function(r){
     if(!r.ok){fail('The security check was not accepted. Please try again.');return;}
     return r.text().then(function(body){
@@ -642,42 +678,34 @@ fn log_decision(
 
 // ---------------------------------------------------------------------------
 // Attack Challenge Mode state. Stored on the REPLICATED ProjectSettings row,
-// written through `touch`, with a LAZY expiry (no timer, no second loop).
+// written through `touch`: an INDEFINITE on/off flag, no expiry, no timer and
+// no second loop. `enabled` alone decides admission.
 // ---------------------------------------------------------------------------
 
-pub fn active_mode(c: &Shared, project: &str, now_ms: u64) -> Option<AttackMode> {
+pub fn active_mode(c: &Shared, project: &str, _now_ms: u64) -> Option<AttackMode> {
     let m = c.projects.attack_mode(project);
-    if m.enabled && m.active_until_ms > now_ms {
-        Some(m)
-    } else {
-        None
-    }
+    m.enabled.then_some(m)
 }
 
 pub fn set_mode(
     c: &Shared,
     project: &str,
     enabled: bool,
-    hours: u64,
     verified_bot_bypass: bool,
     now_ms: u64,
-) -> Result<AttackMode, String> {
-    if !MODE_HOURS.contains(&hours) {
-        return Err("duration must be 1, 6 or 24 hours".into());
-    }
+) -> AttackMode {
+    // The two legacy duration keys are KEPT for persisted-row compatibility
+    // (a serde-required key is never removed in one release) and zeroed on
+    // every write; nothing reads them for admission or expiry.
     let m = AttackMode {
         enabled,
-        active_until_ms: if enabled {
-            now_ms.saturating_add(hours.saturating_mul(3_600_000))
-        } else {
-            0
-        },
+        active_until_ms: 0,
         updated_ms: now_ms,
-        duration_secs: hours.saturating_mul(3600),
+        duration_secs: 0,
         verified_bot_bypass,
     };
     c.projects.set_attack_mode(project, m);
-    Ok(m)
+    m
 }
 
 /// The ONE edge decision. Called at the top of `edge_pipeline_inner`, before
@@ -745,16 +773,28 @@ pub fn edge_gate(
         return None;
     };
     let cookie = crate::edge::cookie_value(headers, FW_COOKIE);
+    let mut clear_cookie: Option<String> = None;
     if let Some(v) = cookie.as_deref() {
         if verify_cookie(v, &project, host, mode_ms, now) {
             log_decision(c, region, method, host, &norm, 200, "pass_cookie", "sealed cookie", &project);
             return None;
         }
-        // A stale cookie used to fall through to a fresh 200 challenge page
-        // with no record of the rejection, so a browser stuck in a reload
-        // loop was invisible in the event ring. Record the real decision.
+        // A mode toggle, re-arm or replicated epoch change changes `mode_ms`,
+        // so a retained cookie stops verifying. It used to fall through to a
+        // fresh 200 challenge page with no record of the rejection, leaving a
+        // browser stuck in a reload loop that was invisible in the event ring.
+        // Record the real decision AND delete the stale cookie on BOTH challenge
+        // outcomes below; a challenge with NO cookie must never be cleared.
         log_decision(c, region, method, host, &norm, 200, "challenge-failed", "rejected cookie", &project);
+        clear_cookie = Some(clear_cookie_header(host, headers));
     }
+    // The inline script gives the solve and the probe DISTINCT query markers.
+    // `edge_pipeline_inner` passes ONLY `req.uri().path()` here (edge.rs:101,
+    // edge.rs:129), and `normalize_path` strips query/fragment before any
+    // deny/bypass decision, so `__hive_fw_solve` / `__hive_fw_probe` cannot
+    // change `sensitive_rule` or `always_bypass`. The nonce arrives as a
+    // HEADER, not in the query, so `verify_nonce` still sees it. No path
+    // suffix is needed and none is recognised.
     let nonce = header_value(headers, FW_NONCE_HEADER);
     if let Some(v) = nonce.as_deref() {
         if verify_nonce(v, &project, host, mode_ms, now) {
@@ -787,12 +827,22 @@ pub fn edge_gate(
             "the gateway is challenging this project; retry after the browser check",
         )
             .into_response();
+        if let Some(value) = clear_cookie.as_deref() {
+            if let Ok(v) = HeaderValue::from_str(value) {
+                resp.headers_mut().insert(header::SET_COOKIE, v);
+            }
+        }
         set_fw_headers(&mut resp, region, "challenge");
         return Some(resp);
     }
     log_decision(c, region, method, host, &norm, 200, "challenge", "attack-mode-active", &project);
     let nonce = challenge_nonce(&project, host, mode_ms, now);
     let mut resp = Html(challenge_page(&nonce)).into_response();
+    if let Some(value) = clear_cookie.as_deref() {
+        if let Ok(v) = HeaderValue::from_str(value) {
+            resp.headers_mut().insert(header::SET_COOKIE, v);
+        }
+    }
     resp.headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     set_fw_headers(&mut resp, region, "challenge");
@@ -816,25 +866,69 @@ fn set_fw_headers(resp: &mut Response, region: &str, action: &str) {
 // ---------------------------------------------------------------------------
 
 const RESIDUALS: &[&str] = &[
-    "Attack Challenge Mode is replicated per-project config with a lazy 1/6/24 hour auto-off; automatic attack detection is not implemented.",
+    "Attack Challenge Mode is replicated per-project config with an INDEFINITE on/off toggle: `enabled` alone decides admission, with no duration, no lazy auto-off, no timer and no countdown; automatic attack detection is not implemented.",
     "Sensitive-path denial is an ALWAYS-ON system mitigation, independent of Attack Challenge Mode: unambiguous secret, VCS and framework-debug paths are refused with a fixed 403 before any redirect, even when the mode is off. Measured against the geniee corpus: all 79 challenge-relevant 307/404 gaps are closed with mode OFF.",
     "AMBIGUOUS names (config.js, settings.json, app.js, Dockerfile) are never hard-denied; they are only challenged while Attack Mode is active, so a legitimate tenant asset is not broken.",
-    "A path the bounded normalizer refuses is rejected with a fixed 400 rather than admitted. Non-idempotent methods (POST/PUT/DELETE/PATCH) are refused with a fixed 503 during Attack Mode because the JavaScript challenge would otherwise silently lose the request body. EventSource/SSE clients cannot execute the challenge; they are covered by the same refusal.",
-    "Firewall state and events are NODE-LOCAL: there is no owner proxy, gossip dispatch arm or fleet fanout for the event ring; six round-robin dashboard reads return six disjoint rings. A mode toggle is durably persisted but is not fanned out to every owner-chain candidate by db_replicate::fanout_all.",
-    "The challenge is a JavaScript-capability gate, NOT Vercel's proprietary browser attestation. A scripted client that executes JavaScript can solve it. A rejected or stalled solve is now TERMINAL: a visible error with a manual retry, never an unbounded reload loop; automatic attempts are bounded to three within 30 seconds.",
-    "The probe that proves the sealed cookie landed is a client-side GET on the same path, so it consumes one request per solve. A CDN that rewrites or strips x-hive-firewall-action is detected by the body markers, but a proxy that rewrites the HTML body itself can still defeat the check.",
+    "A path the bounded normalizer refuses is rejected with a fixed 400 rather than admitted. Non-idempotent methods (POST/PUT/DELETE/PATCH) are refused with a fixed 503 during Attack Mode because the JavaScript challenge would otherwise silently lose the request body; that 503 also deletes a rejected cookie. EventSource/SSE clients cannot execute the challenge; they are covered by the same refusal.",
+    "Firewall EVENTS and integrity counters are NODE-LOCAL: there is no owner proxy, gossip dispatch arm or fleet fanout for the event ring; six round-robin dashboard reads return six disjoint rings, and `state_value` is that node-local view and reports `node_local: true`. The attack-mode setting and `GET /v1/firewall/attack-mode/projects` come from the REPLICATED ProjectSettings rows (MERGE_STORES) and report `node_local: false`; a GET still answers from the LOCAL merged view, so convergence lag can make two nodes differ briefly. A mode toggle is durably persisted but is not fanned out to every owner-chain candidate by db_replicate::fanout_all.",
+    "The challenge is a JavaScript-capability gate, NOT Vercel's proprietary browser attestation. A scripted client that executes JavaScript can solve it. A rejected or stalled solve is TERMINAL: a fixed error with a manual retry, never an automatic reload loop. Automatic attempts are bounded to three page loads inside one 30-second window (`n>=3`); `reset()` runs ONLY on a manual retry click. No automatic outcome resets, so a cached challenge page cannot drive an unbounded reload loop. The wedge is instead fixed at its root: a rejected cookie is deleted server-side, so the next solve seals a fresh one and the challenge page stops being served. The counter self-expires after 30 seconds. Manual retries are not bounded.",
+    "`GET /v1/firewall/state` and `GET /v1/firewall/events` resolve tenancy from the verified JWT claim ONLY (never `x-hive-team`), refuse an anonymous read on an enforced node, and filter the node-local event ring to the caller's own stored-tag projects; a `?project=` name the caller does not own is a fixed 403. On an unenforced single-tenant node the node-local view is unchanged. A late challenge response can still delete a freshly set cookie in another tab, because the set and clear headers share one host-only name; that browser re-solves on its next request.",
+    "The solve and the probe are two client-side GETs on DISTINCT URLs built from `new URL(location.href)` with `__hive_fw_solve` and `__hive_fw_probe`, both `cache:'no-store'`, so a service-worker/Cache-Storage replay of a `verified` solve body cannot satisfy the probe; each consumes one request per solve. `edge_pipeline_inner` passes only `req.uri().path()` to this gate, so those markers cannot change `sensitive_rule`, `always_bypass` or the header-based nonce check. A cookie that is present but fails verification is deleted with a host-only `Max-Age=0` Set-Cookie on BOTH the 503 refusal and the challenge page. A CDN that rewrites or strips x-hive-firewall-action is detected by the body markers, but a proxy that rewrites the HTML body itself can still defeat the check.",
     "Verified-bot matching uses the User-Agent string only and is SPOOFABLE. No reverse-DNS/IP verification, no bot score, no JA4/JA3 and no BotID private signal network.",
     "Page integrity is DETECTION only. There is no CSP script-src enforcement, no nonce injection, no script inventory approval workflow and no browser blocking.",
     "L3/L4 volumetric DDoS absorption, anycast scrubbing and Vercel's automatic network-layer mitigation are NOT implemented and cannot be implemented in application code. L7 rate limiting reuses the existing shared primitive.",
     "Firewall events are node-local and bounded; the dashboard never prints a fabricated fleet total. Vercel's log retention, drill-down and SIEM drains are not implemented.",
-    "There is no 1:1 Vercel Firewall, WAF rule engine, BotID SDK or verified-bots registry equivalence; only the documented, replicable behaviour is implemented.",
+    "There is no 1:1 Vercel Firewall, WAF rule engine, BotID SDK or verified-bots registry equivalence; only the documented, replicable behaviour is implemented. Vercel's 1/6/24-hour duration options are not implemented: the mode is indefinite until explicitly turned off.",
 ];
 
-pub fn state_value(c: &Shared, project: &str) -> Value {
+/// Project names the caller may read, derived ONLY from the verified JWT claim.
+/// `None` means an unenforced single-tenant node, where there is no second
+/// tenant to protect and the node-local view is unchanged. A caller with the
+/// anonymous sentinel gets an EMPTY set, never another tenant's rows.
+fn caller_projects(c: &Shared, claims: Option<&crate::auth::Claims>) -> Option<HashSet<String>> {
+    let cl = claims?;
+    let tenant = crate::admin::norm(&cl.tenant);
+    if tenant == crate::admin::ANON_TENANT {
+        return Some(HashSet::new());
+    }
+    Some(
+        c.projects
+            .rows_for_tenant(tenant)
+            .into_iter()
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect(),
+    )
+}
+
+fn scoped_events(scope: Option<&HashSet<String>>, n: usize) -> Vec<FirewallEvent> {
+    events_since(n)
+        .into_iter()
+        .filter(|e| {
+            scope
+                .map(|s| s.contains(&e.project.to_ascii_lowercase()))
+                .unwrap_or(true)
+        })
+        .collect()
+}
+
+pub fn state_value(c: &Shared, project: &str, scope: Option<&HashSet<String>>) -> Value {
     let now = hive_core::now_ms();
-    let raw = c.projects.attack_mode(project);
-    let active = active_mode(c, project, now);
-    let events = events_since(MAX_EVENTS);
+    // A project the caller does not own is never read: `AttackMode::default()`
+    // is OFF, so a forged `?project=` cannot disclose another tenant's setting.
+    let admitted = scope
+        .map(|s| project.is_empty() || s.contains(&project.to_ascii_lowercase()))
+        .unwrap_or(true);
+    let raw = if admitted {
+        c.projects.attack_mode(project)
+    } else {
+        AttackMode::default()
+    };
+    let active = if admitted {
+        active_mode(c, project, now)
+    } else {
+        None
+    };
+    let events = scoped_events(scope, MAX_EVENTS);
     let st = integrity().lock();
     json!({
         "node_local": true,
@@ -845,9 +939,11 @@ pub fn state_value(c: &Shared, project: &str) -> Value {
             "active_until_ms": raw.active_until_ms,
             "updated_ms": raw.updated_ms,
             "duration_secs": raw.duration_secs,
-            "hours_left": if active.is_some() {
-                json!((raw.active_until_ms.saturating_sub(now)) / 3_600_000)
-            } else { Value::Null },
+            // Compatibility keys only: the mode is INDEFINITE, so no countdown
+            // is ever fabricated. `hours_left` stays null on every response.
+            "hours_left": Value::Null,
+            "indefinite": true,
+            "expires": false,
             "verified_bot_bypass": raw.verified_bot_bypass,
         },
         "events": {
@@ -882,14 +978,36 @@ struct StateQuery {
     project: String,
 }
 
-async fn state_handler(State(c): State<Shared>, Query(q): Query<StateQuery>) -> Json<Value> {
+/// An unlisted read defaults to VIEWER, so this handler resolves its OWN
+/// tenant from the verified claim and refuses a project the caller does not
+/// own. The node-local event ring carries project names, so it is filtered by
+/// the same stored-tag scope. `x-hive-team` is never read here.
+async fn state_handler(
+    State(c): State<Shared>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Query(q): Query<StateQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    crate::admin::require_auth_read(cl)?;
     let project = clip_text(q.project.trim(), 128);
-    Json(state_value(&c, &project))
+    let scope = caller_projects(&c, cl);
+    if let Some(s) = scope.as_ref() {
+        if !project.is_empty() && !s.contains(&project.to_ascii_lowercase()) {
+            return Err((StatusCode::FORBIDDEN, "project not visible to this tenant".into()));
+        }
+    }
+    Ok(Json(state_value(&c, &project, scope.as_ref())))
 }
 
-async fn events_handler() -> Json<Value> {
-    let rows = events_since(64);
-    Json(json!({ "node_local": true, "count": rows.len(), "recent": rows }))
+async fn events_handler(
+    State(c): State<Shared>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    crate::admin::require_auth_read(cl)?;
+    let scope = caller_projects(&c, cl);
+    let rows = scoped_events(scope.as_ref(), 64);
+    Ok(Json(json!({ "node_local": true, "count": rows.len(), "recent": rows })))
 }
 
 #[derive(Deserialize)]
@@ -913,14 +1031,10 @@ async fn integrity_handler(Json(b): Json<IntegrityBody>) -> Json<Value> {
 #[derive(Deserialize)]
 struct AttackModeBody {
     enabled: bool,
-    #[serde(default = "default_hours")]
-    hours: u64,
     #[serde(default)]
     verified_bot_bypass: bool,
-}
-
-fn default_hours() -> u64 {
-    1
+    // No `deny_unknown_fields`: a legacy dashboard still sending `hours` is
+    // ignored by serde. The mode has no duration, so there is no validation.
 }
 
 async fn attack_mode_put(
@@ -944,8 +1058,8 @@ async fn attack_mode_put(
         &project,
     )?;
     let now = hive_core::now_ms();
-    set_mode(&c, &project, b.enabled, b.hours, b.verified_bot_bypass, now)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // INDEFINITE on/off: no duration argument and no duration validation.
+    set_mode(&c, &project, b.enabled, b.verified_bot_bypass, now);
     // A security decision must be durable BEFORE it is acknowledged; a failed
     // fsync fails closed rather than leaving a mode that survives only in RAM.
     if !crate::persist::persist_durable(&c) {
@@ -956,13 +1070,55 @@ async fn attack_mode_put(
         ));
     }
     record_event(&project, "/v1/firewall/attack-mode", 200, "log", "mode-updated");
-    Ok(Json(state_value(&c, &project)))
+    let scope = caller_projects(&c, claims.as_ref().map(|e| &e.0));
+    Ok(Json(state_value(&c, &project, scope.as_ref())))
+}
+
+/// Every project with Attack Challenge Mode ON for the caller's tenant. The
+/// rows are REPLICATED ProjectSettings (MERGE_STORES), so a GET answered
+/// locally on any node behind round-robin DNS names the same projects;
+/// `node_local: false` records that provenance and the node-local event ring
+/// is never read here. Tenancy comes ONLY from the verified JWT claim, never
+/// `x-hive-team`: an asserted identity is mandatory and `rows_for_tenant` is
+/// the SAME stored-tag scope primitive `project_inventory::summary` uses.
+async fn attack_mode_projects_handler(
+    State(c): State<Shared>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    // An asserted identity is mandatory BEFORE any tenant is resolved; an
+    // unenforced node's implicit "personal" would otherwise own everything.
+    if !crate::admin::has_explicit_caller_identity(cl.is_some(), None) {
+        return Err((StatusCode::UNAUTHORIZED, "sign-in required".into()));
+    }
+    crate::admin::require_auth_read(cl)?;
+    // Tenancy is the cryptographically-bound JWT claim ONLY. `x-hive-team` is
+    // spoofable and is never read here; `rows_for_tenant` in the store then
+    // applies the SAME stored-tag scope as `project_inventory::summary`.
+    let t = cl
+        .map(|cl| crate::admin::norm(&cl.tenant).to_string())
+        .filter(|t| t.as_str() != crate::admin::ANON_TENANT)
+        .ok_or((StatusCode::UNAUTHORIZED, "sign-in required".to_string()))?;
+    let mut rows = c.projects.attack_mode_projects(&t);
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let count = rows.len();
+    let projects: Vec<Value> = rows
+        .into_iter()
+        .map(|(project, m)| json!({
+            "project": project,
+            "enabled": true,
+            "updated_ms": m.updated_ms,
+            "indefinite": true,
+        }))
+        .collect();
+    Ok(Json(json!({ "projects": projects, "node_local": false, "count": count })))
 }
 
 pub fn routes() -> Router<Shared> {
     Router::new()
         .route("/v1/firewall/state", get(state_handler))
         .route("/v1/firewall/events", get(events_handler))
+        .route("/v1/firewall/attack-mode/projects", get(attack_mode_projects_handler))
         .route("/v1/firewall/integrity/report", post(integrity_handler))
         .route("/v1/projects/:project/firewall/attack-mode", put(attack_mode_put))
 }

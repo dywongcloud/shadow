@@ -236,8 +236,10 @@ pub struct BrowserDbRestToken {
 /// Project-scoped Attack Challenge Mode. Additive and #[serde(default)]: an
 /// older node's row without this key still deserializes, and the existing
 /// projects MERGE_STORES per-row updated_ms merge carries it fleet-wide.
-/// Auto-off is LAZY (checked against active_until_ms on every request), so
-/// there is no timer and no second background loop.
+/// INDEFINITE on/off: `enabled` alone decides admission. `active_until_ms`,
+/// `updated_ms` and `duration_secs` are KEPT with #[serde(default)] for
+/// persisted-row compatibility; the two duration fields are zeroed on every
+/// write and are never read for expiry. No timer, no second loop.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttackMode {
     #[serde(default)]
@@ -2122,6 +2124,26 @@ impl ProjectStore {
             .get(project)
             .map(|s| s.attack_mode)
             .unwrap_or_default()
+    }
+
+    /// REPLICATED ProjectSettings rows with Attack Challenge Mode ON, as
+    /// (project, mode), scoped by `rows_for_tenant` - the SAME stored-tag
+    /// primitive `project_inventory::summary` and
+    /// `GET /v1/gitops/projects?view=summary` use. One read lock over the
+    /// existing map, no new state and no node-local event ring: MERGE_STORES
+    /// carries these rows to every node, so a GET answered locally behind
+    /// round-robin DNS lists the same projects everywhere. Bounded by the
+    /// replicated row count, never by a caller-controlled length. A row
+    /// another tenant holds never leaves this store.
+    pub fn attack_mode_projects(&self, tenant: &str) -> Vec<(String, AttackMode)> {
+        self.rows_for_tenant(tenant)
+            .into_iter()
+            .filter_map(|(name, row)| {
+                row.attack_mode
+                    .enabled
+                    .then_some((name, row.attack_mode))
+            })
+            .collect()
     }
 
     pub fn set_cron_enabled(&self, project: &str, on: bool) {
