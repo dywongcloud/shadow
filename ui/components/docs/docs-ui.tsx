@@ -140,18 +140,27 @@ export function DocsFigure({
 }) {
   return (
     <figure className="my-8">
-      <div className="overflow-hidden rounded-xl border border-border bg-[#0a0a0a]">
+      <div
+        tabIndex={0}
+        role="region"
+        aria-label={`${caption} Full-resolution capture; scroll horizontally to inspect.`}
+        className="overflow-x-auto rounded-xl border border-border bg-[#0a0a0a] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-link"
+      >
         <Image
           src={src}
           alt={alt}
           width={width}
           height={height}
-          sizes="(max-width: 768px) 100vw, 768px"
-          className="h-auto w-full"
+          unoptimized
+          className="h-auto max-w-none"
+          style={{ width }}
         />
       </div>
       <figcaption className="mt-3 text-sm font-medium text-fg">{caption}</figcaption>
       <p className="mt-1 text-xs leading-relaxed text-secondary">{note}</p>
+      <p className="mt-1 text-xs text-secondary">
+        Scroll the frame horizontally, or focus it and use the arrow keys, to read at full 2x resolution.
+      </p>
     </figure>
   );
 }
@@ -185,7 +194,7 @@ export function DocsLead({
   );
 }
 
-/** The compact index: a destination without another identical frame. */
+/** The compact index: a destination with no repeated frame at all. */
 export function DocsIndexLink({
   title,
   desc,
@@ -198,9 +207,9 @@ export function DocsIndexLink({
   return (
     <Link
       href={href}
-      className="tap-44 group flex flex-col gap-0.5 border-b border-border py-3 transition-colors hover:border-border-strong"
+      className="tap-44 group flex flex-col gap-0.5 py-2.5"
     >
-      <span className="text-sm font-medium text-fg group-hover:text-link">{title}</span>
+      <span className="text-sm font-medium text-fg underline decoration-border underline-offset-4 group-hover:text-link group-hover:decoration-link">{title}</span>
       <span className="text-[13px] leading-relaxed text-secondary">{desc}</span>
     </Link>
   );
