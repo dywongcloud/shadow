@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-11-24 - Rolls stop electing the shut-off bkk host
+
+`ansible/playbooks/parallel-deploy.yml` elected its build hosts by
+`groups['glibc239'][0]` / `groups['glibc238'][0]`. `bkk` is shut off and has no
+`ansible_host` definition, so it is `groups['glibc238'][0]` but can NEVER be in
+`platform`; the assert demanding its presence made every unscoped roll fail
+before a single binary changed. The five deleted hosts (bkk hk va2 sp fr) are
+still named in the glibc/browser/litebox groups with no definition line, and
+14 released instances carry `hive_retired=true`.
+
+All deploy playbooks now open with a `group_by` prelude that partitions
+`platform` into `hive_live` (non-retired AND `ansible_host` defined) and
+`hive_retired_hosts`, and every later play targets `hive_live` (or the
+intersections `hive_live:!sj`, `hive_live:&sj`, `hive_live:&fc_kvm`,
+`hive_live:&fc_pvm`, `hive_live:&litebox`). Play-level `hosts:` is templated at
+parse time where neither `hostvars` nor `group_vars` exist, so a runtime group
+is the only correct primitive. Build hosts are elected from live rows in
+`group_vars/all/vars.yml`, an empty `glibc238` builder is explicitly allowed,
+and a released IP is never contacted. `--limit` still narrows the roster.
+`node-join.yml` keeps its `-e new_node` requirement.
+
+Witness: all five playbooks pass `--syntax-check`; a real unscoped
+`--tags always` run reports `live=fc-orlando,phx,sj,sj7,va,va3
+retired_or_dead=14` and `live build hosts present for every represented glibc
+group`, rc=0; `--tags always --limit fc_pvm` reports the five PVM hosts, rc=0.
+No production roll was run.
+
 ## 2026-11-24 - Attack Challenge is indefinite and self-healing
 
 Attack Challenge Mode no longer expires. `PUT

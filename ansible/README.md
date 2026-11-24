@@ -127,11 +127,15 @@ ansible-playbook playbooks/parallel-deploy.yml --tags ui             # ui/ dashb
 ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm        # subset of hosts
 ```
 
-Requires `inventory/hosts.ini`'s `[glibc239]`/`[glibc238]` groups to stay
-current with the fleet's real glibc membership (AGENTS.md "Fleet has two
-glibc groups" -- membership is by OS image, not region; verify with
-`scripts/audit-runtime-versions.sh` before trusting the group split after
-adding or re-imaging a node).
+Every deploy playbook first partitions `platform` with `group_by` into `hive_live`
+(non-retired AND `ansible_host` defined) and `hive_retired_hosts`, then targets
+`hive_live`. Dead hosts still NAMED in `[glibc238]`/`[browser_nodes]`/`[litebox]`
+(`bkk` is shut off) have no `ansible_host` and never enter a roll; `--limit` still
+narrows both the partition play and every later play. `[glibc238]` has no live
+member, so `parallel-deploy.yml` elects builders from live hosts only -- indexing
+`groups['glibc238'][0]` used to name `bkk` and made the assert unsatisfiable.
+Verify glibc membership with `scripts/audit-runtime-versions.sh` after adding or
+re-imaging a node.
 
 `ansible.cfg`'s `[ssh_connection] ssh_args` already carries
 `ControlMaster=auto`/`ControlPersist=120m` fleet-wide (the same fix

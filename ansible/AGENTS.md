@@ -38,7 +38,11 @@ recompile from code, git log and memory; loaded through `ansible/CLAUDE.md`; roo
   skip it unless `INCLUDE_RETIRED=1`, fail2ban excludes it (a provider re-issues a released IP to a
   stranger). `[glibc239]`/`[glibc238]`/`[browser_nodes]`/`[litebox]` still NAME the five deleted hosts
   (bkk hk va2 sp fr) with no definition line; `[glibc238]` has no live member; every live host is glibc
-  2.39 (`scripts/audit-runtime-versions.sh`). `litebox_verified=true` stays on every host that ran verified
+  2.39 (`scripts/audit-runtime-versions.sh`). `bkk` is shut off: it is `groups['glibc238'][0]` but has NO
+  `ansible_host`, so electing a builder by group index can never satisfy `parallel-deploy.yml`'s assert.
+  Every deploy playbook first runs `group_by` into `hive_live` (non-retired AND `ansible_host` defined)
+  and targets that dynamic group, never raw `platform`; builders come from live hosts only. Play-level
+  `hosts:` cannot read `hostvars` or `group_vars` (parse-time only), so the roster must be a runtime group. `litebox_verified=true` stays on every host that ran verified
   Litebox: an unlimited `--tags litebox` run removes its drop-in and restarts into MockBackend.
 - `ansible.cfg`: `forks = 20` (default 5 silently batches plays without `serial:`; `serial:`/`throttle:`
   are the real bounds); `vault_password_file = .vault_pass` is mandatory: a missing gitignored
