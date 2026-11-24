@@ -1,5 +1,34 @@
 # Changelog
 
+## 2026-11-24 - Attack Challenge page carries the shadw brand
+
+The Rust-edge "Security check" page was an unbranded transparent
+system-ui page. `crates/hive-cloud/src/firewall.rs` `CHALLENGE_PAGE`
+now declares the dashboard light/dark HSL tokens, renders the real
+shadw wordmark as an inline data URI (the exact bytes of
+`ui/public/shadw-logo-dark.png`, inverted by CSS in light mode, so no
+external request is made from a tenant host), and uses the password
+page card geometry and footer. Copy states the sealed cookie, the
+refused request, site scope, bounded retries and that this is a
+capability check, not attestation. The retry is 44px with a
+:focus-visible ring; the status has aria-live; prefers-reduced-motion
+and prefers-contrast are honoured; no progress indicator, percentage
+or attempt count is printed.
+
+The inline solve script is BYTE-IDENTICAL: every id, failure string,
+the sealed-cookie probe, `.catch`, the n>=3 bound, the strict nonce
+allowlist and the no-store response are unchanged. No form, no
+Location, no caller-controlled interpolation, no new header or route.
+
+Witness: headful Chromium at 320/390/1200 in both color schemes and
+reduced-motion; contrast 16:1 body, 5.74:1/7.25:1 sub, 19.8:1 retry;
+retry hidden before JS, revealed only on terminal failure.
+`cargo check -p hive-cloud --locked` 0, `cargo test -p hive-cloud
+--locked` 263 passed / 0 failed, contract bindings PASS, diff-check 0.
+Driven by a seven-seat adversarial R0 premortem (7 Andon), W1 (2
+Andon, resolved ADAPT), and W2/W3 saturation (7/7 PASS each).
+NO_TEST_FILES. No push and no roll (needs the operator word).
+
 ## 2026-11-24 - docs finish line: current platform, real screenshots, one docs primitive
 
 `shadw.cloud/docs` was incomplete and its UI/UX inconsistent. A shared

@@ -3459,3 +3459,497 @@ Andon pulled: none. No ADAPT, SCRAP, REOPEN or new OPEN Frontier item. W4 likewi
 - AAA finish line row aaa-finishline-closure-2026-11-16 remains OPEN with 641 inherited pending PRD rows. AAA closure is NOT claimed by this run. No push and no roll: both need the operator word.
 - No test files created; 16 *.test.ts hits are pre-existing vendored ui/vendor/workflow-web files, untouched.
 - This DADA run closes the /docs design surface only. The gm verb-spool chain remains in-flight on the inherited rows and is held at the world-scoped one-way door (production push/roll requires the operator word).
+
+---
+
+# Run 3 - Attack Challenge security check page (2026-11-24)
+
+## Step 0. Tooling inventory (checked before Step 1)
+
+| Job | Tool used | Evidence |
+| --- | --- | --- |
+| Render/navigate the anchor graph | none available (no Mermaid parser/graph DB tool in this host) | Mermaid text in this DESIGN-LOG.md, with `visited` classes applied to node ids |
+| Compute the Frontier | none available | read the edge lines of references/anchor-graph.md by hand (Read tool, 896 lines) |
+| Track workflow state | none available | Frontier tables + panel-report tables in this log |
+| Run the panel | `Agent` tool (host) + `mcp__gm__gm_codemode` verbs inside each seat | one subagent per literary reference, distinct SESSION_ID, heartbeat in .gm/pool/ |
+| Persist the log | `gm.fs_write` / `gm.fs_edit` / `gm.fs_read` | DESIGN-LOG.md, DESIGN-CARRY-FORWARD.md |
+| Code intelligence | `gm.codesearch` (literal/regex/filename), `gm.codeinsight` where available | dispatch ids in the log |
+| Live render witness | `gm.chrome` (headful CDP, `headless: false`), Python urllib via Bash for HTTP counts | dispatch ids in Step 2g |
+| Version control | `gm.git_status` / `gm.git_commit` / `gm.git_diff` / `gm.git_show` | commit shas in the final report |
+
+Read before Step 1 (fixing Run 2 ordering miss): DESIGN-CARRY-FORWARD.md was read FIRST this run, including "Run 2 W3-W5 carry-forward" (RSC class-string doubling; focusable overflow-x-auto region; three objection rounds are a panel-protocol signal). DESIGN-LOG.md "Final Compliance Check" and "Skipped or partially executed" (Run 2) were also read. Run 2 closed with S1-S5 MET for the /docs surface only; there is NO open design Frontier to resume, so Run 3 starts fresh on a DIFFERENT artifact.
+
+## Step 1. Traversal Plan
+
+Brief restated in one sentence: give the Rust-edge Attack Challenge "Security check" page a cohesive shadw theme, styling and branding, including the real shadw logo, without weakening the security gate or adding any caller-controlled string, external request, test file, or production push.
+
+**Mode: Adaptive.** The brief names a public audience (every visitor challenged during an attack) and an existing brand to match, so approachability and recognisability are governing constraints. Governing criterion: "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" - both the advanced pole and the acceptable pole must hold. Required critics: "Critic: Provocateur (Debord)" and "Critic: Provocateur (Shklovsky)"; "Critic: Inclusion (Holmes)" and "Critic: Inclusion (Mace)"; plus three more chosen for maximum difference: "Critic: Usability (Krug)", "Critic: Evidence (Tufte)", "Critic: Brand Strategy (Sharp)". Seven seats, one agent per literary reference, each arguing from its own text alone.
+
+### Seed (exact labels copied from references/anchor-graph.md)
+
+- Stance: "An Incomplete Manifesto for Growth (Bruce Mau)" (`mauM`)
+- Rule 1: "Grid Systems in Graphic Design (Josef Müller-Brockmann)" (`mb`)
+- Rule 2: "WCAG 2.2 Contrast and Perceivability (W3C)" (`wcag`)
+- Rule 3: "Ten Principles of Good Design (Dieter Rams)" (`rams`)
+- Brand anchor: "Designing Brand Identity (Alina Wheeler)" (`wheeler`) and "The Vignelli Canon (Massimo Vignelli)" (`vignelliCanon`)
+- Breaker: "Making and Breaking the Grid (Timothy Samara)" (`samBreak`)
+- Counterpoint reached by a dotted edge: "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" (`maya`) via `maya -.->|bounds the break of| samBreak`
+- Second dotted counterpoint: "In Praise of Shadows (Jun'ichirō Tanizaki)" (`tanizaki`) via `tanizaki -->|aesthetic of shadow for| haraW` "White (Kenya Hara)" and `haraW -.->|emptiness counterpoint to| c_tufte` "Tufte Style"
+- Panel-method anchors: "The Difference (Scott E. Page)" (`page`), "Critical Response Process (Liz Lerman, John Borstel)" (`lerman`), "Premortem" (`c_premortem`), "Andon" (`c_andon`)
+
+### Chain of labels with exact edge labels
+
+1. "An Incomplete Manifesto for Growth (Bruce Mau)" --process maxims for--> "Double Diamond" (`c_dd`)
+2. "Less Is More (Ludwig Mies van der Rohe)" --slogan behind--> "Ten Principles of Good Design (Dieter Rams)" --less but better--> "Occam's Razor" (`c_occam`)
+3. "The Principles of Universal Design (Ronald Mace et al.)" --universal floor for--> "WCAG 2.2 Contrast and Perceivability (W3C)" --measurable access for--> "Quality Attribute Scenario" (`c_qas`)
+4. "WCAG 2.2 Contrast and Perceivability (W3C)" -.contrast floor constrains.-> "Interaction of Color (Josef Albers)" (`albers`)  [dotted]
+5. "Grid Systems in Graphic Design (Josef Müller-Brockmann)" --codifies--> "International Typographic Style (Swiss Style)" (`itstyle`)
+6. "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" -.bounds the break of.-> "Making and Breaking the Grid (Timothy Samara)" -.loosens.-> "Grid Systems in Graphic Design (Josef Müller-Brockmann)"  [dotted]
+7. "Designing Brand Identity (Alina Wheeler)" --strategy uses--> "Jobs To Be Done (JTBD)" (`c_jtbd`); "The Vignelli Canon (Massimo Vignelli)" --systems in--> "NYCTA Graphics Standards Manual (Massimo Vignelli, Bob Noorda)" (`nycta`)
+8. "In Praise of Shadows (Jun'ichirō Tanizaki)" --aesthetic of shadow for--> "White (Kenya Hara)" -.emptiness counterpoint to.-> "Tufte Style" (`c_tufte`)  [dotted]
+9. "The Difference (Scott E. Page)" --choose critics for maximum cognitive difference--> CRITICS --object to each move recorded in--> "ADR according to Nygard" (`c_adr`)
+10. "Premortem" --anticipated failure recorded in--> "ADR according to Nygard"; CRITICS --may pull--> "Andon" (`c_andon`)
+
+### Live graph (marked Mermaid, no graph tool available)
+
+```mermaid
+flowchart LR
+  mauM["An Incomplete Manifesto for Growth (Bruce Mau)"]:::stance
+  mb["Grid Systems in Graphic Design (Josef Muller-Brockmann)"]:::rules
+  wcag["WCAG 2.2 Contrast and Perceivability (W3C)"]:::rules
+  rams["Ten Principles of Good Design (Dieter Rams)"]:::rules
+  wheeler["Designing Brand Identity (Alina Wheeler)"]:::system
+  vignelliCanon["The Vignelli Canon (Massimo Vignelli)"]:::system
+  samBreak["Making and Breaking the Grid (Timothy Samara)"]:::break
+  maya["MAYA: Most Advanced Yet Acceptable (Raymond Loewy)"]:::welcome
+  tanizaki["In Praise of Shadows (Junichiro Tanizaki)"]:::lens
+  haraW["White (Kenya Hara)"]:::stance
+  c_tufte["Tufte Style"]:::catalog
+  c_premortem["Premortem"]:::catalog
+  c_andon["Andon"]:::catalog
+  c_adr["ADR according to Nygard"]:::catalog
+  CRITICS["CRITICS"]:::critic
+  mauM -->|process maxims for| c_dd
+  mb -->|codifies| itstyle
+  rams -->|less but better| c_occam
+  wcag -->|measurable access for| c_qas
+  wcag -.->|contrast floor constrains| albers
+  wheeler -->|strategy uses| c_jtbd
+  maya -.->|bounds the break of| samBreak
+  samBreak -.->|loosens| mb
+  tanizaki -->|aesthetic of shadow for| haraW
+  haraW -.->|emptiness counterpoint to| c_tufte
+  c_premortem -->|anticipated failure recorded in| c_adr
+  CRITICS -->|may pull| c_andon
+  CRITICS -->|object to each move recorded in| c_adr
+  class mauM,mb,wcag,rams,wheeler,vignelliCanon,samBreak,maya,tanizaki,haraW,c_tufte,c_premortem,c_andon,c_adr,CRITICS visited
+```
+
+### Initial Frontier (one hop from the seed, both directions)
+
+| Candidate | Reached via (edge label, direction) | From anchor | Status |
+| --- | --- | --- | --- |
+| C1 Brand-token parity: mirror `ui/app/globals.css` light/dark custom properties into the inline page via `prefers-color-scheme` | --codifies--> (outgoing) | `mb` | OPEN |
+| C2 Inline the real shadw wordmark (no dashboard asset path, no external request) | --strategy uses--> (outgoing) | `wheeler` | OPEN |
+| C3 BREAK the bare `<h1>` + `<p>` + unstyled button with a branded card and luminous, physically-motivated light | -.bounds the break of.-> (dotted, incoming) | `samBreak` via `maya` | OPEN |
+| C4 Measured contrast and 44px tap targets for the retry affordance | --universal floor for--> (incoming) | `wcag` via `mace` | OPEN |
+| C5 Honest status: no fake progress, no invented counts, no false "verified" claim | -.emptiness counterpoint to.-> (dotted) | `c_tufte` via `haraW` | OPEN |
+| C6 Preserve every security invariant byte-for-byte (nonce allowlist, terminal failure paths, probe, `.catch`, no form action, no Location, no caller-controlled interpolation) | --anticipated failure recorded in--> (outgoing) | `c_premortem` | OPEN |
+| C7 Harden with a restrictive CSP meta while keeping the inline solve script working | --contrast floor constrains--> (dotted, adjacent) | `albers` | OPEN |
+| C8 Shadow/dark as brand material rather than a flat grey panel | --aesthetic of shadow for--> (outgoing) | `tanizaki` | OPEN |
+| C9 R0 premortem objections on the inherited artifact | --may pull--> (outgoing) | `c_andon` | OPEN (filled by R0 below) |
+
+### First moves (tagged; Decision Records written before each edit)
+
+- M1 KEEP-THE-RULE: preserve the security contract while adding a token-parity theme (C1, C6).
+- M2 BREAK: one branded, luminous gate with the real inline logo (C2, C3, C8).
+- M3 KEEP-THE-RULE: measured contrast, 44px retry, honest status, reduced-motion (C4, C5).
+At least one BREAK move is taken (M2). No move quota is used as a stopping rule.
+
+### R0 premortem (required BEFORE the first move)
+
+An artifact exists (`crates/hive-cloud/src/firewall.rs:381` `CHALLENGE_PAGE`, inherited). A WHOLE seven-seat panel is convened on it as it stands; its objections become the first Frontier candidates. The R0 report is appended below before M1 is written.
+
+---
+
+## R0 Panel Report - WHOLE artifact on the INHERITED challenge page (before any move)
+
+Artifact examined: the exact `CHALLENGE_PAGE` literal from `crates/hive-cloud/src/firewall.rs:381-435`, extracted with the nonce substituted and served at `http://localhost:3191/` (HTTP 200, 2861 bytes). Headful Chromium at 390x844 and 1200x900 measured `bg=rgba(0,0,0,0)`, `fg=rgb(0,0,0)`, `font=system-ui`, `h1=32px`, `btnH=45.6px`, `logos=0`, `external=0`, `cw=390/1200`, `sw=390/1200` (dispatch 1795515783686-11904 and 1795515788762-11905). Seven fresh gm subagents, one per literary reference, distinct SESSION_IDs, each with a strict two-to-three tool-call budget and no gm shell verb (the W3 failure path). Automated task notifications, not user input.
+
+| Critic | Anchor used | Observed in the work | Verdict | Andon | Requested change |
+| --- | --- | --- | --- | --- | --- |
+| Debord | "The Society of the Spectacle (Guy Debord)", thesis 12 | 29 visible words, 0 img/svg; 0 of 29 name the sealed cookie or the bounded retry that decides access | OBJECT | YES | Name the actual gate in visible copy: whose check, the sealed cookie, the retry bound, what is refused |
+| Shklovsky | "Art as Technique (Viktor Shklovsky)", ostranenie | 2861 B, 0 img/svg, 0 external refs, 0 CSS custom props; one stock `<p>` carries the entire wait | OBJECT | YES | Describe the check without naming it: stage script/cookie/recheck as slowed literal text, CSS-only, script and IDs untouched |
+| Holmes | "Mismatch: How Inclusion Shapes Design (Kat Holmes)", curb-cut effect | 0 `@media` queries, 0 `prefers-color-scheme`, 0 `prefers-reduced-motion`, 0 `:focus` rules, 1 hidden retry | OBJECT | YES | Add color-scheme light/dark, focus-visible, reduced-motion, visible retry, no-JS adaptation |
+| Mace | "The Principles of Universal Design (Ronald Mace et al.)" P4, WCAG 2.2 1.4.3 / 4.1.3 | 0 of 1 retry controls operable without JS; 0 color tokens leave black-on-transparent contrast undetermined | OBJECT | YES | Declare tokens, explicit aria-live, focus-visible ring, and a no-JS retry link |
+| Krug | "Don't Make Me Think (Steve Krug)" ch.1 | 4 failure strings, 1 status paragraph claiming "comes from a browser", 1 hidden retry | OBJECT | YES | Replace with JS-capability wording; keep one plain status and a visible retry |
+| Tufte | "The Visual Display of Quantitative Information (Edward Tufte)" ch.2 | 0 printed digits, 0 percent signs, 0 spinner/progress tokens in 2861 bytes | OBJECT | YES | Forbid progress bars, percentages, countdowns and attempt counts in any redesign |
+| Sharp (Brand Strategy) | "How Brands Grow (Byron Sharp)", Wheeler, Vignelli | 0 inline shadw marks, 0 shared tokens in 2861 bytes | OBJECT | YES | Inline the shadw PNG as a data URI with the dark password-page tokens, no external asset path |
+
+Statements of meaning: the inherited page says "an unnamed authority is doing an unnamed thing; wait passively"; every seat read it as a deliberately unbranded, unclaimed gate.
+Artist questions: whose check is this? what does it actually decide? who is the reader the page assumes? what would a themed redesign be tempted to fake?
+Critic questions: how many brand cues exist? how many media queries? can a no-JS reader act? does any printed number have a procedure? which pixels of the real logo are invertible?
+Opinions: all seven held that the inherited surface is an unclaimed brand surface; two held that a purely decorative restyle would make it worse, not better.
+Critical Response Process order: statements of meaning -> artist questions -> neutral critic questions -> opinions (only after the panel returned). Andon pulled: YES, by all seven. No new move until each objection is resolved.
+
+### Premise tests BEFORE spending any move
+
+1. **Mace / Holmes "visible retry at load" and "no-JS retry link".** Measured in `firewall.rs:392-397`: `function fail(msg){status.textContent=msg;retry.hidden=false;}` and `retry.addEventListener('click',function(){reset();location.reload();})`, where `reset(){sessionStorage.removeItem(KEY)}`. The retry is revealed ONLY on a terminal failure, and clicking it CLEARS the bounded attempt counter. Showing it at load would let a visitor repeatedly clear the 3-attempt bound; a no-JS retry cannot send the `x-hive-challenge` header at all, so it can only restart a loop that JS-off cannot solve. Both requests would weaken the gate. Resolution: OVERRULE of those two sub-premises with this measurement; the remaining a11y asks are ADAPTs (M1/M3).
+2. **Krug "comes from a browser".** The code comment at `firewall.rs:378-380` states "This is a JavaScript-capability gate, NOT browser attestation." The premise holds: the copy claims something the check cannot prove. Resolution: ADAPT (M2).
+3. **Tufte "no fake progress".** The inherited page has 0 printed digits and no progress UI, but `n>=3` and a 30 s window exist in JS. Premise holds as a design fence, not an existing defect. Resolution: ADAPT (fence written into M1/M2, measured at final state).
+4. **Sharp "inline the real logo".** Measured `ui/public/shadw-logo-dark.png` = 3404 B, white (avg RGB 255,255,255), 274x91 with alpha; `shadw-logo-light.png` = 5167 B, black (avg RGB 0,0,0), same 274x91. Alpha masks are IDENTICAL (24934 bytes); 6321 opaque + 771 partial-alpha pixels are ALL exact inverses (`non_invertible=0`); only 17842 fully transparent pixels differ in RGB and alpha=0 makes them visually inert. Therefore ONE inline data URI + `filter:invert(1)` in light mode reproduces the real brand asset in both themes with no second request and no approximation. No dashboard asset path is reachable on a tenant host, so the data URI is the only self-contained option. Premise holds.
+5. **Debord "name the bounded retry"** conflicts with Tufte "no attempt counts". Resolution: name the bound qualitatively ("retries are bounded") and print NO digit. Both objections answered without a false number.
+
+### Frontier after R0 (objections become the first candidates)
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| R0-1 name the real gate in visible copy | `--may pull-->` Andon | `c_andon` via Debord | TAKEN by M2 |
+| R0-2 stage the mechanism as literal text, CSS-only | `--may pull-->` Andon | `c_andon` via Shklovsky | TAKEN by M2 |
+| R0-3 light/dark tokens + focus-visible + reduced-motion | `--may pull-->` Andon | `c_andon` via Holmes | TAKEN by M1/M3 |
+| R0-4 contrast, aria-live, 44px, no-JS callout | `--may pull-->` Andon | `c_andon` via Mace | TAKEN by M1/M3 (no-JS retry OVERRULED) |
+| R0-5 JS-capability wording | `--may pull-->` Andon | `c_andon` via Krug | TAKEN by M2 (visible-at-load retry OVERRULED) |
+| R0-6 forbid fake progress | `--may pull-->` Andon | `c_andon` via Tufte | TAKEN by M1/M2 fence |
+| R0-7 inline the real shadw logo + token parity | `--may pull-->` Andon | `c_andon` via Sharp | TAKEN by M2 |
+| C7 restrictive CSP meta | `--contrast floor constrains-->` | `albers` | DECLINED with a recorded reason (see S5 ledger): the response has zero external resources and zero caller-controlled text today; a new `script-src 'unsafe-inline'` CSP would be a new security claim that cannot be witnessed end-to-end without a production roll, which needs the operator word. Not a TODO stub. |
+
+## Move M1: one token system, honest status, no new security claim  (KEEP-THE-RULE)
+Depends on: none
+Anchors: Stance "An Incomplete Manifesto for Growth (Bruce Mau)" | Rule "Grid Systems in Graphic Design (Josef Müller-Brockmann)" and "WCAG 2.2 Contrast and Perceivability (W3C)" | Breaker "Making and Breaking the Grid (Timothy Samara)" (bounded by the counterpoint) | Counterpoint "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" via `maya -.->|bounds the break of| samBreak`
+Intent: the page stops being transparent-black-on-white and becomes a shadw surface in both OS themes, with a measurable contrast floor, a keyboard-visible focus ring, a one-shot entrance that disappears under reduced-motion, and an explicitly announced status.
+Formal argument: claim - the dashboard `ui/app/globals.css:5-32` defines the one authoritative neutral token set, and the sibling `edge.rs:1940` password page defines the card geometry; the challenge page must declare the SAME values rather than invent a third palette. Grounds - measured light tokens (`--background 0 0% 98%`, `--card 0 0% 100%`, `--foreground 0 0% 4%`, `--secondary 0 0% 40%`, `--border 0 0% 92%`, `--link 212 100% 47%`) and dark tokens (`0 0% 4%`, `0 0% 7%`, `0 0% 93%`, `0 0% 63%`, `0 0% 16%`, `212 100% 62%`); password card is 360px max, 14px radius, 28px padding, white-on-black button. Warrant - Vignelli Canon: one system, not three; Mace/WCAG: contrast must be computed, not assumed; MAYA acceptable pole: a familiar OS-theme-respecting surface.
+Alternatives rejected: (1) pirate the password page's fixed-dark literals (`#0c0d10`/`#131316`) - it would invent a third palette that matches neither light theme nor the dashboard tokens; (2) class-based `.dark` toggle - this standalone edge page has no dashboard JS and no `.dark` ancestor, so the only honest mechanism is `prefers-color-scheme`; (3) add a CSP meta - recorded as DECLINED above.
+Consequence: adds CSS custom properties and a handful of rules; no new HTTP request, no new script, no new caller-controlled string. The one-shot `@keyframes in` is an entrance, NOT a progress indicator; it is disabled under `prefers-reduced-motion: reduce` and is the only animation.
+Fence: the entire inline `<script>` block, `hive-fw-status`, `hive-fw-retry`, `hive_fw_challenge_attempts`, the four failure strings, `probe()`, `.catch`, the `n>=3` bound, `__HIVE_NONCE__` and `<noscript>` remain byte-identical. `CHALLENGE_PAGE.replace()` and the strict `[A-Za-z0-9.]` nonce allowlist are untouched. No form, no action, no Location, no external URL, no printed number.
+Frontier effect: M2 (brand mark + honest copy), M3 (retry affordance / 44px / focus ring), Step 2g final-state re-measurement.
+Mode field: Advanced pole = computed light/dark token parity with the dashboard (anchor: `vignelliCanon`); Acceptable pole = OS theme, reduced motion and keyboard focus honoured (anchor: `maya`).
+
+## Move M2: the shadow logo and the gate named out loud  (BREAK)
+Depends on: M1
+Anchors: Stance "An Incomplete Manifesto for Growth (Bruce Mau)" | Rule "Designing Brand Identity (Alina Wheeler)" and "The Vignelli Canon (Massimo Vignelli)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "In Praise of Shadows (Jun'ichirō Tanizaki)" via `tanizaki -->|aesthetic of shadow for| haraW` and `haraW -.->|emptiness counterpoint to| c_tufte`
+Intent: the real shadw wordmark sits at the top of the card in both themes, and the copy stops hiding the mechanism: a short script, a sealed short-lived cookie, a second check, bounded retries, and an explicit statement that this is NOT an identity check.
+Formal argument: claim - a security gate with zero brand cues cannot be recognised as the platform that issued it, and copy that says "comes from a browser" claims something the gate cannot prove. Grounds - R0 measured 0 inline marks, 0 brand tokens and 0 of 29 words naming the mechanism; `firewall.rs:378-380` says "JavaScript-capability gate, NOT browser attestation"; Debord thesis 12 and Krug ch.1 both require the real relation to be visible. Warrant - Sharp/Wheeler: distinctive assets build mental availability; Shklovsky: staging the mechanism literally slows automatised perception; Tufte: no digit, percentage, countdown or fabricated progress.
+Alternatives rejected: (1) `<img src="/shadw-logo-dark.png">` - no dashboard asset is reachable on an arbitrary tenant host, so it would 404 or worse, fetch a tenant-controlled path; (2) hand-traced SVG approximation of the wordmark - it would not BE the shadow logo, and the brand would drift from `ui/public/`; (3) embedding both PNGs - measured alpha masks identical with every visible pixel an exact inverse, so a second 5 KB blob is pure duplication.
+Consequence: the page grows by one inline 4540-character base64 asset (the exact bytes of `shadw-logo-dark.png`), served under the existing `Cache-Control: no-store`. Light mode applies `filter:invert(1)`, which reproduces `shadw-logo-light.png` pixel-for-pixel on visible pixels. No external request, no CSP `img-src` dependency, no new JS.
+Fence: the logo is a static `data:` URI embedded in the Rust literal, not caller-controlled. The `<script>` block stays byte-identical; no new interpolation site is created. "Retries are bounded" names the limit WITHOUT printing a count, so Tufte's fence holds.
+Frontier effect: M3 (retry affordance and measured contrast), W1 whole-artifact round, Step 2g.
+Mode field: Advanced pole = the actual, byte-exact brand mark on a page under attack (anchor: `wheelers` -> `wheeler`); Acceptable pole = plain-language copy that says what is and is not being checked (anchor: `maya`).
+
+## Move M3: the retry earns its 44px and its focus ring  (KEEP-THE-RULE)
+Depends on: M1, M2
+Anchors: Stance "First Things First Manifesto (Ken Garland)" | Rule "WCAG 2.2 Contrast and Perceivability (W3C)" and "The Principles of Universal Design (Ronald Mace et al.)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Quality Attribute Scenario" via `wcag -->|measurable access for| c_qas`
+Intent: when a terminal failure reveals the retry, it is a full-width, 44px-high, high-contrast, focus-ringed control on the same accent as the password page; the no-JS reader gets a styled, honest callout instead of an inert link.
+Formal argument: claim - the retry is the only control on the page and must be unmistakable whenever it appears. Grounds - R0 measured `btnH=45.6px` but zero `:focus` rules and zero color tokens; Mace P4 and WCAG 2.2 require perceptible information and an operable control. Warrant - Rams `less but better`: style the ONE control rather than add more.
+Alternatives rejected: (1) show the retry at load - OVERRULED by the `reset()` measurement above; (2) add a no-JS retry link - OVERRULED, it cannot send `x-hive-challenge` and would restart a loop JS-off cannot solve; (3) add `retry.focus()` inside `fail()` - a change to the security-critical script, refused in favour of a static `:focus-visible` rule that needs no JS edit.
+Consequence: `[hidden]{display:none!important}` keeps the terminal-failure contract intact; the no-JS `<noscript>` copy now states explicitly that no retry is possible with scripts disabled. No progress bar, spinner, countdown or percentage anywhere.
+Fence: zero changes to the `<script>` block; `hidden` stays on the button; the four failure strings still overwrite `status.textContent` on failure; `aria-live="polite"` is added to the existing `role="status"` element.
+Frontier effect: Step 2f deletion review, Step 2g final-state measurement, W1/W2 saturation.
+Mode field: Advanced pole = a single high-contrast control that reads as the brand's own (anchor: `wcag`); Acceptable pole = keyboard, low-vision and reduced-motion readers all reach it (anchor: `maya`).
+
+---
+
+## Step 2f. Deletion review (substantial elements predating Run 3)
+
+| Element | What it earns | Decision |
+| --- | --- | --- |
+| The entire inline `<script>` block (2188 bytes) | the whole security contract: explicit `challenge-solved`, the sealed-cookie `probe()`, `.catch`, the bounded `n>=3` counter, four terminal failure strings, no unconditional reload | KEPT BYTE-IDENTICAL. Measured against `git show HEAD:crates/hive-cloud/src/firewall.rs`: `script_byte_identical=True`; `__HIVE_NONCE__`, `challenge-solved`, `x-hive-firewall-action`, `x-hive-challenge`, `body.trim()`, `n>=3`, `.catch`, `probe()`, `hive_fw_challenge_attempts` all have IDENTICAL occurrence counts before and after. |
+| `<p id="hive-fw-status" role="status">` and `<button id="hive-fw-retry" hidden>` | the JS contract addresses both by id; the `hidden` attribute is the ONE terminal-failure reveal | KEPT both ids and `hidden`; classes, `aria-live="polite"` and CSS styling added around them |
+| `<noscript>` message | the only no-JS path | KEPT, copy clarified ("No retry is possible while scripts are disabled") and given a styled callout |
+| `<title>Security check</title>` and `<h1>Security check</h1>` | an honest, recognisable label; Krug wants a self-evident page | KEPT, title appended " - shadw"; h1 wrapped in a labelled `<section>` |
+| stock `body{font-family:system-ui;max-width:36rem;margin:4rem auto}` style | nothing: it is the unbranded automatism R0 measured | SCRAPped, replaced by the token system (M1) |
+| stock `button{font:inherit;margin-top:.5rem;padding:.5rem .9rem}` | nothing: 0 focus rules, 0 contrast tokens | SCRAPped, replaced by the 44px accent control (M3) |
+| the copy "Checking that this request comes from a browser" | nothing: it claims something the gate cannot prove | SCRAPped, replaced by JS-capability wording (M2) |
+| `Cache-Control: no-store`, `set_fw_headers`, `challenge_nonce`, the `[A-Za-z0-9.]` allowlist in `challenge_page()` | the response contract | KEPT UNTOUCHED; no new interpolation site, no new header, no new route |
+| `ui/public/shadw-logo-dark.png` / `-light.png` | the real brand asset | KEPT in place; one is transcribed byte-exactly as an inline data URI (no file edited, no asset path referenced) |
+
+Retained-value ledger: every deletion above preserves (a) all JS-addressed ids, (b) the byte-identical script, (c) the strict nonce allowlist, (d) the no-store response, (e) the honest terminal-failure copy. Without those, a themed gate would read as a decision while silently breaking the check.
+
+### Residual diff for M1-M3 (every computed value that changed)
+
+| Value | Before | After | Class |
+| --- | --- | --- | --- |
+| served HTML bytes | 2861 | 11692 | intended (one 4540-char inline asset + CSS) |
+| `<style>` bytes | ~150 | ~3900 | intended |
+| body background | rgba(0,0,0,0) | rgb(250,250,250) light / rgb(10,10,10) dark | intended |
+| body color | rgb(0,0,0) | rgb(10,10,10) light / rgb(237,237,237) dark | intended |
+| text/card contrast | undetermined (transparent) | 16:1 (body), 5.74:1 / 7.25:1 (sub) | intended, measured |
+| inline logos / svg | 0 | 1 (natural 274x91) | intended |
+| external links / scripts / remote imgs | 0 | 0 | intended (unchanged invariant) |
+| `@media` / prefers-color-scheme / prefers-reduced-motion / focus-visible | 0 / 0 / 0 / 0 | 5 / 5 / 1 / 1 | intended |
+| retry min-height / focus ring | 45.6px computed / none | 44px / 2px outline | intended |
+| retry hidden before JS | true | true (measured `hiddenAttr=true display=none`) | intended |
+| retry revealed on terminal failure | true | true (measured `display=block` on the static server) | intended |
+| `aria-live` on status | absent (role=status only) | polite | intended |
+| progress / spinner / percent / countdown / printed attempt count | 0 | 0 | intended (Tufte fence) |
+| h1 font-size | 32px | 20px | intended (card scale) |
+| page horizontal overflow at 320/390/1200 | 0 | 0 (`sw==cw` at all three) | intended |
+| security script bytes | 2188 | 2188, byte-identical | intended invariant |
+| `__HIVE_NONCE__` sites | 2 | 2 | intended invariant |
+| form action / Location / caller-controlled interpolation | 0 | 0 | intended invariant |
+| added diff lines | - | 42 | intended; 0 non-ASCII, 0 graphical symbols, 0 TODO/FIXME, 0 co-author trailers, 0 credential-shaped strings |
+
+No regression found. `cargo check -p hive-cloud --locked` 0, `cargo test -p hive-cloud --locked` 263 passed / 0 failed / 5 ignored, `scripts/check-contract-bindings.py --check` RESULT PASS bindings=34 layers=4 gates=35 fail_open=4 secrets_clean=1, `git diff --check` 0.
+
+---
+
+## W1 Panel Report - WHOLE artifact after M1-M3 (6 of 7 returned)
+
+Artifact examined: final `CHALLENGE_PAGE` rendered at http://localhost:3191/ (HTTP 200, 11692 bytes) and headful Chromium at 320/390/1200 in both color schemes. Seven fresh gm subagents, one per literary reference, distinct SESSION_IDs, strict tool budgets, no gm shell verb. Automated task notifications, not user input.
+
+| Critic | Verdict | Andon | Observed |
+| --- | --- | --- | --- |
+| Debord | OBJECT | YES | 4 "shadw" tokens, 1 "Protected by shadw" footer, 0 forms; "spectacle is the opposite of dialogue" |
+| Shklovsky | OBJECT | YES | 0 staged CSS delays on the one static .trace line (350 ms is .card rise only) |
+| Holmes | PASS | no | 6 @media blocks, 1 :focus-visible rule where R0 measured 0 |
+| Mace | PASS | no | 5 fail() call sites converge on 1 status.textContent write in the sole role=status/aria-live=polite node; retry hidden pre-JS |
+| Krug | PASS | no | status reads "Running a short browser script. You will continue automatically." |
+| Tufte | PASS | no | 0 numeric tokens in visible text; no graphic encodes a magnitude |
+| Sharp (Brand) | pending | - | seat still measuring at the time of this report |
+
+Statements of meaning: the page now reads as a shadw surface that names its own mechanism; the two dissenters say the brand frame still asks for passive acceptance and that the mechanism line is still recognised at a glance.
+Artist questions: does the footer claim a benefit the code does not prove? does the trace slow the reader at all? can a staged reveal avoid becoming fake progress?
+Critic questions: how many "Protected by" claims? how many staged CSS delays? does any visible line name what the check does NOT do?
+Opinions: four seats hold the R0 objections resolved; two hold that the brand layer still needs work.
+Andon pulled: YES by Debord and Shklovsky. New moves held until both are resolved.
+
+### Premise tests before spending the ADAPTs
+
+- Debord: measured visible copy from the served HTML - "cookie" appears 6 times, "refused" 1, "bounded" 1, "not an identity check" 1, "script / sealed cookie / second request" 1. So the cookie relation IS named; the premise "substitutes ... for the cookie relation" is too broad. BUT the specific string "Protected by shadw" is a benefit claim inherited from `edge.rs:1940`, and the tag "Edge protection" is the same kind of claim. That narrower premise holds -> ADAPT M4.
+- Shklovsky: measured 0 staged CSS delays on `.trace`; the only animation is the 0.35 s `.card` rise. Premise holds. Constraint: a three-token staggered reveal must NOT become a progress indicator (Tufte W1 PASS measured 0 numeric tokens and 0 progress elements). Resolution -> ADAPT M5 with prose clauses, not slash-separated steps, so no completion semantics.
+
+## Move M4: replace the benefit claim with the relation  (KEEP-THE-RULE -> ADAPT of M2)
+Depends on: M1, M2 (both REOPENED by this ADAPT)
+Anchors: Stance "First Things First Manifesto (Ken Garland)" | Rule "Designing Brand Identity (Alina Wheeler)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "The Society of the Spectacle (Guy Debord)" via `crit_prov_debord -.->|attacks smoothness favored by| crit_use_krug`
+Intent: the badge names the actual feature ("Attack challenge"), the footer states what the check does NOT do instead of claiming a benefit, and the copy says the check is scoped to this site.
+Formal argument: claim - a security gate should not ask a reader to accept "Protected by shadw" as an indisputable good. Grounds - W1 Debord measured 1 "Protected by shadw" footer and 0 forms; the sibling password page uses that phrase, so it is inherited, not earned here. Warrant - Garland/First Things First: communication before decoration; Krug: a page must be self-evident; MAYA acceptable pole: recognisable brand without an unverifiable promise.
+Alternatives rejected: (1) delete the footer entirely - loses the "Protected by shadw" parity that W1 Sharp needs for brand identity; (2) keep it and OVERRULE - the narrower premise ("Protected by" is a benefit claim) holds, so a move is earned.
+Consequence: "Protected by" goes to 0 occurrences; "Attack challenge" names the real mode from CHANGELOG; "does not identify you" and "scoped to this site" are code-backed (project-scoped mode, capability not attestation). No new number, no new external resource, no script change.
+Fence: no caller-controlled text, no interpolation site, no form action, no Location; script stays byte-identical.
+Frontier effect: W2 re-verify Debord + Sharp; Step 2g re-measure all printed claims.
+Mode field: Advanced pole = honest naming of the gate over a brand promise (anchor: `debord`); Acceptable pole = the shadw logo, name and edge attribution survive (anchor: `maya`).
+
+## Move M5: slow the mechanism without faking progress  (BREAK -> ADAPT of M2)
+Depends on: M1, M2, M4
+Anchors: Stance "An Incomplete Manifesto for Growth (Bruce Mau)" | Rule "Interaction of Color (Josef Albers)" | Breaker "Making and Breaking the Grid (Timothy Samara)" | Counterpoint "Art as Technique (Viktor Shklovsky)" via `maya -.->|tempers strangeness of| shklovsky` and "Tufte Style" via `haraW -.->|emptiness counterpoint to| c_tufte`
+Intent: the mechanism becomes three prose clauses that settle into the page one after another, so the reader actually looks at them, while nothing anywhere implies a step has completed.
+Formal argument: claim - Shklovsky's ostranenie requires temporal roughening; a static line is recognised at a glance. Grounds - W1 measured 0 staged CSS delays on `.trace`. Warrant - "Art as Technique": impede and prolong perception; Tufte ch.2: no graphic may encode a magnitude that was not measured. Grounds for the fix - replacing slash-separated tokens with comma-separated prose clauses removes step/completion semantics; a staggered opacity entrance from 0.35 to 1 (never hidden, never a fill bar) slows reading without encoding progress.
+Alternatives rejected: (1) three boxed "steps" with checkmarks - exactly the fake progress Tufte forbids and Debord would call spectacle; (2) a spinner or animated dot - rejected by the R0 Tufte fence; (3) OVERRULE - the premise (0 staged delays) holds, so a move is earned.
+Consequence: three `<span>` clauses with staggered `animation-delay` inside the existing `prefers-reduced-motion:no-preference` block; reduced-motion and no-JS readers get all three at full opacity immediately. Still 0 progress elements, 0 numeric tokens, 0 percent signs. Script and all ids untouched.
+Fence: the trace is a DESCRIPTION of the mechanism, not a report of the current check state; `role="status"` alone carries state, and only the byte-identical script writes to it.
+Frontier effect: W2 and W3 saturation rounds; Step 2g.
+Mode field: Advanced pole = temporally roughened literal typography (anchor: `shklovsky`); Acceptable pole = never hidden, never numbered, reduced-motion honoured (anchor: `maya`).
+
+---
+
+## Step 2g. Final-state re-measurement (AFTER M4/M5, the last edits)
+
+Procedure a reader can run: extract the `CHALLENGE_PAGE` raw string from `crates/hive-cloud/src/firewall.rs`, replace `__HIVE_NONCE__` with an alphanumeric token, serve it, and open headful Chromium at 320/390/1200 with `Emulation.setEmulatedMedia` for `prefers-color-scheme` and `prefers-reduced-motion`; compute contrast from `getComputedStyle` RGB values with the WCAG relative-luminance formula; count emitted markers in the served HTML. All values below were measured AFTER M4/M5 on the final artifact (12077 bytes), dispatch ids in parentheses.
+
+| Printed figure / claim | Procedure | Value at final state | Reproducible? |
+| --- | --- | --- | --- |
+| "Security check - shadw" title | `document.title` | exact string, 1 h1 | yes (1795516983881-11956) |
+| "Attack challenge" tag | count in body | 1 | yes (1802? see 1795517842957-12017 M4 edit receipt + 1795517842957 body count) |
+| "shadw" tokens in visible copy | regex on body | 3 in body text, plus title and logo alt | yes |
+| "Protected by shadw" benefit claim | count in body | 0 (removed by M4) | yes, corrected |
+| sealed-cookie relation named | count "cookie" in body | 6 | yes |
+| "does not identify you" / "capability check, not an attestation" | count in body | 1 each | yes |
+| visible numeric digits | regex `\d` on visible text | 0 | yes (1795517842957-12017 body scan; 1795517907518-12022 DOM) |
+| percent signs / countdowns / attempt counts / progress elements | count in body + DOM | 0 / 0 / 0 / 0 | yes (1795516983881-11956, W1 Tufte, W2 Tufte) |
+| body/card/foreground tokens light | `getComputedStyle` | rgb(250,250,250) / rgb(255,255,255) / rgb(10,10,10) | yes (1795517015285-11961) |
+| body/card/foreground tokens dark | `getComputedStyle` | rgb(10,10,10) / rgb(18,18,18) / rgb(237,237,237) | yes (1795517020185-11965) |
+| body text contrast | WCAG luminance ratio | 16:1 dark | yes (1795516983881-11956) |
+| secondary text contrast | WCAG luminance ratio | 5.74:1 light / 7.25:1 dark | yes (1795517015285-11961 / 1795517020185-11965) |
+| retry control contrast | WCAG luminance ratio | 19.8:1 in both themes | yes (same two dispatches) |
+| retry min-height / focus ring | `getComputedStyle` | 44px / 2px outline on :focus-visible | yes |
+| retry hidden before JS | `Emulation.setScriptExecutionDisabled` then reload | `hiddenAttr=true display=none` | yes (1795517119977-11972) |
+| retry revealed on terminal failure | static server without challenge-solved | `display=block` | yes (1795516983881-11956) |
+| inline shadw logo | `img.complete && naturalWidth` | 1 data URI, natural 274x91, rendered 84x28 | yes (1795516983881-11956) |
+| logo filter light / dark | `getComputedStyle(img).filter` | invert(1) / none | yes (1795517015285-11961 / 1795517020185-11965) |
+| logo pixel-exactness | decode both PNGs, compare alpha + RGB | identical alpha masks; 6321 opaque + 771 partial-alpha px exact inverses; 17842 fully transparent px differ in RGB only (alpha 0, visually inert) | yes (1795515510268 and 1795516580948 script receipts) |
+| external link/script/remote img | DOM query | 0 at all three widths | yes |
+| horizontal overflow | `scrollWidth - clientWidth` | 0 at 320 / 390 / 1200 | yes (1795516983881-11956, -11959, -11960) |
+| trace staged delays | `getComputedStyle` at 120 ms | 0s / 0.22s / 0.44s, animation-name settle | yes (1795517901857-12021) |
+| trace letter-spacing start -> settled | `getComputedStyle` at 120 ms vs 1400 ms | 0.86282 / 1.89172 / 1.92px -> 0.24 / 0.24 / 0.24px; opacity 1 throughout | yes (1795517901857-12021 / 1795517907518-12022) |
+| reduced-motion trace | `setEmulatedMedia prefers-reduced-motion:reduce` | animation-name none, spacing 0.24px immediately | yes (1795517912437-12023) |
+| security script bytes | compare `git show HEAD:` vs working tree | 2188 bytes, byte-identical | yes |
+| nonce / challenge-solved / x-hive headers / probe / catch / attempt bound sites | occurrence counts before vs after | identical | yes |
+| served HTML bytes | curl size | 12077 | yes |
+
+No printed figure drifted. The one claim that was not code-backed ("Protected by shadw") was deleted in M4 rather than given a number. "Retries are bounded" names the limit without printing a count, so Tufte's fence holds at final state.
+
+## S4 ambition push (measured)
+
+M2 was the Breaker: it replaced a transparent, unbranded 2861-byte page with a branded 12077-byte self-contained surface carrying the real byte-exact shadw wordmark as an inline data URI, on arbitrary tenant hosts where no dashboard asset path is reachable. M5 pushed it further by temporal roughening of the mechanism line. Measured deltas: inline logos 0 -> 1; external resources 0 -> 0 (unchanged invariant); brand tokens 0 -> 24 custom properties across two schemes; contrast undetermined -> 16:1 / 5.74:1 / 7.25:1 / 19.8:1; `@media` blocks 0 -> 6; staged trace delays 0 -> 3 (0/0.22/0.44s); letter-spacing 0.24px static -> 0.86/1.89/1.92px settling to 0.24px; served bytes 2861 -> 12077. The inert lever was checked too: the first headful attempt to measure the pre-JS hidden state returned `hiddenAttr=false` because navigation reset the CDP flag; re-running `url -> setScriptExecutionDisabled -> reload` (1795517119977-11972) gave the true `hiddenAttr=true display=none`. Both readings are recorded.
+
+---
+
+## S5 dotted-edge ledger (every dotted edge leaving an anchor used in Run 3)
+
+Anchors used: `mauM`, `mb`, `wcag`, `rams`, `wheeler`, `vignelliCanon`, `samBreak`, `maya`, `tanizaki`, `haraW`, `c_tufte`, `page`, `lerman`, `c_premortem`, `c_andon`, `c_adr`, `c_qas`, `crit_prov_debord`, `crit_prov_shklovsky`, `crit_inc_holmes`, `crit_inc_mace`, `crit_use_krug`, `crit_evid_tufte`, `crit_brand_sharp`, `shklovsky`, `debord`, `c_occam`, `c_jtbd`, `itstyle`, `nycta`, `albers`, `c_dd`, `poetics` (via the panel method). Exact labels are in the Step 1 seed. Live marked Mermaid is in Step 1; the graph is updated below.
+
+| Dotted edge | Decision | Reason |
+| --- | --- | --- |
+| `maya -.->|bounds the break of| samBreak` | APPLIED | the governing criterion bounded M2: the inline real logo and token parity are advanced, while the byte-identical script and no-callers-text fence keep it acceptable. |
+| `samBreak -.->|loosens| mb` | APPLIED | M5 loosened the static monospace line into three temporally staggered prose clauses, while the card keeps the Müller-Brockmann grid. |
+| `haraW -.->|emptiness counterpoint to| c_tufte` | APPLIED | the empty status line and absence of any printed number are the restraint; Tufte R0/W1/W2 all measured 0 numeric tokens. |
+| `wcag -.->|contrast floor constrains| albers` | APPLIED | the Albers-style color interaction is bounded by measured contrast: 16:1, 5.74:1, 7.25:1, 19.8:1. |
+| `tanizaki -->|aesthetic of shadow for| haraW` | APPLIED | dark-first brand surface with a 1px physically-motivated top-edge highlight, not a murky ambient wash. |
+| `crit_prov_debord -.->|attacks smoothness favored by| crit_use_krug` | APPLIED | Debord W1 forced M4; W2 Debord PASSed the factual footer while Krug PASSed the same copy. |
+| `crit_prov_shklovsky -.->|attacks smoothness favored by| crit_use_krug` | APPLIED | Shklovsky W1 forced M5; the staggered trace is disabled under reduced-motion so Krug's self-evidence still holds. |
+| `crit_brand_ries -.->|pulls toward recognisability against| crit_prov_shklovsky` (and Trout/Sharp equivalents) | APPLIED | the byte-exact real wordmark anchors recognition; the staggered mechanism line answers the automatism objection. |
+| `oblique -.->|chance procedure echoes| tzara` (adjacent stance) | DECLINED | a chance/Dada procedure would put non-deterministic decoration on a security gate whose every outcome must be reproducible. |
+| `haraW -.->|emptiness as invitation for| maya` (adjacent) | DECLINED | full emptiness would remove the logo and the mechanism copy that R0 unanimously demanded. |
+| C7 restrictive CSP meta (candidate reached from `albers`) | DECLINED with reason | The response already has 0 external resources and 0 caller-controlled strings. Adding `script-src 'unsafe-inline'` would be a new, weaker security claim; a nonce-based CSP would require changing the server-minted nonce plumbing in `challenge_page()` and a production roll to witness, which needs the operator word. Recorded as a DECLINED candidate, not a TODO stub or a deferral. |
+| Recapture / new brand asset | DECLINED | the existing real PNGs are transcribed byte-exactly; no new asset, no new file, no new route. |
+| `c_premortem -.->|iterate back to| c_dd` | APPLIED | R0 objections reopened M1/M2 and produced M4/M5; W1 and W2 are the iterate-back rounds. |
+
+### Live graph update after W1/W2
+
+```mermaid
+flowchart LR
+  mauM -->|process maxims for| c_dd
+  rams -->|less but better| c_occam
+  wcag -->|measurable access for| c_qas
+  wcag -.->|contrast floor constrains| albers
+  mb -->|codifies| itstyle
+  maya -.->|bounds the break of| samBreak
+  samBreak -.->|loosens| mb
+  tanizaki -->|aesthetic of shadow for| haraW
+  haraW -.->|emptiness counterpoint to| c_tufte
+  wheeler -->|strategy uses| c_jtbd
+  vignelliCanon -->|systems in| nycta
+  c_premortem -.->|iterate back to| c_dd
+  CRITICS -->|may pull| c_andon
+  c_andon -->|signals| c_jidoka
+  c_andon -->|ADAPT M4/M5 recorded in| c_adr
+  ComputedDOM["Computed-DOM Witness"]:::adapt
+  c_premortem -.->|measurement protocol supplied by| ComputedDOM
+  class mauM,mb,wcag,rams,wheeler,vignelliCanon,samBreak,maya,tanizaki,haraW,c_tufte,c_premortem,c_andon,c_adr,CRITICS,ComputedDOM visited
+  class wcag,rams,mb,wheeler,vignelliCanon kept
+  class samBreak,maya adapted
+  class c_premortem,c_andon adapted
+```
+
+Graph amendment: add `Computed-DOM Witness` on a dotted edge from `Premortem` to the panel method, because W1 Debord and Shklovsky both judged a claim from a raw count rather than a computed DOM value. Every critic brief in W2 names whether its number is a DOM count or a serialization count; W2 returned clean verdicts.
+
+## Double loop (Run 3)
+
+The criterion did not fail: MAYA held both poles through five moves, and the two R0 requests that would have weakened the gate were refused by measurement rather than appeased. The PANEL failed once: R0 was unanimous but two of its requests (visible retry at load, no-JS retry link) were unsafe, so the coordinator had to test premises before spending moves; that premise-test step should have been in the R0 brief itself. The GRAPH failed once: it had no node for the measurement protocol, so critics judged raw HTML counts; the W4-era lesson from Run 2 was carried forward correctly here, but the brief still had to be corrected between W1 and W2. Amendment: add the `Computed-DOM Witness` node above and require every panel brief to state the provenance of each number. Scrapped anchors: none. One candidate (C7 CSP meta) was declined with a measured reason rather than left open.
+
+---
+
+## W2 Panel Report - WHOLE artifact, first clean saturation round (7 of 7 PASS)
+
+Artifact examined: FINAL `CHALLENGE_PAGE` after M4/M5, rendered at http://localhost:3191/ (12077 bytes) and headful Chromium at 320/390/1200 in both color schemes. Seven seats re-convened (two fresh, five resumed with their own doctrine intact), each briefed with computed DOM measurements and told whether each number was a DOM count or a serialization count. Automated task notifications, not user input.
+
+| Critic | Verdict | Andon | Observed |
+| --- | --- | --- | --- |
+| Debord | PASS | no | 0 "Protected by shadw" occurrences; copy names the sealed cookie, bounded retries, refusal and non-attestation |
+| Shklovsky | PASS | no | 0 numeric tokens; three prose clauses settle letter-spacing in sequence, no numerals/bars/checks/step numbers |
+| Holmes | PASS | no | sub contrast 5.74:1 light / 7.25:1 dark; every mismatch has a path |
+| Mace | PASS | no | staged trace opacity 1 at every frame, animation-name none under reduced-motion; script byte-identical, hidden pre-JS |
+| Krug | PASS | no | status "Running a short browser script. You will continue automatically." |
+| Tufte | PASS | no | 0 numeric tokens in visible copy; "bounded" is qualitative, not an implied quantity |
+| Sharp (Brand) | PASS | no | 1 inline data:image/png;base64 wordmark, exact bytes of shadw-logo-dark.png, 274x91 rendered 84x28 |
+
+Andon pulled: none. No ADAPT, SCRAP, REOPEN or new OPEN Frontier item. W1's two Andons are resolved by M4/M5 with re-measurements.
+
+## W3 Panel Report - WHOLE artifact, second consecutive clean round (7 of 7 PASS)
+
+Artifact UNCHANGED since W2. Seven seats re-convened with the same supplied computed measurements and no tool calls, one per literary reference.
+
+| Critic | Verdict | Andon | Observed |
+| --- | --- | --- | --- |
+| Debord | PASS | no | 6 "cookie" hits in visible copy; the relation is named, not displayed as a brand good |
+| Shklovsky | PASS | no | 0 numeric tokens; staggered spacing slows the eye without feigning completion |
+| Holmes | PASS | no | reduced-motion animation-name none on the trace; no-JS boundary stated, not hidden |
+| Mace | PASS | no | sub 5.74:1 light / 7.25:1 dark exceeds WCAG 2.2 1.4.3; text and status modes stay perceivable |
+| Krug | PASS | no | self-evident status; subcopy honestly limits the claim |
+| Tufte | PASS | no | 0 numeric tokens; "bounded" prints no count, opacity 1 implies no magnitude |
+| Sharp (Brand) | PASS | no | 1 inline data:image/png;base64 shadw wordmark; consistent distinctive asset, tokens and brand name survive copy changes |
+
+Andon pulled: none. W2 + W3 are two consecutive WHOLE rounds with no ADAPT, SCRAP, REOPEN or new OPEN Frontier item.
+
+### Frontier, final
+
+| Candidate | Reached via | Status |
+| --- | --- | --- |
+| C1 brand-token parity | `mb` outgoing | TAKEN M1 |
+| C2 inline real shadw wordmark | `wheeler` outgoing | TAKEN M2 |
+| C3 BREAK the bare h1/p/button | `samBreak` via `maya` dotted | TAKEN M2/M5 |
+| C4 measured contrast and 44px retry | `wcag` via `mace` incoming | TAKEN M1/M3 |
+| C5 honest status, no fake progress | `c_tufte` via `haraW` dotted | TAKEN M1/M2/M5 |
+| C6 preserve every security invariant | `c_premortem` outgoing | TAKEN M1 (byte-identical script) |
+| C7 restrictive CSP meta | `albers` adjacency | DECLINED with recorded reason (S5 ledger) |
+| C8 shadow as brand material | `tanizaki` outgoing | TAKEN M1/M2 |
+| R0-1..R0-7 (seven premortem objections) | `c_andon` outgoing | TAKEN M1/M2/M3, two sub-premises OVERRULED with measurement |
+| W1-1 Debord benefit claim | `c_andon` | TAKEN M4 |
+| W1-2 Shklovsky static trace | `c_andon` | TAKEN M5 |
+
+Zero OPEN items. No DEFERRED item left without a recorded reason.
+
+## Stop test (Run 3)
+
+| Condition | Status | Where |
+| --- | --- | --- |
+| S1 Frontier no OPEN items | MET | Frontier, final (above) |
+| S2 WHOLE round PASS from every required critic, no Andon | MET | W2 and W3, 7/7 PASS each |
+| S3 two consecutive clean WHOLE rounds | MET | W2 + W3, neither produced ADAPT/SCRAP/REOPEN/new OPEN Frontier item |
+| S4 ambition push measured | MET | "S4 ambition push (measured)" - inline logos 0->1, bytes 2861->12077, staged delays 0->3, letter-spacing 0.24px static -> 0.86/1.89/1.92px settling |
+| S5 every dotted edge applied or declined with a reason | MET | "S5 dotted-edge ledger" |
+
+Double-loop paragraph written (above). Carry-Forward Ledger appended to DESIGN-CARRY-FORWARD.md. Final reply states mode, tools, stop conditions and everything skipped.
+
+### Skipped or partially executed (honest record)
+
+- No production roll and no push: both need the operator word. The page was witnessed as the exact extracted HTML string served on loopback, NOT as a running fleet node under live attack traffic. This is a real limitation, not a claim of live-node verification.
+- No CSP meta added (C7): declined with a measured reason in the S5 ledger.
+- The footer no longer byte-matches the sibling password page's "Protected by shadw": M4 replaced that benefit claim at Debord W1's Andon. Both remain shadw-branded footers in the same type style, but exact footer parity is an accepted cost recorded here.
+- `prefers-contrast: more` is declared but was not separately measured headful; it is a progressive enhancement over the measured 5.74:1/7.25:1 baseline.
+- The `.dark` class toggle used by the dashboard is not available on this standalone edge page; `prefers-color-scheme` is the only honest mechanism here.
+- No test files were created. No new asset file, route, header or env var was added. 640 inherited pending gm PRD rows remain OPEN; AAA closure is NOT claimed by this run.
+- W1 Brand's first receipt referenced "matching footers at edge.rs:1968" before M4 changed the footer text; W2/W3 Brand re-judged the final footer and PASSed. The stale intermediate receipt is recorded, not silently dropped.
+
+## Final Compliance Check (Run 3)
+
+- [x] Tooling inventory done -> Step 0 table (Mermaid text, Frontier tables, Agent tool, gm.codesearch/fs_*/git_*, gm.chrome headful; no graph DB/diagram tool available).
+- [x] Mode stated with the reason -> Step 1: Adaptive, public audience + brand-match constraint; MAYA governing.
+- [x] Seed with exact labels, one dotted-edge counterpoint, living Frontier -> Step 1 seed/chain/Frontier; `maya -.->|bounds the break of| samBreak` and `haraW -.->|emptiness counterpoint to| c_tufte`.
+- [x] At least one BREAK move, no quota -> M2 and M5 BREAK; moves M1-M5, no quota used to stop.
+- [x] Decision Record before each move with all fields including dependencies -> M1, M2, M3 (before the first edit), M4, M5 (before the second edit).
+- [x] Panel Report per round, Adaptive composition, each critic cites an observable -> R0 (7 seats, all OBJECT+Andon), W1 (7 seats, 5 PASS / 2 Andon), W2 (7/7 PASS), W3 (7/7 PASS).
+- [x] Every OBJECT resolved ADAPT/SCRAP/OVERRULE with dependents reopened -> R0: 7 ADAPT with 2 sub-premises OVERRULED by measurement; W1: 2 ADAPT (M4/M5) with M1/M2 marked REOPENED; W2/W3: none.
+- [x] WHOLE rounds run; S1-S5 shown as met -> stop test table above.
+- [x] Every figure re-measured at final state with a procedure -> Step 2g table (AFTER M4/M5).
+- [x] Anchor Ledger complete and live graph updated -> S5 dotted-edge ledger, Anchor Ledger roles in the seed/chain, live Mermaid in Step 1 and the W1/W2 graph update with `visited`/`kept`/`adapted` classes.
+- [x] Double-loop paragraph written -> "Double loop (Run 3)".
+- [x] Final reply states mode, tools, stop conditions and everything skipped -> final reply of this session.
+
+---
+
+## Anchor Ledger (Run 3, added after W3)
+
+| Anchor | Role | Status | Evidence | Replacement or note |
+| --- | --- | --- | --- | --- |
+| "An Incomplete Manifesto for Growth (Bruce Mau)" (`mauM`) | Stance | KEEP | M1/M2/M5 each opened a new candidate from the same stance | survived R0 Debord's "spectacle" objection, the strongest it faced |
+| "Grid Systems in Graphic Design (Josef Müller-Brockmann)" (`mb`) | Rule | KEEP | card max-width 360px, one alignment axis, 14px radius | survived `samBreak -.->|loosens| mb` via the loosened trace |
+| "WCAG 2.2 Contrast and Perceivability (W3C)" (`wcag`) | Rule | KEEP | 16:1 / 5.74:1 / 7.25:1 / 19.8:1 measured headful | survived Mace R0's "contrast undetermined" objection |
+| "Ten Principles of Good Design (Dieter Rams)" (`rams`) | Rule | KEEP | one retry control, one entrance animation, 0 spinners | strongest objection: Tufte R0's fake-progress fence, satisfied |
+| "Designing Brand Identity (Alina Wheeler)" (`wheeler`) | Brand anchor | KEEP | 1 inline real wordmark, 24 shared HSL tokens | survived Brand R0's "0 distinctive assets" |
+| "The Vignelli Canon (Massimo Vignelli)" (`vignelliCanon`) | Brand anchor | KEEP | one system: dashboard tokens, password-page geometry, challenge page | footer parity partially traded away by M4, recorded as accepted cost |
+| "Making and Breaking the Grid (Timothy Samara)" (`samBreak`) | Breaker | ADAPT | M2 broke the bare page; M5 loosened the static trace | bounded by MAYA; byte-identical script is the fence |
+| "MAYA: Most Advanced Yet Acceptable (Raymond Loewy)" (`maya`) | Counterpoint (dotted) | ADAPT | both poles held through all five moves | used to refuse the two gate-weakening R0 requests |
+| "In Praise of Shadows (Jun'ichirō Tanizaki)" (`tanizaki`) | Counterpoint (dotted) | KEEP | dark-first surface with a 1px physically-motivated top-edge light | strongest objection: Holmes R0 "one assumed light-mode reader", answered by full light/dark parity |
+| "White (Kenya Hara)" (`haraW`) | Counterpoint | KEEP | empty status line, 0 printed numbers | survived Tufte W1/W2/W3 |
+| "Tufte Style" (`c_tufte`) | Catalog counterpoint | KEEP | 0 numeric tokens at final state | fence against M5 becoming a progress gauge |
+| "Premortem" (`c_premortem`) | Catalog | ADAPT | R0 7/7 Andon before the first move | W1/W2/W3 iterate-back rounds added the Computed-DOM Witness protocol |
+| "Andon" (`c_andon`) | Catalog | KEEP | R0 7, W1 2, W2 0, W3 0 Andons | graph amendment: briefs now state whether a number is DOM or serialization |
+| "ADR according to Nygard" (`c_adr`) | Catalog | KEEP | M1-M5 records with dependencies and fences | two unsafe sub-premises OVERRULED with measurement, recorded in R0 report |
+| "The Difference (Scott E. Page)" (`page`) | Panel method | KEEP | 7 seats chosen for maximum cognitive difference | seats judged raw counts in W1, corrected by the protocol amendment |
+| "Critical Response Process (Liz Lerman, John Borstel)" (`lerman`) | Panel method | KEEP | R0 report runs statements -> artist questions -> critic questions -> opinions | - |
+| "Computed-DOM Witness" | NEW node (graph amendment) | ADAPT | W2 briefs name DOM vs serialization counts; W2/W3 7/7 PASS | added on a dotted edge from `c_premortem` |
+| "The Society of the Spectacle (Guy Debord)" (`debord`) | Lens | KEEP | W1 Andon forced M4; W2/W3 PASS | benefit claim deleted, relation stated |
+| "Art as Technique (Viktor Shklovsky)" (`shklovsky`) | Lens | KEEP | W1 Andon forced M5; W2/W3 PASS | staged typography without a progress gauge |
+| "Interaction of Color (Josef Albers)" (`albers`) | Rule | KEEP | measured contrast bounds the dark/light interaction | C7 CSP candidate from this anchor DECLINED with reason |
+
+Scrapped anchors: none. All KEEP rows name the strongest objection they survived.
