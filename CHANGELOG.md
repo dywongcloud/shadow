@@ -1,5 +1,57 @@
 # Changelog
 
+## 2026-11-24 - push and backend roll of the challenge fix
+
+At the operator's word (`push and deploy/roll`), the four local commits
+`c66ae302..193be01f` were pushed and the backend was rolled. No UI roll (zero
+`ui/` files in the range), no IP deny, no SSH change, no inventory edit.
+
+Pre-roll gates on the final tree: `scripts/audit-secret-keys.sh` 6/6 clean;
+`scripts/check-contract-bindings.py --check` RESULT PASS bindings=34 layers=4
+gates=35; `cargo test --workspace --locked` TEST_EXIT=0;
+`scripts/cli-acceptance.sh` 35 passed / 0 failed (its first run hit the 300 s
+timeout and exited 124; the rerun with a warm build cache exited 0);
+`git diff --check` 0; ansible `--syntax-check` exit 0. Pushed SHA
+`193be01f239a67b371d17cc95f0bd93147382858` confirmed on GitHub
+`repos/dywongcloud/shadow/branches/main`, ahead 0 / behind 0.
+
+GitHub CI run 45315644161 is NOT a code verdict: all 11 jobs have
+`runner_id=0`, `steps=0`, 1-2 s durations and zero log lines, and the check-run
+annotation reads "The job was not started because recent account payments have
+failed or your spending limit needs to be increased. Please check the 'Billing
+& plans' section in your settings". That is the same billing abort as the prior
+push. The local gates above are the substitute witnesses; fixing the billing
+state is an operator account action, not a code change.
+
+Roll: `ansible-playbook playbooks/parallel-deploy.yml --tags backend --limit
+'fc-orlando:va:va3:sj:sj7:phx'`, default serial 1 (no
+`deploy_serial_backend` override), the live-only limit. The playbook was
+launched with `start_new_session=True` and no inherited pipes: the previous
+roll's first detached attempt died mid-push when its launching task ended.
+ROLL_EXIT=0, PLAY RECAP `failed=0 unreachable=0` on all 6 hosts, `BACKEND
+VERIFIED: 6/6 hosts run the controller and install the cell agent built in
+this run`, controller or agent content changed on 6 hosts, controllers
+`36df83f1994f`, cell agents `d15d323d8b10`. Re-kicks converged (fc-orlando
+4/4, va 3/3, va3 3/3 visible healthy peers).
+
+Independent running-binary proof (never a Rust format literal): on all 6 nodes
+`sha256sum /proc/<MainPID>/exe` = `36df83f1994f6438` (was `399e903fbe295233`),
+and `strings -a /proc/<MainPID>/exe | grep -c` finds `challenge-failed`=1,
+`rejected nonce`=1 and `The security check was not accepted`=2. `hive-node`
+is active on all 6; `hive-devhub.service` stayed active on fc-orlando. A
+fleet-vantage sweep from va3 returns 200 on all 6 public IPs over both
+HTTP/1.1 and HTTP/2, twice each; two brief TLS warm-up timeouts on sj/sj7
+immediately after their restarts cleared without intervention.
+
+HELD, and not claimed as witnessed: the live challenge-page behaviour after
+the roll. Attack Challenge Mode's 1 h window auto-expired during the roll
+(`active=false` on 5 nodes; sj7 has a newer epoch and is active), and public
+traffic is served by fc-sanjose whose mode is off, so `edge_gate` correctly
+bypasses and the tenant app is served. Re-arming the mode would gate ALL
+public traffic behind the challenge again and needs its own operator word.
+The pre-roll headful-browser witness (see the entry below) covered the exact
+emitted page against the real geniee.site solve decisions. NO_TEST_FILES.
+
 ## 2026-11-24 - Attack Challenge Mode: terminate a failed solve
 
 Project-scoped Attack Challenge Mode could stall on "Security check" or reload
