@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-11-24 - Attack Challenge Mode: terminate a failed solve
+
+Project-scoped Attack Challenge Mode could stall on "Security check" or reload
+forever. `challenge_page` used `fetch(...).then(function(){location.reload()})`
+with no success check, no `.catch` and no retry bound; a rejected nonce returns
+a **200 challenge page**, so `.then()` fired and the browser reloaded into a
+fresh nonce indefinitely. A fetch that never resolved simply stalled with no
+message. Live read-only witnesses on geniee.site confirm all three rejected
+token shapes (bad nonce, expired nonce, bad cookie) answer 200
+`x-hive-firewall-action: challenge`; all six DNS IPs serve the challenge and all
+six nodes report the same mode epoch (`updated_ms=1795476755397`), so this is a
+client-handshake defect, not state divergence.
+
+A solve is now accepted only on an explicit `challenge-solved` signal (or its
+exact `verified` body). Before reloading, a `cache: no-store` probe on the same
+path proves the sealed `hive_fw` cookie landed, so a browser that refuses
+cookies or a CDN replaying the solve body cannot restart the challenge. Any
+other answer - a rejected nonce, a redirect, a 403, a cached or service-worker
+page - shows a visible error with a manual retry, never an automatic reload.
+`.catch` reports a fetch that never resolves, `<noscript>` has its own message,
+and automatic attempts are bounded to three within 30 seconds via
+`sessionStorage`. The inline script keeps NO caller-controlled text, NO form
+action and NO Location; the nonce is filtered to an alphanumeric/dot allowlist
+because HTML entities are not decoded inside a `<script>` element.
+
+The solve response now carries `Cache-Control: no-store` (it holds a
+`Set-Cookie` on the page's own URL), and a rejected cookie or nonce emits the
+`challenge-failed` action that the observability vocabulary already documented
+but no code produced. `RESIDUALS` records the extra probe request and the case
+where a body-rewriting proxy can defeat the probe's markers.
+
+Witnessed this turn: `cargo check -p hive-cloud --locked --offline` exit 0;
+`git diff --check` exit 0; headful Chromium against the exact emitted page
+relayed to the real geniee.site - success reaches the real 11,675-byte app page
+after one reload, rejection shows the visible error with one attempt and zero
+reloads, both with 0 console errors. Local work only: NO push and NO roll.
+
 ## 2026-11-23 - UI roll and fail2ban apply
 
 At the operator's word (`proceed with the UI roll, fail2ban apply`), two

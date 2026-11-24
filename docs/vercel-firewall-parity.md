@@ -28,6 +28,20 @@ loopback). Cookies are bound to (project, host, mode generation, expiry) with
 a distinct HMAC domain separator over the fleet-shared at-rest key, verified
 with `admin::ct_eq`. A `verified_bot_bypass` opt-in is OFF by default.
 
+The solve handshake is TERMINAL, not a reload loop. A solve is accepted only
+on the `x-hive-firewall-action: challenge-solved` response (or its exact
+`verified` body); a rejected nonce, a redirect, a 403, a cached page or a
+service-worker answer shows a visible failure with a manual retry instead of
+calling `location.reload()`. Before reloading, a second `cache: no-store`
+request proves the sealed cookie actually landed, so a browser that refuses
+cookies or a CDN replaying the solve body cannot restart the challenge.
+`.catch` reports a fetch that never resolves, and automatic attempts are
+bounded to three within 30 seconds. There is a `<noscript>` fallback. The
+solve response carries `Cache-Control: no-store` because it holds a
+`Set-Cookie` on the page's own URL. Rejected cookies and nonces emit the
+`challenge-failed` action in the node-local event ring; they used to fall
+through to a fresh 200 challenge page with no record of the rejection.
+
 ## Sensitive-path denial (always-on system mitigation)
 
 The gate runs at the TOP of `edge_pipeline_inner`, BEFORE ACME, before any
@@ -117,6 +131,9 @@ keeps them closed with mode ON. Corpus and witness outputs are in
   deployment-password unlock token).
 - Triple-encoded traversal (`%25252e...`) survives the bounded double decode;
   static bypass prefixes beyond the listed asset classes.
+- The cookie probe costs one extra same-origin GET per solve plus one reload.
+  A proxy that rewrites the HTML body can defeat its body markers; the client
+  then shows a visible failure rather than restarting a reload loop.
 - No 1:1 Vercel Firewall or BotID SDK equivalence. No challenge cookie name
   and no challenge HTTP status are documented by Vercel; `hive_fw` and the
   200 challenge page are platform-specific.

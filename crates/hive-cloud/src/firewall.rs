@@ -365,22 +365,85 @@ fn header_value(headers: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
-/// A bounded challenge screen. It contains NO caller-controlled text, NO form
-/// action and NO Location. The browser re-fetches the SAME path with a sealed
-/// nonce header; the server then sets the cookie and the page reloads. This is
-/// a JavaScript-capability gate, NOT Vercel's proprietary browser attestation.
+/// A challenge screen with ONE terminal failure path. NO caller-controlled
+/// text, NO form action and NO Location. A solve is accepted only when the
+/// server answers with an explicit `challenge-solved` signal; any other
+/// outcome (a 200 challenge page from a rejected nonce, a redirect, a 403,
+/// a cached or service-worker response) is a FAILURE shown to the visitor,
+/// never an unconditional `location.reload()`.
+///
+/// Before reloading, a second request proves the sealed cookie actually
+/// landed. Without that proof a browser that refuses the cookie (or a CDN
+/// replaying the solve response) reloads into another challenge page forever.
+/// `.catch` covers a fetch that never resolves, which otherwise stalls on
+/// "Security check" with no message. A manual retry mints a fresh nonce.
+/// This is a JavaScript-capability gate, NOT browser attestation.
+const CHALLENGE_PAGE: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Security check</title>
+<style>body{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;line-height:1.6}button{font:inherit;margin-top:.5rem;padding:.5rem .9rem}</style>
+</head><body><h1>Security check</h1>
+<p id="hive-fw-status" role="status">Checking that this request comes from a browser. You will continue automatically.</p>
+<button type="button" id="hive-fw-retry" hidden>Try again</button>
+<noscript><p>JavaScript is required to complete this check. Enable it and reload the page.</p></noscript>
+<script>
+(function(){
+  var status=document.getElementById('hive-fw-status');
+  var retry=document.getElementById('hive-fw-retry');
+  var KEY='hive_fw_challenge_attempts';
+  function fail(msg){status.textContent=msg;retry.hidden=false;}
+  function reset(){try{sessionStorage.removeItem(KEY);}catch(e){}}
+  retry.addEventListener('click',function(){reset();location.reload();});
+  var now=Date.now(),start=now,n=0;
+  try{
+    var raw=sessionStorage.getItem(KEY),p=raw?raw.split(':'):null;
+    if(p&&p.length===2&&Number(p[0])>0&&now-Number(p[0])<30000&&Number(p[1])>0){
+      start=Number(p[0]);n=Number(p[1]);
+    }
+    sessionStorage.setItem(KEY,start+':'+(n+1));
+  }catch(e){}
+  if(n>=3){fail('The security check could not be completed. Please try again.');return;}
+  function probe(){
+    return fetch(location.href,{method:'GET',credentials:'same-origin',cache:'no-store'})
+      .then(function(p){return p.text().then(function(body){
+        // A legitimate app response may be a 404 or a redirect: only a
+        // challenge page (or a replayed "verified" solve body) means the
+        // sealed cookie did not land. Check all three signals so a CDN that
+        // strips the action header still cannot restart a reload loop.
+        var again=p.headers.get('x-hive-firewall-action')==='challenge'||
+                  body.trim()==='verified'||body.indexOf('hive-fw-status')>=0;
+        if(!again){reset();location.reload();}
+        else{fail('This browser did not keep the security cookie. Please enable cookies and try again.');}
+      });});
+  }
+  fetch(location.href,{
+    method:'GET',credentials:'same-origin',cache:'no-store',
+    headers:{'x-hive-challenge':'__HIVE_NONCE__'}
+  }).then(function(r){
+    if(!r.ok){fail('The security check was not accepted. Please try again.');return;}
+    return r.text().then(function(body){
+      if(r.headers.get('x-hive-firewall-action')==='challenge-solved'||body.trim()==='verified'){
+        return probe();
+      }
+      fail('The security check was not accepted. Please try again.');
+    });
+  }).catch(function(){
+    fail('The security check could not reach the server. Please try again.');
+  });
+})();
+</script>
+</body></html>"##;
+
 pub fn challenge_page(nonce: &str) -> String {
-    let safe = crate::edge::html_escape(nonce);
-    format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Security check</title>\
-<style>body{{font-family:system-ui,sans-serif;max-width:36rem;margin:4rem auto;padding:0 1rem;line-height:1.6}}</style>\
-</head><body><h1>Security check</h1>\
-<p>Checking that this request comes from a browser. You will continue automatically.</p>\
-<script>fetch(location.href,{{headers:{{'x-hive-challenge':'{safe}'}},credentials:'same-origin'}}).then(function(){{location.reload()}});</script>\
-</body></html>"
-    )
+    // The nonce is server-minted, but a strict allowlist keeps the inline
+    // <script> a closed string context even if the token format changes.
+    // HTML entities are NOT decoded inside a script element, so this is not
+    // html_escape: an escaped token would silently stop verifying.
+    let safe: String = nonce
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.')
+        .collect();
+    CHALLENGE_PAGE.replace("__HIVE_NONCE__", &safe)
 }
 
 // ---------------------------------------------------------------------------
@@ -645,26 +708,34 @@ pub fn edge_gate(
         return None;
     };
     let cookie = crate::edge::cookie_value(headers, FW_COOKIE);
-    if cookie
-        .as_deref()
-        .is_some_and(|v| verify_cookie(v, &project, host, mode_ms, now))
-    {
-        log_decision(c, region, method, host, &norm, 200, "pass_cookie", "sealed cookie", &project);
-        return None;
+    if let Some(v) = cookie.as_deref() {
+        if verify_cookie(v, &project, host, mode_ms, now) {
+            log_decision(c, region, method, host, &norm, 200, "pass_cookie", "sealed cookie", &project);
+            return None;
+        }
+        // A stale cookie used to fall through to a fresh 200 challenge page
+        // with no record of the rejection, so a browser stuck in a reload
+        // loop was invisible in the event ring. Record the real decision.
+        log_decision(c, region, method, host, &norm, 200, "challenge-failed", "rejected cookie", &project);
     }
     let nonce = header_value(headers, FW_NONCE_HEADER);
-    if nonce
-        .as_deref()
-        .is_some_and(|v| verify_nonce(v, &project, host, mode_ms, now))
-    {
-        let token = seal_cookie(&project, host, mode_ms, now);
-        log_decision(c, region, method, host, &norm, 200, "challenge-solved", "sealed nonce", &project);
-        let mut resp = (StatusCode::OK, "verified").into_response();
-        if let Ok(v) = HeaderValue::from_str(&cookie_header(&token, host, headers)) {
-            resp.headers_mut().insert(header::SET_COOKIE, v);
+    if let Some(v) = nonce.as_deref() {
+        if verify_nonce(v, &project, host, mode_ms, now) {
+            let token = seal_cookie(&project, host, mode_ms, now);
+            log_decision(c, region, method, host, &norm, 200, "challenge-solved", "sealed nonce", &project);
+            let mut resp = (StatusCode::OK, "verified").into_response();
+            if let Ok(v) = HeaderValue::from_str(&cookie_header(&token, host, headers)) {
+                resp.headers_mut().insert(header::SET_COOKIE, v);
+            }
+            // The solve carries a Set-Cookie and shares its URL with the page.
+            // Without no-store a shared cache can replay "verified" to other
+            // visitors, or replay it to the solver instead of the real page.
+            resp.headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            set_fw_headers(&mut resp, region, "challenge-solved");
+            return Some(resp);
         }
-        set_fw_headers(&mut resp, region, "challenge-solved");
-        return Some(resp);
+        log_decision(c, region, method, host, &norm, 200, "challenge-failed", "rejected nonce", &project);
     }
     if m.verified_bot_bypass {
         if let Some(name) = verified_bot(ua) {
@@ -713,7 +784,8 @@ const RESIDUALS: &[&str] = &[
     "AMBIGUOUS names (config.js, settings.json, app.js, Dockerfile) are never hard-denied; they are only challenged while Attack Mode is active, so a legitimate tenant asset is not broken.",
     "A path the bounded normalizer refuses is rejected with a fixed 400 rather than admitted. Non-idempotent methods (POST/PUT/DELETE/PATCH) are refused with a fixed 503 during Attack Mode because the JavaScript challenge would otherwise silently lose the request body. EventSource/SSE clients cannot execute the challenge; they are covered by the same refusal.",
     "Firewall state and events are NODE-LOCAL: there is no owner proxy, gossip dispatch arm or fleet fanout for the event ring; six round-robin dashboard reads return six disjoint rings. A mode toggle is durably persisted but is not fanned out to every owner-chain candidate by db_replicate::fanout_all.",
-    "The challenge is a JavaScript-capability gate, NOT Vercel's proprietary browser attestation. A scripted client that executes JavaScript can solve it.",
+    "The challenge is a JavaScript-capability gate, NOT Vercel's proprietary browser attestation. A scripted client that executes JavaScript can solve it. A rejected or stalled solve is now TERMINAL: a visible error with a manual retry, never an unbounded reload loop; automatic attempts are bounded to three within 30 seconds.",
+    "The probe that proves the sealed cookie landed is a client-side GET on the same path, so it consumes one request per solve. A CDN that rewrites or strips x-hive-firewall-action is detected by the body markers, but a proxy that rewrites the HTML body itself can still defeat the check.",
     "Verified-bot matching uses the User-Agent string only and is SPOOFABLE. No reverse-DNS/IP verification, no bot score, no JA4/JA3 and no BotID private signal network.",
     "Page integrity is DETECTION only. There is no CSP script-src enforcement, no nonce injection, no script inventory approval workflow and no browser blocking.",
     "L3/L4 volumetric DDoS absorption, anycast scrubbing and Vercel's automatic network-layer mitigation are NOT implemented and cannot be implemented in application code. L7 rate limiting reuses the existing shared primitive.",
