@@ -69,3 +69,13 @@ that still exists; DESIGN-LOG.md keeps the historical records.
 
 
 # Run 2 carry-forward rows (2026-11-24): see DESIGN-LOG.md "Carry-Forward Ledger (Run 2)" for the seven measured facts. Read both before Step 1 of a later run on this project.
+
+# Run 2 W3-W5 carry-forward (2026-11-24)
+
+In Next 16 RSC output, a raw HTML grep of a class string counts it twice: once in the rendered markup and once in the flight payload. W4 Shklovsky raw-counted 24 underlines and 4 leads; the live DOM measured 10 underlines and 2 lead titles. W4 Debord raw-counted 4 scroll hints where the DOM has 2 figures. Always state whether a number is a DOM count or a serialization count, and give critic panels the computed DOM value. The W4 frame swap added a Computed-DOM Witness node in DESIGN-LOG.md; W5 returned 7/7 PASS with no Andon after that correction.
+
+A focusable overflow-x-auto region with role=region, tabIndex=0 and an aria-label is enough to make a full-resolution figure reachable by keyboard and touch without new JS; measured at 320/390px with scrollLeft=400, sw=2880, cw=285/355, page overflow-x=clip. A resting title underline is a link affordance, not a frame; removing it to satisfy an automatism objection would reverse the equitable-use ADAPT.
+
+Three consecutive objection rounds (W2 ADAPTs, W3 tool failures, W4 serialization miscounts) are a signal about the panel protocol, not always about the artifact. Fix the measurement path, re-convene with supplied DOM values, and record the frame swap.
+
+Read DESIGN-LOG.md "Final Compliance Check" and "Skipped or partially executed" before Step 1 of a later run on this project.
