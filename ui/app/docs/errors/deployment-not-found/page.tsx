@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { ExternalLink } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
+import { DocsSection as Section } from "@/components/docs/docs-ui";
 
 const DESC =
   "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, or an unattached custom domain — and how it differs from 503 DEPLOYMENT_NOT_READY.";
@@ -13,15 +14,6 @@ export const metadata: Metadata = pageMeta({
   description: DESC,
   path: "/docs/errors/deployment-not-found",
 });
-
-function Section({ id, title, children }: { id: string; title: string; children: React.ReactNode }) {
-  return (
-    <section id={id} className="scroll-mt-20 border-t border-border pt-12 first:border-0 first:pt-0">
-      <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">{title}</h2>
-      <div className="mt-5 space-y-4 text-[15px] leading-relaxed text-secondary">{children}</div>
-    </section>
-  );
-}
 
 function Cause({ title, children }: { title: string; children: React.ReactNode }) {
   return (

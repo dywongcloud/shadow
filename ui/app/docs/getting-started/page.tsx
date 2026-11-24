@@ -3,7 +3,12 @@ import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { ArrowRight } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
-
+import {
+  DocsSection as Section,
+  DocsH3 as H3,
+  DocsIn as In,
+  DocsCallout as Callout,
+} from "@/components/docs/docs-ui";
 
 export const metadata: Metadata = pageMeta({
   title: "Getting Started — Docs",
@@ -15,27 +20,6 @@ export const metadata: Metadata = pageMeta({
   path: "/docs/getting-started",
 });
 
-function Section({ id, title, eyebrow, children }: { id: string; title: string; eyebrow?: string; children: React.ReactNode }) {
-  return (
-    <section id={id} className="scroll-mt-20 border-t border-border pt-12 first:border-0 first:pt-0">
-      {eyebrow && <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">{eyebrow}</div>}
-      <h2 className="text-2xl font-semibold tracking-tight sm:text-3xl">{title}</h2>
-      <div className="mt-5 space-y-4 text-[15px] leading-relaxed text-secondary">{children}</div>
-    </section>
-  );
-}
-function H3({ children }: { children: React.ReactNode }) {
-  return <h3 className="!mt-8 text-lg font-semibold text-fg">{children}</h3>;
-}
-function In({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-subtle px-1.5 py-0.5 font-mono text-[0.85em] text-fg">{children}</code>;
-}
-function Callout({ children, tone = "info" }: { children: React.ReactNode; tone?: "info" | "warn" }) {
-  const cls = tone === "warn"
-    ? "border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-    : "border-link/30 bg-link/5 text-secondary";
-  return <div className={`rounded-lg border px-4 py-3 text-sm ${cls}`}>{children}</div>;
-}
 function One({ code, lang, filename }: { code: string; lang: "ts" | "bash" | "python" | "json"; filename?: string }) {
   return <CodeBlock tabs={[{ label: filename ?? lang, code, lang, filename }]} />;
 }
@@ -127,8 +111,8 @@ fluidctl ls                        # list deployments
 hivectl submit --image node:20 -c 'npm ci' -c 'npm run build' --follow`} />
         </Section>
 
-        <Section id="api" eyebrow="Reference" title="API reference">
-          <p>All endpoints live under <In>https://api.shadw.cloud</In> (self-hosting: your node&apos;s admin API). Authenticate with a platform <strong className="text-fg">API key</strong> (<In>hive_…</In>, created under Settings → API Keys or <In>POST /v1/apikeys</In>) via <In>Authorization: Bearer</In> — the key is bound to its team, so no team header is needed. Without a key, the <In>x-hive-team</In> header scopes requests in dev mode (no <In>HIVE_JWT_SECRET</In>); when <In>HIVE_JWT_SECRET</In> is set, mutations need a JWT or an API key, and <In>POST /v1/token</In> is server-only.</p>
+        <Section id="api" eyebrow="Reference" title="API basics">
+          <p>All endpoints live under <In>https://api.shadw.cloud</In> (self-hosting: your node&apos;s admin API). Authenticate with a platform <strong className="text-fg">API key</strong> (<In>hive_…</In>, created under Settings → API Keys or <In>POST /v1/apikeys</In>) via <In>Authorization: Bearer</In> — the key is bound to its team, so no team header is needed. An API key&apos;s role caps at its minter&apos;s role, so a viewer key cannot perform a write. The <In>x-hive-team</In> header scopes requests only on a dev node without <In>HIVE_JWT_SECRET</In>; on an enforced node, mutations need a JWT or an API key, and <In>POST /v1/token</In> is server-only. See the <Link href="/docs/api-reference" className="text-link hover:underline">API reference</Link> for the full endpoint catalog.</p>
           <ApiTable />
         </Section>
 

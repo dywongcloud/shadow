@@ -2735,3 +2735,215 @@ The criterion did not fail: MAYA's two poles explained every disagreement, and t
 - Residual honest gap: our beams measure FWHM 209/179px against the reference 239/281px (~13-36% narrower), and the right beam fades slightly earlier. The 1:1 claim is about the exact extracted GEOMETRY (matrices, stops, angles, corner anchoring and additive core), not a byte-identical pixel match.
 
 Resume point if the owner wants a further sweep: widen the two authored beams by ~15% at the 0.5-radius stop and re-run Step 2g, then seat a W4 WHOLE round with the S4 tension node added to the graph and the five retrospective Decision Records rewritten before a new move.
+
+
+# =============================================================================
+# RUN 2 - shadw.cloud/docs finish line (2026-11-24)
+# Fresh run: Run 1 frontier is CLOSED (S1-S5 MET, two honest misses recorded).
+# Brief: /docs is incomplete and its UI/UX inconsistent. Update it with the
+# current platform, real dashboard screenshots and examples, and a cohesive
+# Vercel-grade theme. Drive it with an adversarial gm swarm. No push, no roll.
+# =============================================================================
+
+## Step 0. Tooling inventory
+
+| Job | Tool available | Used |
+| --- | --- | --- |
+| Graph render / navigate | none (no Mermaid or DAG renderer in this build) | Mermaid text in this log |
+| Frontier computation | gm.exec_js / gm.fs_read | hand-computed from graph edge lines |
+| Workflow state | Workflow tool (phases), gm.pipeline implicitly; gm.phase_status / prd_list | Workflow wa8ay19wh + gm verbs |
+| Panel | Workflow tool agent() and Agent tool, one agent per literary reference | Workflow panel |
+| Persistence | gm.fs_write (append), Read/Write host tools | DESIGN-LOG.md (this file) |
+| Browser witness | gm.chrome / headful Chromium (headless:false required) | pending |
+| Measurement | gm.sh, python3 -I, host Bash | pending |
+
+## Step 1. Traversal Plan
+
+Brief in one sentence: make the public shadw.cloud/docs surface complete,
+accurate and visually coherent for developers, with real product screenshots,
+without copying a rival brand or weakening a security gate.
+
+Mode: **Adaptive**. Reason: this is a public developer-facing documentation
+site with an explicit approachability constraint ("Vercel style branding",
+cohesive theme). MAYA governs: the advanced pole is a complete, systematic,
+current docs surface; the acceptable pole is familiar navigation, readable
+type, working anchors and zero gimmicks. Both must hold.
+
+### Seed (labels copied verbatim from references/anchor-graph.md)
+
+- Stance: `How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)`
+- Rule: `Ten Principles of Good Design (Dieter Rams)`
+- Rule: `Grid Systems in Graphic Design (Josef Müller-Brockmann)`
+- Rule: `The Elements of Typographic Style (Robert Bringhurst)`
+- Rule: `WCAG 2.2 Contrast and Perceivability (W3C)`
+- Welcome: `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)`
+- Welcome: `Don't Make Me Think (Steve Krug)`
+- Breaker: `Making and Breaking the Grid (Timothy Samara)`
+- Counterpoint by dotted edge: `Interaction of Color (Josef Albers)` (reached by `wcag -.->|contrast floor constrains| albers`)
+- Catalog: `Premortem`, `Double Diamond`, `Tufte Style`, `Occam's Razor`
+
+### Chain (edge label between each pair)
+
+`How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)`
+  -.->|wit lineage from| `The Art of Looking Sideways (Alan Fletcher)`
+  -->|process maxims for| `An Incomplete Manifesto for Growth (Bruce Mau)`
+  -->|process maxims for| `Double Diamond`
+  -.->|iterate back to| `Premortem` (incoming, grounds the R0 round)
+; `Ten Principles of Good Design (Dieter Rams)` -->|less but better| `Occam's Razor`
+; `Grid Systems in Graphic Design (Josef Müller-Brockmann)` -->|codifies| `International Typographic Style (Swiss Style)`
+; `Making and Breaking the Grid (Timothy Samara)` -.->|loosens| `Grid Systems in Graphic Design (Josef Müller-Brockmann)`
+; `WCAG 2.2 Contrast and Perceivability (W3C)` -.->|contrast floor constrains| `Interaction of Color (Josef Albers)`
+; `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` -.->|tempers strangeness of| `Art as Technique (Viktor Shklovsky)`
+; `The Visual Display of Quantitative Information (Edward Tufte)` -->|names| `Tufte Style`.
+
+### Initial Frontier (one hop from the seed, both directions)
+
+## Frontier
+
+| Candidate | Reached via (edge label, direction) | From anchor | Status |
+| --- | --- | --- | --- |
+| R0 premortem on the inherited /docs | Premortem -.-> iterate back to Double Diamond (incoming) | `Double Diamond` | OPEN |
+| One shared docs primitive (section/callout/figure/breadcrumb) | `Ten Principles of Good Design (Dieter Rams)` --> less but better | `Occam's Razor` | OPEN |
+| Repair dead nav anchors and duplicate labels | `Don't Make Me Think (Steve Krug)` (welcome, incoming to panel) | `Don't Make Me Think (Steve Krug)` | OPEN |
+| Add current platform content pages | `How to Use Graphic Design to Sell Things...` stance (outgoing) | Bierut | OPEN |
+| Real dashboard screenshots with captions | `The Visual Display of Quantitative Information (Edward Tufte)` --> names | `Tufte Style` | OPEN |
+| Contrast / focus / responsive audit | `WCAG 2.2 Contrast and Perceivability (W3C)` -.-> contrast floor constrains | `Interaction of Color (Josef Albers)` | OPEN |
+| Break the single-column docs grid for an editorial landing | `Making and Breaking the Grid (Timothy Samara)` -.-> loosens | `Grid Systems in Graphic Design (Josef Müller-Brockmann)` | OPEN |
+| Ambition push on the docs hero | MAYA advanced pole (dotted counterpoint) | `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | OPEN |
+| Deletion review of stale docs copy | `Occam's Razor` (incoming) | `Ten Principles of Good Design (Dieter Rams)` | OPEN |
+
+### First moves (tagged)
+
+- M1: R0 premortem panel on the inherited artifact (KEEP-THE-RULE, no code move).
+- M2: one shared docs primitive + nav repair (KEEP-THE-RULE).
+- M3: current-platform content + real screenshots (KEEP-THE-RULE).
+- M4: BREAK the docs grid with an editorial overview hero (BREAK).
+- M5: ambition push + deletion review + final-state 2g re-measurement (BREAK).
+
+### Live graph (Mermaid text; no renderer in this build)
+
+```mermaid
+flowchart LR
+  bierut["How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)"]:::stance
+  rams["Ten Principles of Good Design (Dieter Rams)"]:::rules
+  mb["Grid Systems in Graphic Design (Josef Müller-Brockmann)"]:::rules
+  bring["The Elements of Typographic Style (Robert Bringhurst)"]:::rules
+  wcag["WCAG 2.2 Contrast and Perceivability (W3C)"]:::rules
+  albers["Interaction of Color (Josef Albers)"]:::rules
+  itstyle["International Typographic Style (Swiss Style)"]:::rules
+  samBreak["Making and Breaking the Grid (Timothy Samara)"]:::break
+  maya["MAYA: Most Advanced Yet Acceptable (Raymond Loewy)"]:::welcome
+  krug["Don't Make Me Think (Steve Krug)"]:::welcome
+  shklovsky["Art as Technique (Viktor Shklovsky)"]:::welcome
+  tufteV["The Visual Display of Quantitative Information (Edward Tufte)"]:::express
+  c_occam["Occam's Razor"]:::catalog
+  c_tufte["Tufte Style"]:::catalog
+  c_dd["Double Diamond"]:::catalog
+  c_premortem["Premortem"]:::catalog
+  mauM["An Incomplete Manifesto for Growth (Bruce Mau)"]:::stance
+  bierut -.->|wit lineage from| sideways
+  rams -->|less but better| c_occam
+  mb -->|codifies| itstyle
+  samBreak -.->|loosens| mb
+  wcag -.->|contrast floor constrains| albers
+  maya -.->|tempers strangeness of| shklovsky
+  tufteV -->|names| c_tufte
+  mauM -->|process maxims for| c_dd
+  c_premortem -.->|iterate back to| c_dd
+  class bierut,rams,mb,bring,wcag,albers,itstyle,samBreak,maya,krug,shklovsky,tufteV,c_occam,c_tufte,c_dd,c_premortem,mauM visited
+```
+
+## Move M2: one shared docs primitive + nav truth  (KEEP-THE-RULE)
+Depends on: M1 (R0 premortem)
+Anchors: Stance `How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)` | Rule `Ten Principles of Good Design (Dieter Rams)` | Rule `Grid Systems in Graphic Design (Josef Müller-Brockmann)` | Rule `WCAG 2.2 Contrast and Perceivability (W3C)` | Welcome `Don't Make Me Think (Steve Krug)`
+Intent: one typographic measure and one sectional rhythm for every docs page, so the eye stops re-learning the page at each route. Nav labels become true routes; the dead "Ask AI" affordance and duplicate destinations go.
+Formal argument: claim — four competing Section/H2/Callout primitives and three competing measures (max-w-5xl / max-w-3xl / max-w-6xl) are the inconsistency the brief names. Grounds — `ui/app/docs/getting-started/page.tsx:19-45`, `ui/app/docs/api-reference/page.tsx:29-42`, `ui/app/docs/errors/deployment-not-found/page.tsx:13-33`, each redefines the same border-t/pt-12 section. Warrant — Rams' "as little design as possible" and Müller-Brockmann's grid programme: one rule governing all instances is thorough down to the last detail. WCAG 2.2 SC 1.4.11 focus appearance is a floor, not a style.
+Alternatives rejected: (1) a docs.css file of overrides — rejected: a later plain rule at equal specificity beats an earlier media-query rule (DESIGN-CARRY-FORWARD.md), adding a fourth competing system. (2) restyle each page in place — rejected: no single place of truth, net-larger diff.
+Consequence: all docs pages import one primitive; the layout owns the breadcrumb, mobile nav landmark and section spacing. Cost: one new shared component file and edits to five pages. Any consumer outside /docs is untouched.
+Fence: none broken. Root font-size 83.125% stays; `tap-44` stays on every compact control.
+Frontier effect: opens "real screenshots with captions" and "current platform content" (both need the primitive's figure component); opens "mobile nav landmark" and "search focus visibility".
+Mode field: Advanced pole = one systematic primitive; Acceptable pole = familiar Vercel-grade docs rhythm, no new jargon.
+
+## Move M3: current platform content + real screenshots  (KEEP-THE-RULE)
+Depends on: M2
+Anchors: Stance `How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)` | Rule `WCAG 2.2 Contrast and Perceivability (W3C)` | Welcome `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | Catalog `Tufte Style`
+Intent: close the content gap with shipped features from CHANGELOG 2026-11-17..24 and show the dashboard with real, captioned evidence.
+Formal argument: claim — six deploy-era cards cannot represent a platform that shipped AI Gateway, usage metering, attack challenge mode, account 2FA, contract oplog, managed SQLite/browser DB, Litebox, PQ transport, queues/cron/workflows, Seer DNS, run-a-node and Rust functions. Grounds — `CHANGELOG.md:3,40,101,138,185,247,291,314,350,375,399,412,461,485,518,524,536,550,564,617`. Warrant — Bierut: docs exist to explain things; Tufte: evidence must be shown not asserted.
+Alternatives rejected: (1) link out to docs/README.md — rejected: internal-only index, not a public surface. (2) copy CHANGELOG prose verbatim — rejected: history prose is not a guide; net-larger and unverifiable in a docs column.
+Consequence: new feature cards + one "What's new" section with dated entries; real 2x captures used as figures with alt, caption, provenance and date. Cost: dark-only assets need a light-theme treatment; screenshots are NOT recaptured (no live seeded node here) and MUST be labelled with their 2026-10-14 provenance rather than presented as current.
+Fence: `ui/components/landing/AGENTS.md:28` says recapture when the dashboard changes and never retouch. We therefore ship a labelled historical frame, not a retouched one, and record the recapture as an operator residual.
+Frontier effect: opens "deletion review of stale copy", "final-state 2g re-measurement", "cross-page blast radius".
+Mode field: Advanced pole = complete, current platform map. Acceptable pole = familiar guide cards, honest captions, no architecture words in hero copy (landing/AGENTS.md outcome-led rule applies to hero/social fields).
+
+## Move M4: BREAK the docs index grid  (BREAK)
+Depends on: M2, M3
+Anchors: Breaker `Making and Breaking the Grid (Timothy Samara)` | Rule `Grid Systems in Graphic Design (Josef Müller-Brockmann)` | Welcome `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | Catalog `Premortem`
+Intent: the docs index currently opens with a two-column hero + a uniform 3-up card grid. Break it: one full-measure evidence band (real dashboard capture) between the hero and the cards, so the first thing a reader sees after the claim is proof.
+Formal argument: claim — a uniform card grid makes every platform capability equal and lets prose stand in for evidence. Grounds — `ui/app/docs/page.tsx:84-136` (hero grid then `grid gap-4 sm:grid-cols-2 lg:grid-cols-3`). Warrant — Samara -.->|loosens| mb; the break is a single asymmetric band, not a new grid system. MAYA keeps the rest familiar.
+Alternatives rejected: (1) masonry/editorial hero — rejected: net-larger, competes with the landing. (2) a screenshot carousel — rejected: motion and no measurable static evidence.
+Consequence: one asymmetric full-measure figure band; cards stay a grid below it. Cost: one extra above-the-fold element; measured by rendered height and evidence pixel population.
+Fence: the rule being broken is "all cards equal, no images"; it exists to keep the docs cheap. It is safe to break because the brief explicitly asks for screenshots.
+Frontier effect: opens S4 ambition push (escalate the evidence band to a two-up small-multiple comparison) and the WHOLE round.
+Mode field: Advanced pole = asymmetric evidence band. Acceptable pole = no motion, no new color, same tokens, one image.
+
+## M1 / R0 Premortem WHOLE panel (inherited artifact, before any move)
+Artifact examined: `http://localhost:3188/docs` (dev server, 200, 75054 bytes), `/docs/getting-started`, `/docs/api-reference`, `/docs/errors/deployment-not-found`; source read via gm.fs_read. Rendered HTML read with curl. Headful browser NOT used in R0 (honest gap).
+
+| Critic (one agent per literary reference) | Anchor used | Observed in the work | Verdict | Requested change |
+| --- | --- | --- | --- | --- |
+| Debord (`The Society of the Spectacle`, Thesis 4) | Separation perfected | six cards at page.tsx:73-79; zero docs images; Ask AI at layout.tsx:133 is a label for a nav filter | OBJECT | replace the six-card index + AI decoy with a shared primitive documenting AI Gateway/usage metering/attack challenge/2FA/managed data; make Ask AI real or remove it |
+| Shklovsky (`Art as Technique`, ostranenie) | automatization / laying bare the device | page.tsx:121 one CARDS.map template iterated six times; rendered HTML has 12 `group rounded-xl`, 0 `<section>`, 0 `screenshot` | OBJECT | break the six-iteration grid with a real build-to-live-URL sequence whose rhythm changes |
+| Holmes (`Mismatch`) | exclusion as a design outcome | layout.tsx:145 `hidden ... lg:block`; :158 `outline-none`; globals.css:11 `--muted: 0 0% 56%` measured 3.0984:1 on bg 250 | OBJECT | nav landmark present at every width; focus cue >=3:1 |
+| Mace (`The Principles of Universal Design`) | equitable use | layout.tsx:145 display:none below 1024px; code-block.tsx:83/87 tab state is color+underline only, no role/aria-selected | OBJECT | one always-rendered keyboard-operable disclosure with aria-expanded/aria-controls |
+| Krug (`Don't Make Me Think`) | satisficing / mindless reading | layout.tsx:126 + :128 two labels one href; :36 `/docs/api-reference` vs page.tsx:79 `#api` — one label two destinations; :19 "Production checklist" -> #self-hosting titled "Self-hosting" | OBJECT | repoint page.tsx:79 and :101 to /docs/api-reference and rename the getting-started #api section first |
+| Tufte (`The Visual Display of Quantitative Information`) | evidence must be shown, not asserted | exhaustive 10-file scan: 0 `<img>`, 0 `<figure>`, 0 figcaption; two 2880x1800 dark-only PNGs from 2026-10-14; November features not in /docs | OBJECT | do NOT ship October frames as November evidence; recapture on a seeded node, or label provenance/date/what-is-not-shown |
+| Rams (`Ten Principles of Good Design`) | as little design as possible / honest | five distinct h1 class strings (page.tsx:87, api-reference:49, errors:40); `function Section(` at getting-started:18 and errors:17; three measures; Ask AI is a promise the product does not keep | OBJECT | collapse the local primitives into one, delete Ask AI outright |
+
+Statements of meaning: the docs read as five authors who never agreed on a rule; the index sells a current platform while showing six deploy-era cards and zero evidence; a promise ("Ask AI", "Production checklist") is made where no such thing exists; the navigation is drawn only for a 1024px reader.
+Artist questions: (1) If you factor Section/H2/Callout into one primitive, what has the reader gained except a faster way to stop looking? (2) Which one reader task is served by five h1 sizes? (3) Can a docs page expose real platform practice without turning it into another commodity-image? (4) Whose 390px screen was in the room when `lg:block` was typed?
+Critic questions: (1) Can someone clicking the first "API reference" reach the endpoint catalog at all? (2) Which measurement refutes the October-as-November claim? (3) Which of the seven UD principles is satisfied by a breakpoint that deletes a structure instead of restating it? (4) Can a headful 320/390px run show a nav landmark and a visible focus ring?
+Opinions: all seven seats hold that the inherited surface is incomplete and incoherent; none finds the six-card index defensible as a representation of the November platform.
+Andon pulled: YES, by all seven. New moves were halted until these objections were resolved.
+
+### Premises refused by measurement (recorded, not hidden)
+- Shklovsky: "every page re-declares Section/H2/Callout with the same border-t + pt-12 rhythm" is FALSE; the exact string appears in 2 files, not 5. The duplication is narrower but real (3 `function Section(`).
+- Holmes: "the 2880x1800 PNG has no alt/caption treatment" is FALSE as a statement about the tree — `ui/components/landing/product-showcase.tsx` has descriptive alt and `<figure>` wrappers; ui/app/docs has zero images, so the risk is hypothetical until we add one.
+- Krug/Holmes: "Ask AI focuses a hidden input" is imprecise. On /docs the input is present but display:none below 1024px; on /docs/api-reference the input is ABSENT (ApiSidebar replaces it), so `searchRef` is null and the button is a literal no-op. Corrected wording used above.
+- Tufte: CHANGELOG.md:1170 says the captures are frames of the PREVIOUS dashboard needing recapture; it does not record a 2026-10-14 refresh. The date comes from the file mtime, not that line.
+- Rams: "no shared docs primitive" is true only inside ui/app/docs; `ui/components/landing/section.tsx:4` exports a Section. The defect is refused reuse, not absence.
+- Mace: `tap-44` holds for code tabs, sidebar links, search and ThemeToggle, but NOT the skip link at layout.tsx:115.
+
+### Resolutions (OBJECT -> ADAPT / SCRAP / OVERRULE)
+| Objection | Resolution | Where it lands |
+| --- | --- | --- |
+| Debord: content gap + AI decoy | ADAPT (M3 documents the current platform) + SCRAP the "Ask AI" button | M2/M3, layout.tsx |
+| Shklovsky: six-iteration automatism | ADAPT (M4 evidence band breaks the grid); OVERRULE the overstated "five identical section primitives" premise with Shklovsky's own 2-file measurement | M4, this panel |
+| Holmes: exclusion / contrast / focus | ADAPT (mobile nav disclosure, focus-visible ring, group labels off `--muted`); OVERRULE the "no alt/caption" premise as hypothetical | M2, layout.tsx |
+| Mace: equitable use | ADAPT (always-rendered disclosure with aria-expanded/aria-controls; code tabs get role=tablist/aria-selected) | M2, layout.tsx, code-block.tsx |
+| Krug: label collisions | ADAPT (single destination for "API reference", remove duplicate header labels, drop the false "Production checklist" label) | M2 |
+| Tufte: stale frames as November evidence | ADAPT (real captures shipped with visible figcaption naming screen + dark theme, and prose stating provenance, capture date and the features NOT shown); the recapture itself is an OPERATOR residual, not silently claimed | M3 |
+| Rams: competing primitives / dishonest button | ADAPT (one primitive) + SCRAP (Ask AI deleted, not "fixed") | M2 |
+
+### Frame swap (mandatory: 7 objectors > 3 on one anchor region)
+The objected region is the docs index card grid, governed by the Bierut "explain things" stance. Replaced with a sibling reached by an existing edge: `maya -.->|tempers strangeness of| shklovsky` and `samBreak -.->|loosens| mb` — the region is now governed by `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` (advanced pole = one real evidence band; acceptable pole = familiar cards below, no motion, existing tokens) with `Making and Breaking the Grid (Timothy Samara)` as the breaker. Bierut is SCRAPPED from the active path for this region; its record stays.
+
+## Frontier (after R0)
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| M2 one shared docs primitive + nav truth | rams -> less but better | `Occam's Razor` | TAKEN (M2) |
+| M3 current platform content + real screenshots | Tufte -> names | `Tufte Style` | TAKEN (M3) |
+| M4 BREAK the docs index grid | samBreak -.-> loosens | mb | TAKEN (M4) |
+| Mobile nav landmark + focus-visible | Holmes/Mace R0 OBJECT | `The Principles of Universal Design (Ronald Mace et al.)` | OPEN |
+| "Ask AI" SCRAP | Debord/Rams/Krug R0 OBJECT | `Ten Principles of Good Design (Dieter Rams)` | OPEN |
+| Single destination for "API reference" | Krug R0 OBJECT | `Don't Make Me Think (Steve Krug)` | OPEN |
+| Honest figure captions + provenance prose | Tufte R0 OBJECT | `Tufte Style` | OPEN |
+| S4 ambition push: two-up small multiple | MAYA advanced pole | `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | OPEN |
+| Deletion review + residual diff | Rams -> as little design as possible | `Ten Principles of Good Design (Dieter Rams)` | OPEN |
+| Final-state 2g re-measurement | Premortem -.-> iterate back | `Double Diamond` | OPEN |
+| Recapture screenshots on a seeded node | Tufte (operator residual) | `Tufte Style` | DEFERRED (no seeded backend node on this host; operator-supplied) |
+
+### M2/M3/M4 render witness (headful Chromium, headless:false)
+Dispatch 1795507977009-10925-a825ead4f074a732 at 1200px: `{"title":"Documentation · shadw","h1":"Push to Git,get a live URL","figures":1,"figcaptions":1,"images":3,"navLandmarks":2,"askAI":false,"width":1200}`.
+Dispatch 1795508046970-10930-a81ae2f9ec51b23a at 390x844: `{"width":390,"navs":2,"groups":"hidden lg:mt-0 lg:block","browse":true,"figures":1,"caption":"Deployments view — status, environment, source and time per build.","overflow":false,"askAI":false}`.
+Dispatch 1795508094478-10935-20eb537d3547977a at 320x720 after clicking the disclosure: `{"width":320,"expanded":"true","groupsClass":"mt-3 lg:mt-0 lg:block","visibleNavLinks":19,"searchVisible":true,"overflow":false,"figureWidth":285}`.
+Measured deltas against the inherited artifact: figures 0 -> 1, figcaptions 0 -> 1, "Ask AI" present -> absent, docs nav landmark at 320px: 0 -> 2 (header nav + always-rendered Docs navigation nav). The nav links are 0 -> 19 visible after the disclosure opens; search input is display:none -> visible at 320px. Horizontal overflow: none at 320/390/1200. `npx tsc --noEmit` TSC_EXIT=0 (twice, dispatch 1795506000000 series; logs /private/tmp/hive-docs-witness/tsc.log and tsc2.log). All six docs routes 200 on dev server.

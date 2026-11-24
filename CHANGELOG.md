@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-11-24 - docs finish line: current platform, real screenshots, one docs primitive
+
+`shadw.cloud/docs` was incomplete and its UI/UX inconsistent. A shared
+`ui/components/docs/docs-ui.tsx` now owns the article measure, page header,
+section rhythm, callouts, inline code and figures; the five docs routes no
+longer each declare their own `Section`/`H2`/`Callout` helpers. The nav is one
+always-rendered landmark at every width with a keyboard disclosure at 320px,
+a visible focus-visible ring, group labels off the 3.1:1 token, and one
+destination per label. The dead "Ask AI" button is gone.
+
+Two new pages, `/docs/platform` and `/docs/examples`, document the shipped
+platform (AI Gateway, usage metering, managed data, sandboxes, security,
+workloads, a dated change list) with worked examples built from verified
+routes. The docs index breaks its uniform card grid with a full-measure,
+captioned real dashboard capture. Captions state provenance, the dark theme
+and the 2026-10-14 capture date, and explicitly name the November features
+those frames do NOT show; they are evidence of the dashboard shell, not of
+later features. Frames are unretouched.
+
+Driven by an adversarial R0 premortem panel of seven independent gm agents
+(Debord, Shklovsky, Holmes, Mace, Krug, Tufte, Rams), each of which returned
+OBJECT with Andon. Objections were resolved ADAPT/SCRAP/OVERRULE with
+premises refused by measurement; a frame swap replaced the Bierut-governed
+card grid with MAYA/Samara. A bounded Workflow swarm returned 8 map lenses
+and partial refutations before stalling in the shared store lane; it was
+stopped and Judge/Design never ran. `DESIGN-LOG.md` holds the Traversal Plan,
+Decision Records, Panel Reports, Anchor Ledger and Compliance Check.
+
+Witnessed live on a headful Chromium dev server at `http://localhost:3188`:
+all six /docs routes 200; at 1200/390/320px measured figures 0 to 1,
+figcaptions 0 to 1, nav landmarks 0 to 2 at phone width, 19 visible nav links
+after the disclosure, no horizontal overflow. Gates: `npx tsc --noEmit` 0,
+`npm run lint` 0, `check-contract-bindings.py --check` PASS 34/4/35,
+`git diff --check` 0. NO_TEST_FILES. No push and no roll (needs the operator
+word); `ui/next-env.d.ts` was restored, never committed. The AAA finish-line
+row stays OPEN: 641 pending rows are not silently marked done.
+
 ## 2026-11-24 - macOS node builds and installs no longer need Xcode
 
 One shared Xcode-free Darwin lane replaces every host-side plain `cargo`

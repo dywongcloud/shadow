@@ -1,8 +1,9 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
-import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2 } from "lucide-react";
+import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2, Sparkles, ShieldCheck, Database, Workflow } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
+import { DocsCard, DocsFigure } from "@/components/docs/docs-ui";
 
 export const metadata: Metadata = pageMeta({
   title: "Documentation",
@@ -76,7 +77,13 @@ const CARDS = [
   { icon: GitBranch, title: "GitOps", desc: "Connect GitHub once — push to deploy, config-as-code, two-way sync.", href: "/docs/getting-started#gitops" },
   { icon: Globe2, title: "Regions", desc: "Regions follow where your nodes are; requests go to a healthy node in their own region first.", href: "/docs/getting-started#regions" },
   { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that pack concurrent requests; production stays warm, previews scale to zero.", href: "/docs/getting-started#deploying" },
-  { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/getting-started#api" },
+  { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/api-reference" },
+  { icon: Sparkles, title: "AI Gateway", desc: "One provider pool, profitable per-model price cards and bounded web search.", href: "/docs/platform#ai-gateway" },
+  { icon: Database, title: "Managed data", desc: "Per-database SQLite, a CRDT browser database, and managed Postgres and Redis records.", href: "/docs/platform#managed-data" },
+  { icon: ShieldCheck, title: "Security", desc: "Attack Challenge Mode, sensitive-path denies, optional 2FA and a signed contract oplog.", href: "/docs/platform#security" },
+  { icon: Workflow, title: "Queues, cron & workflows", desc: "Tenant-held queue tokens, node-local cron and durable workflow runs.", href: "/docs/platform#workloads" },
+  { icon: Boxes, title: "Worked examples", desc: "Deploy, encrypted env, custom domains, gateway calls and Lakebed bindings.", href: "/docs/examples" },
+  { icon: Globe2, title: "Platform overview", desc: "What the platform ships today, with real dashboard captures and a dated change list.", href: "/docs/platform" },
 ];
 
 export default function DocsIndex() {
@@ -84,7 +91,7 @@ export default function DocsIndex() {
     <div className="mx-auto max-w-5xl">
       <div className="grid gap-10 pb-8 lg:grid-cols-[1.05fr_1fr] lg:items-center">
         <div>
-          <h1 className="text-5xl font-bold leading-[1.05] tracking-tight sm:text-6xl">
+          <h1 className="text-4xl font-semibold leading-[1.05] tracking-tight sm:text-5xl">
             Push to Git,
             <br />
             get a live URL
@@ -98,11 +105,22 @@ export default function DocsIndex() {
               Get started guide <ArrowRight className="h-4 w-4" />
             </Link>
             <Link href="/settings/api-keys" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
-            <Link href="/docs/getting-started#api" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
+            <Link href="/docs/api-reference" className="tap-44 inline-flex items-center rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
           </div>
         </div>
         <CodeBlock tabs={HERO_TABS} />
       </div>
+
+      {/* M4: asymmetric evidence band breaks the uniform card grid. */}
+
+      <DocsFigure
+        src="/product/dashboard-deployments.png"
+        alt="shadw dashboard, deployments tab: a project named storefront with three deployment rows showing status ready, environment Production or Preview, source commit and creation time."
+        caption="Deployments view — status, environment, source and time per build."
+        note="Real 2x capture of a seeded local node, dark theme, 2026-10-14. Shown as evidence of the dashboard shell; it predates the November 2026 features (AI Gateway, usage metering, Attack Challenge Mode, 2FA, managed data). Frames are unretouched. Recapture on a seeded node is an operator task."
+        width={2880}
+        height={1800}
+      />
 
       <p className="border-t border-border pt-8 text-[15px] leading-relaxed text-secondary">
         Connect your{" "}
@@ -115,18 +133,7 @@ export default function DocsIndex() {
       <h2 className="mb-5 mt-12 text-2xl font-semibold tracking-tight">Build with shadw</h2>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {CARDS.map((c) => (
-          <Link
-            key={c.title}
-            href={c.href}
-            className="group rounded-xl border border-border bg-card p-5 transition-colors hover:border-border-strong hover:bg-subtle/40"
-          >
-            <c.icon className="h-6 w-6 text-fg" />
-            <div className="mt-4 flex items-center gap-1.5 font-semibold">
-              {c.title}
-              <ArrowRight className="h-4 w-4 -translate-x-1 text-muted opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
-            </div>
-            <p className="mt-1.5 text-sm leading-relaxed text-secondary">{c.desc}</p>
-          </Link>
+          <DocsCard key={c.title} icon={<c.icon className="h-6 w-6" />} title={c.title} desc={c.desc} href={c.href} />
         ))}
       </div>
 

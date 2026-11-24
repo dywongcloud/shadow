@@ -2,6 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { CodeBlock } from "@/components/code-block";
+import { DocsIn as Code } from "@/components/docs/docs-ui";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
 export const metadata: Metadata = pageMeta({
@@ -26,14 +27,10 @@ const TOC = [
 
 function H2({ id, children }: { id: string; children: React.ReactNode }) {
   return (
-    <h2 id={id} className="mb-4 mt-14 scroll-mt-20 text-2xl font-bold tracking-tight">
+    <h2 id={id} className="mb-4 mt-14 scroll-mt-20 text-2xl font-semibold tracking-tight">
       {children}
     </h2>
   );
-}
-
-function Code({ children }: { children: React.ReactNode }) {
-  return <code className="rounded bg-subtle px-1.5 py-0.5 font-mono text-[0.85em]">{children}</code>;
 }
 
 export default function ApiReferencePage() {
