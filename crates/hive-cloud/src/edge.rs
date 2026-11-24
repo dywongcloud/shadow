@@ -475,12 +475,15 @@ async fn edge_pipeline_inner(
         && !host.is_empty()
         && (!serve_local || container_owner.is_some() || prefer_peer)
     {
-        let healthy_ids: std::collections::HashSet<String> = cloud
+        let healthy_nodes: Vec<hive_edge::region::NodeInfo> = cloud
             .registry
             .nodes()
             .into_iter()
             .filter(|n| n.healthy)
-            .map(|n| n.id)
+            .collect();
+        let healthy_ids: std::collections::HashSet<String> = healthy_nodes
+            .iter()
+            .map(|n| n.id.clone())
             .collect();
         let raw: Vec<crate::state::PeerRoute> = {
             let routes = cloud.peer_routes.read();
@@ -496,66 +499,48 @@ async fn edge_pipeline_inner(
                 .cloned()
                 .collect()
         };
-        let had_routes = !raw.is_empty();
-
-        let mut cands: Vec<crate::state::PeerRoute> = if let Some(owner) = &container_owner {
-            cloud
-                .registry
-                .nodes()
-                .into_iter()
-                .find(|n| &n.id == owner && n.healthy)
-                .map(|n| crate::state::PeerRoute {
-                    node_id: n.id,
-                    region: n.region,
-                    gateway: n.public_url,
-                    latency_ms: n.latency_ms,
-                    healthy: true,
-                    last_seen_ms: hive_core::now_ms(),
-                })
-                .into_iter()
-                .collect()
-        } else {
-            let project = cloud
-                .gw
-                .project_for_host(&host)
-                .unwrap_or_else(|| sub.clone());
-            let fs = cloud.projects.get(&project).functions;
-            order_candidates_with_cold(raw.clone(), &fs, &region, |node| {
-                crate::health::is_cold(&cloud.registry, node)
+        let project = cloud
+            .gw
+            .project_for_host(&host)
+            .unwrap_or_else(|| sub.clone());
+        let fs = cloud.projects.get(&project).functions;
+        let owner_route = container_owner.as_ref().and_then(|owner| {
+            healthy_nodes
+                .iter()
+                .find(|n| &n.id == owner)
+                .map(peer_route_from_node)
+        });
+        let successors: Vec<crate::state::PeerRoute> = raw
+            .into_iter()
+            .filter(|r| {
+                owner_route
+                    .as_ref()
+                    .map(|owner| owner.node_id.as_str() != r.node_id.as_str())
+                    .unwrap_or(true)
             })
-        };
-
+            .collect();
+        let mut cands: Vec<crate::state::PeerRoute> = order_candidates_with_cold(
+            successors,
+            &fs,
+            &region,
+            |node| crate::health::is_cold(&cloud.registry, node),
+        );
+        if let Some(owner) = owner_route {
+            cands.insert(0, owner);
+        }
         if cands.is_empty() {
-            if container_owner.is_some() {
-                let mut ev = cloud.event(
-                    &region,
-                    &method,
-                    &host,
-                    &path,
-                    503,
-                    "mesh-region-unavailable",
-                    &sub,
-                );
-                ev.request_id = rid.clone();
-                cloud.record(ev);
-                return fail_response(fluid_core::FailureClass::NoHealthyRegion, &region, &rid);
-            }
-            if had_routes {
-                tracing::warn!(
-                    sub = %sub,
-                    routes = ?raw.iter().map(|r| (r.node_id.clone(), r.region.clone())).collect::<Vec<_>>(),
-                    "no candidate in preferred region; falling back to healthy routes (incomplete per-node route metadata)"
-                );
-                let mut fb = raw;
-                fb.sort_by_key(|r| {
-                    (
-                        u8::from(crate::health::is_cold(&cloud.registry, &r.node_id)),
-                        if r.region == region { 0u8 } else { 1u8 },
-                        hive_edge::region::peer_latency_sort_key(r.latency_ms),
-                    )
-                });
-                cands = fb;
-            }
+            let mut ev = cloud.event(
+                &region,
+                &method,
+                &host,
+                &path,
+                503,
+                "mesh-region-unavailable",
+                &sub,
+            );
+            ev.request_id = rid.clone();
+            cloud.record(ev);
+            return fail_response(fluid_core::FailureClass::NoHealthyRegion, &region, &rid);
         }
         if !cands.is_empty() {
             let path_q = if query.is_empty() {
@@ -868,6 +853,20 @@ async fn edge_pipeline_inner(
                         Ok(r) => {
                             let status = r.status();
                             let rheaders = r.headers().clone();
+                            // A healthy node with no cell answers with the platform's own
+                            // DEPLOYMENT_NOT_FOUND page. That is a routing miss, not a tenant
+                            // response; keep retrying the bounded successor list.
+                            let deployment_miss = status.as_u16()
+                                == StatusCode::NOT_FOUND.as_u16()
+                                && rheaders
+                                    .get("x-hive-error")
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| {
+                                        v.eq_ignore_ascii_case("DEPLOYMENT_NOT_FOUND")
+                                    });
+                            if deployment_miss {
+                                continue 'cands;
+                            }
                             let mut builder = Response::builder().status(status.as_u16());
                             for (k, v) in rheaders.iter() {
                                 let lk = k.as_str().to_lowercase();
@@ -2114,6 +2113,18 @@ fn usable_gateway(gateway: &str) -> bool {
             .any(|bad| g.contains(bad))
 }
 
+/// Synthesize a route from registry facts only; no caller-controlled value enters the gateway.
+fn peer_route_from_node(n: &hive_edge::region::NodeInfo) -> crate::state::PeerRoute {
+    crate::state::PeerRoute {
+        node_id: n.id.clone(),
+        region: n.region.clone(),
+        gateway: n.public_url.clone(),
+        latency_ms: n.latency_ms,
+        healthy: n.healthy,
+        last_seen_ms: n.last_seen_ms,
+    }
+}
+
 /// HTTP-fallback timeout for one candidate: iroh and the fallback share ONE per-candidate deadline
 /// (`HIVE_EDGE_CANDIDATE_MS`, default 30 s), the fallback getting what iroh left, floored at 1 s.
 fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
@@ -2128,10 +2139,11 @@ fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
         .max(std::time::Duration::from_secs(1))
 }
 
-/// Orders mesh candidates by the deployment's region/failover policy: no `regions` is
-/// same-region-first anycast with latency as tiebreak, `failover: true` keeps only configured
-/// regions (primary first), `failover: false` restricts to the PRIMARY region and never crosses it
-/// (an empty result makes the caller 503). Only `healthy` candidates are passed in.
+/// Orders mesh candidates by the deployment's region preference: configured regions come first in
+/// their configured order and every healthy unconfigured region stays PRESENT as the last tier.
+/// `failover` no longer fences the candidate set; it cannot make a healthy region unusable. No
+/// `regions` is same-region-first anycast with latency as tiebreak. Only `healthy` candidates are
+/// passed in.
 #[allow(dead_code)]
 fn order_candidates(
     raw: Vec<crate::state::PeerRoute>,
@@ -2157,6 +2169,7 @@ fn order_candidates_with_cold(
                 cold(r),
                 if r.region == serving_region { 0u8 } else { 1u8 },
                 latency(r),
+                r.node_id.clone(),
             )
         });
         return balance_same_region(raw, &is_cold);
@@ -2165,15 +2178,9 @@ fn order_candidates_with_cold(
         regions
             .iter()
             .position(|cr| cr.eq_ignore_ascii_case(&r.region))
+            .unwrap_or(regions.len())
     };
-    if fs.failover {
-        raw.retain(|r| rank(r).is_some());
-        raw.sort_by_key(|r| (cold(r), rank(r).unwrap_or(usize::MAX) as u16, latency(r)));
-    } else {
-        let primary = regions[0].clone();
-        raw.retain(|r| r.region.eq_ignore_ascii_case(&primary));
-        raw.sort_by_key(|r| (cold(r), latency(r)));
-    }
+    raw.sort_by_key(|r| (cold(r), rank(r), latency(r), r.node_id.clone()));
     balance_same_region(raw, &is_cold)
 }
 
@@ -2464,32 +2471,34 @@ mod tests {
         let out = order_candidates(raw, &fs(&["bangkok", "los-angeles"], true), "san-francisco");
         let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
         // Primary (bangkok) first, then the next configured region (los-angeles);
-        // san-francisco is excluded entirely (not a configured region).
-        assert_eq!(ids, vec!["bkk1", "la1"]);
+        // san-francisco is an unconfigured healthy region and remains the last tier.
+        assert_eq!(ids, vec!["bkk1", "la1", "sf1"]);
     }
 
     #[test]
-    fn failover_false_restricts_to_primary_region() {
+    fn failover_false_orders_primary_first_without_a_fence() {
         let raw = vec![route("la1", "los-angeles", 5), route("bkk1", "bangkok", 50)];
         let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
         let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["bkk1"],
-            "no cross-region: only the primary region's node"
+            vec!["bkk1", "la1"],
+            "configured primary first; a healthy unconfigured region remains a fallback"
         );
     }
 
     #[test]
-    fn failover_false_primary_down_yields_empty() {
+    fn failover_false_primary_down_keeps_healthy_unconfigured_regions() {
         let raw = vec![
             route("la1", "los-angeles", 5),
             route("sf1", "san-francisco", 1),
         ];
         let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
-        assert!(
-            out.is_empty(),
-            "primary down + no failover → empty (caller returns 503, never crosses)"
+        let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["sf1", "la1"],
+            "primary down: healthy unconfigured regions are ordered by latency and remain usable"
         );
     }
 
