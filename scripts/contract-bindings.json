@@ -58,14 +58,14 @@
     },
     {
       "assertion": "beta BLOCKED from alpha's database (404)",
-      "canonical_sha256": "f92a69cb0d3e24a6cae7f5a8ef7ab24184ab214cad40053b525b69ea3d3d6687",
+      "canonical_sha256": "0099f8da571fefd57a153b71f1d1ef145984a1e70c23c6d6a9945518f3093316",
       "id": "unit.roles.rules",
       "layer": "unit",
       "path": "crates/hive-cloud/src/roles.rs"
     },
     {
       "assertion": "npm run lint",
-      "canonical_sha256": "65a77194c7c27acd7db84e93276fba0615ff3f5e662ddf9389f5b23259a2f756",
+      "canonical_sha256": "f3e719be2ed3eff942ec936985b91475273ec31d3ae7b9183a0c825097a02e17",
       "id": "ui.roles.mirror",
       "layer": "integration",
       "path": "ui/lib/team-role.ts"
