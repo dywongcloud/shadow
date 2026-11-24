@@ -3215,3 +3215,154 @@ Intent: a reader on a touch screen sees the destinations are links before touchi
 Formal argument: claim — M8 removed the static border and left every cue in a hover state. Grounds — W2 Mace measured 18 compact anchors, 18 tap-44, 0 resting underline / 0 resting link hue / 0 icon at ui/components/docs/docs-ui.tsx:196-204; the dev server at that moment still had the pre-M8 markup, but the post-M8 code also gates both underline and colour on group-hover. Warrant — Mace: a hover-only cue does not exist on touch, so the affordance is inequitable. Grounds for the fix — a resting underline on the title with a subtle border-coloured decoration, strengthening to the link colour on hover; the underline is ink, not a frame, so it does not reintroduce Shklovsky automatism. Alternatives rejected: (1) re-add a bottom border — that is the W2 Shklovsky objection; (2) add a lucide arrow per row — 18 new SVG nodes and a repeated icon rhythm, heavier than one underline.
 Consequence: the list acquires a resting underline per title; Tufte data-ink cost is 18 thin rules of text decoration rather than 18 full-width rectangles. Fence: tap-44 is retained, and the underline is on the title text only, so the descriptive line stays quiet. Frontier effect: candidate "W3 re-verify all four W2 Andons on the post-M7/M8/M9/M10 artifact".
 Mode field: Advanced pole = no static frames anywhere in the index (anchor: Less, but better); Acceptable pole = a visible resting link cue at every width and on touch (anchor: MAYA).
+
+---
+
+## W2 Panel Report - WHOLE artifact, round W2 (complete, 7 of 7 seats)
+
+Artifact examined: local commits c76c0c43b3 and 05c57fd1ac, rendered at http://localhost:3188/docs and the six sibling routes. Seven independent gm subagents, one per literary reference, distinct SESSION_IDs, each briefed with the W1 objections and instructed to re-verify by live curl. All results are automated task notifications, not user input.
+
+| Critic | Anchor used | Observed in the work | Verdict | Andon | Resolution |
+| --- | --- | --- | --- | --- | --- |
+| Debord | spectacle / pseudo-need | curl /docs/platform: "19 real cumulative counters" 0 times, 2 figcaptions, 2 visible notes dated 2026-10-14 naming excluded November features | PASS | no | none |
+| Shklovsky | ostranenie / automatism | first result 24 raw bottom-border markers, 0/0 group rounded-xl, 4/2 title strings, 2/1 grid parents; resumed result "14 DOM border-b border-border", docs-ui.tsx:201 still emits 10 border-b links plus 2 framed leads | OBJECT | YES | ADAPT M8 |
+| Holmes | inclusion / width exclusivity | curl: 7/7 docs routes 200, each 1 nav / 1 skip / 1 h1 class; M5 band hidden=0, provenance served; band stacks to one column at phone width | PASS | no | none |
+| Mace | equitable use | curl /docs + /docs/platform: 18 compact anchors, 18 tap-44, 0 underline / 0 resting link hue / 0 icon; both cues hover-only | OBJECT | YES | ADAPT M8 + M10 |
+| Krug | satisficing / scent | curl /docs 200: 12/12 CARDS hrefs intact, 21/21 internal paths 200; page.tsx:153 heads the 10-link list "Everything else" though it holds API reference, Examples, Platform overview; "Functions & Fluid" lands on #deploying | OBJECT | YES | ADAPT M7 |
+| Tufte | lie factor | curl /docs/examples: 0 scrollable figure containers; examples/page.tsx:113 claims a scrollable full-2x frame; 19-counters string gone and 2+10/8 counts reproduce | OBJECT | YES | ADAPT M9 |
+| Rams | less, but better / one rule | 0 local h1/measure declarations in ui/app/docs (exhaustive codesearch); sole width site docs-ui.tsx:15-19; 7/7 live routes import it; three named widths do not break one rule | PASS | no | none |
+
+Statements of meaning: the run says it answered W1 with one typographic rule and a real break; the four dissenters say the answer was incomplete at the level of scent, resting affordance, repeated rules and a printed promise the artifact could not keep.
+Artist questions: (a) Does a link look like a link before it is hovered? (b) Does the heading tell a reader what the list holds? (c) Can a reader actually reach full resolution, and is the claim true at computed width? (d) Did removing frames merely rename them?
+Critic questions: (a) How many static bottom borders remain in the DOM? (b) Where does "Fluid" appear in the getting-started page? (c) What is the figure img naturalWidth versus its rendered width and its scroll container scrollWidth? (d) Does any route still declare its own h1?
+Opinions: three seats held that the W1 repairs survived; four held that a repair which fixes structure but leaves a false promise, a dead label or a hover-only affordance is not finished work.
+Andon pulled: YES - Shklovsky, Mace, Krug, Tufte. Four objections, each naming a measurement. No new moves were made until each was resolved.
+
+### Premise tests (before spending any move)
+| Objector | Test | Result |
+| --- | --- | --- |
+| Krug | codesearch literal "Fluid" in getting-started/page.tsx, dispatch 1795511589575-11516 | exactly 1 match, line 48 in Introduction; none in #deploying. Premise holds -> ADAPT. |
+| Shklovsky | codesearch literal "border-b border-border", dispatch 1795511982982-11597 | exactly 1 match at docs-ui.tsx:201, on DocsIndexLink. Premise holds -> ADAPT. |
+| Tufte | headful eval at 390px, dispatch 1795512122764-11604 | natural=390x243, rendered=355, attrW=2880, chain DIV:hidden:cw355:sw355; no scroll possible. Premise holds -> ADAPT. |
+| Mace | post-M8 source read of docs-ui.tsx:196-204 | both underline and colour gated on group-hover. Premise holds -> ADAPT. |
+
+### ADAPT resolutions, each re-measured after the edit
+| Move | Change | Witness of the computed value |
+| --- | --- | --- |
+| M7 | heading -> "Guides, reference, examples and platform"; Fluid card href -> #introduction | curl /docs: old heading 0, new heading 2 (HTML + RSC payload), #introduction present; tsc 0, lint 0, diff-check 0 |
+| M8 | DocsIndexLink loses its static border, gains hover underline | curl /docs: raw border-b markers 24 -> 4; /docs/platform 4; index-link markers 20/16; tsc 0, lint 0 |
+| M9 | DocsFigure becomes a labelled overflow-x-auto region serving the unoptimized 2880x1800 PNG, with a visible scroll hint | headful 390px (1795512274307-11617): natural=2880 rendered=2880 region=auto cw=355 sw=2880 scrollLeft=400 pageOverflow=clip; 320px (1795512288798-11618): cw=285 sw=2880 scrollLeft=400; disk and HTTP both 2880x1800 |
+| M10 | resting title underline on every compact link | curl /docs: "underline decoration-border" 24 (12 links x 2 markup copies), border-b still 4; /docs/platform 16; tsc 0, lint 0, diff-check 0 |
+
+The earlier dev-server reading natural=1200x750 was a stale cached derivative, not the artifact: curl of /product/dashboard-deployments.png returned 171503 bytes and file/sips both report 2880x1800. Network.setCacheDisabled plus reload (1795512260268-11614) gave natural=2880x1800. Both the inert-looking reading and the substitute that worked are recorded.
+
+Commit for M7-M10: 80738e3797, secrets_gate PASS. W3 saturation round re-convened all seven references on the post-M7/M8/M9/M10 artifact with a two-tool-call budget each.
+
+---
+
+## S5 dotted-edge ledger (every dotted edge leaving an anchor used in Run 2)
+
+Adaptive seed anchors used: Most Advanced Yet Acceptable (stance); Information scent, Grid as discipline, Data-ink ratio, Less but better, Equitable use (rules); Defamiliarization, Provenance-Labelled Historical Frame (breakers); Premortem, Tufte lie factor, Mace equitable use, Rams one-rule, Krug satisficing, Shklovsky automatism (lenses/critics). The graph is in references/anchor-graph.md; the live marked Mermaid is in the Run 2 Traversal Plan and the Anchor Ledger section above.
+
+| Dotted edge | From anchor | Decision | Reason |
+| --- | --- | --- | --- |
+| Data-ink ratio -> Provenance-Labelled Historical Frame | c_tufte | APPLIED | A real 2026-10-14 capture needs a date, provenance and explicit feature exclusions; captions carry all three on 1/1 and 2/2 figures. M9 then made the printed 2x claim reachable. |
+| Less, but better -> Grid as discipline | c_rams | APPLIED | M6 unified h1/h2/measures; M8 deleted DocsCard and all static frames. One rule, not six. |
+| Defamiliarization -> Data-ink ratio | c_shklovsky | APPLIED | M5 moved the capture into a grid cell and broke the uniform border field; measured 12 -> 0 rounded-xl. |
+| Equitable use -> Information scent | c_mace | APPLIED | M7 named the list and fixed the Fluid destination; M10 restored a resting link cue after M8 removed frames. |
+| Premortem -> Provenance-Labelled Historical Frame | c_premortem | APPLIED | W1/W2/W3 whole rounds judged the dated frames before any claim of closure. |
+| Information scent -> Less, but better | c_krug | DECLINED | Dropping every label to satisfy minimalism would remove the destinations; the acceptable pole of MAYA requires the reader can find them. Recorded, not silently skipped. |
+| Grid as discipline -> Defamiliarization | c_muller | DECLINED as a new node | The double-loop amendment proposes adding Muller-Brockmann to a later panel; adding a critic mid-run would change the panel composition and invalidate W1/W2 comparability. |
+| Tufte lie factor -> claim of zero overflow | c_tufte | DECLINED | The 5px is measured and clipped (310/315, 380/385, 1190/1195), not claimed as zero. Step 2g records the actual value. |
+| Krug satisficing -> CLI naming (fluidctl/hivectl) | c_krug | DEFERRED with reason | The swarm examples lens flagged stale CLI names in getting-started. It is a backend/CLI documentation question, not a docs-typography move; a separate witness over the actual CLI binary is required. Filed as a frontier row, not a TODO stub. |
+| Mace equitable use -> code-block tab semantics | c_mace | DEFERRED with reason | role=tablist/aria-selected lives in ui/components/code-block.tsx, shared by dashboard routes. Changing it needs a witness pass over those routes; this docs-only run has none. W1 and W2 Mace both named it without pulling Andon on that point. |
+| Mace equitable use -> docs search live region | c_mace | DEFERRED with reason | Same shared-component reason as above; layout.tsx search is node-local and needs an announcement-count witness. |
+| Provenance-Labelled Historical Frame -> recapture on a seeded node | c_premortem | DEFERRED with reason | A world-scoped operator task: recapturing the dashboard requires a seeded node and the operator word. Captions already state the date and excluded features, so no reader is misled while it is deferred. |
+
+### S1 Frontier status
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| code-block role=tablist/aria-selected | dotted edge | Inclusion | DEFERRED (reason above) |
+| docs search live region | dotted edge | Inclusion | DEFERRED (reason above) |
+| CLI naming in getting-started | outgoing edge | Usability | DEFERRED (reason above) |
+| recapture the two PNGs | dotted edge | Data-ink ratio | DEFERRED (operator task, reason above) |
+| AAA finish line row aaa-finishline-closure-2026-11-16 | outgoing edge | Systems | TAKEN off the DADA frontier into the gm row store: it is a gm PRD row, not a design move. It remains OPEN there with 641 inherited pending rows. No design frontier item is OPEN. |
+
+---
+
+## W3 Panel Report - WHOLE artifact, saturation round (partial, 2 of 7 returned)
+
+Artifact examined: local commit 80738e3797 plus the row-closure commit; FINAL http://localhost:3188/docs at 320/390/1200px. Seven fresh independent gm subagents, one per literary reference, each with its own SESSION_ID and a strict two-tool-call budget (one live curl, one located Read) so the round measures the artifact rather than re-running W1/W2 discovery. Automated task notifications, not user input.
+
+| Critic | Anchor used | Observed in the work | Verdict | Andon |
+| --- | --- | --- | --- | --- |
+| Shklovsky | ostranenie / automatism | border-b border-border=4 in served HTML, all in header, nav and tab strip; 24 underlined titles; DocsIndexLink emits no frame | PASS | no |
+| Rams | less, but better / one rule | 1 distinct h1 class across 6 live /docs routes, declared once at docs-ui.tsx:25; four fixes reuse DocsH1 and existing tokens | PASS | no |
+
+Statements of meaning (partial): the artifact now says the break is structural, not nominal; the two seats that pulled Andons in earlier rounds report the specific measured defect is gone.
+Artist questions (partial): does any repeated frame remain, and did the four fixes add a competing system?
+Critic questions (partial): how many static bottom borders are emitted, and how many distinct h1 class strings?
+Opinions (partial): both seats hold that the repairs reused the single primitive rather than adding layers.
+Andon pulled so far: none. Five seats outstanding; the report is completed when they return.
+
+---
+
+## W3 Panel Report - complete tally and the three tool failures
+
+| Critic | Verdict | Andon | Observed | Note |
+| --- | --- | --- | --- | --- |
+| Debord | PASS | no | 30 platform-word hits; /docs keeps text primary beside deploy code and platform links | valid |
+| Shklovsky | PASS | no | border-b border-border=4, all in header/nav/tab strip; 24 underlined titles; DocsIndexLink emits no frame | valid |
+| Holmes | OBJECT (first) | yes | "0 live curl responses; gm shell verb missing; curl/read never ran" | TOOL FAILURE, not a defect |
+| Mace | PASS | no | 24 underline decoration-border, 1 role="region"; resting underlines + labelled focusable figure region | valid |
+| Krug | OBJECT (first) | yes | "gm dispatch aborted before curl; zero heading/href counts" | TOOL FAILURE, not a defect |
+| Krug re-run | PASS | no | new_heading=2 old_heading=0 introduction_href=3 fluid_label=1; Fluid compute defined inside #introduction | valid, dispatch 1795513127 |
+| Tufte | OBJECT (first) | yes | "gm run_shell unknown verb; curl/read blocked" | TOOL FAILURE, not a defect |
+| Rams | PASS | no | 1 distinct h1 class across 6 live /docs routes, declared once at docs-ui.tsx:25 | valid |
+
+Canary: three W3 seats returned "unverified" verdicts caused by a missing gm shell verb, not by anything in the artifact. Per the "object premise before spending a move" rule, the coordinator measured each premise itself: Krug heading/href (new_heading=2, old_heading=0, introduction_href=3, fluid_label=1), Tufte figure regions (headful natural=2880, sw=2880, scrollLeft=400, role=region), Holmes widths (320/390/1200 all clip, no hidden provenance). Rather than OVERRULE, all three seats were re-run with a working direct-path brief, because an unmeasured seat is not a PASS. The failed receipts stay in this log.
+
+Statements of meaning: the final artifact says the docs are one system, current, evidenced and inspectable; every seat that could actually measure it agreed.
+Artist questions: is any repeated frame left, is any printed claim unreachable, is any reader excluded by width, and did the fixes add a competing system?
+Critic questions: count static borders, count h1 classes, count region roles, count heading strings, count platform-word substitutions.
+Opinions: four clean PASS seats plus Krug re-run hold that the W2 objections are resolved; the two outstanding re-runs are tool-path repairs, not new design disagreement.
+Andon pulled on artifact grounds: none in W3. Three Andons were pulled on tool grounds and are recorded as failures of the dispatch path, not of the work.
+
+---
+
+## Compliance Check (Run 2, written before the final W3/W4 receipts land)
+
+- [x] Tooling inventory done; tool used for each job, or "none available" -> Run 2 Step 0 table. Mermaid text for the graph, DESIGN-LOG.md for the frontier and log, Workflow tool for the bounded swarm (wf_8bb27d6b-307, map/refute phases only), Agent tool for one gm subagent per literary reference, gm.chrome headful for render measurement. No graph database or diagram renderer was available.
+- [x] Mode stated with the reason -> Run 2 Step 1: Adaptive, because the brief names a public docs audience and approachability ("ui/ux inconsistent", "cohesive").
+- [x] Seed with exact labels, including one dotted-edge counterpoint, and a living Frontier -> Run 2 Step 1 chain and Frontier table; S5 dotted-edge ledger and S1 Frontier status below.
+- [x] At least one BREAK move taken, no quota used as a stopping rule -> M4 BREAK, ADAPTed by M5 and M8; M7/M9/M10 ADAPTs. Moves M1-M10, no quota.
+- [x] A Decision Record written before each move, with all fields filled, including dependencies -> M2/M3/M4 before W1; M5/M6 before the W1 ADAPTs; M7/M8/M9/M10 each written before its own edit, with dispatch ids in the log. Run 1 miss (records reconstructed after moves) is recorded in the Double loop.
+- [x] A Panel Report per round from a panel meeting the mode composition rule, each critic citing something observable -> R0 (7 seats), W1 (7 seats), W2 (7 seats), W3 (7 seats plus 3 tool-failure re-runs). Adaptive requires Provocateur + Inclusion + at least 3 more: Debord, Shklovsky, Holmes, Mace, Krug, Tufte, Rams = 7.
+- [x] Every OBJECT resolved as ADAPT, SCRAP or OVERRULE, with dependents reopened -> W1: 2 ADAPT (M5, M6); W2: 4 ADAPT (M7-M10); R0: 7 objections resolved in the R0 Panel Report. M2/M3/M4 marked REOPENED at each ADAPT; three tool-failure OBJECTs recorded as dispatch-path failures and re-run, not counted as defect votes.
+- [ ] WHOLE rounds run; S1 to S5 each shown as met, with where -> W1, W2, W3 run; S4 met at "S4 ambition push (M5, measured)"; S5 met at "S5 dotted-edge ledger"; S1 status at "S1 Frontier status". S3 requires TWO consecutive WHOLE rounds with no ADAPT/SCRAP/REOPEN: W2 produced four ADAPTs, so W3 alone does not satisfy it. W4 is the second saturation round; until its receipts land this box is NOT checked.
+- [x] Every figure the artifact displays re-measured at the final state, with the procedure -> Step 2g table, re-run after M10 (the last edit): diff-check 0, tsc 0, lint 0, bindings PASS 34/4/35, all 7 routes 200 with one h1 each, headful 320/390/1200 clipped. The 2x claim is now reachable by the printed procedure.
+- [x] Anchor Ledger complete and the live graph updated -> Anchor Ledger / live graph update after R0 and W1; graph amendment (Provenance-Labelled Historical Frame node) recorded in Double loop.
+- [x] Double-loop paragraph written -> "Double loop (Run 2)". Carry-Forward Ledger written to DESIGN-LOG.md and DESIGN-CARRY-FORWARD.md.
+- [ ] Final reply states the mode, the tools used, the stop conditions and everything skipped -> this is the remaining obligation of the final reply.
+
+### Stop test, stated honestly
+
+| Condition | Status | Where / why |
+| --- | --- | --- |
+| S1 Frontier no OPEN items | MET for the DADA frontier | S1 Frontier status: 4 DEFERRED with reasons, 1 TAKEN into the gm row store. The AAA row is OPEN in the gm store, not on the design frontier. |
+| S2 WHOLE round PASS from every required critic, no Andon | PENDING W3/W4 receipts | W3 has 5 valid PASS and 3 tool-failure OBJECTs (2 re-runs outstanding). |
+| S3 two consecutive clean WHOLE rounds | NOT YET MET | W2 had 4 ADAPTs; W3 and W4 must both be clean. |
+| S4 ambition push measured | MET | "S4 ambition push (M5, measured)": rounded-xl 12->0, bytes 91968->78775, h1 strings 5->1. |
+| S5 dotted edges applied or declined with a reason | MET | "S5 dotted-edge ledger", 12 edges each APPLIED, DECLINED or DEFERRED with a reason. |
+
+### Steps skipped or partially executed (honest record)
+
+- R0 used curl and source reading, not a headful browser; W1/W2/W3 had headful witnesses. Recorded in the Double loop.
+- The bounded Workflow swarm wf_8bb27d6b-307 stalled at 28 journal lines / 13 results (8 map lenses, 6 refuters); its Judge and Design phases never ran. It was stopped via TaskStop. The map/refute findings were used, not silently claimed as a completed swarm.
+- W2 saturation required four ADAPTs; W3 required three tool-failure re-runs. No round was claimed clean on an unverified seat.
+- Step 1 was written BEFORE reading DESIGN-CARRY-FORWARD.md, an ordering miss; the file was read afterwards and the Run 2 carry-forward pointer appended.
+- ui/components/code-block.tsx tab semantics (role=tablist/aria-selected) and the docs search live region remain DEFERRED with reasons; both are shared dashboard surfaces needing their own witness.
+- The two dashboard PNGs are real 2026-10-14 captures; recapture on a seeded node is an operator task, not done here.
+- The AAA finish line row aaa-finishline-closure-2026-11-16 remains OPEN with 641 inherited pending PRD rows. AAA closure is NOT claimed. No push and no roll: both need the operator word.
+- No test files were created; 16 *.test.ts hits are pre-existing vendored ui/vendor/workflow-web files, untouched.
