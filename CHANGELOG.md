@@ -43,14 +43,23 @@ fleet-vantage sweep from va3 returns 200 on all 6 public IPs over both
 HTTP/1.1 and HTTP/2, twice each; two brief TLS warm-up timeouts on sj/sj7
 immediately after their restarts cleared without intervention.
 
-HELD, and not claimed as witnessed: the live challenge-page behaviour after
-the roll. Attack Challenge Mode's 1 h window auto-expired during the roll
-(`active=false` on 5 nodes; sj7 has a newer epoch and is active), and public
-traffic is served by fc-sanjose whose mode is off, so `edge_gate` correctly
-bypasses and the tenant app is served. Re-arming the mode would gate ALL
-public traffic behind the challenge again and needs its own operator word.
-The pre-roll headful-browser witness (see the entry below) covered the exact
-emitted page against the real geniee.site solve decisions. NO_TEST_FILES.
+HELD RESOLVED 2026-11-24 at the operator's word (`proceed`): Attack Mode
+was re-armed for a bounded ~4 s window on fc-sanjose (the node serving the
+public traffic), witnessed live against the RUNNING binary from a fleet
+vantage, then disabled in the witness script's `finally`. The operator JWT
+was minted on the node from the running process's environ; no secret or
+token was printed, stored or passed on a command line. W1: `GET /` returns
+the new 2,922-byte page, `x-hive-firewall-action: challenge`,
+`Cache-Control: no-store`, an 81-char nonce, `hive-fw-retry`/`noscript`/
+`hive_fw_challenge_attempts`/`.catch` all present and ZERO occurrences of
+the old unconditional `then(function(){location.reload()});`. W2: a valid
+nonce returns `challenge-solved` + `Set-Cookie` + `Cache-Control: no-store`
+and the exact `verified` body. W3: the sealed cookie passes to the real
+69,709-byte app page with no challenge. W4: a rejected nonce returns a 200
+challenge page and the node-local ring records `challenge-failed`=1. After:
+`DISABLE_STATUS 200`, `active=false enabled=false`, `DISABLE_VERIFIED true`;
+all 6 nodes report `active=False` and the public site returns 200 on all 6
+IPs plus global DNS. NO_TEST_FILES.
 
 ## 2026-11-24 - Attack Challenge Mode: terminate a failed solve
 
