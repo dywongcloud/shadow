@@ -11,8 +11,19 @@ import type { ReactNode } from "react";
  * is no docs.css and no new color.
  */
 
-/** The one article measure. */
+/** The one article measure. Every other docs width is a named variant below. */
 export const DOCS_MEASURE = "mx-auto max-w-3xl";
+/** Index/platform: a hero code pane or full-width figures need the extra room. */
+export const DOCS_MEASURE_WIDE = "mx-auto max-w-5xl";
+/** API reference: the article shares its row with a table of contents or an example rail. */
+export const DOCS_MEASURE_REFERENCE = "mx-auto max-w-6xl";
+
+/** The one h1 rule for /docs. No route declares its own title class. */
+export const DOCS_H2 = "scroll-mt-20 text-2xl font-semibold tracking-tight";
+
+export function DocsH1({ children }: { children: ReactNode }) {
+  return <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">{children}</h1>;
+}
 
 export function DocsPage({
   eyebrow,
@@ -30,12 +41,12 @@ export function DocsPage({
   wide?: boolean;
 }) {
   return (
-    <div className={wide ? "mx-auto max-w-5xl" : DOCS_MEASURE}>
+    <div className={wide ? DOCS_MEASURE_WIDE : DOCS_MEASURE}>
       <header className="mb-12">
         <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">
           {eyebrow}
         </div>
-        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">{title}</h1>
+        <DocsH1>{title}</DocsH1>
         {lead && (
           <p className="mt-4 text-[15px] leading-relaxed text-secondary">{lead}</p>
         )}
@@ -74,7 +85,7 @@ export function DocsSection({
           {eyebrow}
         </div>
       )}
-      <h2 className="text-2xl font-semibold tracking-tight">{title}</h2>
+      <h2 className={DOCS_H2}>{title}</h2>
       <div className="mt-5 space-y-4 text-[15px] leading-relaxed text-secondary">
         {children}
       </div>
@@ -145,7 +156,11 @@ export function DocsFigure({
   );
 }
 
-export function DocsCard({
+/**
+ * A lead destination. Two of these at the head of the index replace the
+ * uniform card field with a deliberate change of scale.
+ */
+export function DocsLead({
   icon,
   title,
   desc,
@@ -159,11 +174,34 @@ export function DocsCard({
   return (
     <Link
       href={href}
-      className="group rounded-xl border border-border bg-card p-5 transition-colors hover:border-border-strong hover:bg-subtle/40"
+      className="group tap-44 flex flex-col justify-between rounded-lg border border-border bg-card p-6 transition-colors hover:border-border-strong hover:bg-subtle/40"
     >
-      <div className="h-6 w-6 text-fg">{icon}</div>
-      <h3 className="mt-4 flex items-center gap-1.5 font-semibold">{title}</h3>
-      <p className="mt-1.5 text-sm leading-relaxed text-secondary">{desc}</p>
+      <div className="h-7 w-7 text-fg">{icon}</div>
+      <div className="mt-8">
+        <h3 className="text-xl font-semibold tracking-tight">{title}</h3>
+        <p className="mt-2 text-sm leading-relaxed text-secondary">{desc}</p>
+      </div>
+    </Link>
+  );
+}
+
+/** The compact index: a destination without another identical frame. */
+export function DocsIndexLink({
+  title,
+  desc,
+  href,
+}: {
+  title: string;
+  desc: string;
+  href: string;
+}) {
+  return (
+    <Link
+      href={href}
+      className="tap-44 group flex flex-col gap-0.5 border-b border-border py-3 transition-colors hover:border-border-strong"
+    >
+      <span className="text-sm font-medium text-fg group-hover:text-link">{title}</span>
+      <span className="text-[13px] leading-relaxed text-secondary">{desc}</span>
     </Link>
   );
 }

@@ -12,6 +12,7 @@ import {
   endpointUrl,
   findEndpoint,
 } from "@/lib/api-catalog";
+import { DocsH1, DOCS_H2, DOCS_MEASURE_REFERENCE } from "@/components/docs/docs-ui";
 import { pageMeta } from "@/lib/page-meta";
 
 export function generateStaticParams() {
@@ -37,7 +38,7 @@ export async function generateMetadata(props: { params: Promise<{ category: stri
 function Section({ id, title, children }: { id?: string; title: string; children: React.ReactNode }) {
   return (
     <section className="mt-12">
-      <h2 id={id} className="group mb-4 flex scroll-mt-20 items-center gap-2 text-2xl font-bold tracking-tight">
+      <h2 id={id} className={`group mb-4 flex items-center gap-2 ${DOCS_H2}`}>
         {title}
         {id && <Link2 className="h-4 w-4 text-muted opacity-0 transition-opacity group-hover:opacity-100" />}
       </h2>
@@ -71,7 +72,7 @@ export default async function MethodPage(props: { params: Promise<{ category: st
   const ex = codeExamples(ep);
 
   return (
-    <div className="mx-auto flex max-w-6xl flex-col gap-8 lg:flex-row lg:gap-10">
+    <div className={`${DOCS_MEASURE_REFERENCE} flex flex-col gap-8 lg:flex-row lg:gap-10`}>
       <article className="min-w-0 flex-1 pb-24">
         <div className="mb-6 flex flex-wrap items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
@@ -81,7 +82,7 @@ export default async function MethodPage(props: { params: Promise<{ category: st
           <span className="font-medium text-fg">{ep.name}</span>
         </div>
 
-        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">{ep.name}</h1>
+        <DocsH1>{ep.name}</DocsH1>
 
         <div className="mt-5 flex flex-wrap items-center gap-3">
           <span className={`rounded-md px-2 py-0.5 font-mono text-xs font-semibold ${METHOD_TONE[ep.method]}`}>

@@ -3,7 +3,14 @@ import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2, Sparkles, ShieldCheck, Database, Workflow } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
-import { DocsCard, DocsFigure } from "@/components/docs/docs-ui";
+import {
+  DocsLead,
+  DocsIndexLink,
+  DocsFigure,
+  DocsH1,
+  DOCS_H2,
+  DOCS_MEASURE_WIDE,
+} from "@/components/docs/docs-ui";
 
 export const metadata: Metadata = pageMeta({
   title: "Documentation",
@@ -76,7 +83,7 @@ const CARDS = [
   { icon: KeyRound, title: "Environment & secrets", desc: "Inject vars at runtime or into the build; sensitive values are encrypted at rest.", href: "/docs/getting-started#env" },
   { icon: GitBranch, title: "GitOps", desc: "Connect GitHub once — push to deploy, config-as-code, two-way sync.", href: "/docs/getting-started#gitops" },
   { icon: Globe2, title: "Regions", desc: "Regions follow where your nodes are; requests go to a healthy node in their own region first.", href: "/docs/getting-started#regions" },
-  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that pack concurrent requests; production stays warm, previews scale to zero.", href: "/docs/getting-started#deploying" },
+  { icon: Zap, title: "Functions & Fluid", desc: "Serverless instances that pack concurrent requests; production stays warm, previews scale to zero.", href: "/docs/getting-started#introduction" },
   { icon: Code2, title: "API reference", desc: "The documented endpoints for deploys, env, projects, nodes and more.", href: "/docs/api-reference" },
   { icon: Sparkles, title: "AI Gateway", desc: "One provider pool, profitable per-model price cards and bounded web search.", href: "/docs/platform#ai-gateway" },
   { icon: Database, title: "Managed data", desc: "Per-database SQLite, a CRDT browser database, and managed Postgres and Redis records.", href: "/docs/platform#managed-data" },
@@ -88,14 +95,14 @@ const CARDS = [
 
 export default function DocsIndex() {
   return (
-    <div className="mx-auto max-w-5xl">
+    <div className={DOCS_MEASURE_WIDE}>
       <div className="grid gap-10 pb-8 lg:grid-cols-[1.05fr_1fr] lg:items-center">
         <div>
-          <h1 className="text-4xl font-semibold leading-[1.05] tracking-tight sm:text-5xl">
+          <DocsH1>
             Push to Git,
             <br />
             get a live URL
-          </h1>
+          </DocsH1>
           <p className="mt-6 max-w-md text-lg leading-relaxed text-secondary">
             Deploy serverless functions, containers and static sites from Git, hosted or on machines you
             operate.
@@ -111,29 +118,42 @@ export default function DocsIndex() {
         <CodeBlock tabs={HERO_TABS} />
       </div>
 
-      {/* M4: asymmetric evidence band breaks the uniform card grid. */}
+      {/* M5: the evidence band is a grid cell, and the card field loses its uniform frame. */}
+      <div className="grid gap-4 sm:grid-cols-2">
+        {CARDS.slice(0, 2).map((c) => (
+          <DocsLead key={c.title} icon={<c.icon className="h-7 w-7" />} title={c.title} desc={c.desc} href={c.href} />
+        ))}
+      </div>
 
-      <DocsFigure
-        src="/product/dashboard-deployments.png"
-        alt="shadw dashboard, deployments tab: a project named storefront with three deployment rows showing status ready, environment Production or Preview, source commit and creation time."
-        caption="Deployments view — status, environment, source and time per build."
-        note="Real 2x capture of a seeded local node, dark theme, 2026-10-14. Shown as evidence of the dashboard shell; it predates the November 2026 features (AI Gateway, usage metering, Attack Challenge Mode, 2FA, managed data). Frames are unretouched. Recapture on a seeded node is an operator task."
-        width={2880}
-        height={1800}
-      />
+      <div className="mt-10 grid gap-8 lg:grid-cols-[1.6fr_1fr] lg:items-start">
+        <DocsFigure
+          src="/product/dashboard-deployments.png"
+          alt="shadw dashboard, deployments tab: a project named storefront with three deployment rows showing status ready, environment Production or Preview, source commit and creation time."
+          caption="Deployments view — status, environment, source and time per build."
+          note="Real 2x capture of a seeded local node, dark theme, 2026-10-14. Shown as evidence of the dashboard shell; it predates the November 2026 features (AI Gateway, usage metering, Attack Challenge Mode, 2FA, managed data). Frames are unretouched. Recapture on a seeded node is an operator task."
+          width={2880}
+          height={1800}
+        />
+        <div className="border-t border-border pt-6 text-[15px] leading-relaxed text-secondary lg:border-l lg:border-t-0 lg:pl-8 lg:pt-2">
+          <p>
+            Connect your{" "}
+            <Link href="/docs/getting-started#gitops" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">Git repository</Link>{" "}
+            to deploy on every push, with{" "}
+            <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">preview deployments</Link>{" "}
+            for testing changes before production.
+          </p>
+          <p className="mt-4">
+            The capture beside this text is a real dashboard frame, not a mock. Its date and provenance
+            travel with it; the November 2026 platform features are documented in the platform overview,
+            not claimed by an older image.
+          </p>
+        </div>
+      </div>
 
-      <p className="border-t border-border pt-8 text-[15px] leading-relaxed text-secondary">
-        Connect your{" "}
-        <Link href="/docs/getting-started#gitops" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">Git repository</Link>{" "}
-        to deploy on every push, with{" "}
-        <Link href="/docs/getting-started#deploying" className="text-fg underline decoration-border underline-offset-4 hover:decoration-fg">preview deployments</Link>{" "}
-        for testing changes before production.
-      </p>
-
-      <h2 className="mb-5 mt-12 text-2xl font-semibold tracking-tight">Build with shadw</h2>
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-        {CARDS.map((c) => (
-          <DocsCard key={c.title} icon={<c.icon className="h-6 w-6" />} title={c.title} desc={c.desc} href={c.href} />
+      <h2 className={`mb-1 mt-12 ${DOCS_H2}`}>Guides, reference, examples and platform</h2>
+      <div className="grid gap-x-10 sm:grid-cols-2">
+        {CARDS.slice(2).map((c) => (
+          <DocsIndexLink key={c.title} title={c.title} desc={c.desc} href={c.href} />
         ))}
       </div>
 

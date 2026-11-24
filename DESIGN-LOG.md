@@ -2947,3 +2947,240 @@ Dispatch 1795507977009-10925-a825ead4f074a732 at 1200px: `{"title":"Documentatio
 Dispatch 1795508046970-10930-a81ae2f9ec51b23a at 390x844: `{"width":390,"navs":2,"groups":"hidden lg:mt-0 lg:block","browse":true,"figures":1,"caption":"Deployments view — status, environment, source and time per build.","overflow":false,"askAI":false}`.
 Dispatch 1795508094478-10935-20eb537d3547977a at 320x720 after clicking the disclosure: `{"width":320,"expanded":"true","groupsClass":"mt-3 lg:mt-0 lg:block","visibleNavLinks":19,"searchVisible":true,"overflow":false,"figureWidth":285}`.
 Measured deltas against the inherited artifact: figures 0 -> 1, figcaptions 0 -> 1, "Ask AI" present -> absent, docs nav landmark at 320px: 0 -> 2 (header nav + always-rendered Docs navigation nav). The nav links are 0 -> 19 visible after the disclosure opens; search input is display:none -> visible at 320px. Horizontal overflow: none at 320/390/1200. `npx tsc --noEmit` TSC_EXIT=0 (twice, dispatch 1795506000000 series; logs /private/tmp/hive-docs-witness/tsc.log and tsc2.log). All six docs routes 200 on dev server.
+
+## Anchor Ledger (Run 2)
+
+| Anchor | Role | Status | Evidence | Replacement or note |
+| --- | --- | --- | --- | --- |
+| `How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)` | Stance (seed) | SCRAP (frame swap) | R0: six deploy-era cards cannot "explain" a November platform; Debord/Krug/Shklovsky all OBJECT | Replaced for the card-grid region by `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)`; the stance still grounds the two new explain-things pages |
+| `Ten Principles of Good Design (Dieter Rams)` | Rule | KEEP | Survived Rams' own strongest objection (five h1 strings); one primitive now governs all routes | `npx tsc --noEmit` 0 and headful 1200px `figures=1` |
+| `Grid Systems in Graphic Design (Josef Müller-Brockmann)` | Rule | ADAPT | Grid survives below the evidence band; Samara -.-> loosens it | one asymmetric full-measure band, cards remain a grid |
+| `The Elements of Typographic Style (Robert Bringhurst)` | Rule | KEEP | All docs headings now inherit one class string | no objection named it directly; kept with the typographic measure |
+| `WCAG 2.2 Contrast and Perceivability (W3C)` | Rule | KEEP | Holmes measured --muted 3.0984:1; group labels moved to --secondary, focus-visible ring added, nav landmark at 320px | strongest objection survived: exclusion at phone width |
+| `Interaction of Color (Josef Albers)` | Counterpoint (dotted: contrast floor constrains) | KEEP | Dark-only captures are framed on a dark plate, with light-theme text around them; no new color introduced | applied as the contrast floor, not as decoration |
+| `MAYA: Most Advanced Yet Acceptable (Raymond Loewy)` | Welcome / governing criterion | KEEP | Advanced pole: evidence band + current platform; acceptable pole: familiar cards, same tokens, no motion | frame-swap replacement for Bierut in the index region |
+| `Don't Make Me Think (Steve Krug)` | Welcome | KEEP | One destination per label; "Ask AI" SCRAPped | survived the satisficing objection via the nav truth edit |
+| `Making and Breaking the Grid (Timothy Samara)` | Breaker | KEEP | M4 BREAK taken: the uniform grid is broken by one evidence band | measured delta: figures 0 -> 1 at 1200px |
+| `Art as Technique (Viktor Shklovsky)` | Welcome / counterpoint | ADAPT | Shklovsky's own 2-file measurement refused the overstated premise; the six-card automatism was real | OVERRULE on the premise, ADAPT on the grid |
+| `Premortem` | Catalog | KEEP | R0 seated seven independent agents, all OBJECT, all Andon | produced the Frontier that drove M2-M4 |
+| `Double Diamond` | Catalog | KEEP | Premortem -.-> iterate back to Double Diamond fired after Step 2g removed an unreproducible count | final-state re-measurement |
+| `Tufte Style` | Catalog | KEEP | Captions with alt + figcaption + provenance + date + explicit limits | Tufte's "evidence must be shown" satisfied by labelling, not recapture |
+| `Occam's Razor` | Catalog | KEEP | Four local helper definitions deleted; one primitive | Rams -> less but better |
+| `The Principles of Universal Design (Ronald Mace et al.)` | Welcome (panel) | KEEP | One always-rendered disclosure nav with aria-expanded/aria-controls | Mace's equitable-use objection |
+| `Mismatch: How Inclusion Shapes Design (Kat Holmes)` | Welcome (panel) | KEEP | nav landmark at 320px, visible focus ring | Holmes' exclusion objection |
+| `The Society of the Spectacle (Guy Debord)` | Lens (panel) | KEEP | content gap closed with shipped features, Ask AI removed | Debord's spectacle objection |
+
+### Live graph update after R0 and W1 (Mermaid text; no graph renderer available in this build)
+
+```mermaid
+flowchart LR
+  bierut["How to Use Graphic Design to Sell Things, Explain Things, Make Things Look Better (Michael Bierut)"]:::stance
+  rams["Ten Principles of Good Design (Dieter Rams)"]:::rules
+  mb["Grid Systems in Graphic Design (Josef Müller-Brockmann)"]:::rules
+  wcag["WCAG 2.2 Contrast and Perceivability (W3C)"]:::rules
+  albers["Interaction of Color (Josef Albers)"]:::rules
+  samBreak["Making and Breaking the Grid (Timothy Samara)"]:::break
+  maya["MAYA: Most Advanced Yet Acceptable (Raymond Loewy)"]:::welcome
+  krug["Don't Make Me Think (Steve Krug)"]:::welcome
+  shklovsky["Art as Technique (Viktor Shklovsky)"]:::welcome
+  holmes["Mismatch: How Inclusion Shapes Design (Kat Holmes)"]:::welcome
+  mace["The Principles of Universal Design (Ronald Mace et al.)"]:::welcome
+  debord["The Society of the Spectacle (Guy Debord)"]:::lens
+  tufteV["The Visual Display of Quantitative Information (Edward Tufte)"]:::express
+  c_occam["Occam's Razor"]:::catalog
+  c_tufte["Tufte Style"]:::catalog
+  c_premortem["Premortem"]:::catalog
+  c_dd["Double Diamond"]:::catalog
+  rams -->|less but better| c_occam
+  mb -->|codifies| itstyle
+  samBreak -.->|loosens| mb
+  wcag -.->|contrast floor constrains| albers
+  maya -.->|tempers strangeness of| shklovsky
+  tufteV -->|names| c_tufte
+  c_premortem -.->|iterate back to| c_dd
+  class rams,mb,wcag,albers,samBreak,maya,krug,shklovsky,holmes,mace,debord,tufteV,c_occam,c_tufte,c_premortem,c_dd visited
+  class bierut scrapped
+  class mb,wcag,shklovsky adapted
+  class rams,krug,samBreak,maya,albers,holmes,mace,debord,tufteV,c_occam,c_tufte,c_premortem,c_dd kept
+```
+
+## Double loop
+
+The CRITERION did not fail: MAYA's two poles explained every disagreement — the acceptable pole (familiar cards, existing tokens, no motion, honest captions) repeatedly overrode a purer formalist reading, and the advanced pole (one real evidence band, current platform content, nav at phone width) stopped the run from being cosmetic. The PANEL did fail once: Run 1 seated two merged critics before the one-agent-per-literary-reference rule; Run 2 seated seven independent references from the start, each citing its own literature and observable line. The GRAPH needs one concrete amendment under "Graph amendments": add a "Provenance-Labelled Historical Frame" tension node reached by a dotted edge from c_tufte to c_premortem, recording that a dated, captioned historical capture is honest evidence of a SHELL but not of later features, so a later run does not re-litigate whether the October frames may be shipped. No criterion, panel or graph change was made merely to please a score: three R0 premises were OVERRULED with the objectors' own measurements, and the objections stay in the log.
+
+## Carry-Forward Ledger (Run 2, appended to DESIGN-CARRY-FORWARD.md)
+
+| Fact | Measurement that established it | Move it changed |
+| --- | --- | --- |
+| A Next 16 dev server at `localhost` (not `127.0.0.1`) hydrates; `127.0.0.1` does not. | dev-server.log "Ready in 318ms", all six docs routes 200 on localhost; ui/AGENTS.md | M2/M3/M4 witness routing: all headful gm.chrome calls used `http://localhost:3188`.
+| `npm ci --offline` fails with ENOTCACHED for zustand-4.5.7; an ONLINE `npm ci` succeeds and `node_modules/next` version 16.3.3. | npm-ci.log ENOTCACHED vs npm-ci-online.log NPM_CI_EXIT=0 NODE_MODULES=present | Enabled tsc, lint and the headful browser witness. `next dev` rewrites ui/next-env.d.ts; restored via git_checkout, never commit it.
+| `next/image` with a string src under /public plus width/height is current in Next 16 (node_modules/next/dist/docs/01-app/01-getting-started/12-images.md). | guide read verbatim | DocsFigure uses next/image; a plain <img> would have been an eslint a11y regression. images.deviceSizes includes 2880, matching the real captures.
+| An invented API route is the easiest defect to ship: `/v1/ai/gateway` returned 0 exhaustive matches in crates/hive-cloud/src; the real route is `/v1/chat/completions` (ai_gateway.rs:2405) with `model` + `messages`. | gm.codesearch literal exhaustive, 133 files; ai_gateway.rs:2396-2425 | Both AI Gateway examples were rewritten before the commit. A workflow map lens caught the same class in existing quickstart prose.
+| Tailwind `focus-visible:ring-*` needs a color token; `link` exists in tailwind.config.ts, `--muted` at 0 0% 56% on bg 98% computes 3.0984:1. | tailwind.config.ts:10-28, globals.css:11 | Group labels moved to `text-secondary`; search input gained `focus-visible:ring-2 ring-link`.
+| `overflow-x: clip` is scoped to `html:has(#docs-content)` (globals.css:211-215), not global; a no-horizontal-overflow measurement on docs is honest. | DESIGN-CARRY-FORWARD.md Run 1 + globals.css read | 320px witness `overflow:false` at 320/390/1200.
+| gm.chrome `viewport` takes WIDTHxHEIGHT, not WIDTH,HEIGHT; `click` takes a snapshot uid, not a selector — an `eval` that calls `.click()` works. | dispatch refusals 1795507999242 / 1795508074347; success 1795508094478. | W1 measurement at 320x720 with disclosure opened.
+| AGENTS.md is 30,717 bytes against a 30,720 cap; no new prose can be appended without a full compaction pass. | fs_stat, carried from Run 1 | The project fact was recorded in DESIGN-LOG.md and CHANGELOG.md, not AGENTS.md.
+
+
+---
+
+## W1 Panel Report — WHOLE artifact, round W1 (2026-11-24)
+
+Artifact examined: local commit c76c0c43b3 (docs one-primitive/current-platform/screenshots), rendered at http://localhost:3188/docs, /docs/platform, /docs/examples, /docs/getting-started, /docs/api-reference, /docs/errors/deployment-not-found. Seven independent gm subagents, one per literary reference, re-convened with the same doctrine and SESSION_ID; each returned compact JSON with an observed file:line or live curl fact. These are automated task results, not user input.
+
+| Critic | Anchor used | Observed in the work | Verdict | Requested change |
+| --- | --- | --- | --- | --- |
+| Debord | spectacle / pseudo-need | curl /docs: figure=1, figcaption=1, Ask AI=0, nav links=19, one /docs/api-reference anchor, 2026-10-14 caveat present | PASS | none |
+| Shklovsky | ostranenie / automatism | ui/app/docs/page.tsx:135 CARDS.map, 12 icon entries at :75-86; curl /docs 'group rounded-xl' -> 24 (R0: 12); DocsFigure at :116 precedes the grid, not within it | OBJECT | actually break the grid; stop multiplying one border |
+| Holmes | inclusion / width exclusivity | curl /docs 200, 91968 bytes: <nav aria-label="Docs navigation"> with no hidden, aria-controls="docs-nav-groups", aria-expanded, 38 href="/docs/ links, 1 focus-visible:ring-2, 1 <figcaption>; ui/app/docs/layout.tsx:154 | PASS | none |
+| Mace | equitable use / disclosure | layout.tsx:154 aria-label, :159 aria-expanded, :160 aria-controls; curl /docs: aside=0, nav=1, 1 Browse docs button, 1 Search docs input, focus:min-h-[44px] skip link, 1 figcaption; 19 NAV items at :16-54 | PASS | none (remaining: tab aria-selected, search live region) |
+| Krug | satisficing / one label one destination | curl /docs: 'API reference' -> /docs/api-reference in nav AND hero; Guides/API/Platform/Examples -> four distinct hrefs; 'Ask AI' absent; /docs/platform and /docs/examples 200 | PASS | none |
+| Tufte | lie factor / data-ink | curl 2026-11-24T08:30:14Z (dispatch 1795509014183-11120-7bef27e532e1d6cd): /docs 200 91968 B sha256 773e4c75…; /docs/platform 200 110258 B sha256 935b7afc…; figures/figcaptions 1/1 and 2/2; descriptive alt, provenance, date, exclusions, operator residual | PASS | two loose premises: 2026-11-24 has four CHANGELOG headings; '19 real cumulative counters' still printed |
+| Rams | less, but better / one rule | curl /docs/api-reference -> h1 class="text-4xl font-bold tracking-tight" + max-w-6xl; /docs/errors h1 "text-3xl font-semibold sm:text-4xl" + max-w-3xl; api-reference/page.tsx:28 still a local H2; exhaustive DocsPage search: only examples/page.tsx:26 and platform/page.tsx:39. 'Ask AI': 0 hits everywhere | OBJECT | one heading rule and one measure across all six routes, not a primitive governing two |
+
+Statements of meaning: the run says the docs are now a current, evidenced, navigable product surface; the dissent says it says that with twelve interchangeable boxes and four competing title voices, so the eye is told "system" while the markup says "six local conventions".
+
+Artist questions: (a) Is the evidence band part of the grid's rhythm or a poster pasted above it? (b) Does one import from docs-ui govern every route, or only the two routes written this run? (c) Does any number printed to a reader have a procedure they can run?
+
+Critic questions: (a) How many distinct h1 class strings remain in ui/app/docs? (b) How many distinct page measures? (c) Where exactly does the figure sit relative to CARDS.map? (d) What does '19 real cumulative counters' measure at final state?
+
+Opinions: five seats held that the inherited exclusions and the dated-caption false currency are repaired; two held that the repair added a layer rather than removing one. Both objections name measurements, so neither is overruled.
+
+Andon pulled: YES — Shklovsky and Rams. No new moves until resolved.
+
+Resolutions (records M5 and M6 below, written before the edits): ADAPT for both. Tufte's two premises are treated as Step 2g findings: the CHANGELOG date is a fact of the repository (four 2026-11-24 headings), and the '19 real cumulative counters' string at ui/app/docs/platform/page.tsx:29 is a figure the artifact prints without a procedure a reader can run; it is removed at final state.
+
+## Move M5: break the actual grid, not the space above it  (BREAK -> ADAPT of M4)
+Depends on: M2, M3, M4 (all REOPENED by this ADAPT)
+Anchors: Stance "Most Advanced Yet Acceptable" | Rule "Make it familiar, then make it strange" | Breaker "Defamiliarization" | Counterpoint "Provenance-Labelled Historical Frame" (dotted edge from "Data-ink ratio")
+Intent: the eye meets two lead entries at a different scale, then a real dated capture occupying grid cells, then a borderless compact index of the rest. The uniform border stops being the unit of the page.
+Formal argument: claim — M4 did not break the grid, it placed a figure above it. Grounds — ui/app/docs/page.tsx:116 DocsFigure precedes the grid at :134, and curl /docs counts 24 'group rounded-xl' occurrences (12 cards, two class strings each) versus 12 at R0. Warrant — Shklovsky: automatism is the repeated identical frame; multiplying it industrializes perception. Grounds for the fix — the figure becomes a grid item and the remaining entries shed their borders, so the count falls to the lead pair only. Alternatives rejected: (1) keep 12 cards but span one across two columns — changes a value, not the rhythm, and still leaves ten identical frames; (2) SCRAP the figure band and let prose carry provenance — loses the only real product evidence, which Debord and Tufte both credited. Consequence: fewer large tap targets in the lower index; each keeps a 44px floor via tap-44. The card count a reader can see drops from 12 to 2 bordered units; the destinations do not drop. Fence: the grid exists to make destinations scannable; the break preserves one link per destination and the same hrefs, so the rule's purpose survives. Frontier effect: candidate "one heading/measure system across all six routes" (M6), candidate "re-measure all printed figures at final state" (Step 2g). Mode field: Advanced pole = heterogeneous rhythm with a real capture inside the grid (anchor: Defamiliarization); Acceptable pole = every prior destination stays one click away with the same labels (anchor: MAYA).
+
+## Move M6: one primitive governs all six routes  (KEEP-THE-RULE -> ADAPT of M2)
+Depends on: M2, M5
+Anchors: Stance "Most Advanced Yet Acceptable" | Rule "Less, but better" | Breaker "Grid as discipline" | Counterpoint "Data-ink ratio" (dotted edge from "Less, but better")
+Intent: one title voice and one declared measure per route kind, imported from one file, so /docs reads as one document rather than six local stylesheets.
+Formal argument: claim — DocsPage currently governs 2 of 6 routes (Tufte/Rams exhaustive search). Grounds — five distinct h1 class strings in ui/app/docs (api-reference/[category]/[method]/page.tsx:84, api-reference/page.tsx:46, getting-started/page.tsx:32, errors/deployment-not-found/page.tsx:32, page.tsx:94) and three ad-hoc measures (max-w-3xl, max-w-5xl, max-w-6xl). Warrant — Rams: a primitive that governs only the new pages is another layer, not one rule. Grounds for the fix — export DocsH1 (one component, one documented hero variant) and three NAMED measure constants from docs-ui.tsx, and import them on every route; the values stop being local decisions. Alternatives rejected: (1) force every route to max-w-3xl — the two API-reference routes carry a TOC/aside and would wrap their code examples; measured by their existing flex max-w-6xl; (2) rewrite all six routes to call DocsPage wholesale — the API-reference article/TOC sibling structure and the index hero/CodeBlock two-column would have to be rebuilt inside a space-y-2 wrapper, a structural change with no measured benefit over importing the same constants. Consequence: three named variants remain, but each is declared once with a stated purpose, which is the fence. Fence: a variant earns its keep only when a named sibling element needs the width; the reference variants name their TOC/aside. Frontier effect: candidate "verify computed h1 class equality at every route" (witness for 2b), candidate "fix code-block tab semantics" (Mace residual, DEFERRED with reason). Mode field: Advanced pole = one exported typographic rule (anchor: Grid as discipline); Acceptable pole = no route's existing structure is rebuilt (anchor: MAYA).
+
+## Step 2g re-measurement plan (to be executed after M5 and M6 land)
+Printed figures in the artifact: 12 card destinations, 8 FEATURES entries, 4 dated "What's new" rows, 19 NAV items, 2 capture dates 2026-10-14, 2 frame dimensions 2880x1800, 1 "19 real cumulative counters" claim. Procedure: curl each route and count the emitted markers; node fs stat for the two PNG dimensions and mtimes; grep-equivalent via gm.codesearch for the changelog headings. Any figure that drifts is corrected or deleted before the stop test.
+
+---
+
+## Step 2g - final-state re-measurement (after M5 and M6, the last edits to the artifact)
+
+Procedure stated for a reader: run npx tsc --noEmit and npm run lint from ui/; curl each docs route at http://localhost:3188; count emitted class strings and figcaptions in the HTML; file and stat the two PNGs in ui/public/product/. All counts below were produced by those procedures AFTER the final edit, dispatch ids in parentheses.
+
+| Printed figure / claim | Procedure | Value at final state | Reproducible? |
+| --- | --- | --- | --- |
+| one h1 rule | curl all 7 routes, regex the h1 class attribute | 1 distinct h1 class string across 7/7 routes: text-3xl font-semibold tracking-tight sm:text-4xl (1795511275751 / 1795511291148 / 1795511305975) | yes, corrected from 5 |
+| one h2 base | curl all 7 routes, regex the h2 class attribute | 1 distinct base scroll-mt-20 text-2xl font-semibold tracking-tight; route-local margins compose around it | yes, corrected from 3 |
+| page measures | curl all 7 routes, regex max-w-(3xl|5xl|6xl) | max-w-3xl on 3 prose routes, max-w-5xl on 2 figure routes, max-w-6xl on 2 TOC routes. Three NAMED constants in docs-ui.tsx, zero ad-hoc declarations in ui/app/docs (1795510720653) | yes, reduced from 3 anonymous to 3 declared |
+| 12 index destinations | curl /docs, count hrefs into the index list | 2 DocsLead + 10 DocsIndexLink = 12; 38 href="/docs/" occurrences overall including nav (1795511305975 headful) | yes, unchanged from W1 |
+| 2 real dashboard captures | curl /docs and /docs/platform, count figure/figcaption | /docs 1/1, /docs/platform 2/2, /docs/examples 2/2 (1795511181029) | yes |
+| 2880x1800, 2026-10-14 | file + stat ui/public/product/dashboard-{deployments,projects}.png | both 2880x1800 8-bit RGB opaque PNG, mtime 2026-10-14T16:45:10Z | yes |
+| "19 real cumulative counters" | curl /docs/platform | 0 occurrences; string deleted from FEATURES at ui/app/docs/platform/page.tsx:29. The platform prose now prints only the qualitative "Real cumulative counters are wired at single-writer boundaries" | corrected - the number had no reader-runnable procedure |
+| 4 dated What's new rows | curl /docs/platform, count dated strong tags | 4 rows (2026-11-24, -20, -19, -18), each naming a shipped change present in CHANGELOG.md | yes |
+| 8 FEATURES entries | curl /docs/platform, count DocsIndexLink markers | 8 (16 markers because the class string appears in the RSC payload too) (1795510960279) | yes |
+| 19 NAV items | ui/app/docs/layout.tsx:16-54 | 19 items; curl /docs emits one nav landmark at every width | yes |
+| phone overflow | headful Chromium 390x844, eval documentElement | clientWidth=380, scrollWidth=385, computed overflow-x: clip, so the 5px is clipped and no horizontal scroll is reachable; the offender is the full-bleed left-1/2 w-screen -translate-x-1/2 wrapper (1795511305975) | yes - measured, bounded, not claimed as zero |
+| no test files added | git diff over the docs surfaces + filename search | 0 test/spec/__tests__ files in the diff; the 16 *.test.ts hits are pre-existing vendored ui/vendor/workflow-web files, untouched (1795510956414) | yes |
+| no TODO/FIXME/XXX/HACK in docs | codesearch regex over ui/app/docs | 0 matches, exhaustive=true (1795510942450-11234) | yes |
+| no co-author trailer, no secrets, no unchecked panic in added lines | full git diff over 7 changed files | 119 added lines, 0 matches for TODO/FIXME/Co-Authored-By/Anthropic/credential shapes/graphical symbols/unwrap()/panic!() | yes |
+
+Residual diff for the M2/M5/M6 refactor, each changed computed value classified: 5 h1 class strings -> 1 (intended); 3 h2 strings -> 1 base + composed margins (intended); 3 anonymous page measures -> 3 named constants (intended); 12 bordered cards on /docs -> 2 lead frames + 10 borderless rows (intended); group rounded-xl on /docs: 12 -> 0 (intended); /docs HTML bytes 91968 -> 78775 (intended, fewer frames); /docs/platform HTML bytes 110258 -> 96183 (intended); /docs h1 font-size 4xl/5xl -> 3xl/4xl (intended, one rule); figure position above grid -> inside a grid cell (intended); "19 real cumulative counters" -> qualitative claim (intended); no regression found. Native h1 visual weight on the index hero drops one step; that is the cost of one rule and is recorded as an accepted cost, not an inert edit.
+
+## Step 2f - deletion review (substantial pre-existing elements)
+
+| Element predating Run 2 | Value it earns | Decision |
+| --- | --- | --- |
+| local Section/H2/In/Callout helpers on 4 inherited routes | none after docs-ui.tsx provides them; four competing typographies | SCRAPped; aliases import the primitive |
+| 12-card index grid on /docs | one link per destination, but the uniform frame hid the evidence | SCRAPped the frames, KEPT all 12 hrefs and labels |
+| Ask AI / Sparkles in the docs header | none; focused a hidden input | SCRAPped in W1 |
+| api-reference local H2 and method-page local Section | the method page needs an anchor link icon that DocsSection does not render | KEPT the method page Section wrapper, but its h2 now uses DOCS_H2; the index H2 now uses DOCS_H2 |
+| four local h1 class strings | none | SCRAPped; one DocsH1 |
+| three ad-hoc page measures | the TOC/aside and figure routes genuinely need width | KEPT as three NAMED constants, declared once, not as three local decisions |
+| DocsCard primitive (added by this run at M2) | none after M5 | SCRAPped in the same run; retained-value ledger: every destination keeps its href, title, description and tap-44 target |
+| CHANGELOG.md, docs/PENDING_VALIDATION.md | durable history and the pending-witness ledger | KEPT |
+| two 2026-10-14 PNGs | only real product captures available; recapture is an operator task on a seeded node | KEPT, with mandatory provenance/exclusion figcaptions |
+
+Deferred with a recorded reason (not a TODO stub): code-block tabs still lack role=tablist/aria-selected, and the docs search has no live region (Mace W1 PASS named both). Both live in ui/components/code-block.tsx and layout.tsx shared by non-docs routes; changing them needs a separate witness pass over the dashboard, which this docs-only run does not have. Filed as an open frontier row, not deferred work in the code.
+
+---
+
+## W1 objection resolutions (ADAPT, with re-measured premises)
+
+| Objector | Premise tested before spending the move | Measurement | Resolution |
+| --- | --- | --- | --- |
+| Shklovsky | "12 identical borders, figure above the grid" | ui/app/docs/page.tsx:116 DocsFigure preceded the grid at :134; curl /docs counted 24 group rounded-xl markers (12 cards, 2 markup copies) | ADAPT M5. Re-measured: group rounded-xl on /docs = 0; 2 DocsLead (h3.text-xl) + 10 DocsIndexLink; the capture is now a cell of grid lg:grid-cols-[1.6fr_1fr]; /docs bytes 91968 -> 78775. Objection survives as history, not as a live defect. |
+| Rams | "four h1 strings, three measures, primitive governs 2 routes" | 5 distinct h1 class strings in ui/app/docs and 3 anonymous measures; exhaustive DocsPage search found only platform/examples | ADAPT M6. Re-measured: codesearch literal h1 tag over ui/app/docs = 0 matches, exhaustive=true (1795510716767); all 7 routes render one h1 class; max-w declarations in ui/app/docs reduced to 2 non-page uses |
+| Tufte (PASS, two loose premises) | "19 real cumulative counters" and four 2026-11-24 changelog headings | platform/page.tsx:29 printed the number; CHANGELOG.md has four headings that date | Step 2g correction: number deleted, qualitative claim kept. The four changelog headings are a fact of the repo, not a defect in the artifact. |
+
+Depends on M2/M3/M4 -> all three marked REOPENED when M5 ADAPTed M4; re-verified at final state above. No move was marked final before this re-check.
+
+## S4 ambition push (M5, measured)
+
+W1 demanded a break of the grid; the escalation pushed M4 past its original fence. M4 had added a full-measure figure ABOVE the grid and kept 12 uniform cards. M5 deleted DocsCard (a primitive this run had added at M2), put the real capture INSIDE a grid cell beside provenance prose, and replaced the uniform frames with 2 lead entries at a different scale plus 10 borderless rows. Measured delta on the rendered work, same URL and viewport: group rounded-xl 12 -> 0; bordered destinations 12 -> 2; HTML bytes 91968 -> 78775; /docs/platform bytes 110258 -> 96183; h1 class strings 5 -> 1; h2 strings 3 -> 1 base; figure parent above-grid -> inside-grid. The lever moved; this is not a declaration.
+
+## Double loop (Run 2)
+
+The criterion did not fail: MAYA named both poles and the W1 dissent was about an insufficiently advanced pole, not about an unacceptable one. The PANEL failed once: R0 ran on curl and source rather than a headful browser, so it could not see the phone-width exclusion it was asked to judge; W1/W2 were given live headful and curl witnesses. The GRAPH failed once: Run 1 marked the live graph only after moves, so Decision Records M5-M9 were reconstructed after the fact. Run 2 added a Provenance-Labelled Historical Frame tension node on the dotted edge from c_tufte to c_premortem, because the real, dated screenshots forced a new counterpoint between data-ink honesty and premortem risk.
+
+Graph amendments: add that node; keep Premortem as a required first-round node (it produced the only two Andons); add one critic for typographic systems (Muller-Brockmann) to the Adaptive panel so a future run judges one rule before it is broken rather than after.
+
+## Carry-Forward Ledger (Run 2, facts about this medium)
+
+| Fact | Measurement that established it | Move it changed |
+| --- | --- | --- |
+| A full-bleed wrapper using left-1/2 w-screen -translate-x-1/2 reports +5px scrollWidth at a 390px viewport because w-screen includes the scrollbar; html:has(#docs-content) overflow-x: clip makes it unreachable. | headful Chromium 390x844: clientWidth=380, scrollWidth=385, computed overflow-x=clip (1795511305975) | recorded as bounded instead of claiming zero overflow |
+| A component primitive that only the new pages import is a new layer, not a refactor; the count of remaining local h1 strings is the honest test. | codesearch literal h1 tag over ui/app/docs = 0 at final state vs 5 before M6 | M6 imports DocsH1 on all 7 routes |
+| Calling a figure band above a grid a break leaves the grid intact; the parent of the figure is the measurable fact. | W1 Shklovsky curl: 24 group rounded-xl markers and DocsFigure outside CARDS.map | M5 moved the figure into a grid cell and deleted DocsCard |
+| Stale screenshots become honest only when the caption names the date, provenance AND the features the frame does NOT show. | W1 Tufte PASS with sha256-bounded /docs and /docs/platform HTML; provenance notes on 1/1 and 2/2 figures | M3 caption contract kept at final state |
+| A printed number with no reader-runnable procedure is a lie factor even when it is true. | "19 real cumulative counters" in FEATURES had no procedure in the artifact; removed, 0 occurrences at final state | Step 2g correction |
+| Next.js RSC payload duplicates each class string, so a naive grep count doubles card counts; count rendered markers in a headful DOM instead. | curl /docs 24 group rounded-xl vs headful DOM 12 card elements at R0 | W1 premise test and M5 measurement used DOM/route counts |
+| A five-seat PASS is not saturation: two objectors with measurements reopen all dependent moves. | W1 5 PASS / 2 OBJECT with Andon | ADAPT M5 and M6, then W2 re-convened as fresh agents |
+
+### Frontier (open at the time of writing, before W2 returns)
+
+| Candidate | Reached via | From anchor | Status |
+| --- | --- | --- | --- |
+| code-block role=tablist/aria-selected | dotted edge from Mace equitable use | Inclusion | DEFERRED - shared with dashboard routes, needs its own witness pass |
+| docs search live region | dotted edge from Mace equitable use | Inclusion | DEFERRED - same reason |
+| CLI naming (fluidctl/hivectl) in getting-started | outgoing edge from Krug one-label-one-destination | Usability | DEFERRED - swarm examples lens finding, not re-verified in Run 2 |
+| recapture the two dashboard PNGs on a seeded node | dotted edge from Provenance-Labelled Historical Frame | Data-ink ratio | DEFERRED - operator task, no seeded node in this run |
+| AAA finish line row aaa-finishline-closure-2026-11-16 | outgoing edge from Premortem | Systems | OPEN - 640 inherited pending PRD rows; no push and no roll |
+
+---
+
+## W2 Panel Report (partial - 1 of 7 seats returned)
+
+Artifact examined: final local tree, http://localhost:3188/docs and the 6 sibling routes; seven fresh independent gm subagents with distinct SESSION_IDs, one per literary reference, each briefed with the W1 objections and told to re-verify by live curl rather than trust prose. Automated task results, not user input.
+
+| Critic | Anchor used | Observed in the work | Verdict | Requested change |
+| --- | --- | --- | --- | --- |
+| Krug | satisficing / information scent | curl /docs 200: 12/12 CARDS hrefs intact (2 DocsLead + 10 DocsIndexLink), 21/21 internal paths 200; ui/app/docs/page.tsx:153 heads that 10-link list "Everything else" and it includes /docs/api-reference, /docs/examples, /docs/platform | OBJECT | rename the heading; the "Functions & Fluid" label promises Fluid but lands on #deploying |
+
+Premise test BEFORE spending a move (dispatch 1795511589575-11516): codesearch literal "Fluid" in ui/app/docs/getting-started/page.tsx returns exactly 1 match, at line 48 in the Introduction <li>, and none in the #deploying section. Krug is right about what is there. The heading claim was also re-read verbatim at ui/app/docs/page.tsx:153. Both premises hold, so this is an ADAPT, not an OVERRULE.
+
+Andon pulled: YES (Krug). New moves are held until it is resolved; the remaining six W2 verdicts are being collected first so the ADAPT answers the whole round rather than one seat at a time.
+
+## Independent headful witness at all three widths (post-M5/M6)
+
+| Viewport | dispatch id | clientWidth/scrollWidth | computed overflow-x | h1 / figure / figcaption / nav |
+| --- | --- | --- | --- | --- |
+| 320x800 | 1795511695350-11544-6a68243a6074df20 | 310/315 | clip | 1/1/1/2 |
+| 390x844 | 1795511305975-11418-62023519325e726c | 380/385 | clip | h1=1 fig=1 cap=1 leads=2 docslinks=38 |
+| 1200x900 | 1795511699289-11545-ccf5b3fc51798821 | 1190/1195 | clip | 1/1/1/2 |
+
+The earlier browser lease (pid 62774) died between calls: CDP connection refused. gm.browser_reset (1795511659970-11539) closed that pid and released the lease, then a fresh headful window was opened for 320 and 1200. The failed calls are recorded, not silently replaced. No browser was killed by name.
+
+---
+
+## Move M7: restore information scent after the grid break  (BREAK -> ADAPT of M5)
+Depends on: M5, M6 (both REOPENED by this ADAPT)
+Anchors: Stance "Most Advanced Yet Acceptable" | Rule "Information scent" | Breaker "Defamiliarization" | Counterpoint "Less, but better" (dotted edge from "Grid as discipline")
+Intent: the eye reads a heading that names what follows, and every label lands on a section that actually discusses its subject.
+Formal argument: claim — M5 broke the frames but destroyed the scent of the resulting list. Grounds — ui/app/docs/page.tsx:153 heads a 10-link list "Everything else" although it contains the API reference, worked examples and the platform overview, the three primary destinations; the "Functions & Fluid" card points at #deploying, and codesearch literal "Fluid" in ui/app/docs/getting-started/page.tsx returns exactly one match at :48 in the Introduction, none in #deploying (dispatch 1795511589575-11516). Warrant — Krug: a user satisfices on the first label that smells like the answer; a heading that calls primary destinations "else" gives no scent, and a label that promises Fluid on a page without the word is a dead end. Grounds for the fix — rename the heading to a truthful index label, and point the Fluid card at the Introduction that defines "Fluid compute" (id=introduction), which is where the term is actually explained.
+Alternatives rejected: (1) keep "Everything else" and OVERRULE on the grounds that the two lead cards are the primary ones — the measurement refuses it, since the list holds 3 of the 4 header destinations; (2) add a Fluid subsection to #deploying — that is a new content claim about runtime behaviour needing its own verification, whereas the Introduction already defines the term. Consequence: two labels now share neither a destination nor a false promise; the heading loses its provocative tone but gains the acceptable pole. Fence: M5s heterogeneous rhythm survives untouched; only strings and one href change, so Shklovsky and Rams measurements are unaffected.
+Frontier effect: candidate "re-run W3 saturation on the post-M7 artifact"; candidate "reconcile the two remaining dotted edges with reasons" (S5).
+Mode field: Advanced pole = the asymmetric grid remains (anchor: Defamiliarization); Acceptable pole = a first-time reader can tell what the list contains and where each label goes (anchor: MAYA).

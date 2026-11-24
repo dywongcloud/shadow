@@ -1,7 +1,7 @@
 import Link from "next/link";
 import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
-import { ArrowRight, Database, ShieldCheck, Sparkles, Boxes, Workflow, Radio, Cpu, KeyRound } from "lucide-react";
+import { ArrowRight } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 import {
   DocsPage,
@@ -10,7 +10,7 @@ import {
   DocsIn,
   DocsCallout,
   DocsFigure,
-  DocsCard,
+  DocsIndexLink,
 } from "@/components/docs/docs-ui";
 
 export const metadata: Metadata = pageMeta({
@@ -24,14 +24,14 @@ export const metadata: Metadata = pageMeta({
 });
 
 const FEATURES = [
-  { icon: Boxes, title: "Builds & deployments", desc: "Git or Dockerfile builds, framework detection, preview URLs, instant rollback and no-cache redeploys.", href: "/docs/getting-started#deploying" },
-  { icon: Sparkles, title: "AI Gateway", desc: "One provider pool, profitable per-model price cards and a bounded server-side web search tool.", href: "/docs/platform#ai-gateway" },
-  { icon: Radio, title: "Usage metering", desc: "19 real cumulative counters at stored-record boundaries; charging stays opt-in.", href: "/docs/platform#metering" },
-  { icon: Database, title: "Managed data", desc: "Per-database SQLite files, a CRDT browser database, and managed Postgres and Redis records.", href: "/docs/platform#managed-data" },
-  { icon: Cpu, title: "Sandboxes & isolation", desc: "A capability-probed Litebox backend on macOS plus Linux cell backends; placement never assumes a runtime.", href: "/docs/platform#sandboxes" },
-  { icon: ShieldCheck, title: "Security", desc: "Attack Challenge Mode, sensitive-path denies, optional account 2FA and a signed contract oplog.", href: "/docs/platform#security" },
-  { icon: Workflow, title: "Queues, cron & workflows", desc: "Tenant-held queue tokens, node-local cron and durable workflow runs.", href: "/docs/platform#workloads" },
-  { icon: KeyRound, title: "Credentials & keys", desc: "Server-side credential resolution, encrypted host-only cookies and a fail-closed at-rest key.", href: "/docs/getting-started#env" },
+  { title: "Builds & deployments", desc: "Git or Dockerfile builds, framework detection, preview URLs, instant rollback and no-cache redeploys.", href: "/docs/getting-started#deploying" },
+  { title: "AI Gateway", desc: "One provider pool, profitable per-model price cards and a bounded server-side web search tool.", href: "/docs/platform#ai-gateway" },
+  { title: "Usage metering", desc: "Cumulative counters at single-writer boundaries; charging stays opt-in.", href: "/docs/platform#metering" },
+  { title: "Managed data", desc: "Per-database SQLite files, a CRDT browser database, and managed Postgres and Redis records.", href: "/docs/platform#managed-data" },
+  { title: "Sandboxes & isolation", desc: "A capability-probed Litebox backend on macOS plus Linux cell backends; placement never assumes a runtime.", href: "/docs/platform#sandboxes" },
+  { title: "Security", desc: "Attack Challenge Mode, sensitive-path denies, optional account 2FA and a signed contract oplog.", href: "/docs/platform#security" },
+  { title: "Queues, cron & workflows", desc: "Tenant-held queue tokens, node-local cron and durable workflow runs.", href: "/docs/platform#workloads" },
+  { title: "Credentials & keys", desc: "Server-side credential resolution, encrypted host-only cookies and a fail-closed at-rest key.", href: "/docs/getting-started#env" },
 ];
 
 export default function PlatformPage() {
@@ -69,9 +69,9 @@ export default function PlatformPage() {
           width={2880}
           height={1800}
         />
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="mt-8 grid gap-x-10 sm:grid-cols-2">
           {FEATURES.map((f) => (
-            <DocsCard key={f.title} icon={<f.icon className="h-6 w-6" />} title={f.title} desc={f.desc} href={f.href} />
+            <DocsIndexLink key={f.title} title={f.title} desc={f.desc} href={f.href} />
           ))}
         </div>
       </DocsSection>

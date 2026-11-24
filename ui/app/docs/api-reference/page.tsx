@@ -2,7 +2,7 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { CodeBlock } from "@/components/code-block";
-import { DocsIn as Code } from "@/components/docs/docs-ui";
+import { DocsIn as Code, DocsH1, DOCS_H2, DOCS_MEASURE_REFERENCE } from "@/components/docs/docs-ui";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
 
 export const metadata: Metadata = pageMeta({
@@ -27,7 +27,7 @@ const TOC = [
 
 function H2({ id, children }: { id: string; children: React.ReactNode }) {
   return (
-    <h2 id={id} className="mb-4 mt-14 scroll-mt-20 text-2xl font-semibold tracking-tight">
+    <h2 id={id} className={`mb-4 mt-14 ${DOCS_H2}`}>
       {children}
     </h2>
   );
@@ -35,7 +35,7 @@ function H2({ id, children }: { id: string; children: React.ReactNode }) {
 
 export default function ApiReferencePage() {
   return (
-    <div className="mx-auto flex max-w-6xl gap-12">
+    <div className={`${DOCS_MEASURE_REFERENCE} flex gap-12`}>
       <article className="min-w-0 flex-1 pb-24">
         <div className="mb-6 flex items-center gap-2 text-sm text-secondary">
           <span>APIs &amp; SDKs</span>
@@ -43,7 +43,7 @@ export default function ApiReferencePage() {
           <span className="font-medium text-fg">shadw REST API</span>
         </div>
 
-        <h1 className="text-4xl font-bold tracking-tight">Using the REST API</h1>
+        <DocsH1>Using the REST API</DocsH1>
         <p className="mt-6 text-[15px] leading-relaxed text-secondary">
           Interact programmatically with your shadw cloud using direct HTTP requests. You can create
           deployments, manage custom domains and DNS, configure projects, and wire up webhooks, all

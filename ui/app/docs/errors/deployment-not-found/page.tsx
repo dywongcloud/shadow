@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import { pageMeta } from "@/lib/page-meta";
 import { ExternalLink } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
-import { DocsSection as Section } from "@/components/docs/docs-ui";
+import { DocsSection as Section, DocsH1, DOCS_MEASURE } from "@/components/docs/docs-ui";
 
 const DESC =
   "Why a request returns 404 DEPLOYMENT_NOT_FOUND on shadw, how to read the error ID, and how to fix each cause — wrong URL, deleted or superseded deployment, or an unattached custom domain — and how it differs from 503 DEPLOYMENT_NOT_READY.";
@@ -26,10 +26,10 @@ function Cause({ title, children }: { title: string; children: React.ReactNode }
 
 export default function DeploymentNotFoundPage() {
   return (
-    <div className="mx-auto max-w-3xl space-y-12 pb-24">
+    <div className={`${DOCS_MEASURE} space-y-12 pb-24`}>
       <header>
         <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">Errors</div>
-        <h1 className="text-3xl font-semibold tracking-tight sm:text-4xl">DEPLOYMENT_NOT_FOUND</h1>
+        <DocsH1>DEPLOYMENT_NOT_FOUND</DocsH1>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
           A request was made for a deployment that does not exist. The hostname resolved and reached
           a shadw edge node, but neither that node nor the peers it knows of have a deployment or

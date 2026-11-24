@@ -8,6 +8,8 @@ import {
   DocsH3 as H3,
   DocsIn as In,
   DocsCallout as Callout,
+  DocsH1,
+  DOCS_MEASURE,
 } from "@/components/docs/docs-ui";
 
 export const metadata: Metadata = pageMeta({
@@ -26,10 +28,10 @@ function One({ code, lang, filename }: { code: string; lang: "ts" | "bash" | "py
 
 export default function GettingStarted() {
   return (
-    <div className="mx-auto max-w-3xl">
+    <div className={DOCS_MEASURE}>
       <div className="mb-12">
         <div className="mb-2 font-mono text-xs uppercase tracking-widest text-link">Documentation</div>
-        <h1 className="text-4xl font-bold tracking-tight sm:text-5xl">Getting started</h1>
+        <DocsH1>Getting started</DocsH1>
         <p className="mt-4 text-lg text-secondary">
           Guides for deploying apps on <strong className="text-fg">shadw</strong>, from your first push to your own nodes.
         </p>
