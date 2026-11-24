@@ -18,8 +18,9 @@ AR_BIN="$LLVM_BIN/llvm-ar"
 RANLIB_BIN="$LLVM_BIN/llvm-ranlib"
 STRIP_BIN="$LLVM_BIN/llvm-strip"
 
-for tool in "$AR_BIN" "$RANLIB_BIN" "$STRIP_BIN"; do
-  [ -x "$tool" ] || { echo "FATAL: missing $tool (brew install llvm)"; exit 1; }
+PY3=/opt/homebrew/bin/python3
+for tool in "$AR_BIN" "$RANLIB_BIN" "$STRIP_BIN" "$PY3"; do
+  [ -x "$tool" ] || { echo "FATAL: missing $tool (brew install llvm python)"; exit 1; }
 done
 
 TARGET_GROUPS=("2.38" "2.39")
@@ -32,7 +33,7 @@ cd "$REPO_ROOT"
 
 # elf_check <path> linked|stripped: .symtab required; "stripped" also requires no .debug_* left.
 elf_check() {
-  python3 - "$1" "$2" <<'PY'
+  "$PY3" -I - "$1" "$2" <<'PY'
 import struct, sys
 p, mode = sys.argv[1], sys.argv[2]
 with open(p, "rb") as f:

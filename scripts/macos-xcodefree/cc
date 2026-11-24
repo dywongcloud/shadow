@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Xcode-free Darwin C compiler and linker.
+#
+# zig cc ships its own Darwin libc headers under
+#   <zig lib>/libc/include/any-darwin-any
+# and links Mach-O without xcrun, ld64 or an Xcode SDK. Homebrew LLVM clang
+# is NOT a substitute: /opt/homebrew/Cellar/llvm/*/etc/clang/
+# arm64-apple-darwin.cfg hardcodes -isysroot <CLT SDK path>.
+#
+# The stub sysroot holds install-name-only .tbd files for the system
+# libraries/frameworks rustc and the Apple-gated crates reference. Their
+# real implementations live in the dyld shared cache on every macOS host,
+# so -undefined,dynamic_lookup resolves them at load time. Nothing is
+# removed: sep_signer, security-framework, ring, rustls and every TLS
+# dependency stay compiled and linked. scripts/macos-xcodefree.sh --verify
+# forces all deferred symbols to bind at launch before the binary ships.
+#
+# Apple-target C build scripts (aws-lc-sys, ring, ...) pass
+# --target=arm64-apple-macosx and -march=armv8.4-a+sha3. Zig names that
+# arch aarch64 and reads -march as a CPU name, so normalize the target and
+# drop -march. Zig's aarch64-macos default already carries +sha3; all six
+# aws-lc-sys capability probes were witnessed compiling Xcode-free.
+#
+# objc2 and system-configuration each emit -lobjc, and zig lld writes one
+# LC_LOAD_DYLIB per occurrence; dyld aborts at launch on a duplicate linked
+# dylib. Repeated system -l/-framework flags are therefore deduplicated.
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+STUB="$HERE/stubs"
+ZIG="${HIVE_ZIG:-/opt/homebrew/bin/zig}"
+
+[ -x "$ZIG" ] || { echo "FATAL: missing $ZIG (brew install zig)" >&2; exit 1; }
+[ -f "$STUB/usr/lib/libobjc.tbd" ] || { echo "FATAL: missing stub sysroot $STUB" >&2; exit 1; }
+
+args=()
+seen=""
+pending_fw=""
+for a in "$@"; do
+  case "$a" in
+    *arm64-apple-macosx*)  a="${a//arm64-apple-macosx/aarch64-macos}" ;;
+    *arm64-apple-darwin*)  a="${a//arm64-apple-darwin/aarch64-macos}" ;;
+    *x86_64-apple-macosx*) a="${a//x86_64-apple-macosx/x86_64-macos}" ;;
+    *x86_64-apple-darwin*) a="${a//x86_64-apple-darwin/x86_64-macos}" ;;
+    -march=*) continue ;;
+  esac
+  if [ "$pending_fw" = "1" ]; then
+    pending_fw=""
+    key="fw:$a"
+    [ "${seen#*"|$key|"}" != "$seen" ] && continue
+    seen="$seen|$key|"
+    args+=("-framework" "$a")
+    continue
+  fi
+  if [ "$a" = "-framework" ]; then pending_fw="1"; continue; fi
+  case "$a" in
+    -lobjc|-liconv|-lSystem|-lc|-lm|-lresolv)
+      key="l:$a"
+      [ "${seen#*"|$key|"}" != "$seen" ] && continue
+      seen="$seen|$key|" ;;
+  esac
+  args+=("$a")
+done
+[ "$pending_fw" = "1" ] && args+=("-framework")
+exec "$ZIG" cc -L"$STUB/usr/lib" -F"$STUB/System/Library/Frameworks" \
+  -Wl,-undefined,dynamic_lookup "${args[@]}"

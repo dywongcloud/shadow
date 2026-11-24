@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-11-24 - macOS node builds and installs no longer need Xcode
+
+One shared Xcode-free Darwin lane replaces every host-side plain `cargo`
+invocation in the macOS node install path. `scripts/macos-xcodefree.sh`
+preflights Homebrew zig/python3/git/llvm-ar/llvm-ranlib, sets
+`DEVELOPER_DIR=/nonexistent` so CLT shims fail loudly, pins both Darwin
+target linkers and C compilers, and offers `--verify`, which runs the binary
+with `DYLD_BIND_AT_LAUNCH=1` and parses the Mach-O load commands.
+`scripts/macos-xcodefree/cc` is a zig-only shim with a checked-in
+install-name-only `.tbd` stub sysroot. `scripts/shadwd.sh install` either
+consumes a sha256-verified prebuilt Mach-O (`HIVE_NODE_BIN` +
+`HIVE_NODE_SHA256`, `.old` backup, no compiler on the node) or builds through
+the lane; `PATHVAL` no longer puts `/usr/bin` first when node is missing and
+every launchd plist gets `DEVELOPER_DIR=/nonexistent`.
+`scripts/build-fleet-binary.sh` pins Homebrew `python3`.
+
+No security gate was weakened: `ring`, `rustls`, `aws-lc-rs`,
+`security-framework`, `sep_signer` and `IntegritySigner` are unchanged, and
+`Security.framework` remains linked. `scripts/cli-acceptance.sh` and the CI
+workflows stay byte-identical because `contract-bindings.json` pins their
+canonical hashes; no `--sync` was run.
+
+Witnessed live with CLT installed but disabled (`xcode-select -p` =
+`/nonexistent`): clean `cargo build -p hive-cloud --features zkauth --locked`
+through the committed lane, `BUILD_EXIT=0`; `--verify` `VERIFY_EXIT=0`,
+`macho_loads=10 security_framework=1 dupes=0 eager_bind=0`, Mach-O arm64,
+`--help` with empty stderr. `docs/macos-xcodefree.md` records the refuted
+substitutes (Homebrew clang's hardcoded CLT SDK, rust-lld, `dyld_info`), the
+residuals (x86_64 lane, release profile, CLT-free launchd boot, prebuilt
+artifact source) and the operator-supplied pieces. Phase A local only:
+NO push and NO roll, no inventory/vault/hosts.ini edit, NO_TEST_FILES.
+
 ## 2026-11-24 - push and backend roll of the challenge fix
 
 At the operator's word (`push and deploy/roll`), the four local commits

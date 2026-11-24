@@ -27,8 +27,15 @@ BKK_PEER="${BKK_PEER:-http://127.0.0.1:18796}"
 VA_PEER="${VA_PEER:-http://127.0.0.1:18797}"
 SJ_PEER="${SJ_PEER:-http://127.0.0.1:18798}"
 VA2_PEER="${VA2_PEER:-http://127.0.0.1:18799}"
-NODE_BIN="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/false)")"
-PATHVAL="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+# Homebrew wins over /usr/bin, whose git/python3/cc are CLT shims on a Mac
+# without Xcode. Never derive a PATH prefix from a possibly-missing binary:
+# the old `/usr/bin/false` fallback put /usr/bin first when node was absent.
+NODE_DIR="$(dirname "$(command -v node 2>/dev/null || echo /opt/homebrew/bin/node)")"
+PATHVAL="/opt/homebrew/bin:/opt/homebrew/opt/llvm/bin:$NODE_DIR:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
+XCODEFREE="$REPO/scripts/macos-xcodefree.sh"
+# A CLT shim that ignores PATH must fail loudly, never open the
+# "Install Command Line Developer Tools" dialog on an unattended Mac.
+DEV_DIR=/nonexistent
 RL="info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
 WATCHDOG_LABEL=dev.shadw.watchdog
 LABELS=(dev.shadw.lima dev.shadw.node-a)
@@ -53,6 +60,7 @@ $(xml_args "${args[@]}")  </array>
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$PATHVAL</string>
+    <key>DEVELOPER_DIR</key><string>$DEV_DIR</string>
     <key>RUST_LOG</key><string>$RL</string>
     <key>HIVE_DATA</key><string>$data</string>
     <key>HIVE_DASHBOARD_URL</key><string>$DASH</string>
@@ -83,6 +91,7 @@ write_lima_plist() {
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$PATHVAL</string>
+    <key>DEVELOPER_DIR</key><string>$DEV_DIR</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>300</integer>
@@ -105,6 +114,7 @@ write_watchdog_plist() {
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$PATHVAL</string>
+    <key>DEVELOPER_DIR</key><string>$DEV_DIR</string>
     <key>WATCHDOG_LOOP</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -128,6 +138,7 @@ write_fc_plist() {
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$PATHVAL</string>
+    <key>DEVELOPER_DIR</key><string>$DEV_DIR</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>60</integer>
@@ -141,9 +152,30 @@ load_agent()   { launchctl bootout "$DOMAIN/$1" 2>/dev/null; launchctl bootstrap
 unload_agent() { launchctl bootout "$DOMAIN/$1" 2>/dev/null || true; }
 
 cmd_install() {
-  echo "==> Building hive-cloud ($PROFILE, --features zkauth)…"
-  if [ "$PROFILE" = "release" ]; then cargo build --release -p hive-cloud --features zkauth || { echo "build failed"; exit 1; }
-  else cargo build -p hive-cloud --features zkauth || { echo "build failed"; exit 1; }; fi
+  if [ -n "${HIVE_NODE_BIN:-}" ]; then
+    # Fleet deployment: consume a sha256-verified prebuilt Mach-O. No compiler
+    # runs on a Mac without Xcode, and CLT shims are never selected.
+    [ -n "${HIVE_NODE_SHA256:-}" ] || { echo "HIVE_NODE_SHA256 is required with HIVE_NODE_BIN"; exit 1; }
+    [ -f "$HIVE_NODE_BIN" ] || { echo "prebuilt binary missing: $HIVE_NODE_BIN"; exit 1; }
+    actual="$(shasum -a 256 "$HIVE_NODE_BIN" | awk '{print $1}')"
+    [ "$actual" = "$HIVE_NODE_SHA256" ] || { echo "prebuilt binary sha256 mismatch"; exit 1; }
+    mkdir -p "$(dirname "$BIN")"
+    [ ! -f "$BIN" ] || cp -p "$BIN" "$BIN.old"
+    cp -p "$HIVE_NODE_BIN" "$BIN"
+    chmod +x "$BIN"
+    "$XCODEFREE" --verify "$BIN" || { echo "prebuilt binary rejected"; exit 1; }
+  else
+    # Local build: the shared lane needs zig + Homebrew, never Xcode/CLT.
+    echo "==> Building hive-cloud ($PROFILE, --features zkauth) Xcode-free"
+    if [ "$PROFILE" = "release" ]; then
+      "$XCODEFREE" cargo build --release -p hive-cloud --features zkauth --locked \
+        || { echo "build failed"; exit 1; }
+    else
+      "$XCODEFREE" cargo build -p hive-cloud --features zkauth --locked \
+        || { echo "build failed"; exit 1; }
+    fi
+    "$XCODEFREE" --verify "$BIN" || { echo "binary verification failed"; exit 1; }
+  fi
   mkdir -p "$LA" "$LOGS"
   echo "==> Stopping any hand-started nodes (frees :8786/:8787)…"
   pkill -f "name node-[a-z] --listen" 2>/dev/null; sleep 1
@@ -194,7 +226,9 @@ cmd_fc_daemon() {
   local REPO_IN_VM="/Users/$(id -un)/fluid/hive"
   limactl list --format '{{.Status}}' "$VM" 2>/dev/null | grep -q Running || { echo "Lima VM '$VM' not running (run: $0 start)"; exit 1; }
   echo "==> [fc] resolving Cargo.lock on host (VM mount is read-only)…"
-  cargo check -p hive-cell-agent >/dev/null 2>&1 || true
+  # Host-side Cargo.lock resolution still uses the Xcode-free lane. The
+  # in-VM builds below run inside Linux and keep their own toolchain.
+  "$XCODEFREE" cargo check -p hive-cell-agent >/dev/null 2>&1 || true
   echo "==> [fc] provisioning the VM: node runtime, static agent, guest rootfs, node binary, systemd unit"
   limactl shell "$VM" bash -lc '
     set -e
