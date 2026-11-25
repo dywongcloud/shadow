@@ -43,6 +43,20 @@ cannot print `NODE_PROBE=PASS`. A static boot log
 is a plain literal, so `strings -a /proc/<MainPID>/exe` can prove the
 RUNNING binary after a roll; a Rust format literal cannot.
 
+## ROLL STATUS: HELD (2026-11-25)
+
+Pushed and CI-green, but `scripts/audit-secret-keys.sh` exits 1:
+fc-sanjose (the strict owner-chain HEAD, 170.106.158.151) is SSH-unreachable.
+Every fleet vantage and the laptop get `Not allowed at this time` as a
+pre-banner on :22; ping and TCP 22/80/443/8787 are up and peers still adopt
+its snapshots as leader. An 11-minute quiet window did not clear it, so this
+is a host-level sshd condition, not a probe-induced per-source penalty.
+The roll playbook restarts the chain head LAST and verifies 6/6 hosts; a
+partial roll would leave a mixed-version mesh, and the audit explicitly says
+to fix the node BEFORE rolling. The roll is therefore HELD, not silently
+weakened. Resolve SSH on fc-sanjose, rerun the audit, then run
+`playbooks/site.yml --tags node24` and `parallel-deploy.yml --tags backend`.
+
 ## HOLD: operator-gated residuals (NOT claimed done)
 
 | Residual | Required gate |

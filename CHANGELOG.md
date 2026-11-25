@@ -21,8 +21,9 @@ are refused. `run_host` prepends that bin to the build PATH after checkout
 a host with no default binary gets a typed `NODE_RUNTIME_MISSING` warning.
 `build_toolchain_identity` executes `node --version` and marks `verified=0`
 when the ACTUAL major is not 24; the live `--node-probe` refuses PASS on that
-measurement. That helper has only `#[cfg(test)]` callers in this tree, so no
-production cache behaviour is claimed.
+measurement. Only `compute_cache_key` has exclusively `#[cfg(test)]` callers
+in this tree, so no production build-cache behaviour is claimed here;
+`--node-probe` is the live consumer of that measurement.
 
 `ansible/roles/prerequisites` converges the host default to exact `v24.22.3`
 (dnf nodejs alone left mixed v22 patches), with `force: true` on the pinned
