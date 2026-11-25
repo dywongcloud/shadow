@@ -22,6 +22,7 @@ pub use iroh::Endpoint;
 pub mod dht;
 pub mod establish;
 pub mod private_path;
+pub mod swarm;
 
 pub use establish::{establish_stats, ClassCounts, ClassLimits, EstablishStats, PeerBudget};
 use establish::{ConnClass, ConnectFailure, Event as EstablishEvent};
