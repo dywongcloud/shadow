@@ -1,5 +1,51 @@
 # Changelog
 
+## 2026-11-24 - network swarm: probed QUIC channel, honest inference admission
+
+An adversarial research swarm (six confirmed results, `wf_754ef243-7f8`) and a
+lean synthesis (three refuters plus a judge, `wf_884c852f-bd4`) refused two
+false premises in the request: this tree ALREADY has cross-node inference
+pooling over `<public_ip>:50052`, and RDMA is NOT CAPABLE on this host. A
+drop-in TCP-to-QUIC tunnel shim was refuted on six failure modes (phantom
+tensor transport, unauthenticated relay splice, missing ALPN budget, forbidden
+`copy_bidirectional`, 30 s QUIC idle timeout against a 3600 s load, and
+`EADDRINUSE` on reserved `:50052`). Vendor speed ratios were not admitted.
+
+The synthesis also killed a first proposed fix: `member_rtts` trusted a FRESH
+gossip `latency_ms` and never connected to `:50052`, so filtering
+`RTT_UNKNOWN` could not catch a member whose llama-rpc was stopped. That dead
+member still counted its VRAM, appeared in `--rpc`, and parked the endpoint
+for 3600 s while `HIVE_INFERENCE_URL` was already injected fleet-wide.
+
+Shipped, local only:
+
+- `crates/hive-p2p/src/swarm.rs`: strict length-prefixed frames with a hard
+  bound, a typed `SwarmError`, affine `SwarmChannel` typestate whose
+  transitions consume self, a Drop-guarded `InflightSlot`, a PROBED
+  `SwarmCapability` (`None` = NOT CAPABLE), and a loopback-only bind over the
+  production `HIVE_ALPN` and hybrid PQ crypto provider. No new ALPN, no new
+  `ConnClass`, no verbs FFI, no phantom: every public symbol has a caller in
+  `--swarm-probe`.
+- `inference.rs`: `member_rtts` and its stale 300 s cache are gone.
+  `member_links` runs ONE `BoundedRound` and requires a FRESH successful
+  `rpc_port_reachable` for every candidate, independent of gossip latency;
+  `Completion`'s drop guard fails closed. `plan_members` is a pure morphism
+  that refuses unreachable members by name. `HIVE_INFERENCE_URL` is injected
+  only after a live 2xx `/health` from the coordinator's serving socket and
+  withdrawn only when it is the exact platform-shaped URL; a gossiped IP is
+  PARSED into `IpAddr` before it can reach a URL. No `health::demote` on an
+  inference service fault.
+- `hive-cloud --swarm-probe`: operator diagnostic with non-vacuous gates -
+  byte-exact framed echoes, real `pq_kex_stats()` hybrid group, a PARKED
+  straggler that lands in a later round, released slots, and explicit scope
+  (`fleet_public_path=NOT_PROVEN`, `speedup_claim=none`).
+
+Decision record and the HOLD residuals: `docs/swarm-transport.md`. Witnessed
+live: `--swarm-probe` SWARM_PROBE=PASS; `cargo test --workspace --locked`
+TEST_EXIT=0; `scripts/cli-acceptance.sh` 35/0; bindings `--check` PASS
+bindings=34; `git diff --check` 0; `tmp/r8-witness.sh` WITNESS_EXIT=0.
+NO_TEST_FILES. No push, no roll, no dependency or Cargo.lock change.
+
 ## 2026-11-24 - jitllm is a HOLD, not an inference backend
 
 An adversarial review of jitllm v0.2.7 (pinned HEAD
