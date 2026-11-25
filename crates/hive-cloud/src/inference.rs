@@ -1045,7 +1045,7 @@ pub(crate) enum InferenceUrlAction {
 
 /// Is this exactly a platform-shaped inference URL we could have injected?
 /// Strict parse, no interpolation, no path beyond /v1.
-fn is_platform_inference_url(raw: &str) -> bool {
+pub(crate) fn is_platform_inference_url(raw: &str) -> bool {
     let Some(rest) = raw.strip_prefix("http://") else {
         return false;
     };
@@ -1568,49 +1568,55 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                     .collect();
                 let ambiguous = ambiguous_inference_ports(&candidates);
                 for (p, spec) in &desired {
-                    // Never advertise an endpoint URL for a backend we refused.
-                    if spec.backend != crate::project_settings::InferenceBackend::LlamaCpp {
-                        continue;
-                    }
-                    let Some(coord) = coordinator_for(&cloud, p) else {
-                        continue;
-                    };
-                    let Some(ip) = coord.public_ip.clone() else {
-                        continue;
-                    };
-                    let port = port_for(p);
-                    let Some(base) = inference_endpoint_base(&ip, port) else {
-                        continue;
-                    };
-                    let url = format!("{base}/v1");
+                    // ONE decision point, reached for EVERY desired spec.
+                    // An early continue here would leave a platform-injected
+                    // URL behind after a backend switch, a coordinator move,
+                    // a disappeared public_ip or an unroutable address.
                     let current = cloud.projects.env_map(p).get("HIVE_INFERENCE_URL").cloned();
-                    let port_ambiguous = ambiguous.contains(&(ip.clone(), port));
-                    // One decision covers ALL failure shapes: an ambiguous
-                    // FNV port, a dead endpoint, and a coordinator move. A
-                    // HOLD withdraws a platform-injected URL instead of
-                    // leaving it pointing at another project model.
-                    let ready = !port_ambiguous && coordinator_endpoint_ready(&ip, port).await;
-                    match inference_url_action(current.as_deref(), &url, ready) {
+                    let port = port_for(p);
+                    let target: Option<(String, String)> =
+                        if spec.backend != crate::project_settings::InferenceBackend::LlamaCpp {
+                            None
+                        } else {
+                            coordinator_for(&cloud, p)
+                                .and_then(|coord| coord.public_ip.clone())
+                                .and_then(|ip| {
+                                    inference_endpoint_base(&ip, port).map(|base| (ip, base))
+                                })
+                        };
+                    // No target, an ambiguous FNV port or a dead socket are all
+                    // NOT READY. A HOLD must be state-correcting in each case.
+                    let ready = match &target {
+                        None => false,
+                        Some((ip, _)) => {
+                            !ambiguous.contains(&(ip.clone(), port))
+                                && coordinator_endpoint_ready(ip, port).await
+                        }
+                    };
+                    let wanted = target
+                        .as_ref()
+                        .map(|(_, base)| format!("{base}/v1"))
+                        .unwrap_or_default();
+                    match inference_url_action(current.as_deref(), &wanted, ready) {
                         InferenceUrlAction::Inject => {
                             cloud.projects.put_env(
                                 p,
                                 crate::project_settings::EnvVar {
                                     key: "HIVE_INFERENCE_URL".into(),
-                                    value: url.clone(),
+                                    value: wanted.clone(),
                                     target: "all".into(),
                                     scope: "runtime".into(),
                                     sensitive: false,
                                     updated_ms: hive_core::now_ms(),
                                 },
                             );
-                            tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL after a positive readiness proof");
+                            tracing::info!(project = %p, url = %wanted, "inference: injected HIVE_INFERENCE_URL after a positive readiness proof");
                         }
                         InferenceUrlAction::Withdraw => {
                             cloud.projects.delete_env(p, "HIVE_INFERENCE_URL");
                             tracing::warn!(
                                 project = %p,
-                                port,
-                                port_ambiguous,
+                                ready,
                                 "inference: withdrew HIVE_INFERENCE_URL - endpoint is not proven ready for this project"
                             );
                         }

@@ -107,21 +107,27 @@ RESULT url_gate=PASS ready_200=1 loading_503=0 closed_port=0
 RESULT url_parameterisation=PASS v6_bracketed=1 link_local_refused=1 metadata_refused=1
 RESULT port_collision=PASS shared_held=1 unique_admitted=1
 RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1
+RESULT url_no_target=PASS backend_switch_withdraw=1 coordinator_move_withdraw=1
 RESULT rdma_verbs=NOT_CAPABLE typed_refusal=swarm capability not proven: rdma_verbs
 RESULT thunderbolt_bridge_ip_only=true (IP interface, never an RDMA transport)
-RESULT bind=PASS relay=disabled dht=disabled address_lookup=none
-RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=1
-RESULT round=PASS landed=3 bytes=133143 outstanding=1 spent_ms=150 deadline_ms=3000
+RESULT bind=PASS port_a=<ephemeral> port_b=<ephemeral> relay=disabled dht=disabled address_lookup=none
+RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=<0|1>
+RESULT round=PASS landed=3 bytes=133143 outstanding=1 spent_ms=<leash> deadline_ms=3000
 RESULT straggler=PASS dispatched_round=1 drained_in_round=6 bytes=8192
-RESULT kex=PASS hybrid_pq_delta=9 classical_fallback_delta=0 unknown_delta=0
-RESULT server=PASS connections=5 served_bytes=141335
+RESULT kex=PASS hybrid_pq_delta=<N> classical_fallback_delta=0 unknown_delta=0
+RESULT server=PASS connections=<N> served_bytes=141335
 RESULT scope=dial_target=loopback_direct_only fleet_public_path=NOT_PROVEN speedup_claim=none
 RESULT inflight_slots_released=PASS live=0
 SWARM_PROBE=PASS
 ```
 
+Ephemeral ports, the straggler drain round, the connection count and the KEX
+delta vary between runs; the transcript shows their shape, not pinned values.
+`capability_missing` is 1 on this Mac (no verbs device) and 0 on a CAPABLE
+host, where that typed error is not constructed.
+
 Every gate is a NON-DEFAULT result: three byte-exact framed echoes landed in
-this round, the real negotiated hybrid KEX group moved `pq_kex_stats()` by 8,
+this round, the real negotiated hybrid KEX group moved `pq_kex_stats()` by a positive delta,
 the server echoed 141335 bytes, one straggler was PARKED (not cancelled) and
 landed in a later round, and all in-flight slots were released. Zero completed
 dials cannot print PASS. A hard timeout wraps EACH bind. The diagnostic
@@ -180,7 +186,7 @@ the same turn and the third is now fixed too.
 The verifier also confirmed, by live execution, what is NOT refuted: no new
 dependency (`git diff --numstat` on `Cargo.lock`/`Cargo.toml` is empty), the
 probe filters `ProbeOutcome::default()` out, `served_bytes=141335` equals
-`133143 + 8192`, and `hybrid_pq_delta=8` comes from the real
+`133143 + 8192`, and a positive `hybrid_pq_delta` comes from the real
 `negotiated_key_exchange_group` read off four completed handshakes, not from
 the ALPN. It explicitly noted that a fresh `BoundedRound` per tick discards
 parked stragglers, which is fail-closed and not a defect.
@@ -218,6 +224,32 @@ project-bound identity (a replicated endpoint status via owner proxy plus a
 `--alias`) and a two-node witness. The decision record and the PRD row
 `swarm-replicated-endpoint-status-20261124` name that gate. It is not claimed
 as done.
+
+## Fifth sweep: no early exit before the decision
+
+`wf_8a207b5a-5a2` found three more defects, all repaired:
+
+1. **Early `continue`s skipped withdrawal.** A backend switch to `jitllm`, a
+   missing coordinator, a disappeared `public_ip` or an unroutable address all
+   returned from the leader loop before `inference_url_action` ran, leaving a
+   platform-injected URL in a tenant env that no longer has an endpoint. The
+   loop now has ONE decision point reached for every desired spec: `target` is
+   `None` in all those cases, `ready` is false, and a platform-shaped current
+   value is withdrawn. Witnessed `url_no_target=PASS
+   backend_switch_withdraw=1 coordinator_move_withdraw=1`.
+2. **`capability_missing=1` was hard-coded.** On a CAPABLE host `require_rdma`
+   returns `Ok`, so no `CapabilityMissing` is constructed, yet the probe
+   printed `capability_missing=1` and PASS. The count is now measured from the
+   actual result and is 0 on a CAPABLE host.
+3. **Pinned per-run values in this document.** Ephemeral ports, the straggler
+   drain round, the connection count and the KEX delta vary between runs. The
+   transcript now shows their shape with explicit placeholders rather than
+   claiming a fixed measurement.
+
+One gate stays OPEN and is not claimed done: `coordinator_endpoint_ready()`
+proves a 2xx on a socket, not that the answering server is THIS project's
+llama-server. Closing it needs a replicated endpoint status (owner proxy plus
+`gossip::dispatch`) or a verified model identity, and a two-node witness.
 
 ## Gates run on the final tree
 

@@ -351,6 +351,24 @@ async fn admission_witness() -> Result<()> {
         }
     }
     println!("RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1");
+    // (6b) A backend switch, a missing coordinator or an unroutable IP must
+    // also WITHDRAW, not early-continue. The leader loop now has ONE decision
+    // point; an empty wanted URL with ready=false is that exact state.
+    for current in [Some(wanted.as_str()), Some(moved.as_str()), None] {
+        let got = inference_url_action(current, "", false);
+        let expect = if current.is_some_and(|c| {
+            crate::inference::is_platform_inference_url(c)
+        }) {
+            InferenceUrlAction::Withdraw
+        } else {
+            InferenceUrlAction::Hold
+        };
+        if got != expect {
+            bail!("backend-switch decision wrong for {current:?}: got {got:?}");
+        }
+    }
+    println!("RESULT url_no_target=PASS backend_switch_withdraw=1 coordinator_move_withdraw=1");
+
 
 
 
@@ -379,13 +397,22 @@ pub async fn run() -> Result<()> {
     admission_witness().await?;
 
     let cap = hive_p2p::swarm::probe_capability();
-    match hive_p2p::swarm::require_rdma(&cap) {
-        Ok(dev) => println!(
-            "RESULT rdma_verbs=CAPABLE hca={} port={} uverbs={}",
-            dev.hca, dev.port, dev.uverbs.len()
-        ),
-        Err(error) => println!("RESULT rdma_verbs=NOT_CAPABLE typed_refusal={error}"),
-    }
+    // MEASURE whether CapabilityMissing was actually constructed. On a host
+    // with a real ACTIVE verbs device require_rdma returns Ok, so a hard-coded
+    // capability_missing=1 would be a false witness.
+    let capability_missing = match hive_p2p::swarm::require_rdma(&cap) {
+        Ok(dev) => {
+            println!(
+                "RESULT rdma_verbs=CAPABLE hca={} port={} uverbs={}",
+                dev.hca, dev.port, dev.uverbs.len()
+            );
+            false
+        }
+        Err(error) => {
+            println!("RESULT rdma_verbs=NOT_CAPABLE typed_refusal={error}");
+            matches!(error, hive_p2p::swarm::SwarmError::CapabilityMissing(_))
+        }
+    };
     println!(
         "RESULT thunderbolt_bridge_ip_only={} (IP interface, never an RDMA transport)",
         cap.thunderbolt_bridge_ip_only
@@ -439,8 +466,8 @@ pub async fn run() -> Result<()> {
 
     // (7) Every typed error has a LIVE constructor, not just a declaration.
     // A deliberately wrong peer id and an already-elapsed deadline exercise
-    // UntrustedPeer and Timeout, while require_rdma exercised
-    // CapabilityMissing above.
+    // UntrustedPeer and Timeout, while require_rdma decides whether
+    // CapabilityMissing is even admissible on this host.
     let wrong = iroh::SecretKey::generate().public();
     let untrusted = hive_p2p::swarm::check_peer(&probe_conn, wrong).unwrap_err();
     if !matches!(untrusted, hive_p2p::swarm::SwarmError::UntrustedPeer(_)) {
@@ -451,7 +478,10 @@ pub async fn run() -> Result<()> {
     if !matches!(timed, hive_p2p::swarm::SwarmError::Timeout) {
         bail!("elapsed deadline did not produce Timeout");
     }
-    println!("RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=1");
+    println!(
+        "RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing={}",
+        u8::from(capability_missing)
+    );
 
     let pq_before = hive_p2p::pq_kex_stats();
     let mut round: BoundedRound<ProbeOutcome> = BoundedRound::new();
