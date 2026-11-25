@@ -1031,6 +1031,66 @@ pub(crate) fn ambiguous_inference_ports(
         .collect()
 }
 
+/// One pure decision for HIVE_INFERENCE_URL. A HOLD must be STATE-CORRECTING:
+/// when readiness is lost (a port became ambiguous, the endpoint died, or the
+/// coordinator moved), a URL the platform itself injected must be withdrawn,
+/// not merely left in the tenant env forever. A different value is a tenant
+/// override and is never touched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum InferenceUrlAction {
+    Inject,
+    Withdraw,
+    Hold,
+}
+
+/// Is this exactly a platform-shaped inference URL we could have injected?
+/// Strict parse, no interpolation, no path beyond /v1.
+fn is_platform_inference_url(raw: &str) -> bool {
+    let Some(rest) = raw.strip_prefix("http://") else {
+        return false;
+    };
+    let Some((authority, path)) = rest.split_once('/') else {
+        return false;
+    };
+    if path != "v1" {
+        return false;
+    }
+    let (host, port) = if let Some((h, p)) = authority.rsplit_once(':') {
+        if h.starts_with('[') && h.ends_with(']') {
+            (&h[1..h.len() - 1], p)
+        } else {
+            (h, p)
+        }
+    } else {
+        return false;
+    };
+    if host.parse::<std::net::IpAddr>().is_err() {
+        return false;
+    }
+    match port.parse::<u16>() {
+        Ok(n) => (50100..=50999).contains(&n),
+        Err(_) => false,
+    }
+}
+
+pub(crate) fn inference_url_action(
+    current: Option<&str>,
+    wanted: &str,
+    ready: bool,
+) -> InferenceUrlAction {
+    if ready {
+        return if current == Some(wanted) {
+            InferenceUrlAction::Hold
+        } else {
+            InferenceUrlAction::Inject
+        };
+    }
+    if current.is_some_and(is_platform_inference_url) {
+        return InferenceUrlAction::Withdraw;
+    }
+    InferenceUrlAction::Hold
+}
+
 pub(crate) fn inference_endpoint_base(ip: &str, port: u16) -> Option<String> {
     let addr = ip.parse::<std::net::IpAddr>().ok()?;
     let blocked = match addr {
@@ -1519,43 +1579,42 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                         continue;
                     };
                     let port = port_for(p);
-                    if ambiguous.contains(&(ip.clone(), port)) {
-                        tracing::warn!(
-                            project = %p,
-                            port,
-                            "inference: HOLD HIVE_INFERENCE_URL - port is shared by another desired project; a single /health cannot identify the owner"
-                        );
-                        continue;
-                    }
                     let Some(base) = inference_endpoint_base(&ip, port) else {
                         continue;
                     };
                     let url = format!("{base}/v1");
                     let current = cloud.projects.env_map(p).get("HIVE_INFERENCE_URL").cloned();
-                    if !coordinator_endpoint_ready(&ip, port).await {
-                        // A dead endpoint must not stay advertised. Remove ONLY
-                        // the exact platform-shaped URL we injected ourselves;
-                        // a different value is a tenant override and is left
-                        // untouched.
-                        if current.as_deref() == Some(url.as_str()) {
-                            cloud.projects.delete_env(p, "HIVE_INFERENCE_URL");
-                            tracing::warn!(project = %p, port, "inference: withdrew HIVE_INFERENCE_URL - coordinator endpoint is not answering");
+                    let port_ambiguous = ambiguous.contains(&(ip.clone(), port));
+                    // One decision covers ALL failure shapes: an ambiguous
+                    // FNV port, a dead endpoint, and a coordinator move. A
+                    // HOLD withdraws a platform-injected URL instead of
+                    // leaving it pointing at another project model.
+                    let ready = !port_ambiguous && coordinator_endpoint_ready(&ip, port).await;
+                    match inference_url_action(current.as_deref(), &url, ready) {
+                        InferenceUrlAction::Inject => {
+                            cloud.projects.put_env(
+                                p,
+                                crate::project_settings::EnvVar {
+                                    key: "HIVE_INFERENCE_URL".into(),
+                                    value: url.clone(),
+                                    target: "all".into(),
+                                    scope: "runtime".into(),
+                                    sensitive: false,
+                                    updated_ms: hive_core::now_ms(),
+                                },
+                            );
+                            tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL after a positive readiness proof");
                         }
-                        continue;
-                    }
-                    if current.as_deref() != Some(url.as_str()) {
-                        cloud.projects.put_env(
-                            p,
-                            crate::project_settings::EnvVar {
-                                key: "HIVE_INFERENCE_URL".into(),
-                                value: url.clone(),
-                                target: "all".into(),
-                                scope: "runtime".into(),
-                                sensitive: false,
-                                updated_ms: hive_core::now_ms(),
-                            },
-                        );
-                        tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL after a positive readiness proof");
+                        InferenceUrlAction::Withdraw => {
+                            cloud.projects.delete_env(p, "HIVE_INFERENCE_URL");
+                            tracing::warn!(
+                                project = %p,
+                                port,
+                                port_ambiguous,
+                                "inference: withdrew HIVE_INFERENCE_URL - endpoint is not proven ready for this project"
+                            );
+                        }
+                        InferenceUrlAction::Hold => {}
                     }
                 }
             }

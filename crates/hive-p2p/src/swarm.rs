@@ -44,16 +44,18 @@ pub struct SwarmCapability {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct RdmaDevice {
-    pub uverbs: String,
+    /// The HCA/port whose state was ACTUALLY read ACTIVE. uverbs lists every
+    /// device node present so the verbs stack is known to exist; it is NOT a
+    /// claim that a given node maps to this HCA, which sysfs alone cannot prove.
     pub hca: String,
     pub port: String,
+    pub uverbs: Vec<String>,
 }
 
 /// Probe the real device nodes. Absent or unreadable paths are NOT CAPABLE,
 /// not an error: a probe that fails closed is still an honest measurement.
 /// Linux IB sysfs writes a numeric prefix with the state, e.g. `4: ACTIVE`,
 /// not bare `ACTIVE`. Accept both shapes; every other state is NOT CAPABLE.
-/// Accept both shapes; every other state is NOT CAPABLE.
 pub fn port_is_active(state: &str) -> bool {
     state
         .trim()
@@ -63,11 +65,19 @@ pub fn port_is_active(state: &str) -> bool {
 }
 
 fn probe_rdma_verbs() -> Option<RdmaDevice> {
-    let uverbs = std::fs::read_dir("/dev/infiniband")
+    // Do NOT pair the first uverbsN with an arbitrary ACTIVE HCA: a host
+    // with uverbs0 on a DOWN HCA and an ACTIVE mlx5_1 must not be reported
+    // as CAPABLE with the wrong device. Require at least one uverbs node for
+    // the verbs stack, then return the HCA/port we actually measured.
+    let uverbs: Vec<String> = std::fs::read_dir("/dev/infiniband")
         .ok()?
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .find(|name| name.starts_with("uverbs"))?;
+        .filter(|name| name.starts_with("uverbs"))
+        .collect();
+    if uverbs.is_empty() {
+        return None;
+    }
     for hca in std::fs::read_dir("/sys/class/infiniband").ok()?.flatten() {
         let Ok(ports) = std::fs::read_dir(hca.path().join("ports")) else {
             continue;
@@ -76,9 +86,9 @@ fn probe_rdma_verbs() -> Option<RdmaDevice> {
             let state = std::fs::read_to_string(port.path().join("state")).unwrap_or_default();
             if port_is_active(&state) {
                 return Some(RdmaDevice {
-                    uverbs,
                     hca: hca.file_name().to_string_lossy().into_owned(),
                     port: port.file_name().to_string_lossy().into_owned(),
+                    uverbs,
                 });
             }
         }

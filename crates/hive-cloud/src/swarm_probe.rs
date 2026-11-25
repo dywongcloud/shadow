@@ -331,6 +331,28 @@ async fn admission_witness() -> Result<()> {
         bail!("a unique port was wrongly held");
     }
     println!("RESULT port_collision=PASS shared_held=1 unique_admitted=1");
+    // (6) A HOLD must WITHDRAW a platform-injected URL, not just stop
+    // writing. This is the exact decision the leader loop applies on an
+    // ambiguous port, a dead endpoint and a coordinator move.
+    use crate::inference::{inference_url_action, InferenceUrlAction};
+    let wanted = format!("http://10.0.0.1:{p9}/v1");
+    let moved = format!("http://10.0.0.9:{p9}/v1");
+    let cases = [
+        (None, &wanted, true, InferenceUrlAction::Inject),
+        (Some(wanted.as_str()), &wanted, true, InferenceUrlAction::Hold),
+        (Some(wanted.as_str()), &wanted, false, InferenceUrlAction::Withdraw),
+        (Some(moved.as_str()), &wanted, false, InferenceUrlAction::Withdraw),
+        (Some("http://tenant.example/v1"), &wanted, false, InferenceUrlAction::Hold),
+    ];
+    for (current, url, ready, expect) in cases {
+        let got = inference_url_action(current, url, ready);
+        if got != expect {
+            bail!("url decision wrong for current={current:?} ready={ready}: got {got:?}, want {expect:?}");
+        }
+    }
+    println!("RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1");
+
+
 
     Ok(())
 }
@@ -360,7 +382,7 @@ pub async fn run() -> Result<()> {
     match hive_p2p::swarm::require_rdma(&cap) {
         Ok(dev) => println!(
             "RESULT rdma_verbs=CAPABLE hca={} port={} uverbs={}",
-            dev.hca, dev.port, dev.uverbs
+            dev.hca, dev.port, dev.uverbs.len()
         ),
         Err(error) => println!("RESULT rdma_verbs=NOT_CAPABLE typed_refusal={error}"),
     }
@@ -406,6 +428,30 @@ pub async fn run() -> Result<()> {
         connections.clone(),
         live.clone(),
     ));
+
+    // A real completed handshake, reused to witness the typed identity gate.
+    let probe_conn = tokio::time::timeout(DIAL_TIMEOUT, a.connect(addr_b.clone(), hive_p2p::HIVE_ALPN))
+        .await
+        .map_err(|_| anyhow::anyhow!("probe connection timed out"))??;
+    if let Err(error) = hive_p2p::swarm::check_peer(&probe_conn, id_b) {
+        bail!("real probe connection failed identity/ALPN check: {error}");
+    }
+
+    // (7) Every typed error has a LIVE constructor, not just a declaration.
+    // A deliberately wrong peer id and an already-elapsed deadline exercise
+    // UntrustedPeer and Timeout, while require_rdma exercised
+    // CapabilityMissing above.
+    let wrong = iroh::SecretKey::generate().public();
+    let untrusted = hive_p2p::swarm::check_peer(&probe_conn, wrong).unwrap_err();
+    if !matches!(untrusted, hive_p2p::swarm::SwarmError::UntrustedPeer(_)) {
+        bail!("wrong peer id did not produce UntrustedPeer");
+    }
+    let elapsed = tokio::time::timeout(Duration::from_millis(1), std::future::pending::<()>()).await.unwrap_err();
+    let timed = hive_p2p::swarm::map_timeout::<()>(Err(elapsed)).unwrap_err();
+    if !matches!(timed, hive_p2p::swarm::SwarmError::Timeout) {
+        bail!("elapsed deadline did not produce Timeout");
+    }
+    println!("RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=1");
 
     let pq_before = hive_p2p::pq_kex_stats();
     let mut round: BoundedRound<ProbeOutcome> = BoundedRound::new();

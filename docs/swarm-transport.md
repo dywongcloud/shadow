@@ -106,13 +106,15 @@ RESULT reachable_pool=PASS members=2
 RESULT url_gate=PASS ready_200=1 loading_503=0 closed_port=0
 RESULT url_parameterisation=PASS v6_bracketed=1 link_local_refused=1 metadata_refused=1
 RESULT port_collision=PASS shared_held=1 unique_admitted=1
+RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1
 RESULT rdma_verbs=NOT_CAPABLE typed_refusal=swarm capability not proven: rdma_verbs
 RESULT thunderbolt_bridge_ip_only=true (IP interface, never an RDMA transport)
 RESULT bind=PASS relay=disabled dht=disabled address_lookup=none
-RESULT round=PASS landed=3 bytes=133143 outstanding=1 spent_ms=152 deadline_ms=3000
+RESULT typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=1
+RESULT round=PASS landed=3 bytes=133143 outstanding=1 spent_ms=150 deadline_ms=3000
 RESULT straggler=PASS dispatched_round=1 drained_in_round=6 bytes=8192
-RESULT kex=PASS hybrid_pq_delta=8 classical_fallback_delta=0 unknown_delta=0
-RESULT server=PASS connections=4 served_bytes=141335
+RESULT kex=PASS hybrid_pq_delta=9 classical_fallback_delta=0 unknown_delta=0
+RESULT server=PASS connections=5 served_bytes=141335
 RESULT scope=dial_target=loopback_direct_only fleet_public_path=NOT_PROVEN speedup_claim=none
 RESULT inflight_slots_released=PASS live=0
 SWARM_PROBE=PASS
@@ -137,6 +139,7 @@ speedup is claimed anywhere.
 | RDMA in a data center | RoCEv2/InfiniBand NICs, `rdma-core`/libibverbs FFI with a `Cargo.lock` change, an ACTIVE port, and a measured on-hardware A/B before any ratio is quoted. |
 | QUIC tensor plane | `SWARM_ALPN` with its own `ConnClass`/`InboundBudgets`, a 40 s accept deadline, an established trunk that is never evicted, a bounded splice that copies each direction itself, an idle-timeout plan covering a 3600 s model load, `TcpStream` shim ports reserved in `raw_ports.rs`, and `scripts/hive-lockdown.sh` closing public `:50052`. |
 | Replicated endpoint status | An owner proxy (`build_get` + `fetch_from_host`) plus a `gossip::dispatch` arm if URL advertisement must follow a coordinator's in-process status rather than a direct readiness probe. |
+| Project-bound readiness (OPEN, found by `wf_e9dcac85-a5b`) | `coordinator_endpoint_ready()` proves a 2xx on a socket, not that the answering server is THIS project's llama-server. A stray or leftover server on a unique port still satisfies it. Needs a replicated endpoint status or a verified `--alias`/model-identity check, plus a two-node witness. Tracked as `swarm-replicated-endpoint-status-20261124`; NOT claimed done. |
 | Capability advertisement | A probed `NodeInfo` field and ONE shared `schedule` predicate, gated on real hardware and a roll. Nothing advertises an unprobed capability today. |
 | Fleet dialability | A two-node witness over the real `HIVE_PUBLIC_IP`:`HIVE_IROH_PORT` path. The loopback diagnostic deliberately does not claim this. |
 | Live children | A reconcile tick that re-plans members for an ALREADY-RUNNING child; today the load watchdog still covers a member that dies mid-load. |
@@ -181,6 +184,40 @@ probe filters `ProbeOutcome::default()` out, `served_bytes=141335` equals
 `negotiated_key_exchange_group` read off four completed handshakes, not from
 the ALPN. It explicitly noted that a fresh `BoundedRound` per tick discards
 parked stragglers, which is fail-closed and not a defect.
+
+## Third verification round: the HOLD must be state-correcting
+
+A final workflow (`wf_e9dcac85-a5b`, two refuters) attacked the repaired tree
+and found two more real defects.
+
+1. **An ambiguity HOLD stopped injecting but never withdrew.** Once
+   `proj-9` had a valid `HIVE_INFERENCE_URL`, adding the colliding `proj-90`
+   made the port ambiguous; the bare `continue` left `proj-9`'s URL pointing at
+   whichever server won the bind race, i.e. another project's model. A
+   coordinator move left the same stale value. Fixed with
+   `inference_url_action()`, a pure decision over `(current, wanted, ready)`:
+   `Inject` when ready and different, `Withdraw` when not ready and the current
+   value is platform-shaped, `Hold` otherwise (a tenant override is never
+   touched). Witnessed `url_state=PASS inject=1 hold=2 withdraw=2
+   tenant_override_untouched=1`, including a coordinator-move case.
+2. **Three typed errors had callers but only one was constructed live.**
+   `UntrustedPeer` and `Timeout` could not fire in a passing probe. The
+   diagnostic now deliberately checks a wrong peer id against the REAL
+   handshake and maps a real elapsed deadline:
+   `typed_errors=PASS untrusted_peer=1 timeout=1 capability_missing=1`.
+   `probe_rdma_verbs()` also no longer pairs the first `uverbsN` with an
+   unrelated ACTIVE HCA; it reports the HCA/port it actually measured and
+   states that `uverbs` is a presence list, not a proven node-to-HCA mapping.
+
+The verifier's remaining point is NOT fixed and is recorded as an open
+residual: `coordinator_endpoint_ready()` proves a 2xx on a socket, not that
+the answering server is THIS project's llama-server. A stray or leftover
+server on a unique port still satisfies it. Closing that needs a
+project-bound identity (a replicated endpoint status via owner proxy plus a
+`gossip::dispatch` arm, or a verified model-alias check against the launched
+`--alias`) and a two-node witness. The decision record and the PRD row
+`swarm-replicated-endpoint-status-20261124` name that gate. It is not claimed
+as done.
 
 ## Gates run on the final tree
 
