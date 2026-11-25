@@ -351,6 +351,33 @@ async fn admission_witness() -> Result<()> {
         }
     }
     println!("RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1");
+    // (6c) A HEALTHY endpoint must still never clobber a tenant override.
+    // Only a stale PLATFORM-shaped url is ours to replace on Inject.
+    let tenant_override = "https://tenant.example/v1";
+    if inference_url_action(Some(tenant_override), &wanted, true)
+        != InferenceUrlAction::Hold
+    {
+        bail!("healthy Inject clobbered a tenant override");
+    }
+    if inference_url_action(Some(moved.as_str()), &wanted, true)
+        != InferenceUrlAction::Inject
+    {
+        bail!("a stale platform url was not replaced on a healthy Inject");
+    }
+    // (6d) A removed inference spec is absent from desired. The leader must
+    // still withdraw its platform-shaped URL via the orphan sweep.
+    if inference_url_action(Some(wanted.as_str()), "", false)
+        != InferenceUrlAction::Withdraw
+    {
+        bail!("orphaned spec url was not withdrawn");
+    }
+    if inference_url_action(Some(tenant_override), "", false)
+        != InferenceUrlAction::Hold
+    {
+        bail!("orphan sweep would delete a tenant override");
+    }
+    println!("RESULT url_override=PASS healthy_inject_preserved=1 stale_platform_replaced=1 orphan_withdrawn=1 orphan_override_held=1");
+
     // (6b) A backend switch, a missing coordinator or an unroutable IP must
     // also WITHDRAW, not early-continue. The leader loop now has ONE decision
     // point; an empty wanted URL with ready=false is that exact state.

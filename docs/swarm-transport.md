@@ -107,6 +107,7 @@ RESULT url_gate=PASS ready_200=1 loading_503=0 closed_port=0
 RESULT url_parameterisation=PASS v6_bracketed=1 link_local_refused=1 metadata_refused=1
 RESULT port_collision=PASS shared_held=1 unique_admitted=1
 RESULT url_state=PASS inject=1 hold=2 withdraw=2 tenant_override_untouched=1
+RESULT url_override=PASS healthy_inject_preserved=1 stale_platform_replaced=1 orphan_withdrawn=1 orphan_override_held=1
 RESULT url_no_target=PASS backend_switch_withdraw=1 coordinator_move_withdraw=1
 RESULT rdma_verbs=NOT_CAPABLE typed_refusal=swarm capability not proven: rdma_verbs
 RESULT thunderbolt_bridge_ip_only=true (IP interface, never an RDMA transport)
@@ -246,10 +247,33 @@ as done.
    transcript now shows their shape with explicit placeholders rather than
    claiming a fixed measurement.
 
+## Sixth sweep: tenant overrides and orphaned specs
+
+The long-running `wf_e9dcac85-a5b` verdict arrived after the previous round
+and found two more state-correcting defects in the same class. Its two supplied
+votes were stale (they described a bare `continue` already removed), but its
+judge independently re-ran the gates on the final tree and confirmed both new
+findings. Both are now fixed and witnessed:
+
+1. **A healthy `Inject` clobbered a tenant override.** `inference_url_action`
+   returned `Inject` for any `current != wanted`, so a tenant's own
+   `https://.../v1` was overwritten whenever the managed endpoint was healthy.
+   The decision now replaces only a stale PLATFORM-shaped URL and holds any
+   other value. Witnessed `url_override=PASS healthy_inject_preserved=1
+   stale_platform_replaced=1`.
+2. **A removed inference spec left an orphaned URL.** `desired` is built only
+   from projects WITH a spec, so `set_inference_exact(None)` made a project
+   invisible to the leader loop; the kill path stops the server but never
+   deletes the env var. A leftover server on that FNV port could then serve a
+   deleted-spec tenant app. The leader now sweeps every stored project absent
+   from `desired` and withdraws only platform-shaped URLs. `env_map`/`get` are
+   read-only (`unwrap_or_default`), so the sweep cannot mint ghost rows.
+   Witnessed `url_override=PASS orphan_withdrawn=1 orphan_override_held=1`.
+
 One gate stays OPEN and is not claimed done: `coordinator_endpoint_ready()`
-proves a 2xx on a socket, not that the answering server is THIS project's
-llama-server. Closing it needs a replicated endpoint status (owner proxy plus
-`gossip::dispatch`) or a verified model identity, and a two-node witness.
+still proves only a 2xx on a socket, not that the answering server is THIS
+project's llama-server. Closing it needs a replicated endpoint status or a
+verified model identity plus a two-node witness.
 
 ## Gates run on the final tree
 

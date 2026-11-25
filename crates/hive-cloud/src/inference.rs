@@ -1079,10 +1079,14 @@ pub(crate) fn inference_url_action(
     ready: bool,
 ) -> InferenceUrlAction {
     if ready {
-        return if current == Some(wanted) {
-            InferenceUrlAction::Hold
-        } else {
-            InferenceUrlAction::Inject
+        return match current {
+            None => InferenceUrlAction::Inject,
+            Some(value) if value == wanted => InferenceUrlAction::Hold,
+            // A stale PLATFORM url (old coordinator/port) is ours to
+            // replace. Anything else is a tenant override and must never
+            // be clobbered, even when the managed endpoint is healthy.
+            Some(value) if is_platform_inference_url(value) => InferenceUrlAction::Inject,
+            Some(_) => InferenceUrlAction::Hold,
         };
     }
     if current.is_some_and(is_platform_inference_url) {
@@ -1567,6 +1571,34 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                     })
                     .collect();
                 let ambiguous = ambiguous_inference_ports(&candidates);
+                // A project whose inference block was REMOVED is absent from
+                // desired, so the loop below never visits it. Sweep ALL stored
+                // projects and withdraw only platform-shaped URLs that no
+                // longer have a desired inference spec, otherwise a leftover
+                // server on that FNV port can serve a deleted spec tenant app.
+                let desired_names: std::collections::HashSet<&str> =
+                    desired.iter().map(|(p, _)| p.as_str()).collect();
+                for (name, _settings) in cloud.projects.snapshot() {
+                    // desired is built from projects WITH a spec. Everything
+                    // else, including a just-removed spec, is an orphan.
+                    if desired_names.contains(name.as_str()) {
+                        continue;
+                    }
+                    let current = cloud
+                        .projects
+                        .env_map(&name)
+                        .get("HIVE_INFERENCE_URL")
+                        .cloned();
+                    if inference_url_action(current.as_deref(), "", false)
+                        == InferenceUrlAction::Withdraw
+                    {
+                        cloud.projects.delete_env(&name, "HIVE_INFERENCE_URL");
+                        tracing::warn!(
+                            project = %name,
+                            "inference: withdrew orphaned HIVE_INFERENCE_URL - project has no desired inference spec"
+                        );
+                    }
+                }
                 for (p, spec) in &desired {
                     // ONE decision point, reached for EVERY desired spec.
                     // An early continue here would leave a platform-injected

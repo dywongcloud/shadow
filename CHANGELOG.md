@@ -46,7 +46,9 @@ more defects, all repaired and witnessed: an FNV port collision that let one
 project inherit another's inference URL, a HOLD that never withdrew an
 already-injected URL, three phantom error variants, a wrong Linux IB sysfs
 parse, IPv6 link-local admission, and an unverified uverbs-to-HCA pairing.
-`inference_url_action` is now a pure state-correcting decision. One gate is
+`inference_url_action` is now a pure state-correcting decision; it also
+never clobbers a tenant override on a healthy Inject, and an orphan sweep
+withdraws URLs left by removed inference specs. One gate is
 explicitly OPEN: a 2xx on a socket is not proof that the answering server is
 this project's llama-server; that needs a replicated endpoint status or a
 verified model identity plus a two-node witness.
