@@ -20,8 +20,9 @@ are refused. `run_host` prepends that bin to the build PATH after checkout
 `node_modules/.bin` shims, so a project-installed shim is never shadowed;
 a host with no default binary gets a typed `NODE_RUNTIME_MISSING` warning.
 `build_toolchain_identity` executes `node --version` and marks `verified=0`
-when the ACTUAL major is not 24, so a Node-24 cache key cannot name bytes
-built by an older runtime.
+when the ACTUAL major is not 24; the live `--node-probe` refuses PASS on that
+measurement. That helper has only `#[cfg(test)]` callers in this tree, so no
+production cache behaviour is claimed.
 
 `ansible/roles/prerequisites` converges the host default to exact `v24.22.3`
 (dnf nodejs alone left mixed v22 patches), with `force: true` on the pinned

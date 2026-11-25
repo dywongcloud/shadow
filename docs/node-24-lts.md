@@ -19,7 +19,7 @@ version, so there is no second version there to change.
 | --- | --- | --- |
 | Build Output API v3 runtime | `nodejs20.x / 22.x / 24.x` in one order | default `nodejs24.x` first in `SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES`; 20/22 stay ADMITTED (no amnesia) |
 | Host build PATH | `preferred_node_bin` scanned v20-v24 nvm dirs; `run_host` used ambient PATH | strict `v24.MINOR.PATCH` parse, sha256-verified tarball install first, operator `HIVE_NODE_BIN` override, `run_host` prepends the PROBED bin after checkout shims |
-| Cache identity | directory NAME named the Node version | `build_toolchain_identity` executes `node --version`; `verified=0` plus `NODE_RUNTIME_MISSING` when the ACTUAL major is not 24 |
+| Version measurement | nothing executed the probed binary | `--node-probe` executes `node --version` and refuses PASS when the ACTUAL major is not 24. The `compute_cache_key` helper has only `#[cfg(test)]` callers in this tree, so NO production cache behaviour is claimed here |
 | CI / release | `node-version: 20` | `node-version: 24` in both workflows |
 | Host provisioning | dnf `nodejs` (mixed v22 patches) plus a `node:sqlite` gate | exact `v24.22.3` tarball, sha256-pinned, `force: true`, symlinks into `/usr/local/bin`, exact-version `failed_when` (idempotent) |
 | UI deploy preflight | `node:sqlite` only (Node >= 22.5) | requires the default major 24 AND `node:sqlite` |
@@ -30,7 +30,7 @@ A directory name is not a version. `strict_lts_dir` refuses `v24.evil`,
 `v24`, `v24.0-rc`, a fourth component and every non-24 major;
 `node_version_major` independently refuses canary suffixes, `unavailable`,
 a missing `v` and a fourth component. The binary must actually REPORT
-major 24 before the cache identity is allowed to claim it.
+major 24 before the operator diagnostic is allowed to print PASS.
 
 ## Operator diagnostic
 

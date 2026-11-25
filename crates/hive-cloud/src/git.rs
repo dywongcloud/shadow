@@ -8025,7 +8025,7 @@ async fn is_wasm_module(p: &Path) -> bool {
 /// binary reports `NODE_RUNTIME_MISSING` rather than silently using whatever
 /// `node` the ambient PATH resolves to. A directory NAME is evidence only after
 /// a strict `v<major>.<minor>.<patch>` parse; the binary's ACTUAL version is
-/// verified in `build_toolchain_identity` before it can name a cache key.
+/// measured by the live `--node-probe` operator diagnostic.
 pub fn preferred_node_bin() -> Option<String> {
     // Operator-pinned absolute bin dir. Parameterized IO: the value is a PATH,
     // never interpolated into a command or URL. A missing/invalid override is
