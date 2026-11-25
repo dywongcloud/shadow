@@ -40,10 +40,21 @@ Shipped, local only:
   straggler that lands in a later round, released slots, and explicit scope
   (`fleet_public_path=NOT_PROVEN`, `speedup_claim=none`).
 
-Decision record and the HOLD residuals: `docs/swarm-transport.md`. Witnessed
-live: `--swarm-probe` SWARM_PROBE=PASS; `cargo test --workspace --locked`
-TEST_EXIT=0; `scripts/cli-acceptance.sh` 35/0; bindings `--check` PASS
-bindings=34; `git diff --check` 0; `tmp/r8-witness.sh` WITNESS_EXIT=0.
+Decision record and the HOLD residuals: `docs/swarm-transport.md`. Two
+further adversarial passes (`wf_7aa55635-ed1`, `wf_e9dcac85-a5b`) found six
+more defects, all repaired and witnessed: an FNV port collision that let one
+project inherit another's inference URL, a HOLD that never withdrew an
+already-injected URL, three phantom error variants, a wrong Linux IB sysfs
+parse, IPv6 link-local admission, and an unverified uverbs-to-HCA pairing.
+`inference_url_action` is now a pure state-correcting decision. One gate is
+explicitly OPEN: a 2xx on a socket is not proof that the answering server is
+this project's llama-server; that needs a replicated endpoint status or a
+verified model identity plus a two-node witness.
+
+Witnessed live: `--swarm-probe` SWARM_PROBE=PASS with 15 RESULT lines;
+`cargo test --workspace --locked` TEST_EXIT=0; `scripts/cli-acceptance.sh`
+35/0; bindings `--check` PASS bindings=34; `git diff --check` 0;
+`tmp/r8-witness.sh` WITNESS_EXIT=0.
 NO_TEST_FILES. No push, no roll, no dependency or Cargo.lock change.
 
 ## 2026-11-24 - jitllm is a HOLD, not an inference backend
