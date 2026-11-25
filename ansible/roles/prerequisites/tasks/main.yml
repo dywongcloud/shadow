@@ -187,36 +187,40 @@
     scope: system
     value: "*"
 
-- name: Install Node.js LTS (needed by hive-cloud's own build/deploy pipeline for tenant apps, and for the dashboard build)
+- name: Install Node.js 24 LTS (needed by hive-cloud's own build/deploy pipeline for tenant apps, and for the dashboard build)
   ansible.builtin.dnf:
     name: nodejs
     state: present
+  tags: [node24, prerequisites]
 
-- name: Check whether the installed node has node:sqlite (>= 22.5)
-  ansible.builtin.command: node -e "require('node:sqlite')"
-  register: hive_node_sqlite_check
+- name: Read the default Node.js version on this host
+  ansible.builtin.command: /usr/local/bin/node --version
+  register: hive_node_version
   failed_when: false
   changed_when: false
+  tags: [node24, prerequisites]
 
-- name: Install Node v22.23.2 from the official tarball (sha256-verified) when node:sqlite is missing
-  when: hive_node_sqlite_check.rc != 0
+- name: Install Node 24 LTS from the official tarball (sha256-verified) when the default is not 24 LTS
+  when: hive_node_version.stdout | default('') != 'v24.22.3'
+  tags: [node24, prerequisites]
   block:
-    - name: Download node v22.23.2 tarball with checksum
+    - name: Download node 24.22.3 tarball with checksum
       ansible.builtin.get_url:
-        url: "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz"
-        dest: /tmp/node-v22.23.2-linux-x64.tar.xz
-        checksum: "sha256:d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307"
+        url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3-linux-x64.tar.xz"
+        dest: /tmp/node-v24.22.3-linux-x64.tar.xz
+        checksum: "sha256:4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb"
+        force: true
 
-    - name: Extract node v22.23.2 into /usr/local
+    - name: Extract node 24.22.3 into /usr/local
       ansible.builtin.unarchive:
-        src: /tmp/node-v22.23.2-linux-x64.tar.xz
+        src: /tmp/node-v24.22.3-linux-x64.tar.xz
         dest: /usr/local
         remote_src: true
-        creates: /usr/local/node-v22.23.2-linux-x64/bin/node
+        creates: /usr/local/node-v24.22.3-linux-x64/bin/node
 
     - name: Symlink node/npm/npx into /usr/local/bin (precedes /usr/bin in default PATH and hive-ui's Environment PATH)
       ansible.builtin.file:
-        src: "/usr/local/node-v22.23.2-linux-x64/bin/{{ item }}"
+        src: "/usr/local/node-v24.22.3-linux-x64/bin/{{ item }}"
         dest: "/usr/local/bin/{{ item }}"
         state: link
         force: true
@@ -227,11 +231,17 @@
 
     - name: Remove the tarball
       ansible.builtin.file:
-        path: /tmp/node-v22.23.2-linux-x64.tar.xz
+        path: /tmp/node-v24.22.3-linux-x64.tar.xz
         state: absent
 
-    - name: Verify node:sqlite is now loadable
+    - name: Verify node:sqlite is loadable
       ansible.builtin.command: /usr/local/bin/node -e "require('node:sqlite')"
+
+    - name: Verify the default is 24 LTS
+      ansible.builtin.command: /usr/local/bin/node --version
+      register: hive_node_version_after
+      changed_when: false
+      failed_when: hive_node_version_after.stdout != 'v24.22.3'
 
 - name: Check whether wasmer v7.2.1 is already installed
   ansible.builtin.command: /usr/local/bin/wasmer --version

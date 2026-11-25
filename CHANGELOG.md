@@ -1,5 +1,45 @@
 # Changelog
 
+## 2026-11-25 - Node.js 24 LTS is the default build/deploy runtime
+
+Node version errors came from the host build lane resolving an ambient
+Node 20/22 while tenant packages and the dashboard need 24. One shared
+default now lives in `fluid_core`: `DEFAULT_NODE_MAJOR = 24`,
+`DEFAULT_NODE_VERSION = "24.22.3"` (official tarball, sha256-pinned) and
+`DEFAULT_BUILD_OUTPUT_NODE_RUNTIME = "nodejs24.x"`. The Build Output API v3
+allowlist puts that default first and keeps 20/22 admitted; CI, release
+workflows, the rootfs default image, the local Firecracker bootstrap, the
+getting-started example and the `hived` warm-up example all move to 24.
+
+`git.rs::preferred_node_bin` is now PROBED, not guessed: it prefers the
+sha256-verified `v24.22.3` tarball install, then strictly parsed
+`v24.MINOR.PATCH` nvm directories (newest patch first), then a Homebrew
+`node@24` keg, with an operator `HIVE_NODE_BIN` absolute-path override.
+`v24.evil`, `v24`, `v24.0-rc`, four-component names and every non-24 major
+are refused. `run_host` prepends that bin to the build PATH after checkout
+`node_modules/.bin` shims, so a project-installed shim is never shadowed;
+a host with no default binary gets a typed `NODE_RUNTIME_MISSING` warning.
+`build_toolchain_identity` executes `node --version` and marks `verified=0`
+when the ACTUAL major is not 24, so a Node-24 cache key cannot name bytes
+built by an older runtime.
+
+`ansible/roles/prerequisites` converges the host default to exact `v24.22.3`
+(dnf nodejs alone left mixed v22 patches), with `force: true` on the pinned
+download, symlinks into `/usr/local/bin`, a `node:sqlite` proof and an exact
+version assertion. `scripts/deploy-ui-fleet.sh` preflight now requires the
+default major 24 instead of only >= 22.5.
+
+`hive-cloud --node-probe` is an operator diagnostic that executes the PROBED
+binary, checks strict parsing and the cache identity, and exits non-zero on
+NOT CAPABLE. A static boot log literal lets `strings -a /proc/<MainPID>/exe`
+prove the RUNNING binary after a roll.
+
+HOLD (operator-gated, NOT done): rebuilding booted `default.ext4` rootfs
+from `node:24-slim`, replacing the reviewed digest-pinned BuildExecutor
+base, and baking `sandbox-node24.ext4` before changing the sandbox default.
+See `docs/node-24-lts.md`. Sandbox defaults intentionally stay at the
+provisioned `node22`: a default naming an absent image is a phantom.
+
 ## 2026-11-24 - network swarm: probed QUIC channel, honest inference admission
 
 An adversarial research swarm (six confirmed results, `wf_754ef243-7f8`) and a

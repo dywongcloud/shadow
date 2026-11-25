@@ -66,6 +66,7 @@ mod hrana;
 mod hrana_proto;
 mod musql;
 mod musql_migrate;
+mod node_probe;
 mod sqlite_engine;
 mod swarm_probe;
 mod identity;
@@ -493,6 +494,12 @@ struct Args {
     /// ALPN, the ACTUAL negotiated hybrid key-exchange group, a bounded round
     /// with a parked straggler, and released in-flight slots. Prints the PROBED
     /// RDMA/Thunderbolt capability. Non-zero exit on any failure.
+    /// Operator diagnostic (same family as "--dns-probe"): execute the
+    /// PROBED default Node.js LTS binary on this host, verify its ACTUAL
+    /// major, and refuse strict version-directory/version-string impostors.
+    /// Starts no node and binds no port. Non-zero exit when NOT CAPABLE.
+    #[arg(long = "node-probe")]
+    node_probe: bool,
     #[arg(long = "swarm-probe")]
     swarm_probe: bool,
     /// Debug-build-only destructive diagnostic against HIVE_DATA. Intended only
@@ -613,6 +620,18 @@ async fn async_main() -> anyhow::Result<()> {
     runtime_watch::spawn(tokio::runtime::Handle::current());
     install_ring_crypto_provider();
     let args = Args::parse();
+    tracing::info!(
+        major = fluid_core::DEFAULT_NODE_MAJOR,
+        version = fluid_core::DEFAULT_NODE_VERSION,
+        "boot: default Node.js LTS major selected for builds and deployments"
+    );
+    if args.node_probe {
+        if let Err(error) = crate::node_probe::run().await {
+            eprintln!("NODE_PROBE=FAIL {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
 
     #[cfg(debug_assertions)]
     if args.guardian_writer_cadence_diagnostic {

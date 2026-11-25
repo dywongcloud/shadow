@@ -7679,7 +7679,9 @@ fn build_output_manifest(
                 ),
             )
         })?;
-        if !matches!(runtime, "nodejs20.x" | "nodejs22.x" | "nodejs24.x") {
+        if runtime != fluid_core::DEFAULT_BUILD_OUTPUT_NODE_RUNTIME
+            && !matches!(runtime, "nodejs20.x" | "nodejs22.x")
+        {
             return Err(build_output_contract_error(
                 "provision Build Output API v3 functions",
                 fluid_core::BuildOutputV3Refusal::unsupported(format!(
@@ -8018,45 +8020,71 @@ async fn is_wasm_module(p: &Path) -> bool {
     f.read_exact(&mut magic).await.is_ok() && &magic == b"\0asm"
 }
 
-/// A STABLE Node 20–24 bin dir, preferred over an unstable system node (such as Homebrew's v26
-/// canary) so framework builds do not fail engine checks: nvm-installed versions first, then
-/// `node@NN` kegs.
+/// A PROBED Node.js bin dir in the platform's default LTS major. `None` = NOT
+/// CAPABLE, never "unknown but admit": a build that cannot name a real default
+/// binary reports `NODE_RUNTIME_MISSING` rather than silently using whatever
+/// `node` the ambient PATH resolves to. A directory NAME is evidence only after
+/// a strict `v<major>.<minor>.<patch>` parse; the binary's ACTUAL version is
+/// verified in `build_toolchain_identity` before it can name a cache key.
 pub fn preferred_node_bin() -> Option<String> {
+    // Operator-pinned absolute bin dir. Parameterized IO: the value is a PATH,
+    // never interpolated into a command or URL. A missing/invalid override is
+    // ignored (handled), not trusted.
+    if let Ok(raw) = std::env::var("HIVE_NODE_BIN") {
+        let dir = PathBuf::from(raw.trim());
+        if dir.is_absolute() && dir.join("node").is_file() {
+            return Some(dir.to_string_lossy().into_owned());
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // The sha256-verified fleet tarball install wins over any per-user nvm dir:
+    // a per-user directory is not an authority for a platform build.
+    candidates.push(PathBuf::from(format!(
+        "/usr/local/node-v{}-linux-x64/bin",
+        fluid_core::DEFAULT_NODE_VERSION
+    )));
     let home = std::env::var("HOME").unwrap_or_default();
-    let nvm = PathBuf::from(&home).join(".nvm/versions/node");
-    let mut best: Option<(u32, PathBuf)> = None;
-    if let Ok(rd) = std::fs::read_dir(&nvm) {
-        for e in rd.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if let Some(major) = name
-                .trim_start_matches('v')
-                .split('.')
-                .next()
-                .and_then(|s| s.parse::<u32>().ok())
-            {
-                if (20..=24).contains(&major) {
+    if !home.is_empty() {
+        let nvm = PathBuf::from(&home).join(".nvm/versions/node");
+        if let Ok(rd) = std::fs::read_dir(&nvm) {
+            let mut strict: Vec<(u32, u32, PathBuf)> = rd
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let (minor, patch) = strict_lts_dir(&name)?;
                     let bin = e.path().join("bin");
-                    if bin.join("node").exists()
-                        && best.as_ref().map(|(m, _)| major > *m).unwrap_or(true)
-                    {
-                        best = Some((major, bin));
-                    }
-                }
-            }
+                    bin.join("node").is_file().then_some((minor, patch, bin))
+                })
+                .collect();
+            // Newest patch wins deterministically; equal versions keep path order.
+            strict.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+            candidates.extend(strict.into_iter().map(|(_, _, p)| p));
         }
     }
-    if let Some((_, bin)) = best {
-        return Some(bin.to_string_lossy().into_owned());
+    for base in ["/opt/homebrew/opt", "/usr/local/opt"] {
+        candidates.push(PathBuf::from(format!(
+            "{base}/node@{}/bin",
+            fluid_core::DEFAULT_NODE_MAJOR
+        )));
     }
-    for major in [24u32, 22, 20] {
-        for base in ["/opt/homebrew/opt", "/usr/local/opt"] {
-            let bin = PathBuf::from(format!("{base}/node@{major}/bin"));
-            if bin.join("node").exists() {
-                return Some(bin.to_string_lossy().into_owned());
-            }
-        }
+    candidates
+        .into_iter()
+        .find(|dir| dir.join("node").is_file())
+        .map(|dir| dir.to_string_lossy().into_owned())
+}
+
+/// Strict `v24.MINOR.PATCH`. Rejects `v24.evil`, `v24`, `v24.0-rc` and
+/// every non-default major. Returns (minor, patch) for deterministic ordering.
+pub(crate) fn strict_lts_dir(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix('v')?;
+    let mut parts = rest.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    let patch: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || major != fluid_core::DEFAULT_NODE_MAJOR {
+        return None;
     }
-    None
+    Some((minor, patch))
 }
 
 /// Node binary for the build-time compile-cache warm-up. V8's bytecode cache is keyed by the exact
@@ -8980,7 +9008,19 @@ impl IsolatedBuild {
         }
         cmd.current_dir(dir);
         cmd.env_clear();
+        // Checkout CLIs first, then the PROBED default LTS bin, then ambient PATH. The default
+        // never shadows a project-installed shim (node_modules/.bin), and never silently falls
+        // through to an ambient canary/older runtime: a missing default is a typed warning.
         let mut path_value = local_bin_dirs_on_path(dir);
+        if let Some(node_bin) = preferred_node_bin() {
+            path_value.push_str(&node_bin);
+            path_value.push(':');
+        } else {
+            tracing::warn!(
+                code = hive_core::fault::NODE_RUNTIME_MISSING,
+                "build: default Node.js LTS is not provisioned on this host; NODE_RUNTIME_MISSING"
+            );
+        }
         path_value.push_str(
             &std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string()),
         );
@@ -9340,7 +9380,18 @@ async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
     }
 }
 
-async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
+/// Pure: parse "v24.22.3" into its major. Anything else (canary suffix, "unavailable",
+/// empty) is None.
+pub(crate) fn node_version_major(raw: &str) -> Option<u32> {
+    let rest = raw.trim().strip_prefix("v")?;
+    let mut parts = rest.split(".");
+    let major: u32 = parts.next()?.parse().ok()?;
+    parts.next()?.parse::<u32>().ok()?;
+    parts.next()?.parse::<u32>().ok()?;
+    (parts.next().is_none() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')).then_some(major)
+}
+
+pub(crate) async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
     if let Ok(explicit) = std::env::var("HIVE_BUILD_TOOLCHAIN_ID") {
         if !explicit.trim().is_empty() {
             return explicit;
@@ -9351,6 +9402,19 @@ async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
         .map(|dir| dir.join("node"))
         .unwrap_or_else(|| PathBuf::from("node"));
     let node_version = command_version(&node, &["--version"], install_dir).await;
+    // A directory name is not a version. Only a binary that actually reports the default LTS
+    // major may name a cache entry with it; anything else is marked unverified so a Node-24 key
+    // cannot name bytes built by an older runtime.
+    let node_tag = if node_version_major(&node_version) == Some(fluid_core::DEFAULT_NODE_MAJOR) {
+        format!("node={node_version};verified=1")
+    } else {
+        tracing::warn!(
+            version = %node_version,
+            code = hive_core::fault::NODE_RUNTIME_MISSING,
+            "build: default Node.js LTS binary is not verified; refusing to claim its version"
+        );
+        format!("node={node_version};verified=0")
+    };
     let pm_program = if pm == "npm" {
         node.parent()
             .map(|dir| dir.join("npm"))
@@ -9361,10 +9425,10 @@ async fn build_toolchain_identity(install_dir: &Path, pm: &str) -> String {
     };
     let pm_version = command_version(&pm_program, &["--version"], install_dir).await;
     format!(
-        "os={};arch={};node={};pm={pm}@{}",
+        "os={};arch={};{};pm={pm}@{}",
         std::env::consts::OS,
         std::env::consts::ARCH,
-        node_version,
+        node_tag,
         pm_version,
     )
 }

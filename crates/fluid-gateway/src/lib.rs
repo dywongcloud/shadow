@@ -192,7 +192,11 @@ pub fn build_output_v3_evaluator(
 /// Exact, closed allowlist (Vercel's currently supported Node.js Lambda runtimes); any other value is
 /// an unsupported capability, never a pattern match.
 pub const SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES: &[&str] =
-    &["nodejs20.x", "nodejs22.x", "nodejs24.x"];
+    &[
+        fluid_core::DEFAULT_BUILD_OUTPUT_NODE_RUNTIME,
+        "nodejs20.x",
+        "nodejs22.x",
+    ];
 
 fn is_supported_build_output_runtime(runtime: &str) -> bool {
     SUPPORTED_BUILD_OUTPUT_NODE_RUNTIMES.contains(&runtime)

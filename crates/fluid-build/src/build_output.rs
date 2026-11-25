@@ -103,7 +103,7 @@ pub struct ImagesConfig {
 /// `.vc-config.json` for a **serverless** function (`functions/<name>.func/`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerlessConfig {
-    /// e.g. "nodejs20.x", "python3.12", "go1.x".
+    /// e.g. "nodejs24.x", "python3.12", "go1.x".
     pub runtime: String,
     pub handler: String,
     #[serde(skip_serializing_if = "Option::is_none")]

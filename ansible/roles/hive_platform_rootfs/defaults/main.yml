@@ -13,7 +13,9 @@ hive_cell_agent_protocol_timeout_seconds: 5
 # controller disappears after stopping hive-node, systemd still starts it.
 hive_runtime_rootfs_build_timeout_seconds: 3600
 hive_runtime_rootfs_restart_guard_seconds: 3900
-hive_runtime_rootfs_image: "node:20-slim"
+# Default deployment runtime: Node.js 24 LTS. A rootfs REBUILD is an
+# operator-owned migration (the rebuild/drain gates above stay false).
+hive_runtime_rootfs_image: "node:24-slim"
 hive_runtime_rootfs_logical_name: "default"
 hive_runtime_rootfs_size_mib: 4096
 hive_cell_agent_install_path: "/usr/local/bin/hive-cell-agent"

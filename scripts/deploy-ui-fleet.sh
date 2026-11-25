@@ -97,9 +97,15 @@ preflight() {
   ssh "${ssh_opts[@]}" "root@$host" '
     command -v node >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: nodejs not installed"; exit 1; }
     command -v npm  >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: npm not installed"; exit 1; }
-    # The @workflow/web 4.1.13 console build needs node:sqlite (Node >= 22.5); a v20 node serves /wfc as 500.
+    # The default build/deploy toolchain is Node.js 24 LTS (v24.22.3,
+    # sha256-verified in ansible/roles/prerequisites). A v22 host can still
+    # serve the dashboard but would resolve a DIFFERENT Node for tenant
+    # builds: refuse rather than silently ship that mismatch.
+    node_major="$(node --version | cut -c2- | cut -d. -f1)"
+    [ "$node_major" = "24" ] \
+      || { echo "PREFLIGHT FAIL: node $(node --version) is not the default 24 LTS"; exit 1; }
     node -e "require(\"node:sqlite\")" 2>/dev/null \
-      || { echo "PREFLIGHT FAIL: node $(node --version) lacks node:sqlite (need >= 22.5)"; exit 1; }
+      || { echo "PREFLIGHT FAIL: node $(node --version) lacks node:sqlite"; exit 1; }
     [ -f /etc/systemd/system/hive-ui.service ] || { echo "PREFLIGHT FAIL: hive-ui.service unit missing"; exit 1; }
     echo "  node $(node --version), npm $(npm --version), unit present"
   '

@@ -117,15 +117,15 @@ scripts/            Lima config + guest bootstrap for the Firecracker path
 ```bash
 cargo build
 
-# Start a Hive node with a warm pool of 2 "node:20" cells.
+# Start a Hive node with a warm pool of 2 "node:24-slim" cells.
 RUST_LOG=info,hive_controlplane=debug \
-  ./target/debug/hived --warm node:20=2 --listen 127.0.0.1:8080 &
+  ./target/debug/hived --warm node:24-slim=2 --listen 127.0.0.1:8080 &
 
 # Watch the cluster (warm pool fills in the background).
 ./target/debug/hivectl status
 
 # Submit a build that lands on a warm cell and follow its logs.
-./target/debug/hivectl submit --image node:20 \
+./target/debug/hivectl submit --image node:24-slim \
   -c 'echo hello from the cell' -c 'uname -a' --follow
 ```
 
@@ -140,7 +140,7 @@ directories keyed by a cache key (e.g. a lockfile hash) — so an unchanged
 `package.json` skips `npm install`:
 
 ```bash
-hivectl submit --image node:20 --cache-key "$(shasum package-lock.json)" \
+hivectl submit --image node:24-slim --cache-key "$(shasum package-lock.json)" \
   --cache-path node_modules \
   -c 'test -d node_modules || npm ci' -c 'npm run build' --follow
 ```

@@ -47,7 +47,7 @@ struct Args {
     #[arg(long, default_value_t = 32 * 1024)]
     box_mem_mib: u32,
 
-    /// Warm-pool targets as `IMAGE=COUNT`, repeatable. e.g. --warm node:20=2
+    /// Warm-pool targets as `IMAGE=COUNT`, repeatable. e.g. --warm node:24-slim=2
     #[arg(long = "warm", value_parser = parse_warm)]
     warm: Vec<(String, usize)>,
 

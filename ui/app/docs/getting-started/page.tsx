@@ -110,7 +110,7 @@ export default function GettingStarted() {
           <p>The repo ships two CLIs. <In>fluidctl</In> talks to a node&apos;s admin API (default <In>http://127.0.0.1:8786</In>, set with <In>--admin</In> or <In>FLUID_ADMIN</In>); <In>hivectl</In> talks to the Hive API served by <In>hived</In> (default <In>http://127.0.0.1:8080</In>, set with <In>--server</In> or <In>HIVE_SERVER</In>).</p>
           <One lang="bash" filename="cli.sh" code={`fluidctl deploy examples/hello     # deploy a local app
 fluidctl ls                        # list deployments
-hivectl submit --image node:20 -c 'npm ci' -c 'npm run build' --follow`} />
+hivectl submit --image node:24-slim -c 'npm ci' -c 'npm run build' --follow`} />
         </Section>
 
         <Section id="api" eyebrow="Reference" title="API basics">

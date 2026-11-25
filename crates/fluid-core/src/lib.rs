@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+/// Node.js LTS major used by default for tenant builds and deployments. PROBED, never assumed:
+/// a host without a binary in this major is NOT CAPABLE, never silently downgraded to an older LTS
+/// or an unstable canary. Every surface that picks a Node version reads these constants.
+pub const DEFAULT_NODE_MAJOR: u32 = 24;
+/// Exact LTS release the fleet provisions (sha256-verified in ansible/roles/prerequisites).
+pub const DEFAULT_NODE_VERSION: &str = "24.22.3";
+/// Build Output API v3 runtime identifier for the default LTS major.
+pub const DEFAULT_BUILD_OUTPUT_NODE_RUNTIME: &str = "nodejs24.x";
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProjectIncarnation(Uuid);

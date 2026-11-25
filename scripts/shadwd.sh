@@ -244,7 +244,7 @@ cmd_fc_daemon() {
     sudo install -D -m0755 $HOME/fc-target/aarch64-unknown-linux-musl/release/hive-cell-agent /usr/local/bin/hive-cell-agent
 
     if [ ! -f /var/lib/hive/rootfs/default.ext4 ] || [ -n "${FC_REBUILD_ROOTFS:-}" ]; then
-      sudo ROOTFS_DIR=/var/lib/hive/rootfs AGENT_BIN=/usr/local/bin/hive-cell-agent bash "$REPO/scripts/build-rootfs.sh" node:20-slim default 2048
+      sudo ROOTFS_DIR=/var/lib/hive/rootfs AGENT_BIN=/usr/local/bin/hive-cell-agent bash "$REPO/scripts/build-rootfs.sh" node:24-slim default 2048
     fi
 
     cargo build --release -p hive-cloud --features zkauth --locked
