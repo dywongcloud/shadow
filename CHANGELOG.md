@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-11-24 - jitllm is a HOLD, not an inference backend
+
+An adversarial review of jitllm v0.2.7 (pinned HEAD
+c4c554167bd9f87e8c4b952805419c1099de0a33, Go, Apache-2.0) returned NO-GO on
+replacing llama.cpp. Three independent refuters found that `jitllmd serve` has a
+disjoint flag set and no cross-machine tensor transport (upstream ROADMAP calls
+network swarm "Not started"), needs converted `.jlm` containers where this repo
+caches GGUF, writes an unconditional 200 on its llama.cpp-compatible /health,
+and needs a Bearer key with no injection channel. The quoted 4x / 4.62x /
+5.53x / 1.53x ratios are vendor same-machine A/B numbers, not measured on this
+fleet; none is admitted as a reason for a change. All five GPU hosts are
+retired, so no live endpoint exists to witness a swap.
+
+`InferenceSpec.backend` is now an additive `#[serde(default)]` field with a
+lenient enum, so an unrecognised tenant string cannot fail `persist::load`.
+`reconcile_local` refuses any backend other than `llama_cpp` with a fixed
+`failed: ... (NodeRuntimeMissing)` status: no child, no download, no
+`HIVE_INFERENCE_URL`. A `fluid.json` asking for `jitllm` no longer silently
+gets llama.cpp. The llama.cpp launcher and `--rpc` pooling path are unchanged.
+The loopback readiness probe now uses `hive_outbound::internal_client()` rather
+than a bare `reqwest::Client::new()`, which honoured ambient proxies and
+followed redirects. Full evidence and residuals: docs/inference-backends.md.
+No push, no roll, no replacement; each residual needs an operator decision.
+
 ## 2026-11-24 - Rolls stop electing the shut-off bkk host
 
 `ansible/playbooks/parallel-deploy.yml` elected its build hosts by

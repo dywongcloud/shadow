@@ -9054,6 +9054,7 @@ async fn inference_endpoints(
                 "project": p,
                 "model": i.model,
                 "pool": i.pool,
+                "backend": i.backend,
                 "coordinator": coord.map(|n| n.name),
                 "port": port,
                 "url": url,

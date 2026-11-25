@@ -918,9 +918,17 @@ fn plan_members(
     Ok(members)
 }
 
+/// Readiness of the child on this node. This is a FLEET-INTERNAL loopback call,
+/// so it goes through `hive_outbound::internal_client()`: a bare
+/// `reqwest::Client::new()` honours ambient HTTP_PROXY/ALL_PROXY and follows
+/// redirects, which would send a loopback health check to a third-party proxy or
+/// follow a 302 off the node. llama-server answers 503 for the whole model load,
+/// so a 2xx here is its positive loaded signal; a backend that writes an
+/// unconditional 200 must not be launched until it has a real readiness proof
+/// (see docs/inference-backends.md).
 async fn health_ok(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
-    match reqwest::Client::new()
+    match hive_outbound::internal_client()
         .get(&url)
         .timeout(Duration::from_secs(3))
         .send()
@@ -929,6 +937,62 @@ async fn health_ok(port: u16) -> bool {
         Ok(r) => r.status().is_success(),
         Err(_) => false,
     }
+}
+
+/// Fixed refusal for a `fluid.json` that names a backend this node cannot run.
+/// It is NOT a silent fallback: no child is spawned, no model is downloaded and
+/// `HIVE_INFERENCE_URL` is not injected. See docs/inference-backends.md.
+const BACKEND_REFUSAL_STATUS: &str =
+    "failed: inference backend is not provisioned on this node (NodeRuntimeMissing)";
+
+fn refuse_backend(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    spec: &crate::project_settings::InferenceSpec,
+) {
+    let port = port_for(project);
+    let mut servers = cloud.inference.servers.lock();
+    let e = servers.entry(project.to_string()).or_insert_with(|| {
+        (
+            None,
+            EndpointStatus {
+                project: project.to_string(),
+                model: spec.model.clone(),
+                coordinator: cloud.node_name.clone(),
+                port,
+                pool: spec.pool,
+                rpc_members: Vec::new(),
+                status: "starting".into(),
+                unassigned_since_ms: 0,
+                load_started_ms: 0,
+                updated_ms: hive_core::now_ms(),
+            },
+        )
+    });
+    // A backend switch must not leave the previous backend's server serving.
+    if let Some(mut child) = e.0.take() {
+        let _ = child.start_kill();
+    }
+    e.1.model = spec.model.clone();
+    e.1.pool = spec.pool;
+    e.1.rpc_members.clear();
+    e.1.load_started_ms = 0;
+    e.1.status = BACKEND_REFUSAL_STATUS.into();
+    e.1.updated_ms = hive_core::now_ms();
+    drop(servers);
+    let unit = format!("{}.scope", scope_name(project));
+    tokio::spawn(async move {
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["stop", &unit])
+            .output()
+            .await;
+    });
+    tracing::warn!(
+        project,
+        backend = ?spec.backend,
+        code = hive_core::fault::NODE_RUNTIME_MISSING,
+        "inference: backend not provisioned; refusing to launch (no silent fallback)"
+    );
 }
 
 /// Reconcile ONE endpoint on its coordinator (this node). Ensures model +
@@ -966,6 +1030,23 @@ async fn reconcile_local(
     project: &str,
     spec: &crate::project_settings::InferenceSpec,
 ) {
+    if spec.backend != crate::project_settings::InferenceBackend::LlamaCpp {
+        // llama.cpp is the only backend with a launcher, a model format, a
+        // readiness contract and --rpc pooling in this tree. A named jitllm is
+        // an explicit HOLD, never a silent substitution of llama.cpp.
+        let parked = {
+            let servers = cloud.inference.servers.lock();
+            servers.get(project).is_some_and(|(child, st)| {
+                child.is_none()
+                    && st.status == BACKEND_REFUSAL_STATUS
+                    && st.model == spec.model
+            })
+        };
+        if !parked {
+            refuse_backend(cloud, project, spec);
+        }
+        return;
+    }
     let port = port_for(project);
     let child_running = {
         let mut servers = cloud.inference.servers.lock();
@@ -1269,7 +1350,11 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
             }
 
             if crate::leadership::may_act(&cloud, crate::leadership::Job::InferenceEnv) {
-                for (p, _spec) in &desired {
+                for (p, spec) in &desired {
+                    // Never advertise an endpoint URL for a backend we refused.
+                    if spec.backend != crate::project_settings::InferenceBackend::LlamaCpp {
+                        continue;
+                    }
                     let Some(coord) = coordinator_for(&cloud, p) else {
                         continue;
                     };

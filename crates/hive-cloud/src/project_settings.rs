@@ -180,15 +180,37 @@ impl Default for FunctionSettings {
     }
 }
 
+/// The inference runner a project asks for. `LlamaCpp` is the only backend with a
+/// launcher, a model format, a readiness contract and cross-node RPC pooling in
+/// this tree. `Jitllm` is recorded so a `fluid.json` asking for it is REFUSED with
+/// an honest status instead of being silently ignored and served by llama.cpp.
+/// `#[serde(default)]` keeps older persisted rows valid: adding a defaulted key
+/// never makes `persist::load` fail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceBackend {
+    #[default]
+    LlamaCpp,
+    Jitllm,
+    /// Any unrecognised name. A tenant-controlled string must never make
+    /// `persist::load` fail (that loses ALL state silently); it is refused
+    /// honestly at reconcile time instead.
+    #[serde(other)]
+    Unknown,
+}
+
 /// The `fluid.json` `inference` block: `model` is a direct GGUF URL or an `org/repo/file.gguf`
 /// HuggingFace path; `pool: true` lets the platform combine same-region GPU nodes (llama.cpp RPC)
 /// when the model exceeds one node's free VRAM. The platform injects `HIVE_INFERENCE_URL` into the
-/// project env.
+/// project env. A non-default `backend` is an explicit HOLD, never a silent fallback (see
+/// `inference::reconcile_local` and docs/inference-backends.md).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct InferenceSpec {
     pub model: String,
     #[serde(default)]
     pub pool: bool,
+    #[serde(default)]
+    pub backend: InferenceBackend,
 }
 
 /// Dashboard-managed config of a CONTAINER-runtime project (a single-Dockerfile deploy): the
