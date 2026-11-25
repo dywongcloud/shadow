@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -150,11 +150,6 @@ pub struct InferenceRuntime {
     /// project → (child, status). Children are this process's own — killed on
     /// process exit, respawned by the reconcile tick after a restart.
     servers: parking_lot::Mutex<HashMap<String, (Option<tokio::process::Child>, EndpointStatus)>>,
-    /// member ip -> (rtt_ms, measured_at_ms): TCP-connect-time probes of member rpc ports,
-    /// in-process with a TTL, the fallback RTT signal for peers the registry has not measured yet
-    /// (see `member_rtts`). Only ever populated on an elected coordinator, because only
-    /// `reconcile_local` reads it.
-    rtt_probe_cache: parking_lot::Mutex<HashMap<String, (u64, u64)>>,
     /// model URL -> its download's state (see [`model_state`]); shared by every project naming it.
     fetches: parking_lot::Mutex<HashMap<String, Fetch>>,
 }
@@ -770,135 +765,192 @@ fn load_timeout_secs() -> u64 {
 const LOAD_TIMEOUT_STATUS: &str =
     "failed: model load exceeded HIVE_INFERENCE_LOAD_TIMEOUT_SECS (rtt-limited member link?)";
 
-const RTT_PROBE_CACHE_TTL_MS: u64 = 300_000;
-/// Sentinel for "probe failed / no address": sorts last and always reads as
-/// over-threshold, so such a member is only ever a last resort.
+/// Sentinel for "no measurement": sorts last and never admits a member.
 const RTT_UNKNOWN: u64 = u64::MAX;
+const RPC_PORT: u16 = 50052;
 
-/// Coordinator-to-member RTT for every same-region pool candidate, keyed by node name. Primary
-/// signal: the registry's `latency_ms`, which each node's OWN gossip probes measure; since
-/// `reconcile_local` runs only on the elected coordinator, the local registry vantage IS the
-/// coordinator-to-candidate RTT. `latency_ms == 0` or `NodeRegistry::RESTORED_LATENCY_MS` on a
-/// non-self peer means 'unmeasured by us' (the latter was restored from indirect gossip), so either
-/// hole falls back to a TCP connect-time probe of the member's rpc port, cached in-process with a
-/// TTL and floored at 1 ms so a sub-ms LAN connect never reads as the 'unmeasured' 0. `u64::MAX` is
-/// withdrawn and likewise never a measurement.
-async fn member_rtts(
+/// Wall budget for ONE bounded round of rpc-port connects. A dead member costs
+/// the round this single deadline, never one timeout per peer.
+fn member_probe_budget_ms() -> u64 {
+    std::env::var("HIVE_INFERENCE_MEMBER_PROBE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1500)
+        .clamp(100, 10_000)
+}
+
+/// One same-region member's link evidence. `reachable` is a FRESH successful
+/// connect to its rpc port in THIS round; gossip latency only ORDERS members,
+/// it never admits one. Default is fail-closed, so a dropped or panicking probe
+/// task can never be read as a reachable member.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MemberLink {
+    pub(crate) rtt_ms: u64,
+    pub(crate) reachable: bool,
+}
+
+impl Default for MemberLink {
+    fn default() -> Self {
+        Self {
+            rtt_ms: RTT_UNKNOWN,
+            reachable: false,
+        }
+    }
+}
+
+/// Coordinator-to-member link evidence for every same-region pool candidate.
+/// The registry's `latency_ms` is a gossip RTT, not proof that llama-rpc is
+/// listening: a node gossips healthily with its rpc-server stopped. Admission
+/// therefore requires a fresh TCP connect to ``<public_ip>:50052`` on EVERY
+/// round, independent of that latency. All connects run as ONE
+/// `bounded_round::BoundedRound`, whose `Completion` drop guard makes a
+/// panicked task fail closed. A fresh connect's RTT orders members; the registry
+/// value is preferred when the node already measured a longer-term link cost.
+/// ONE shared reachability primitive. It takes an ip and a budget and nothing
+/// else: gossip latency is NOT an input, so no caller can substitute a fresh
+/// registry RTT for a real connect. A connect that succeeds is dropped at once.
+pub(crate) async fn rpc_port_reachable(ip: &str, port: u16, budget_ms: u64) -> bool {
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(budget_ms),
+            tokio::net::TcpStream::connect((ip, port)),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+async fn member_links(
     cloud: &Arc<CloudState>,
     coordinator: &hive_edge::NodeInfo,
     pools: &[crate::gpu_pool::GpuPoolRegion],
-) -> HashMap<String, u64> {
+) -> HashMap<String, MemberLink> {
     let mut out = HashMap::new();
     let Some(rp) = pools.iter().find(|p| p.region == coordinator.region) else {
         return out;
     };
     let registry = cloud.registry.nodes();
+    let budget_ms = member_probe_budget_ms();
+    let mut round: crate::bounded_round::BoundedRound<MemberLink> =
+        crate::bounded_round::BoundedRound::new();
+    for (_, name, link) in round.begin() {
+        out.insert(name, link);
+    }
     for cand in rp.nodes.iter().filter(|n| n.name != coordinator.name) {
         let reg = registry.iter().find(|n| n.name == cand.name);
-        if let Some(ms) = reg.map(|n| n.latency_ms).filter(|ms| {
+        let Some(ip) = reg.and_then(|n| n.public_ip.clone()) else {
+            out.insert(cand.name.clone(), MemberLink::default());
+            continue;
+        };
+        let gossip_ms = reg.map(|n| n.latency_ms).filter(|ms| {
             *ms > 0
                 && *ms != hive_edge::region::NodeRegistry::RESTORED_LATENCY_MS
                 && *ms != u64::MAX
-        }) {
-            out.insert(cand.name.clone(), ms);
-            continue;
-        }
-        let Some(ip) = reg.and_then(|n| n.public_ip.clone()) else {
-            out.insert(cand.name.clone(), RTT_UNKNOWN);
-            continue;
-        };
-        let now = hive_core::now_ms();
-        let cached = cloud
-            .inference
-            .rtt_probe_cache
-            .lock()
-            .get(&ip)
-            .filter(|(_, at)| now.saturating_sub(*at) < RTT_PROBE_CACHE_TTL_MS)
-            .map(|(ms, _)| *ms);
-        let ms = match cached {
-            Some(ms) => ms,
-            None => {
-                let t0 = std::time::Instant::now();
-                let ms = match tokio::time::timeout(
-                    Duration::from_secs(2),
-                    tokio::net::TcpStream::connect((ip.as_str(), 50052u16)),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => (t0.elapsed().as_millis() as u64).max(1),
-                    _ => RTT_UNKNOWN,
-                };
-                cloud.inference.rtt_probe_cache.lock().insert(ip, (ms, now));
-                ms
+        });
+        let name = cand.name.clone();
+        let work = async move {
+            let t0 = Instant::now();
+            if !rpc_port_reachable(&ip, RPC_PORT, budget_ms).await {
+                return MemberLink::default();
+            }
+            MemberLink {
+                rtt_ms: gossip_ms.unwrap_or((t0.elapsed().as_millis() as u64).max(1)),
+                reachable: true,
             }
         };
-        out.insert(cand.name.clone(), ms);
+        round.spawn(&name, work);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(budget_ms + 100);
+    let (landed, _) = round.collect(deadline).await;
+    for (dispatched_round, name, link) in landed {
+        if dispatched_round == round.round() {
+            out.insert(name, link);
+        }
+    }
+    for name in round.outstanding() {
+        out.insert(name, MemberLink::default());
     }
     out
 }
 
 /// Placement (pool-aware): a model that fits the coordinator alone needs no members. Otherwise,
-/// when pooling is allowed, same-region members are added until the need is covered: free VRAM is
-/// the ADMISSION bar (a member only counts for what it can hold), but real coordinator-to-member
-/// RTT decides the ORDER, ascending, because 'same region' spans link classes (see the module doc)
-/// and preferring big-VRAM over near-RTT streams a large load at cwnd-limited speed for hours. Free
-/// VRAM only breaks RTT ties, with the name as the last tiebreak so the plan is deterministic
-/// across ticks. Members over `max_rtt_ms` are partitioned behind the near ones (a stable
-/// partition, so RTT order holds within each tier) and used ONLY when the pool cannot cover the
-/// model without them, and loudly. Else an honest failure.
-fn plan_members(
+/// when pooling is allowed, same-region members are added until the need is covered. ADMISSION is
+/// a fresh successful connect to that member's rpc port in this round: gossip health and fresh
+/// gossip latency are NOT reachability, and a member whose llama-rpc is stopped must never count
+/// its VRAM toward coverage or appear in `--rpc`. Among ADMITTED members, free VRAM is what
+/// each can hold, and the measured RTT decides ORDER ascending, because 'same region' spans link
+/// classes (see the module doc) and preferring big-VRAM over near-RTT streams a large load at
+/// cwnd-limited speed for hours. Free VRAM only breaks RTT ties, with the name as the last tiebreak
+/// so the plan is deterministic across ticks. Members over `max_rtt_ms` are partitioned behind
+/// the near ones (a stable partition) and used ONLY when the pool cannot cover the model without
+/// them, and loudly. Else an honest failure naming every refused member.
+pub(crate) fn plan_members(
     need_mb: u64,
-    coordinator: &hive_edge::NodeInfo,
+    coordinator_name: &str,
+    coordinator_region: &str,
+    coordinator_vram_mb: u64,
     pool_allowed: bool,
     pools: &[crate::gpu_pool::GpuPoolRegion],
-    rtts: &HashMap<String, u64>,
+    links: &HashMap<String, MemberLink>,
     max_rtt_ms: u64,
 ) -> Result<Vec<String>, String> {
-    let region_pool = pools.iter().find(|p| p.region == coordinator.region);
+    let region_pool = pools.iter().find(|p| p.region == coordinator_region);
     let coord_free = region_pool
-        .and_then(|p| p.nodes.iter().find(|n| n.name == coordinator.name))
+        .and_then(|p| p.nodes.iter().find(|n| n.name == coordinator_name))
         .map(|n| n.vram_free_mb)
-        .unwrap_or(coordinator.gpu_vram_mb);
+        .unwrap_or(coordinator_vram_mb);
     if need_mb <= coord_free {
         return Ok(Vec::new());
     }
     if !pool_allowed {
         return Err(format!(
             "model needs ~{need_mb}MB VRAM but coordinator {} has {coord_free}MB free and pooling is disabled (set inference.pool=true)",
-            coordinator.name
+            coordinator_name
         ));
     }
     let Some(rp) = region_pool else {
         return Err("no pool data for coordinator region".into());
     };
-    let rtt_of = |name: &str| rtts.get(name).copied().unwrap_or(RTT_UNKNOWN);
+    let link_of = |name: &str| links.get(name).copied().unwrap_or_default();
+    let mut refused: Vec<String> = Vec::new();
     let mut others: Vec<_> = rp
         .nodes
         .iter()
-        .filter(|n| n.name != coordinator.name)
+        .filter(|n| n.name != coordinator_name)
+        .filter(|n| {
+            if link_of(&n.name).reachable {
+                true
+            } else {
+                refused.push(n.name.clone());
+                false
+            }
+        })
         .collect();
+    if !refused.is_empty() {
+        tracing::warn!(
+            members = ?refused,
+            code = hive_core::fault::NODE_RUNTIME_MISSING,
+            "inference: refusing pool members with no successful rpc-port connect this round"
+        );
+    }
     others.sort_by(|a, b| {
-        rtt_of(&a.name)
-            .cmp(&rtt_of(&b.name))
+        link_of(&a.name)
+            .rtt_ms
+            .cmp(&link_of(&b.name).rtt_ms)
             .then(b.vram_free_mb.cmp(&a.vram_free_mb))
             .then(a.name.cmp(&b.name))
     });
     let (near, far): (Vec<_>, Vec<_>) = others
         .into_iter()
-        .partition(|n| rtt_of(&n.name) <= max_rtt_ms);
+        .partition(|n| link_of(&n.name).rtt_ms <= max_rtt_ms);
     let mut covered = coord_free;
     let mut members = Vec::new();
     for n in near.iter().chain(far.iter()) {
         if covered >= need_mb {
             break;
         }
-        let rtt = rtt_of(&n.name);
-        if rtt == RTT_UNKNOWN {
-            tracing::warn!(
-                member = %n.name,
-                "inference: pooling over a member with UNMEASURABLE RTT (no registry latency, rpc-port probe failed) — required for VRAM coverage; model load may be slow or fail"
-            );
-        } else if rtt > max_rtt_ms {
+        let rtt = link_of(&n.name).rtt_ms;
+        if rtt > max_rtt_ms {
             tracing::warn!(
                 member = %n.name,
                 rtt_ms = rtt,
@@ -910,8 +962,17 @@ fn plan_members(
         members.push(n.name.clone());
     }
     if covered < need_mb {
+        let refused_note = if refused.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; {} member(s) refused: no successful rpc-port connect ({})",
+                refused.len(),
+                refused.join(", ")
+            )
+        };
         return Err(format!(
-            "model needs ~{need_mb}MB VRAM but the whole {} pool only has {covered}MB free",
+            "model needs ~{need_mb}MB VRAM but the reachable {} pool only has {covered}MB free{refused_note}",
             rp.region
         ));
     }
@@ -931,6 +992,78 @@ async fn health_ok(port: u16) -> bool {
     match hive_outbound::internal_client()
         .get(&url)
         .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
+        Ok(r) => r.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// Positive readiness proof for the URL the leader is about to advertise. The
+/// coordinator's in-process endpoint status is NODE-LOCAL and cannot be read
+/// from the leader, so this asks the SAME socket a tenant app would call: a
+/// fleet-internal GET on the coordinator's serving port, with no proxy, no
+/// redirect and a short timeout. A placement failure leaves that port closed;
+/// without this gate the leader still injects a connection-refused URL into
+/// every project env.
+/// ONE base-URL primitive for every inference URL: a gossiped string is
+/// PARSED before it can reach a URL, so no userinfo/path/fragment can be
+/// injected and an IPv6 address gets its brackets. Link-local, unspecified,
+/// multicast and broadcast targets are refused; loopback is admitted for dev.
+/// Ports are FNV(project) mod 900, so two projects CAN collide. A single
+/// 2xx /health on that socket cannot say WHICH project owns the listening
+/// server: advertising the URL for both would hand one tenant another
+/// project's model. Return every (coordinator_ip, port) shared by more than
+/// one desired project; the leader must HOLD URL injection for those.
+/// Pure morphism, so the diagnostic can witness the exact decision.
+pub(crate) fn ambiguous_inference_ports(
+    candidates: &[(String, String, u16)],
+) -> std::collections::BTreeSet<(String, u16)> {
+    let mut counts: HashMap<(String, u16), usize> = HashMap::new();
+    for (_, ip, port) in candidates {
+        *counts.entry((ip.clone(), *port)).or_insert(0) += 1;
+    }
+    counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+pub(crate) fn inference_endpoint_base(ip: &str, port: u16) -> Option<String> {
+    let addr = ip.parse::<std::net::IpAddr>().ok()?;
+    let blocked = match addr {
+        std::net::IpAddr::V4(v) => {
+            v.is_link_local() || v.is_unspecified() || v.is_multicast() || v.is_broadcast()
+        }
+        std::net::IpAddr::V6(v) => {
+            v.is_unspecified() || v.is_multicast() || v.is_unicast_link_local()
+        }
+    };
+    if blocked {
+        return None;
+    }
+    Some(match addr {
+        std::net::IpAddr::V4(v) => format!("http://{v}:{port}"),
+        std::net::IpAddr::V6(v) => format!("http://[{v}]:{port}"),
+    })
+}
+
+pub(crate) async fn coordinator_endpoint_ready(ip: &str, port: u16) -> bool {
+    let Some(base) = inference_endpoint_base(ip, port) else {
+        return false;
+    };
+    let url = format!("{base}/health");
+    match hive_outbound::internal_client()
+        .get(&url)
+        .timeout(Duration::from_millis(
+            std::env::var("HIVE_INFERENCE_READY_PROBE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(1500)
+                .clamp(100, 10_000),
+        ))
         .send()
         .await
     {
@@ -1007,11 +1140,11 @@ fn refuse_backend(
 /// aborts to `failed` and parks (see `LOAD_TIMEOUT_STATUS`); `load_started_ms` is 0 once /health
 /// has ever answered OK, so health flaps re-show `starting` but never re-arm the abort.
 ///
-/// Pool admission requires a dialable rpc address: `plan_members` counts a member's VRAM toward
-/// coverage, but the `--rpc` list can only name members with a public IP (`ip:50052`, peer-allowed
-/// through hive-lockdown), so address-less candidates are dropped BEFORE planning, otherwise the
-/// plan could claim coverage the launched server can never reach and fail the load with no honest
-/// placement error.
+/// Pool admission requires a dialable rpc address AND a fresh successful connect:
+/// `member_links` probes every candidate's ``<public_ip>:50052`` this round, and
+/// `plan_members` counts only admitted members toward coverage. Address-less candidates are
+/// dropped BEFORE planning, and a refused one produces an honest placement error rather than a
+/// launched server whose `--rpc` names a dead member.
 ///
 /// Any UNTRACKED llama-server for this project (a survivor of a previous hive-node process) is
 /// killed first, because it holds the port and a tracked child must own the endpoint so
@@ -1183,8 +1316,17 @@ async fn reconcile_local(
         p.nodes
             .retain(|n| n.name == me.name || addressable.contains(&n.name));
     }
-    let rtts = member_rtts(cloud, &me, &pools).await;
-    let members = match plan_members(need, &me, spec.pool, &pools, &rtts, max_member_rtt_ms()) {
+    let links = member_links(cloud, &me, &pools).await;
+    let members = match plan_members(
+        need,
+        &me.name,
+        &me.region,
+        me.gpu_vram_mb,
+        spec.pool,
+        &pools,
+        &links,
+        max_member_rtt_ms(),
+    ) {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(project, error = %e, "inference: placement failed");
@@ -1350,6 +1492,21 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
             }
 
             if crate::leadership::may_act(&cloud, crate::leadership::Job::InferenceEnv) {
+                // FNV mod 900 is not injective. Compute the ambiguous
+                // (ip, port) pairs ONCE from the desired set, before any URL
+                // is advertised.
+                let candidates: Vec<(String, String, u16)> = desired
+                    .iter()
+                    .filter(|(_, spec)| {
+                        spec.backend == crate::project_settings::InferenceBackend::LlamaCpp
+                    })
+                    .filter_map(|(p, _)| {
+                        coordinator_for(&cloud, p)
+                            .and_then(|coord| coord.public_ip.clone())
+                            .map(|ip| (p.clone(), ip, port_for(p)))
+                    })
+                    .collect();
+                let ambiguous = ambiguous_inference_ports(&candidates);
                 for (p, spec) in &desired {
                     // Never advertise an endpoint URL for a backend we refused.
                     if spec.backend != crate::project_settings::InferenceBackend::LlamaCpp {
@@ -1361,8 +1518,31 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                     let Some(ip) = coord.public_ip.clone() else {
                         continue;
                     };
-                    let url = format!("http://{ip}:{}/v1", port_for(p));
+                    let port = port_for(p);
+                    if ambiguous.contains(&(ip.clone(), port)) {
+                        tracing::warn!(
+                            project = %p,
+                            port,
+                            "inference: HOLD HIVE_INFERENCE_URL - port is shared by another desired project; a single /health cannot identify the owner"
+                        );
+                        continue;
+                    }
+                    let Some(base) = inference_endpoint_base(&ip, port) else {
+                        continue;
+                    };
+                    let url = format!("{base}/v1");
                     let current = cloud.projects.env_map(p).get("HIVE_INFERENCE_URL").cloned();
+                    if !coordinator_endpoint_ready(&ip, port).await {
+                        // A dead endpoint must not stay advertised. Remove ONLY
+                        // the exact platform-shaped URL we injected ourselves;
+                        // a different value is a tenant override and is left
+                        // untouched.
+                        if current.as_deref() == Some(url.as_str()) {
+                            cloud.projects.delete_env(p, "HIVE_INFERENCE_URL");
+                            tracing::warn!(project = %p, port, "inference: withdrew HIVE_INFERENCE_URL - coordinator endpoint is not answering");
+                        }
+                        continue;
+                    }
                     if current.as_deref() != Some(url.as_str()) {
                         cloud.projects.put_env(
                             p,
@@ -1375,7 +1555,7 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                                 updated_ms: hive_core::now_ms(),
                             },
                         );
-                        tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL");
+                        tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL after a positive readiness proof");
                     }
                 }
             }

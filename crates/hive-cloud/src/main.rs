@@ -67,6 +67,7 @@ mod hrana_proto;
 mod musql;
 mod musql_migrate;
 mod sqlite_engine;
+mod swarm_probe;
 mod identity;
 mod incidents;
 mod runtime_watch;
@@ -484,6 +485,16 @@ struct Args {
     /// itself. Non-zero exit on failure, so it composes into a shell check.
     #[arg(long = "litebox-probe")]
     litebox_probe: bool,
+    /// Operator diagnostic (same family as `--dns-probe`): prove the
+    /// network-swarm channel on TWO loopback-only iroh endpoints using the
+    /// production `HIVE_ALPN` and hybrid PQ crypto provider. Binds no
+    /// `HIVE_IROH_PORT`, relay, DHT or seeds, joins no mesh and touches no
+    /// running node. Asserts byte-exact framed echoes, endpoint identity and
+    /// ALPN, the ACTUAL negotiated hybrid key-exchange group, a bounded round
+    /// with a parked straggler, and released in-flight slots. Prints the PROBED
+    /// RDMA/Thunderbolt capability. Non-zero exit on any failure.
+    #[arg(long = "swarm-probe")]
+    swarm_probe: bool,
     /// Debug-build-only destructive diagnostic against HIVE_DATA. Intended only
     /// for disposable stores; release binaries do not expose this flag.
     #[cfg(debug_assertions)]
@@ -710,6 +721,14 @@ async fn async_main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
         }
+    }
+
+    if args.swarm_probe {
+        if let Err(error) = crate::swarm_probe::run().await {
+            eprintln!("SWARM_PROBE=FAIL {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     restart_audit::audit_boot(&args.name);
