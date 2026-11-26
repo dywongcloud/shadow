@@ -55,6 +55,9 @@ const MARKS: Record<string, (c?: string) => React.ReactElement> = {
       <path d="M2 3h4l6 10 6-10h4L12 21z" />
     </Avatar>
   ),
+  vuejs: (c) => MARKS.vue(c),
+  "vue.js": (c) => MARKS.vue(c),
+  vue3: (c) => MARKS.vue(c),
   gatsby: (c) => (
     <Avatar className={c} viewBox="0 0 24 24" label="Gatsby">
       <path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8v2a6 6 0 0 1 5.7 4.1L12 12.9V16l6-6A10 10 0 0 0 12 2" />

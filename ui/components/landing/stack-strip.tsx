@@ -4,7 +4,7 @@ import { delay } from "./lp-utils";
 
 /** The preset catalog the build detects (crates/fluid-build/src/framework.rs: nextjs, nuxtjs, sveltekit, astro, vite, vue, create-react-app,
  *  node, static) plus the Dockerfile lane; logos are the dashboard's own (`public/frameworks`). The `vue` preset is Vue CLI (`@vue/cli-service`) and
- *  `create-react-app` is `react-scripts`, so the tiles say so, and Bun is a toolchain, not a framework: it is on the toolchain line. The toolchain line names the
+ *  `create-react-app` is `react-scripts`, and the `vue` preset covers both Vue CLI and Vue 3 + Vite, so the tile says Vue.js. Bun is a toolchain, not a framework: it is on the toolchain line. The toolchain line names the
  *  package managers a build installs with, never Go or Python: a repository whose root is a Go or Python project is an "unsupported root marker"
  *  (`app_discovery.rs`) unless it carries a Dockerfile, a `fluid.json` or a `package.json`. */
 const STACK: { src: string; name: string; w: number; h: number }[] = [
@@ -13,7 +13,7 @@ const STACK: { src: string; name: string; w: number; h: number }[] = [
   { src: "/frameworks/svelte.svg", name: "SvelteKit", w: 47, h: 48 },
   { src: "/frameworks/astro.png", name: "Astro", w: 480, h: 480 },
   { src: "/frameworks/vite.png", name: "Vite", w: 3840, h: 3784 },
-  { src: "/frameworks/vue-js.png", name: "Vue CLI", w: 512, h: 512 },
+  { src: "/frameworks/vue-js.png", name: "Vue.js", w: 512, h: 512 },
   { src: "/frameworks/react.png", name: "Create React App", w: 960, h: 855 },
   { src: "/frameworks/node.png", name: "Node.js", w: 88, h: 100 },
   { src: "/frameworks/docker.png", name: "Docker", w: 1067, h: 771 },

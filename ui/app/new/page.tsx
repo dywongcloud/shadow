@@ -75,6 +75,7 @@ const TEMPLATES: Template[] = [
   { name: "SvelteKit", desc: "Cybernetically enhanced web apps.", repo: "https://github.com/vercel/vercel", root: "examples/sveltekit-1", tag: "S", color: "#ff3e00", icon: "/frameworks/svelte.svg" },
   { name: "Nuxt", desc: "The intuitive Vue framework.", repo: "https://github.com/vercel/vercel", root: "examples/nuxtjs", tag: "Nu", color: "#00dc82", icon: "/frameworks/nuxt.svg" },
   { name: "Vue", desc: "The progressive JavaScript framework.", repo: "https://github.com/vercel/vercel", root: "examples/vue", tag: "Vu", color: "#42b883", icon: "/frameworks/vue-js.png" },
+  { name: "Vue 3 + Vite", desc: "Vue 3 single-file components with the Vite build lane.", repo: "https://github.com/vitejs/vite", root: "packages/create-vite/template-vue", tag: "V3", color: "#42b883", icon: "/frameworks/vue-js.png" },
   { name: "Angular", desc: "The web development framework for building modern apps.", repo: "https://github.com/vercel/vercel", root: "examples/angular", tag: "Ng", color: "#dd0031", icon: "/frameworks/angular.png" },
   { name: "Express", desc: "Fast, unopinionated Node.js web server.", repo: "https://github.com/vercel/vercel", root: "examples/express", tag: "Ex", color: "#000", icon: "/frameworks/express-js.png" },
   { name: "Remix", desc: "Full stack web framework, focused on web standards.", repo: "https://github.com/vercel/vercel", root: "examples/remix", tag: "Rx", color: "#000", icon: "/frameworks/remix.png" },

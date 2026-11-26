@@ -133,6 +133,8 @@ const FRONTEND_DEPS: &[(&str, &str)] = &[
     ("react-scripts", "React"),
     ("react-dom", "React"),
     ("vue", "Vue"),
+    ("@vue/cli-service", "Vue"),
+    ("@vitejs/plugin-vue", "Vue"),
     ("@angular/core", "Angular"),
     ("svelte", "Svelte"),
 ];

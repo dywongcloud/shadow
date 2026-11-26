@@ -471,7 +471,20 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
         if has("react-scripts") {
             frameworks.insert("create-react-app");
         }
-        if has("@vue/cli-service") {
+        // Vue.js: ONE shared predicate covers Vue CLI and Vue 3 + Vite.
+        // A create-vue checkout declares BOTH vue and vite, so the generic
+        // Vite evidence is removed below or classification would refuse it.
+        let mut vue_markers = std::collections::BTreeSet::new();
+        for name in fluid_build::framework::VUE_CONFIG_MARKERS {
+            if regular_marker(dir, relative, name).await? {
+                vue_markers.insert(*name);
+            }
+        }
+        let vue_evidence = fluid_build::framework::vue_present(
+            &|name| has(name),
+            &|name| vue_markers.contains(name),
+        );
+        if vue_evidence {
             frameworks.insert("vue");
         }
         if has("vite") {
@@ -507,9 +520,23 @@ async fn classify(dir: &Path, relative: &Path) -> anyhow::Result<Option<(u8, Vec
         frameworks.remove("nextjs");
         frameworks.remove("vite");
     }
+    // Vue is also a LIBRARY inside higher-order frameworks (Nuxt, an Astro
+    // Vue integration, Next.js with a Vue island); those presets own the
+    // build lane. Generic Vite is only an implementation detail of Vue 3.
+    // Dropping both before the single-framework assertion keeps every
+    // other framework at its existing priority and cannot introduce a new
+    // conflicting-evidence refusal.
+    let higher_order = frameworks
+        .iter()
+        .any(|slug| !matches!(*slug, "vue" | "vite"));
+    if higher_order {
+        frameworks.remove("vue");
+    }
     if frameworks.contains("sveltekit")
         || frameworks.contains("remix")
         || frameworks.contains("astro")
+        || frameworks.contains("vue")
+        || frameworks.contains("nuxtjs")
     {
         frameworks.remove("vite");
     }

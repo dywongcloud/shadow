@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-11-25 - Vue.js is one supported framework, two build lanes
+
+A vue preset already existed, but it hard-coded vue-cli-service build: a
+Vue 3 + Vite checkout (the default create-vue output) declares vue,
+@vitejs/plugin-vue and vite, builds with vite build, and could not run
+that binary. Detection only knew vue.config.js and @vue/cli-service, so
+a Vue 3 project was reported as generic Vite. Worse, app_discovery
+inserted both vue and vite evidence and then refused the app as
+"conflicting framework evidence" - the common Vue 3 workspace could not
+be selected for deployment at all.
+
+One shared, PROBED predicate now lives in fluid_build::framework:
+VUE_DEPENDENCIES, VUE_CONFIG_MARKERS, VITE_CONFIG_MARKERS and vue_present.
+Build detection AND hive-cloud app discovery both call it. Nuxt
+config/dependencies outrank Vue; vite.config.* resolves to vue when Vue
+evidence exists and stays vite otherwise. All config module flavours are
+covered, in detection and in repository_build metadata inputs.
+
+The vue preset now uses the project build script (npm run build, rewritten
+by pmify for pnpm/yarn/bun) instead of a Vue CLI binary, emits dist and is
+Static, so Vue Router history mode gets the existing SPA fallback.
+preset_by_name accepts Vue.js/vuejs/Vue 3/vue3. app_discovery removes
+generic vite (and vue for Nuxt) before its single-framework assertion.
+svcgraph labels all three Vue dependency forms. The dashboard framework
+picker offers Vue.js, the logo accepts vue.js aliases, /new adds a
+verified Vue 3 + Vite starter from vitejs/vite, and the landing tile
+says Vue.js instead of Vue CLI.
+
+Live witness: hive-cloud --vue-probe executes the real detection, plan,
+catalog, SPA fallback and workspace selection on scratch repos and exits
+non-zero unless Vue CLI, Vue 3 + Vite and pnpm Vue 3 all plan correctly,
+plain Vite stays vite, Nuxt stays nuxtjs, and a Vue 3 + Vite workspace
+selects with framework:vue and no framework:vite evidence. docs/vue-framework.md.
+
+HOLD: the reviewed BuildExecutor base, sandbox-node24.ext4 and the booted
+Firecracker rootfs are unchanged operator-gated migrations.
+
 ## 2026-11-25 - Node.js 24 LTS is the default build/deploy runtime
 
 Node version errors came from the host build lane resolving an ambient

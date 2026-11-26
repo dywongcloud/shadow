@@ -67,6 +67,7 @@ mod hrana_proto;
 mod musql;
 mod musql_migrate;
 mod node_probe;
+mod vue_probe;
 mod sqlite_engine;
 mod swarm_probe;
 mod identity;
@@ -500,6 +501,10 @@ struct Args {
     /// Starts no node and binds no port. Non-zero exit when NOT CAPABLE.
     #[arg(long = "node-probe")]
     node_probe: bool,
+    /// Operator diagnostic: prove Vue.js builds, deploys and is selectable,
+    /// by live execution of the real detection and classification code.
+    #[arg(long = "vue-probe")]
+    vue_probe: bool,
     #[arg(long = "swarm-probe")]
     swarm_probe: bool,
     /// Debug-build-only destructive diagnostic against HIVE_DATA. Intended only
@@ -625,6 +630,13 @@ async fn async_main() -> anyhow::Result<()> {
         version = fluid_core::DEFAULT_NODE_VERSION,
         "boot: default Node.js LTS major selected for builds and deployments"
     );
+    if args.vue_probe {
+        if let Err(error) = crate::vue_probe::run().await {
+            eprintln!("VUE_PROBE=FAIL {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if args.node_probe {
         if let Err(error) = crate::node_probe::run().await {
             eprintln!("NODE_PROBE=FAIL {error:#}");

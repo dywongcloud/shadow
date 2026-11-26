@@ -12,6 +12,32 @@ use std::path::Path;
 const MAX_PACKAGE_JSON_BYTES: u64 = 1024 * 1024;
 const MAX_CAPSULE_ENTRY_BYTES: u64 = 256 * 1024;
 
+/// Vue.js dependency evidence, shared by build detection and app discovery.
+/// A vue runtime, the Vue CLI service, and the Vue 3 + Vite plugin all
+/// declare the same framework; none is inferred from a directory name.
+pub const VUE_DEPENDENCIES: &[&str] = &["vue", "@vue/cli-service", "@vitejs/plugin-vue"];
+/// Vue CLI config markers (all module flavours).
+pub const VUE_CONFIG_MARKERS: &[&str] = &[
+    "vue.config.js", "vue.config.ts", "vue.config.mjs", "vue.config.cjs",
+];
+/// Vite config markers, used by both framework detection and the build
+/// snapshot metadata inputs so a config edit cannot serve a stale cache.
+pub const VITE_CONFIG_MARKERS: &[&str] = &[
+    "vite.config.js", "vite.config.ts", "vite.config.mjs",
+    "vite.config.mts", "vite.config.cjs", "vite.config.cts",
+];
+
+/// ONE Vue.js predicate. Both inputs are PROBED by the caller: has_dep
+/// answers a package.json dependency name, has_marker answers a config
+/// filename at the selected application root. Nuxt is checked separately.
+pub fn vue_present(
+    has_dep: &dyn Fn(&str) -> bool,
+    has_marker: &dyn Fn(&str) -> bool,
+) -> bool {
+    VUE_DEPENDENCIES.iter().any(|&name| has_dep(name))
+        || VUE_CONFIG_MARKERS.iter().any(|&name| has_marker(name))
+}
+
 /// A `server/index.*` + `client/index.*` pair alone is NOT Lakebed: plenty of
 /// generic apps use that layout. Only treat it as a capsule when the server
 /// entry actually declares one (`capsule(`) or imports `lakebed/server`.
@@ -180,8 +206,12 @@ pub const PRESETS: &[FrameworkPreset] = &[
         slug: "vue",
         name: "Vue",
         install_command: "npm install",
-        build_command: "vue-cli-service build",
-        dev_command: "vue-cli-service serve",
+        // Both Vue CLI and create-vue (Vue 3 + Vite) define a build
+        // script and emit dist; the project script is authoritative, and
+        // pmify rewrites it for pnpm/yarn/bun. A Vue CLI binary path would
+        // fail on Vue 3 + Vite, so neither lane hard-codes its own tool.
+        build_command: "npm run build",
+        dev_command: "npm run dev",
         output_dir: "dist",
         primitive: Primitive::Static,
         emits_build_output: false,
@@ -775,23 +805,41 @@ fn detect_with_package(
         }
     }
 
-    let markers: &[(&str, &str)] = &[
+    // Vue.js evidence is PROBED once from dependency names AND config markers.
+    // A Vue 3 + Vite checkout carries vite.config.* too, so those markers
+    // resolve to Vue below; a plain Vite checkout stays on the Vite preset.
+    // Nuxt is Vue-based but owns its own build lane, so it outranks Vue.
+    let nuxt_evidence = ["nuxt.config.js", "nuxt.config.ts", "nuxt.config.mjs"]
+        .iter()
+        .any(|f| repo.join(f).exists())
+        || package.is_some_and(|p| has_dep(p, "nuxt") || has_dep(p, "nuxt3"));
+    let vue_evidence = !nuxt_evidence
+        && vue_present(
+            &|name| package.is_some_and(|p| has_dep(p, name)),
+            &|name| repo.join(name).exists(),
+        );
+    let mut markers: Vec<(&str, &str)> = vec![
         ("next.config.js", "nextjs"),
         ("next.config.mjs", "nextjs"),
         ("next.config.ts", "nextjs"),
         ("nuxt.config.js", "nuxtjs"),
         ("nuxt.config.ts", "nuxtjs"),
+        ("nuxt.config.mjs", "nuxtjs"),
         ("svelte.config.js", "sveltekit"),
+        ("svelte.config.ts", "sveltekit"),
         ("astro.config.mjs", "astro"),
         ("astro.config.js", "astro"),
         ("astro.config.ts", "astro"),
         ("gatsby-config.js", "gatsby"),
         ("gatsby-config.ts", "gatsby"),
         ("remix.config.js", "remix"),
-        ("vite.config.js", "vite"),
-        ("vite.config.ts", "vite"),
-        ("vue.config.js", "vue"),
     ];
+    for &name in VUE_CONFIG_MARKERS {
+        markers.push((name, "vue"));
+    }
+    for &name in VITE_CONFIG_MARKERS {
+        markers.push((name, if vue_evidence { "vue" } else { "vite" }));
+    }
     for (file, slug) in markers {
         if repo.join(file).exists() {
             if let Some(preset) = preset(slug) {
@@ -826,11 +874,12 @@ fn detect_with_package(
         if dep("react-scripts") {
             return preset("create-react-app").unwrap();
         }
+        // Vue wins over Vite: create-vue declares both vue and vite.
+        if vue_evidence {
+            return preset("vue").unwrap();
+        }
         if dep("vite") {
             return preset("vite").unwrap();
-        }
-        if dep("@vue/cli-service") {
-            return preset("vue").unwrap();
         }
         for server_dep in NODE_SERVER_FRAMEWORKS {
             if dep(server_dep) {
@@ -917,6 +966,7 @@ pub fn preset_by_name(name: &str) -> Option<&'static FrameworkPreset> {
     }
     let n = match n.as_str() {
         "node (express)" => "node",
+        "vue.js" | "vuejs" | "vue 3" | "vue3" => "vue",
         _ => n.as_str(),
     };
     PRESETS
