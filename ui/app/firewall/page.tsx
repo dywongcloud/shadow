@@ -36,13 +36,14 @@ function fmtMeasured(v: number | null | undefined): string {
   return typeof v === "number" && Number.isFinite(v) ? v.toLocaleString("en-US") : ABSENT;
 }
 
-/** An enabled mode has no timer: only a measured indefinite/expires field answers this row, and
- *  an absent one renders absent rather than a fabricated deadline or a fleet-wide claim. */
+/** A measured epoch-ms deadline is rendered as a stable UTC instant, never a
+ *  client-side countdown. An older node answers indefinite: true and expires:
+ *  false; an absent one renders absent, never a fabricated deadline. */
 function expiresText(indefinite: boolean | null | undefined, expires: boolean | string | number | null | undefined): string {
-  /** The node answers indefinite: true and expires: false: neither one is a countdown. An
-   *  expiry time is printed only when one was actually measured, never as a fabricated number. */
   if (indefinite === true || expires === false) return "Never while on";
-  if (typeof expires === "number") return fmtMeasured(expires);
+  if (typeof expires === "number" && Number.isFinite(expires) && expires > 0 && expires <= 8.64e15) {
+    return new Date(expires).toISOString().replace("T", " ").slice(0, 19) + " UTC";
+  }
   if (typeof expires === "string") return shown(expires);
   return ABSENT;
 }
@@ -76,6 +77,7 @@ export default function FirewallPage() {
   const [fwBusy, setFwBusy] = useState(false);
   const [fwWriteError, setFwWriteError] = useState<string | null>(null);
   const [fwTurningOff, setFwTurningOff] = useState<string | null>(null);
+  const [fwDurationSecs, setFwDurationSecs] = useState(21600);
   const projectNames = useProjectNames();
   const filteredProjectNames = projectNames.filter((name) => name.toLowerCase().includes(fwSearch.trim().toLowerCase()));
   /** A selection hidden by the search text is NOT actionable: no write goes to a project the
@@ -118,7 +120,7 @@ export default function FirewallPage() {
     setFwBusy(true);
     setFwTurningOff(enable ? null : name);
     try {
-      await setFirewallAttackMode(name, enable);
+      await setFirewallAttackMode(name, enable, fwDurationSecs);
       await Promise.all([refreshFw(), refreshAttackProjects()]);
     } catch (e) {
       setFwWriteError(
@@ -259,13 +261,15 @@ export default function FirewallPage() {
       <Card className={cell("mb-4")}>
         <h2 className={cell("text-sm font-medium text-fg")}>Attack Challenge Mode</h2>
         <p className={cell("mt-1 text-xs text-secondary")}>
-          Attack challenge stays on until you turn it off. This is node-local config: the toggle
-          changes only the node that answers this request, and fleet-wide propagation is not
-          implemented.
+          Attack challenge turns itself off at the selected deadline (1, 6 or 24 hours). The
+          setting is a replicated ProjectSettings row, so every node converges on the same
+          expiry; reads can lag briefly.
         </p>
         <div className={cell("mt-3 grid grid-cols-1 gap-2 text-sm sm:grid-cols-2 lg:grid-cols-3")}>
           <FwField label="Measured mode" value={fwModeText} />
           <FwField label="Expires" value={fwExpiresText} />
+          <FwField label="Hours left" value={fmtMeasured(fwMode?.hours_left)} />
+          <FwField label="Duration (secs)" value={fmtMeasured(fwMode?.duration_secs)} />
           <FwField label="Updated (ms)" value={fmtMeasured(fwMode?.updated_ms)} />
           <FwField label="Reported project" value={shown(fw?.project)} />
         </div>
@@ -288,6 +292,17 @@ export default function FirewallPage() {
             {filteredProjectNames.map((name) => (
               <option key={name} value={name}>{name}</option>
             ))}
+          </select>
+          <select
+            aria-label="Duration"
+            value={String(fwDurationSecs)}
+            onChange={(e) => setFwDurationSecs(Number(e.target.value))}
+            disabled={fwBusy || !fwSelectedProject}
+            className={cell("min-h-[44px] rounded-md border border-border bg-card px-3 py-2 text-sm text-fg")}
+          >
+            <option value="3600">1 hour</option>
+            <option value="21600">6 hours</option>
+            <option value="86400">24 hours</option>
           </select>
           <Button
             className={cell("min-h-[44px] sm:w-auto")}
@@ -349,6 +364,7 @@ export default function FirewallPage() {
                   <FwField label="Project" value={shown(row?.project)} />
                   <FwField label="Status" value={row?.enabled === true ? "On" : row?.enabled === false ? "Off" : ABSENT} />
                   <FwField label="Expires" value={expiresText(row?.indefinite, row?.expires)} />
+                  <FwField label="Hours left" value={fmtMeasured(row?.hours_left)} />
                   <FwField label="Updated (ms)" value={fmtMeasured(row?.updated_ms)} />
                 </div>
                 <Button

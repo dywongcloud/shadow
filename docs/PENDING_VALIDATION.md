@@ -331,6 +331,12 @@ RESULT lines, on fc-virginia and fc-phoenix. Live
 `dist`, `static`). No second roll was run: the playbook refuses a no-op
 and a redundant six-host serial restart buys nothing.
 
+## 2026-11-26 - geniee.site Attack Challenge Mode stuck ON (`geniee-attack-mode-stuck-20261126`)
+
+| file | row | witness |
+| --- | --- | --- |
+| `crates/hive-cloud/src/firewall.rs`, `crates/hive-cloud/src/project_settings.rs`, `crates/hive-cloud/src/firewall_probe.rs`, `crates/hive-cloud/src/main.rs`, `ui/app/firewall/page.tsx`, `ui/lib/api.ts` | `geniee-attack-mode-stuck-20261126` | WITNESSED locally: `target/debug/hive-cloud --firewall-probe` prints `FIREWALL_PROBE=PASS` (hours=6 gives `active_until_ms=now+21600000`; active at now, OFF at the deadline; 7 refused request shapes; 6 fail-closed legacy rows; 5 persisted serde keys; 1 tenant-scoped active row); `cargo check -p hive-cloud --locked`; `cargo build -p hive-cloud --locked`; `cargo test --workspace --locked`; `sh scripts/cli-acceptance.sh` (35/35); `python3 -I scripts/check-contract-bindings.py --check` (34/4/35); `npx tsc --noEmit` and `npm run lint` from ui/; `git diff --check`; no test files. HOLD without a new operator word: push (auto-deploys twice) and any roll/deploy. HOLD, not witnessed: live fleet-vantage GET without `x-hive-firewall-action: challenge`, and `/v1/firewall/state` with `enabled=false` on all six nodes. The running binary still has the INDEFINITE build; the one reversible admin PUT that would turn it OFF cannot durably persist on chain head fc-sanjose: `/dev/vda2` has 0 bytes free and `persist_durable` needs a fresh 36,849,138-byte `state.json.tmp` plus a rename. A 503 would leave memory OFF and disk ON, and a reboot would resurrect the challenge. Freeing or provisioning disk is a one-way door needing the operator's word. Second independent live failure: a bypass GET returns 503 `DEPLOYMENT_CIRCUIT_OPEN`, so turning the mode off does not by itself restore the tenant app; a redeploy is a production change. |
+
 HOLD, operator-gated, not claimed done: the served dashboard `.next` has
 zero Vue strings (needs a `--tags ui` roll), fc-sanjose `/dev/vda2` is
 2.0T/2.0T with 0 bytes free (disk reclaim; nothing deleted), plus the

@@ -6,22 +6,32 @@ are live on the edge request path. This is NOT a 1:1 Vercel Firewall clone.
 
 ## Attack Challenge Mode
 
-`PUT /v1/projects/:project/firewall/attack-mode` with `{"enabled":true}`.
+`PUT /v1/projects/:project/firewall/attack-mode` with `{"enabled":true}` and
+an OPTIONAL `duration_secs` (60..86400) or the legacy `hours` (1, 6, 24).
+Neither field means a BOUNDED 6-hour default, so an older dashboard or a
+cached service worker that sends only `enabled` cannot arm an unbounded mode.
 The setting is an additive `#[serde(default)]` `AttackMode` field on the
 replicated `ProjectSettings` row, written through `touch`, so the existing
-per-row `MERGE_STORES` merge carries it to every node. Mode is INDEFINITE:
-`enabled` alone decides admission, with no duration options, no lazy auto-off,
-no timer and no second background loop. The legacy `active_until_ms` and
-`duration_secs` keys are KEPT for persisted-state compatibility (`#[serde(default)]`)
-but zeroed on every write and never consulted. The handler asserts
+per-row `MERGE_STORES` merge carries it to every node. The server derives
+`active_until_ms` from `now_ms` and the admitted duration; a caller cannot
+inject a deadline. Expiry is LAZY: `AttackMode::is_active(now_ms)` is the ONE
+read-time predicate shared by the edge gate, the state view and the enabled-
+project list. There is no timer, no second background loop and no writer for a
+stale replicated row to resurrect. A legacy INDEFINITE row (zero deadline and
+zero duration), an expired row, a duration mismatch, a deadline beyond 24
+hours, a zero clock and an absent row all fail CLOSED. All five persisted keys
+remain `#[serde(default)]`; none is removed or renamed. The handler asserts
 `has_explicit_caller_identity` BEFORE resolving any tenant, then binds the
 row with `require_project_claiming_row`. Roles floor is Admin.
 
-`GET /v1/firewall/attack-mode/projects` lists every project with the mode ON
-for the caller's tenant. It reads the REPLICATED ProjectSettings rows through
-the same `rows_for_tenant` stored-tag scope as `project_inventory::summary`,
-never the node-local event ring, so a GET answered locally behind round-robin
-DNS names the same projects. Tenancy comes ONLY from the verified JWT claim;
+`GET /v1/firewall/state` reports the EFFECTIVE mode: an expired row reads
+`enabled=false` with a null `hours_left` and null `expires`, never a
+fabricated countdown; a live row reports its measured epoch-ms deadline and
+whole-hour remainder. `GET /v1/firewall/attack-mode/projects` lists only
+ACTIVE rows for the caller's tenant. It reads the REPLICATED ProjectSettings
+rows through the same `rows_for_tenant` stored-tag scope as
+`project_inventory::summary`, never the node-local event ring, so a GET
+answered locally behind round-robin DNS names the same projects. Tenancy comes ONLY from the verified JWT claim;
 `x-hive-team` is never read. An asserted identity is mandatory and an
 anonymous GET is refused. The `roles::RULES` row sets an Admin floor (an
 unlisted read would default to Viewer) and `ui/lib/team-role.ts` mirrors it.

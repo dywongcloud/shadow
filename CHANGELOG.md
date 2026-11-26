@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-11-26 UTC - Attack Challenge Mode is bounded again; geniee.site fix (LOCAL, not pushed)
+
+Live evidence: fleet-vantage `GET https://geniee.site/` returned 200 with
+`x-hive-firewall-action: challenge` and a 12995-byte "Security check - shadw"
+page; `GET /v1/firewall/state?project=geniee` on all six nodes reported
+`enabled=true`, `indefinite=true`, `expires=false`, `hours_left=null` and
+`active_until_ms=1795572623620`. That deadline is exactly 21600000 ms after
+`updated_ms=1795551023620` (a 6-hour window set 2026-11-24 20:10:23 UTC),
+expired 2026-11-25 02:10:23 UTC, about 28 hours before the report. The
+INDEFINITE build shipped in `337eb84f3f4d8af0c9846531a1555f9b7147e957`
+removed the read-time `active_until_ms > now_ms` check and the `hours` request
+field; the persisted row still carried the bounded deadline but nothing read
+it. No operator word asked to remove the duration.
+
+Fix: `AttackMode::is_active(now_ms)` is ONE read-time predicate shared by the
+edge gate, `/v1/firewall/state` and `/v1/firewall/attack-mode/projects`.
+`active_until_ms` is server-derived by `bounded_deadline` from `now_ms` and an
+admitted 60..86400-second duration; `duration_secs` is canonical, `hours`
+(1/6/24) is the legacy field, and NEITHER supplied means a bounded 6-hour
+default so a stale service worker cannot re-arm an unbounded mode. All five
+persisted keys stay `#[serde(default)]`; none is removed or renamed. Legacy
+INDEFINITE rows, expired rows, duration mismatches, deadlines beyond 24 hours,
+a zero clock and absent rows all read OFF. No timer, no second loop, no
+node-local writer. `GET /v1/firewall/state` now reports the EFFECTIVE mode
+with a measured epoch-ms deadline rather than `indefinite:true`. The
+dashboard sends `duration_secs`, offers 1/6/24 hours and renders the measured
+UTC instant. Security gates are unchanged: asserted identity, stored-tag
+tenancy, Admin floor, sealed cookies and constant-time MAC comparison.
+
+Witness: `hive-cloud --firewall-probe` executes the real deadline, expiry,
+serde and replicated-store primitives over scratch state and prints
+`FIREWALL_PROBE=PASS` (refused=7, fail-closed rows=6, persisted keys=5,
+active rows=1). The operator diagnostic is not a test file.
+
+HOLD without a new operator word: push (auto-deploys twice, through the
+webhook and `git_poll_seen`) and any roll/deploy. Second independent live
+failure, NOT fixed: a bypass GET behind the challenge returns 503
+`DEPLOYMENT_CIRCUIT_OPEN` (`x-hive-served-by: fc-sanjose`), so turning the
+mode off does not by itself restore the tenant app; a redeploy is a
+production change. Disk reclaim on the 0-byte-free chain head is also held.
+See `docs/vercel-firewall-parity.md` and `docs/PENDING_VALIDATION.md`.
+
 ## 2026-11-26 UTC - backend roll verified live; chain head out of disk
 
 Both changes above are live on all six `hive-node.service` units from

@@ -69,6 +69,7 @@ mod musql_migrate;
 mod node_probe;
 mod vue_probe;
 mod sqlite_engine;
+mod firewall_probe;
 mod swarm_probe;
 mod identity;
 mod incidents;
@@ -505,6 +506,11 @@ struct Args {
     /// by live execution of the real detection and classification code.
     #[arg(long = "vue-probe")]
     vue_probe: bool,
+    /// Operator diagnostic (same family as --node-probe): execute the real
+    /// bounded-deadline and expiry primitives and refuse legacy indefinite
+    /// rows. Binds no port and mutates no state.
+    #[arg(long = "firewall-probe")]
+    firewall_probe: bool,
     #[arg(long = "swarm-probe")]
     swarm_probe: bool,
     /// Debug-build-only destructive diagnostic against HIVE_DATA. Intended only
@@ -633,6 +639,13 @@ async fn async_main() -> anyhow::Result<()> {
     if args.vue_probe {
         if let Err(error) = crate::vue_probe::run().await {
             eprintln!("VUE_PROBE=FAIL {error:#}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    if args.firewall_probe {
+        if let Err(error) = crate::firewall_probe::run() {
+            eprintln!("FIREWALL_PROBE=FAIL {error}");
             std::process::exit(1);
         }
         return Ok(());

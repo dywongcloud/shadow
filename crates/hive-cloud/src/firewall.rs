@@ -16,7 +16,10 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::project_settings::AttackMode;
+use crate::project_settings::{
+    AttackMode, ATTACK_MODE_DEFAULT_DURATION_SECS, ATTACK_MODE_MAX_DURATION_MS,
+    ATTACK_MODE_MAX_DURATION_SECS, ATTACK_MODE_MIN_DURATION_SECS,
+};
 use crate::state::CloudState;
 
 type Shared = Arc<CloudState>;
@@ -36,10 +39,11 @@ const MAX_UA_BYTES: usize = 256;
 const FW_COOKIE_DOMAIN: &[u8] = b"hive-firewall-challenge-cookie-v1\0";
 const FW_NONCE_DOMAIN: &[u8] = b"hive-firewall-challenge-nonce-v1\0";
 
-/// Attack Challenge Mode is INDEFINITE: `enabled` alone decides, with no
-/// duration options, no lazy auto-off, no timer and no second loop. Legacy
-/// `active_until_ms` and `duration_secs` remain persisted keys but are zeroed
-/// on every write and never consulted for admission.
+// Attack Challenge Mode is BOUNDED. The server derives active_until_ms from
+// the requested duration and now_ms; expiry is checked at READ time by
+// AttackMode::is_active, so there is no timer, no second loop and no writer
+// that a stale replicated row can resurrect. A legacy indefinite row with a
+// zero deadline and zero duration reads OFF on every node.
 
 fn clip_text(s: &str, cap: usize) -> String {
     let mut out = String::new();
@@ -677,35 +681,95 @@ fn log_decision(
 }
 
 // ---------------------------------------------------------------------------
-// Attack Challenge Mode state. Stored on the REPLICATED ProjectSettings row,
-// written through `touch`: an INDEFINITE on/off flag, no expiry, no timer and
-// no second loop. `enabled` alone decides admission.
+// Attack Challenge Mode state. Stored on the REPLICATED ProjectSettings row
+// and written through touch. Expiry is LAZY: is_active is checked at READ
+// time against a server-derived deadline, so no timer and no second loop
+// can re-arm a mode from a lagging peer's newer whole-row merge.
 // ---------------------------------------------------------------------------
 
-pub fn active_mode(c: &Shared, project: &str, _now_ms: u64) -> Option<AttackMode> {
+/// Deadlines are server-derived: a caller never supplies active_until_ms.
+/// Validation runs BEFORE any row write, so a refused PUT leaves no partial
+/// state and no persist.
+pub(crate) fn bounded_deadline(now_ms: u64, duration_secs: u64) -> Result<u64, String> {
+    if now_ms == 0 {
+        return Err("firewall clock is unavailable".into());
+    }
+    if !(ATTACK_MODE_MIN_DURATION_SECS..=ATTACK_MODE_MAX_DURATION_SECS)
+        .contains(&duration_secs)
+    {
+        return Err("attack challenge mode duration must be between 60 seconds and 24 hours".into());
+    }
+    let deadline = duration_secs
+        .checked_mul(1000)
+        .and_then(|ms| now_ms.checked_add(ms))
+        .ok_or_else(|| "attack challenge mode deadline overflow".to_string())?;
+    if deadline <= now_ms || deadline > now_ms.saturating_add(ATTACK_MODE_MAX_DURATION_MS) {
+        return Err("attack challenge mode deadline must be a bounded future instant".into());
+    }
+    Ok(deadline)
+}
+
+/// duration_secs is canonical; hours is the legacy dashboard field; neither
+/// present means a bounded 6-hour default so a cached service worker that
+/// sends only enabled cannot arm an unbounded mode. Both are typed u64, so
+/// a negative, fractional or NaN value is refused by serde first.
+pub(crate) fn requested_duration_secs(
+    hours: Option<u64>,
+    duration_secs: Option<u64>,
+) -> Result<u64, String> {
+    let secs = match (duration_secs, hours) {
+        (Some(secs), _) => secs,
+        (None, Some(hours)) => hours
+            .checked_mul(3600)
+            .ok_or_else(|| "attack challenge mode hours overflow".to_string())?,
+        (None, None) => ATTACK_MODE_DEFAULT_DURATION_SECS,
+    };
+    if !(ATTACK_MODE_MIN_DURATION_SECS..=ATTACK_MODE_MAX_DURATION_SECS).contains(&secs) {
+        return Err("attack challenge mode duration must be between 60 seconds and 24 hours".into());
+    }
+    Ok(secs)
+}
+
+/// The replicated row, composed BEFORE any write. Validation refuses a
+/// request without leaving a partial row or a persist behind.
+pub(crate) fn compose_mode(
+    enabled: bool,
+    duration_secs: u64,
+    verified_bot_bypass: bool,
+    now_ms: u64,
+) -> Result<AttackMode, String> {
+    let deadline = if enabled {
+        bounded_deadline(now_ms, duration_secs)?
+    } else {
+        0
+    };
+    Ok(AttackMode {
+        enabled,
+        active_until_ms: deadline,
+        // mode_ms binds sealed cookies and nonces; touch stamps the
+        // row's updated_ms so MERGE_STORES carries it fleet-wide.
+        updated_ms: now_ms,
+        duration_secs: if enabled { duration_secs } else { 0 },
+        verified_bot_bypass,
+    })
+}
+
+pub fn active_mode(c: &Shared, project: &str, now_ms: u64) -> Option<AttackMode> {
     let m = c.projects.attack_mode(project);
-    m.enabled.then_some(m)
+    m.is_active(now_ms).then_some(m)
 }
 
 pub fn set_mode(
     c: &Shared,
     project: &str,
     enabled: bool,
+    duration_secs: u64,
     verified_bot_bypass: bool,
     now_ms: u64,
-) -> AttackMode {
-    // The two legacy duration keys are KEPT for persisted-row compatibility
-    // (a serde-required key is never removed in one release) and zeroed on
-    // every write; nothing reads them for admission or expiry.
-    let m = AttackMode {
-        enabled,
-        active_until_ms: 0,
-        updated_ms: now_ms,
-        duration_secs: 0,
-        verified_bot_bypass,
-    };
+) -> Result<AttackMode, String> {
+    let m = compose_mode(enabled, duration_secs, verified_bot_bypass, now_ms)?;
     c.projects.set_attack_mode(project, m);
-    m
+    Ok(m)
 }
 
 /// The ONE edge decision. Called at the top of `edge_pipeline_inner`, before
@@ -866,7 +930,7 @@ fn set_fw_headers(resp: &mut Response, region: &str, action: &str) {
 // ---------------------------------------------------------------------------
 
 const RESIDUALS: &[&str] = &[
-    "Attack Challenge Mode is replicated per-project config with an INDEFINITE on/off toggle: `enabled` alone decides admission, with no duration, no lazy auto-off, no timer and no countdown; automatic attack detection is not implemented.",
+    "Attack Challenge Mode is replicated per-project config with a BOUNDED deadline: enabled plus a server-derived active_until_ms decide admission, checked lazily at read time. There is no timer, no second loop and no client-side countdown; automatic attack detection is not implemented.",
     "Sensitive-path denial is an ALWAYS-ON system mitigation, independent of Attack Challenge Mode: unambiguous secret, VCS and framework-debug paths are refused with a fixed 403 before any redirect, even when the mode is off. Measured against the geniee corpus: all 79 challenge-relevant 307/404 gaps are closed with mode OFF.",
     "AMBIGUOUS names (config.js, settings.json, app.js, Dockerfile) are never hard-denied; they are only challenged while Attack Mode is active, so a legitimate tenant asset is not broken.",
     "A path the bounded normalizer refuses is rejected with a fixed 400 rather than admitted. Non-idempotent methods (POST/PUT/DELETE/PATCH) are refused with a fixed 503 during Attack Mode because the JavaScript challenge would otherwise silently lose the request body; that 503 also deletes a rejected cookie. EventSource/SSE clients cannot execute the challenge; they are covered by the same refusal.",
@@ -878,7 +942,7 @@ const RESIDUALS: &[&str] = &[
     "Page integrity is DETECTION only. There is no CSP script-src enforcement, no nonce injection, no script inventory approval workflow and no browser blocking.",
     "L3/L4 volumetric DDoS absorption, anycast scrubbing and Vercel's automatic network-layer mitigation are NOT implemented and cannot be implemented in application code. L7 rate limiting reuses the existing shared primitive.",
     "Firewall events are node-local and bounded; the dashboard never prints a fabricated fleet total. Vercel's log retention, drill-down and SIEM drains are not implemented.",
-    "There is no 1:1 Vercel Firewall, WAF rule engine, BotID SDK or verified-bots registry equivalence; only the documented, replicable behaviour is implemented. Vercel's 1/6/24-hour duration options are not implemented: the mode is indefinite until explicitly turned off.",
+    "There is no 1:1 Vercel Firewall, WAF rule engine, BotID SDK or verified-bots registry equivalence; only the documented, replicable behaviour is implemented. Durations are bounded to 1-24 hours via hours or duration_secs with a 6-hour default; Vercel's own attack-mode scheduling UI is not replicated.",
 ];
 
 /// Project names the caller may read, derived ONLY from the verified JWT claim.
@@ -934,16 +998,22 @@ pub fn state_value(c: &Shared, project: &str, scope: Option<&HashSet<String>>) -
         "node_local": true,
         "project": project,
         "attack_mode": {
-            "enabled": raw.enabled,
+            // The EFFECTIVE state, not the stored flag: an expired row reads
+            // OFF, so the dashboard never shows a dead mode as armed.
+            "enabled": active.is_some(),
             "active": active.is_some(),
             "active_until_ms": raw.active_until_ms,
             "updated_ms": raw.updated_ms,
             "duration_secs": raw.duration_secs,
-            // Compatibility keys only: the mode is INDEFINITE, so no countdown
-            // is ever fabricated. `hours_left` stays null on every response.
-            "hours_left": Value::Null,
-            "indefinite": true,
-            "expires": false,
+            // Measured from this node's now_ms, ceiling to a whole hour;
+            // null when off, never a fabricated countdown.
+            "hours_left": active
+                .map(|_| json!(raw.active_until_ms.saturating_sub(now).saturating_add(3_599_999) / 3_600_000))
+                .unwrap_or(Value::Null),
+            "indefinite": false,
+            "expires": active
+                .map(|_| json!(raw.active_until_ms))
+                .unwrap_or(Value::Null),
             "verified_bot_bypass": raw.verified_bot_bypass,
         },
         "events": {
@@ -1033,8 +1103,14 @@ struct AttackModeBody {
     enabled: bool,
     #[serde(default)]
     verified_bot_bypass: bool,
-    // No `deny_unknown_fields`: a legacy dashboard still sending `hours` is
-    // ignored by serde. The mode has no duration, so there is no validation.
+    /// Legacy dashboard: hours (1, 6 or 24). Ignored when duration_secs is
+    /// present. Unknown fields are ignored by serde, so a caller can never
+    /// inject active_until_ms.
+    #[serde(default)]
+    hours: Option<u64>,
+    /// Canonical bounded integer seconds.
+    #[serde(default)]
+    duration_secs: Option<u64>,
 }
 
 async fn attack_mode_put(
@@ -1058,8 +1134,16 @@ async fn attack_mode_put(
         &project,
     )?;
     let now = hive_core::now_ms();
-    // INDEFINITE on/off: no duration argument and no duration validation.
-    set_mode(&c, &project, b.enabled, b.verified_bot_bypass, now);
+    let secs = if b.enabled {
+        requested_duration_secs(b.hours, b.duration_secs)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?
+    } else {
+        0
+    };
+    // set_mode validates BEFORE the row write; a refused request leaves
+    // neither a partial row nor a persist.
+    set_mode(&c, &project, b.enabled, secs, b.verified_bot_bypass, now)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     // A security decision must be durable BEFORE it is acknowledged; a failed
     // fsync fails closed rather than leaving a mode that survives only in RAM.
     if !crate::persist::persist_durable(&c) {
@@ -1099,7 +1183,8 @@ async fn attack_mode_projects_handler(
         .map(|cl| crate::admin::norm(&cl.tenant).to_string())
         .filter(|t| t.as_str() != crate::admin::ANON_TENANT)
         .ok_or((StatusCode::UNAUTHORIZED, "sign-in required".to_string()))?;
-    let mut rows = c.projects.attack_mode_projects(&t);
+    let now = hive_core::now_ms();
+    let mut rows = c.projects.attack_mode_projects(&t, now);
     rows.sort_by(|a, b| a.0.cmp(&b.0));
     let count = rows.len();
     let projects: Vec<Value> = rows
@@ -1108,7 +1193,11 @@ async fn attack_mode_projects_handler(
             "project": project,
             "enabled": true,
             "updated_ms": m.updated_ms,
-            "indefinite": true,
+            "active_until_ms": m.active_until_ms,
+            "duration_secs": m.duration_secs,
+            "hours_left": m.active_until_ms.saturating_sub(now).saturating_add(3_599_999) / 3_600_000,
+            "indefinite": false,
+            "expires": m.active_until_ms,
         }))
         .collect();
     Ok(Json(json!({ "projects": projects, "node_local": false, "count": count })))

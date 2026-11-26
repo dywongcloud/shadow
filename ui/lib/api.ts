@@ -2167,8 +2167,8 @@ export interface FwAttackMode {
   updated_ms?: number | null;
   duration_secs?: number | null;
   hours_left?: number | null;
-  /** An enabled mode has NO timer. These are measurements from the node, never a client-side
-   *  deadline: an absent field renders absent. The expires flag is false while indefinite. */
+  /** A measured epoch-ms deadline, never a client-side countdown. An older
+   *  node answers indefinite: true and expires: false; both render absent. */
   indefinite?: boolean | null;
   expires?: boolean | string | number | null;
 }
@@ -2178,6 +2178,9 @@ export interface FwAttackProject {
   project?: string | null;
   enabled?: boolean | null;
   updated_ms?: number | null;
+  active_until_ms?: number | null;
+  duration_secs?: number | null;
+  hours_left?: number | null;
   indefinite?: boolean | null;
   expires?: boolean | string | number | null;
   node_local?: boolean | null;
@@ -2233,15 +2236,17 @@ export async function getFirewallState(project?: string): Promise<FwState> {
 }
 
 /** The project name is bounded before any request: an overflow or an empty name is a typed
- *  refusal, never a silent truncation on the wire. The server owns the actual admission, and
- *  the mode is on or off indefinitely: there is no duration choice to send. */
-export async function setFirewallAttackMode(project: string, enabled: boolean): Promise<FwState> {
+ *  refusal, never a silent truncation on the wire. The server owns admission. */
+export async function setFirewallAttackMode(project: string, enabled: boolean, durationSecs: number): Promise<FwState> {
   if (project.length > 128) throw new ApiError(400, "Project must be 128 characters or fewer.");
   if (project.trim() === "") throw new ApiError(400, "Enter a project name.");
+  if (!Number.isSafeInteger(durationSecs) || durationSecs < 60 || durationSecs > 86400) {
+    throw new ApiError(400, "Attack challenge mode duration must be between 1 minute and 24 hours.");
+  }
   return apiSend<FwState>(
     "PUT",
     "/v1/projects/" + encodeURIComponent(project) + "/firewall/attack-mode",
-    { enabled },
+    { enabled, duration_secs: durationSecs },
   );
 }
 

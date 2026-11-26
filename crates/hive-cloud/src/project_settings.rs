@@ -258,10 +258,11 @@ pub struct BrowserDbRestToken {
 /// Project-scoped Attack Challenge Mode. Additive and #[serde(default)]: an
 /// older node's row without this key still deserializes, and the existing
 /// projects MERGE_STORES per-row updated_ms merge carries it fleet-wide.
-/// INDEFINITE on/off: `enabled` alone decides admission. `active_until_ms`,
-/// `updated_ms` and `duration_secs` are KEPT with #[serde(default)] for
-/// persisted-row compatibility; the two duration fields are zeroed on every
-/// write and are never read for expiry. No timer, no second loop.
+/// The mode is BOUNDED: active_until_ms is a server-derived deadline checked
+/// LAZILY at read time by is_active, so there is no timer, no second loop and
+/// no writer that a stale replicated row can resurrect. All five keys stay
+/// serde-defaulted; a legacy indefinite row (deadline and duration zero)
+/// reads OFF on every node. No persisted key is removed or renamed.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttackMode {
     #[serde(default)]
@@ -276,6 +277,31 @@ pub struct AttackMode {
     /// measurement, never an attestation. Default false.
     #[serde(default)]
     pub verified_bot_bypass: bool,
+}
+
+/// Admitted durations. A bounded DEFAULT is mandatory: the shipped dashboard
+/// and a cached service worker send only enabled, and without one those
+/// calls would arm an unbounded mode again. Six hours is the operator's
+/// stated window.
+pub const ATTACK_MODE_MIN_DURATION_SECS: u64 = 60;
+pub const ATTACK_MODE_MAX_DURATION_SECS: u64 = 24 * 3600;
+pub const ATTACK_MODE_DEFAULT_DURATION_SECS: u64 = 6 * 3600;
+pub const ATTACK_MODE_MAX_DURATION_MS: u64 = ATTACK_MODE_MAX_DURATION_SECS * 1000;
+
+impl AttackMode {
+    /// ONE read-time predicate, shared by the edge gate, the state view and
+    /// the enabled-projects list. now_ms == 0 fails closed. The upper bound
+    /// refuses a replicated deadline far enough ahead to be effectively
+    /// indefinite; a deadline in the past is expired. enabled alone never
+    /// admits a challenge.
+    pub fn is_active(&self, now_ms: u64) -> bool {
+        now_ms > 0
+            && self.enabled
+            && self.duration_secs >= ATTACK_MODE_MIN_DURATION_SECS
+            && self.duration_secs <= ATTACK_MODE_MAX_DURATION_SECS
+            && self.active_until_ms > now_ms
+            && self.active_until_ms <= now_ms.saturating_add(ATTACK_MODE_MAX_DURATION_MS)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2148,21 +2174,22 @@ impl ProjectStore {
             .unwrap_or_default()
     }
 
-    /// REPLICATED ProjectSettings rows with Attack Challenge Mode ON, as
-    /// (project, mode), scoped by `rows_for_tenant` - the SAME stored-tag
-    /// primitive `project_inventory::summary` and
-    /// `GET /v1/gitops/projects?view=summary` use. One read lock over the
-    /// existing map, no new state and no node-local event ring: MERGE_STORES
-    /// carries these rows to every node, so a GET answered locally behind
-    /// round-robin DNS lists the same projects everywhere. Bounded by the
-    /// replicated row count, never by a caller-controlled length. A row
-    /// another tenant holds never leaves this store.
-    pub fn attack_mode_projects(&self, tenant: &str) -> Vec<(String, AttackMode)> {
+    /// REPLICATED ProjectSettings rows with an ACTIVE Attack Challenge Mode,
+    /// as (project, mode), scoped by rows_for_tenant - the SAME stored-tag
+    /// primitive project_inventory::summary and the gitops summary view use.
+    /// One read lock over the existing map, no new state and no node-local
+    /// event ring: MERGE_STORES carries these rows to every node, so a GET
+    /// answered locally behind round-robin DNS lists the same projects.
+    /// Expiry is evaluated at read time, so a lagging peer's expired row
+    /// never appears here. Bounded by the replicated row count, never by a
+    /// caller-controlled length. A row another tenant holds never leaves
+    /// this store.
+    pub fn attack_mode_projects(&self, tenant: &str, now_ms: u64) -> Vec<(String, AttackMode)> {
         self.rows_for_tenant(tenant)
             .into_iter()
             .filter_map(|(name, row)| {
                 row.attack_mode
-                    .enabled
+                    .is_active(now_ms)
                     .then_some((name, row.attack_mode))
             })
             .collect()
