@@ -84,9 +84,11 @@ the last seven days of journal contain 9731 `No space left on device`
 lines. Measured occupancy: `/var/lib/hive/data` 726.0 GB, 922 litebox
 runtime tars 308.1 GB, `/var/log` 19.7 GB (five rotated `messages-*`
 files of 2.1-3.9 GB each), `/tmp` 12.5 GB in 700006 files,
-`/root/fc-target` 14.2 GB. This is the observed cause of the "freezing"
-that made sshd drop connections. Nothing was deleted: reclaim needs a
-blast-radius guard (`gc_rootfs_images` keep-set and
+`/root/fc-target` 14.2 GB. A full rootfs with 9731 ENOSPC lines is the
+concrete condition behind the intermittent freezes; the earlier
+`Not allowed at this time` was sshd's listener drop on a wedged/rebooting
+host, not a firewall or sshd config change. Nothing was deleted: a
+reclaim needs a blast-radius guard (`gc_rootfs_images` keep-set and
 `HIVE_GC_MAX_REAP_FRACTION`) and an explicit operator word. A UI build
 cannot succeed here: `parallel-deploy.yml` elects the control-plane
 leader (the chain head) as `ui_builder`.
