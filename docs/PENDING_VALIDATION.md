@@ -312,3 +312,27 @@ honeypot IP deny apply (needs operator-supplied page snapshots and
 deletion (908 dangling images / guarded rootfs-image reclaim), a `--tags
 backend` roll, and GitHub CI verdict (billing block needs an operator account
 fix). No inventory, vault, or `hosts.ini` file was edited; no secrets printed.
+
+## Witnessed 2026-11-26 UTC: both rows above are live
+
+`node24-lts-default-20261125` and `vue-framework-20261125` are pushed at
+`017be7af6fe8f93b2c7fb8454229bc443b25860a`; CI run 45752714094 is success,
+11/11 jobs. `scripts/audit-secret-keys.sh` is clean on all six hosts. All
+six `hive-node.service` units execute one identical 150601960-byte
+artifact (sha256
+`c4173192828940ef28e8854496043aaeb7b775bd97a1e96a8f79cdbdeab1b985`,
+mtime 04:28 UTC, unit start 04:30-04:37 UTC). `strings -a
+/proc/<MainPID>/exe | grep -c` returns 1 for the Node 24 boot literal and
+1 for `VUE_PROBE=PASS` on every host. On the DEPLOYED binary,
+`--node-probe` prints `NODE_PROBE=PASS` (`executed=PASS
+reported=v24.22.3`) and `--vue-probe` prints `VUE_PROBE=PASS` with nine
+RESULT lines, on fc-virginia and fc-phoenix. Live
+`GET /v1/build/frameworks` serves the `vue` preset (`npm run build`,
+`dist`, `static`). No second roll was run: the playbook refuses a no-op
+and a redundant six-host serial restart buys nothing.
+
+HOLD, operator-gated, not claimed done: the served dashboard `.next` has
+zero Vue strings (needs a `--tags ui` roll), fc-sanjose `/dev/vda2` is
+2.0T/2.0T with 0 bytes free (disk reclaim; nothing deleted), plus the
+reviewed BuildExecutor base, `sandbox-node24.ext4` and the booted
+Firecracker rootfs. See `docs/node-24-lts.md` and `docs/vue-framework.md`.

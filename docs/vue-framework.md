@@ -1,9 +1,9 @@
 # Vue.js as a supported framework
 
-Status: 2026-11-25. Vue.js is ONE framework preset with TWO build lanes, and
+Status: 2026-11-26. Vue.js is ONE framework preset with TWO build lanes, and
 it is detected, selectable, buildable and deployable through the same checked
 primitives as every other framework. `hive-cloud --vue-probe` is the live
-witness.
+witness; the backend roll is verified on all six nodes (see "Live roll").
 
 ## What was already true
 
@@ -79,8 +79,37 @@ these holds:
   evidence is `framework:vue` with no `framework:vite`, the previously
   failing deployment case. Other evidence (`static:index.html`) is expected.
 
+## Live roll (2026-11-26)
+
+The backend is live on all six nodes from pushed SHA
+`017be7af6fe8f93b2c7fb8454229bc443b25860a`. Every `hive-node.service`
+executes the same 150601960-byte artifact, sha256
+`c4173192828940ef28e8854496043aaeb7b775bd97a1e96a8f79cdbdeab1b985`,
+mtime 04:28 UTC, unit start 04:30-04:37 UTC. `strings -a
+/proc/<MainPID>/exe | grep -c 'VUE_PROBE=PASS'` returns 1 on each host.
+`/root/fc-target/release/hive-cloud --vue-probe` prints `VUE_PROBE=PASS`
+with all nine RESULT lines on fc-virginia and fc-phoenix, and live
+`GET /v1/build/frameworks` returns the `vue` preset with `npm run build`,
+`dist` and `static`. CI run 45752714094 is success, 11/11 jobs.
+
+No second roll was run: the playbook refuses a run whose artifact matches
+the on-disk binary and `/proc/<MainPID>/exe`, and a redundant six-host
+serial restart buys nothing.
+
 ## HOLD: operator-gated residuals
 
+- The served dashboard build is stale. `/root/hive/ui/.next` (BUILD_ID
+  `7S08zWBE_kUO100ORg6j7`) has zero `Vue.js` / `Vue 3 + Vite` occurrences
+  in 3274 files on fc-virginia and 3279 on fc-phoenix, so the picker
+  option, logo aliases, `/new` starter and corrected landing tile are in
+  HEAD but not in the served UI. `--tags backend` never rebuilds the UI.
+  A `--tags ui` roll is a production change needing the operator's word,
+  and the elected `ui_builder` is the chain head, which has 0 bytes free.
+- The chain head fc-sanjose has `/dev/vda2` 2.0T/2.0T, 0 bytes free and
+  9731 `No space left on device` journal lines in seven days. 922 litebox
+  runtime tars take 308.1 GB, `/var/lib/hive/data` 726.0 GB, `/var/log`
+  19.7 GB and `/tmp` 12.5 GB in 700006 files. Nothing was deleted; every
+  reclaim needs a blast-radius guard and an explicit operator word.
 - The reviewed, digest-pinned BuildExecutor base is unchanged. Its Node
   version is whatever that reviewed image carries; changing it needs a new
   pinned digest plus a roll.

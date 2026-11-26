@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-11-26 UTC - backend roll verified live; chain head out of disk
+
+Both changes above are live on all six `hive-node.service` units from
+pushed SHA `017be7af6fe8f93b2c7fb8454229bc443b25860a`: one identical
+150601960-byte artifact, sha256
+`c4173192828940ef28e8854496043aaeb7b775bd97a1e96a8f79cdbdeab1b985`,
+mtime 04:28 UTC, unit start 04:30-04:37 UTC. `strings -a
+/proc/<MainPID>/exe | grep -c` returns 1 for the Node 24 boot literal
+and 1 for `VUE_PROBE=PASS` on every host. Live `--node-probe` and
+`--vue-probe` on the DEPLOYED binary print `NODE_PROBE=PASS` /
+`VUE_PROBE=PASS`, and live `GET /v1/build/frameworks` serves the `vue`
+preset. CI run 45752714094 is success, 11/11 jobs. The pre-roll
+`scripts/audit-secret-keys.sh` is clean on all six hosts; fc-sanjose's
+earlier `Not allowed at this time` on :22 was a frozen/rebooting host,
+not a firewall or sshd change. No second roll was run: the playbook
+refuses a no-op and a redundant serial restart buys nothing.
+
+HOLD, operator-gated: fc-sanjose `/dev/vda2` is 2.0T/2.0T with 0 bytes
+free and 9731 `No space left on device` journal lines in seven days
+(922 litebox runtime tars 308.1 GB, `/var/lib/hive/data` 726.0 GB,
+`/var/log` 19.7 GB, `/tmp` 12.5 GB in 700006 files). Nothing was
+deleted. The served dashboard `.next` still has zero Vue strings, so the
+picker / starter / tile are in HEAD but not in the UI; `--tags backend`
+never rebuilds the UI, and the elected `ui_builder` is the chain head
+with 0 bytes free. A UI roll and any disk reclaim are one-way doors
+needing the operator's word. See `docs/node-24-lts.md` and
+`docs/vue-framework.md`.
+
 ## 2026-11-25 - Vue.js is one supported framework, two build lanes
 
 A vue preset already existed, but it hard-coded vue-cli-service build: a
